@@ -1,0 +1,404 @@
+# Mirror Memory -- word anchors
+# Used for K1 deterministic extraction and K2 closed-set validation.
+# All phrases are bilingual (en/zh) for cross-language matching.
+
+anchors:
+  # -- topic -----------------------------------------------------------------
+  - dimension: topic
+    key: work
+    phrases:
+      - work
+      - job
+      - career
+      - office
+      - boss
+      - colleague
+      - 工作
+      - 职业
+      - 上班
+      - 同事
+
+  - dimension: topic
+    key: family
+    phrases:
+      - family
+      - parent
+      - mom
+      - dad
+      - child
+      - sibling
+      - spouse
+      - partner
+      - 家庭
+      - 父母
+      - 孩子
+      - 配偶
+      - 家人
+
+  - dimension: topic
+    key: health
+    phrases:
+      - health
+      - doctor
+      - exercise
+      - sleep
+      - diet
+      - sick
+      - pain
+      - 健康
+      - 医生
+      - 运动
+      - 睡眠
+      - 生病
+
+  - dimension: topic
+    key: travel
+    phrases:
+      - travel
+      - trip
+      - vacation
+      - flight
+      - hotel
+      - 旅行
+      - 旅游
+      - 度假
+
+  - dimension: topic
+    key: hobby
+    phrases:
+      - hobby
+      - hobby
+      - pastime
+      - interest
+      - 爱好
+      - 兴趣
+
+  - dimension: topic
+    key: education
+    phrases:
+      - school
+      - university
+      - course
+      - study
+      - exam
+      - degree
+      - 学校
+      - 大学
+      - 课程
+      - 学习
+      - 考试
+
+  - dimension: topic
+    key: food
+    phrases:
+      - food
+      - cook
+      - recipe
+      - restaurant
+      - meal
+      - 食物
+      - 做饭
+      - 餐厅
+
+  - dimension: topic
+    key: music
+    phrases:
+      - music
+      - song
+      - concert
+      - band
+      - album
+      - 音乐
+      - 歌曲
+      - 演唱会
+
+  - dimension: topic
+    key: movie
+    phrases:
+      - movie
+      - film
+      - show
+      - series
+      - cinema
+      - 电影
+      - 电视剧
+
+  - dimension: topic
+    key: book
+    phrases:
+      - book
+      - read
+      - novel
+      - author
+      - 书
+      - 阅读
+      - 小说
+
+  - dimension: topic
+    key: sport
+    phrases:
+      - sport
+      - game
+      - team
+      - match
+      - exercise
+      - 体育
+      - 运动
+      - 比赛
+
+  - dimension: topic
+    key: pet
+    phrases:
+      - pet
+      - dog
+      - cat
+      - animal
+      - 宠物
+      - 狗
+      - 猫
+
+  - dimension: topic
+    key: weather
+    phrases:
+      - weather
+      - rain
+      - sunny
+      - cold
+      - hot
+      - 天气
+      - 下雨
+      - 晴天
+
+  - dimension: topic
+    key: technology
+    phrases:
+      - tech
+      - computer
+      - software
+      - app
+      - coding
+      - ai
+      - 技术
+      - 电脑
+      - 编程
+
+  - dimension: topic
+    key: finance
+    phrases:
+      - money
+      - finance
+      - budget
+      - invest
+      - savings
+      - salary
+      - 金钱
+      - 财务
+      - 预算
+      - 投资
+
+  - dimension: topic
+    key: relationship
+    phrases:
+      - friend
+      - friendship
+      - date
+      - dating
+      - love
+      - relationship
+      - 朋友
+      - 约会
+      - 恋爱
+      - 关系
+
+  # -- preference ------------------------------------------------------------
+  - dimension: preference
+    key: prefer
+    phrases:
+      - prefer
+      - I prefer
+      - 我更喜欢
+      - 我偏好
+
+  - dimension: preference
+    key: like
+    phrases:
+      - like
+      - I like
+      - 我喜欢
+
+  - dimension: preference
+    key: love
+    phrases:
+      - love
+      - I love
+      - 我爱
+      - 我超爱
+
+  - dimension: preference
+    key: enjoy
+    phrases:
+      - enjoy
+      - I enjoy
+      - 我享受
+
+  - dimension: preference
+    key: hate
+    phrases:
+      - hate
+      - I hate
+      - 我讨厌
+
+  - dimension: preference
+    key: dislike
+    phrases:
+      - dislike
+      - I don't like
+      - 我不喜欢
+
+  - dimension: preference
+    key: favorite
+    phrases:
+      - favorite
+      - my favorite
+      - 最喜欢
+      - 我的最爱
+
+  # -- fact ------------------------------------------------------------------
+  - dimension: fact
+    key: i_am
+    phrases:
+      - I am
+      - I'm
+      - 我是
+
+  - dimension: fact
+    key: i_work
+    phrases:
+      - I work
+      - I'm working
+      - 我在工作
+      - 我从事
+
+  - dimension: fact
+    key: i_live
+    phrases:
+      - I live
+      - I'm living
+      - 我住在
+
+  - dimension: fact
+    key: i_have
+    phrases:
+      - I have
+      - I've got
+      - 我有
+
+  - dimension: fact
+    key: my_name
+    phrases:
+      - my name
+      - I'm called
+      - call me
+      - 我叫
+      - 我的名字
+
+  - dimension: fact
+    key: age
+    phrases:
+      - years old
+      - I'm * years old
+      - 岁
+      - 我今年
+
+  # -- goal ------------------------------------------------------------------
+  - dimension: goal
+    key: i_want
+    phrases:
+      - I want
+      - I want to
+      - I'd like to
+      - 我想要
+      - 我想
+
+  - dimension: goal
+    key: i_hope
+    phrases:
+      - I hope
+      - hopefully
+      - 我希望
+
+  - dimension: goal
+    key: my_goal
+    phrases:
+      - my goal
+      - my aim
+      - my target
+      - 我的目标
+
+  - dimension: goal
+    key: i_plan
+    phrases:
+      - I plan
+      - I'm planning
+      - I intend to
+      - 我计划
+      - 我打算
+
+  - dimension: goal
+    key: i_wish
+    phrases:
+      - I wish
+      - I dream of
+      - 我希望
+      - 我梦想
+
+  - dimension: goal
+    key: i_need
+    phrases:
+      - I need
+      - I need to
+      - 我需要
+
+  # -- pattern ---------------------------------------------------------------
+  - dimension: pattern
+    key: always
+    phrases:
+      - always
+      - I always
+      - 我总是
+      - 我一直
+
+  - dimension: pattern
+    key: usually
+    phrases:
+      - usually
+      - I usually
+      - 我通常
+
+  - dimension: pattern
+    key: tend_to
+    phrases:
+      - tend to
+      - I tend to
+      - 我倾向于
+
+  - dimension: pattern
+    key: often
+    phrases:
+      - often
+      - I often
+      - 我经常
+
+  - dimension: pattern
+    key: every_time
+    phrases:
+      - every time
+      - each time
+      - 每次
+
+  - dimension: pattern
+    key: whenever
+    phrases:
+      - whenever
+      - whenever I
+      - 每当

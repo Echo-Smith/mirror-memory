@@ -1,0 +1,250 @@
+# Mirror Memory -- display labels
+# Generic terminology (no clinical or domain-specific language).
+# Each entry maps a (dimension, key) pair to a bilingual label.
+
+labels:
+  # -- dimension headers -----------------------------------------------------
+  - key: __header__
+    dimension: topic
+    zh: "话题"
+    en: "Topics"
+
+  - key: __header__
+    dimension: preference
+    zh: "偏好"
+    en: "Preferences"
+
+  - key: __header__
+    dimension: fact
+    zh: "关于你"
+    en: "About You"
+
+  - key: __header__
+    dimension: event
+    zh: "经历"
+    en: "Experiences"
+
+  - key: __header__
+    dimension: goal
+    zh: "目标"
+    en: "Goals"
+
+  - key: __header__
+    dimension: pattern
+    zh: "习惯"
+    en: "Habits"
+
+  - key: __header__
+    dimension: boundary
+    zh: "边界"
+    en: "Boundaries"
+
+  # -- topic labels ----------------------------------------------------------
+  - key: work
+    dimension: topic
+    zh: "工作"
+    en: "Work"
+
+  - key: family
+    dimension: topic
+    zh: "家庭"
+    en: "Family"
+
+  - key: health
+    dimension: topic
+    zh: "健康"
+    en: "Health"
+
+  - key: travel
+    dimension: topic
+    zh: "旅行"
+    en: "Travel"
+
+  - key: hobby
+    dimension: topic
+    zh: "爱好"
+    en: "Hobbies"
+
+  - key: education
+    dimension: topic
+    zh: "教育"
+    en: "Education"
+
+  - key: food
+    dimension: topic
+    zh: "饮食"
+    en: "Food"
+
+  - key: music
+    dimension: topic
+    zh: "音乐"
+    en: "Music"
+
+  - key: movie
+    dimension: topic
+    zh: "影视"
+    en: "Movies"
+
+  - key: book
+    dimension: topic
+    zh: "阅读"
+    en: "Books"
+
+  - key: sport
+    dimension: topic
+    zh: "运动"
+    en: "Sports"
+
+  - key: pet
+    dimension: topic
+    zh: "宠物"
+    en: "Pets"
+
+  - key: weather
+    dimension: topic
+    zh: "天气"
+    en: "Weather"
+
+  - key: technology
+    dimension: topic
+    zh: "科技"
+    en: "Technology"
+
+  - key: finance
+    dimension: topic
+    zh: "财务"
+    en: "Finance"
+
+  - key: relationship
+    dimension: topic
+    zh: "人际关系"
+    en: "Relationships"
+
+  # -- preference labels -----------------------------------------------------
+  - key: prefer
+    dimension: preference
+    zh: "偏好"
+    en: "Prefers"
+
+  - key: like
+    dimension: preference
+    zh: "喜欢"
+    en: "Likes"
+
+  - key: love
+    dimension: preference
+    zh: "热爱"
+    en: "Loves"
+
+  - key: enjoy
+    dimension: preference
+    zh: "享受"
+    en: "Enjoys"
+
+  - key: hate
+    dimension: preference
+    zh: "讨厌"
+    en: "Hates"
+
+  - key: dislike
+    dimension: preference
+    zh: "不喜欢"
+    en: "Dislikes"
+
+  - key: favorite
+    dimension: preference
+    zh: "最爱"
+    en: "Favorite"
+
+  # -- fact labels -----------------------------------------------------------
+  - key: i_am
+    dimension: fact
+    zh: "身份"
+    en: "Identity"
+
+  - key: i_work
+    dimension: fact
+    zh: "职业"
+    en: "Occupation"
+
+  - key: i_live
+    dimension: fact
+    zh: "居住地"
+    en: "Location"
+
+  - key: i_have
+    dimension: fact
+    zh: "拥有"
+    en: "Possessions"
+
+  - key: my_name
+    dimension: fact
+    zh: "姓名"
+    en: "Name"
+
+  - key: age
+    dimension: fact
+    zh: "年龄"
+    en: "Age"
+
+  # -- goal labels -----------------------------------------------------------
+  - key: i_want
+    dimension: goal
+    zh: "愿望"
+    en: "Wants"
+
+  - key: i_hope
+    dimension: goal
+    zh: "希望"
+    en: "Hopes"
+
+  - key: my_goal
+    dimension: goal
+    zh: "目标"
+    en: "Goals"
+
+  - key: i_plan
+    dimension: goal
+    zh: "计划"
+    en: "Plans"
+
+  - key: i_wish
+    dimension: goal
+    zh: "梦想"
+    en: "Dreams"
+
+  - key: i_need
+    dimension: goal
+    zh: "需要"
+    en: "Needs"
+
+  # -- pattern labels --------------------------------------------------------
+  - key: always
+    dimension: pattern
+    zh: "总是"
+    en: "Always"
+
+  - key: usually
+    dimension: pattern
+    zh: "通常"
+    en: "Usually"
+
+  - key: tend_to
+    dimension: pattern
+    zh: "倾向于"
+    en: "Tends to"
+
+  - key: often
+    dimension: pattern
+    zh: "经常"
+    en: "Often"
+
+  - key: every_time
+    dimension: pattern
+    zh: "每次"
+    en: "Every time"
+
+  - key: whenever
+    dimension: pattern
+    zh: "每当"
+    en: "Whenever"

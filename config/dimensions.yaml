@@ -1,0 +1,53 @@
+# Mirror Memory -- dimension definitions
+# All dimensions are generic (zero domain coupling).
+# Override or extend per deployment.
+
+dimensions:
+  - id: topic
+    name:
+      zh: "话题"
+      en: "Topic"
+    description: "Recurring topics the user mentions"
+    render_priority: 1
+
+  - id: preference
+    name:
+      zh: "偏好"
+      en: "Preference"
+    description: "User preferences and styles"
+    render_priority: 2
+
+  - id: fact
+    name:
+      zh: "事实"
+      en: "Fact"
+    description: "Factual information about the user"
+    render_priority: 3
+
+  - id: event
+    name:
+      zh: "事件"
+      en: "Event"
+    description: "Life events and milestones"
+    render_priority: 4
+
+  - id: goal
+    name:
+      zh: "目标"
+      en: "Goal"
+    description: "User goals and intentions"
+    render_priority: 5
+
+  - id: pattern
+    name:
+      zh: "模式"
+      en: "Pattern"
+    description: "Behavioral patterns and tendencies"
+    render_priority: 6
+
+  - id: boundary
+    name:
+      zh: "边界"
+      en: "Boundary"
+    description: "Topics or approaches the user rejects"
+    render_priority: 7

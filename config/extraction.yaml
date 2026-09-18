@@ -1,0 +1,170 @@
+# Mirror Memory -- extraction configuration
+# Keywords and context tags used by detect_topics and K1 extraction.
+# All values are generic (zero domain coupling).
+
+context_tags:
+  - work
+  - family
+  - health
+  - education
+  - social
+  - finance
+  - travel
+  - hobby
+  - relationship
+
+keywords:
+  topic:
+    - work
+    - job
+    - career
+    - family
+    - health
+    - travel
+    - hobby
+    - education
+    - food
+    - music
+    - movie
+    - book
+    - sport
+    - pet
+    - weather
+    - technology
+    - finance
+    - relationship
+    - friend
+    - school
+    - game
+    - cook
+    - read
+    - sleep
+    - exercise
+    - doctor
+    - money
+    - invest
+    - savings
+
+  preference:
+    - prefer
+    - like
+    - love
+    - enjoy
+    - hate
+    - dislike
+    - favorite
+    - interested
+    - boring
+    - exciting
+    - amazing
+    - terrible
+
+  fact:
+    - I am
+    - I work
+    - I live
+    - I have
+    - my name
+    - years old
+    - I'm
+    - I've
+    - I graduated
+    - I studied
+    - born
+    - grew up
+
+  event:
+    - happened
+    - happened to me
+    - last week
+    - yesterday
+    - recently
+    - last month
+    - last year
+    - today
+    - just now
+    - a few days ago
+    - I went
+    - I attended
+    - I started
+    - I finished
+    - I moved
+    - I got
+    - I lost
+
+  goal:
+    - I want
+    - I hope
+    - my goal
+    - I plan
+    - I wish
+    - I need
+    - I'd like to
+    - I'm trying to
+    - I'm working on
+    - I aim to
+    - I dream of
+    - someday
+    - in the future
+
+  pattern:
+    - always
+    - usually
+    - tend to
+    - often
+    - every time
+    - whenever
+    - habit
+    - routine
+    - regularly
+    - frequently
+    - sometimes
+    - occasionally
+    - rarely
+    - never
+
+  boundary:
+    - don't
+    - never
+    - stop
+    - don't want
+    - I refuse
+    - boundary
+    - not comfortable
+    - please don't
+    - I don't like it when
+    - avoid
+    - no thanks
+    - that's off limits
+
+# Regex patterns for structured extraction
+patterns:
+  # Age pattern
+  - regex: "(?:I'm|I am)\\s+(\\d{1,3})\\s+(?:years?\\s+old|yo)"
+    dimension: fact
+    key: age
+
+  # Name pattern
+  - regex: "(?:my name is|call me|I'm called)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?)"
+    dimension: fact
+    key: my_name
+
+  # Location pattern
+  - regex: "(?:I live in|I'm from|I'm living in)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)"
+    dimension: fact
+    key: i_live
+
+  # Goal pattern
+  - regex: "(?:I want to|I'd like to|I hope to|I plan to)\\s+(.+?)(?:\\.|,|$)"
+    dimension: goal
+    key: i_want
+
+  # Preference pattern
+  - regex: "(?:I (?:really )?(?:prefer|like|love|enjoy|hate|dislike))\\s+(.+?)(?:\\.|,|$)"
+    dimension: preference
+    key: like
+
+  # Frequency pattern
+  - regex: "(?:I (?:always|usually|often|sometimes|rarely|never))\\s+(.+?)(?:\\.|,|$)"
+    dimension: pattern
+    key: always
