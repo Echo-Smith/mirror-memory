@@ -25,6 +25,7 @@ from .schema import (
     DimensionConfig,
     PatternRule,
     PromptTemplates,
+    SuppressionRule,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
         "keywords", "patterns", "context_tags",
         "max_claims_per_turn", "llm_every_turns", "llm_min_keyword_hits",
         "high_value_dimensions", "extraction_value_threshold",
+        "suppression_rules",
     }
     unknown = set(data.keys()) - _KNOWN_EXTRACTION_KEYS
     if unknown:
@@ -191,6 +193,10 @@ def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
         llm_min_keyword_hits=max(1, int(data.get("llm_min_keyword_hits", 2))),
         high_value_dimensions=[str(d) for d in high_value_dimensions],
         extraction_value_threshold=extraction_value_threshold,
+        suppression_rules=[
+            SuppressionRule(**r) for r in data.get("suppression_rules", [])
+            if isinstance(r, dict) and r.get("context")
+        ],
     )
 
 

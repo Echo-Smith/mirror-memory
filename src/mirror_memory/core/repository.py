@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -36,6 +36,7 @@ from mirror_memory.core.constants import (
     CONFIDENCE_CEILING,
     DEFAULT_QUESTION_TIER,
     L4_QUESTION_THRESHOLD,
+    LIFE_EVENT_EXPIRY_DAYS,
     MAX_EVIDENCE_REFS,
     QUESTION_TIER_WEIGHT_MAX,
     QUESTION_TIER_WEIGHT_MIN,
@@ -158,7 +159,9 @@ def list_active_beliefs(
     if dimensions:
         conditions.append(Belief.dimension.in_(dimensions))
     stmt = select(Belief).where(*conditions).order_by(desc(Belief.last_evidence_at)).limit(limit)
-    return list(session.scalars(stmt))
+    results = list(session.scalars(stmt))
+    # Filter out expired life events.
+    return [b for b in results if not _is_expired(b)]
 
 
 def list_rejected_beliefs(session: Session, user_id: str, *, limit: int = 5) -> list[Belief]:
@@ -187,6 +190,35 @@ def get_belief_events(session: Session, user_id: str, belief_id: int, *, limit: 
 # ---------------------------------------------------------------------------
 # record_claim -- the main write path
 # ---------------------------------------------------------------------------
+
+
+def _event_key(base_key: str, claim_text: str) -> str:
+    """Derive a unique event key by appending a content hash suffix.
+
+    Life events with the same base key (e.g. ``"trip"``) but different
+    content are distinct memories, not duplicates of one belief.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(claim_text.encode()).hexdigest()[:8]
+    return f"{base_key}:{digest}"
+
+
+def _is_expired(belief: Belief) -> bool:
+    """Check if a life-event belief has expired (expires_at in the past)."""
+    if belief.dimension != "event":
+        return False
+    val = safe_json(belief.value_json)
+    expires_at = val.get("expires_at")
+    if not expires_at:
+        return False
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        return datetime.now(UTC) > expiry
+    except (ValueError, TypeError):
+        return False
 
 
 def record_claim(
@@ -246,6 +278,17 @@ def record_claim(
     if source == "extracted" and layer != "L4":
         logger.warning("Clamping non-L4 layer from extracted claim (layer=%s)", layer)
         layer = "L4"
+
+    # Life events: derive a hash-suffixed key so distinct events don't collide,
+    # and stamp expires_at so the renderer can filter stale events.
+    if dimension == "event":
+        key = _event_key(key, claim_text)
+        if value is None:
+            value = {}
+        value.setdefault(
+            "expires_at",
+            (utcnow() + timedelta(days=LIFE_EVENT_EXPIRY_DAYS)).isoformat(),
+        )
 
     existing = get_belief(session, user_id, key)
     if existing is not None and existing.status == "rejected":

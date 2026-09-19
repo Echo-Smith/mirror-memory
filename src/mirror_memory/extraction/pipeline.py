@@ -56,6 +56,8 @@ class ExtractionPipeline:
         session_id: str,
         text: str,
         turn_count: int,
+        *,
+        context: str = "",
         **kwargs: object,
     ) -> list[dict]:
         """Run extraction for one conversation turn.
@@ -94,6 +96,13 @@ class ExtractionPipeline:
         except Exception:
             logger.warning("pipeline: verification failed; continuing", exc_info=True)
 
+        # -- Context suppression check -----------------------------------------
+        # If a suppression rule matches the current context, skip extraction
+        # for the suppressed dimensions (or entirely if no dimensions listed).
+        if context and self._is_suppressed(context):
+            logger.info("pipeline: extraction suppressed in context=%s", context)
+            return all_claims
+
         # -- K1: Deterministic extraction ------------------------------------
         try:
             k1_claims = extract_claims(text, self._config)
@@ -103,6 +112,7 @@ class ExtractionPipeline:
             logger.warning("pipeline: K1 extraction failed; continuing", exc_info=True)
 
         # -- K2: LLM semantic extraction (throttled) -------------------------
+        k2_context_tags: list[str] = []
         try:
             if self._should_run_k2(text, turn_count, session, user_id):
                 # Temporarily override llm_client if provided at init
@@ -111,15 +121,36 @@ class ExtractionPipeline:
                     effective_config = self._config.model_copy(
                         update={"llm_client": self._llm_client}
                     )
-                k2_claims = self._semantic.extract(text, session, user_id, effective_config)
-                all_claims.extend(k2_claims)
-                logger.info("pipeline: K2 extracted %d claims", len(k2_claims))
+                k2_result = self._semantic.extract(text, session, user_id, effective_config)
+                if isinstance(k2_result, dict):
+                    # New structured format: claims + subject + context_tags.
+                    subject = k2_result.get("subject", "user")
+                    k2_context_tags = k2_result.get("context_tags", [])
+                    if subject == "third_party":
+                        # Claims about someone else are not stored as user beliefs.
+                        logger.info("pipeline: K2 claims skipped (subject=third_party)")
+                    else:
+                        all_claims.extend(k2_result["claims"])
+                        logger.info("pipeline: K2 extracted %d claims", len(k2_result["claims"]))
+                elif isinstance(k2_result, list):
+                    # Legacy list format from _parse_extraction_json.
+                    all_claims.extend(k2_result)
+                    logger.info("pipeline: K2 extracted %d claims", len(k2_result))
         except Exception:
             logger.warning("pipeline: K2 extraction failed; continuing", exc_info=True)
 
         # -- Persist claims --------------------------------------------------
         try:
-            self._persist_claims(session, user_id, session_id, all_claims, **kwargs)
+            # Assemble: scarce dimensions first, cap fill.
+            from mirror_memory.extraction.assembler import assemble_claims
+
+            dim_counts = self._get_dimension_counts(session, user_id)
+            all_claims = assemble_claims(all_claims, self._config, active_dimension_counts=dim_counts)
+            self._persist_claims(
+                session, user_id, session_id, all_claims,
+                context_tags=k2_context_tags or None,
+                **kwargs,
+            )
         except Exception:
             logger.warning("pipeline: claim persistence failed", exc_info=True)
 
@@ -131,6 +162,30 @@ class ExtractionPipeline:
                 logger.warning("pipeline: snippet storage failed", exc_info=True)
 
         return all_claims
+
+    def _is_suppressed(self, context: str) -> bool:
+        """Check if extraction is suppressed in the given context."""
+        for rule in self._config.extraction.suppression_rules:
+            if rule.context == context:
+                # Empty suppress_dimensions = suppress all extraction.
+                return len(rule.suppress_dimensions) == 0
+        return False
+
+    def _get_dimension_counts(self, session: object, user_id: str) -> dict[str, int]:
+        """Get count of active beliefs per dimension (for scarcity scoring)."""
+        from collections import Counter
+
+        from mirror_memory.core.models import Belief
+
+        try:
+            rows = (
+                session.query(Belief.dimension)
+                .filter(Belief.user_id == user_id, Belief.status == "active")
+                .all()
+            )
+            return dict(Counter(r[0] for r in rows))
+        except Exception:
+            return {}
 
     def _should_run_k2(self, text: str, turn_count: int, session: object, user_id: str) -> bool:
         """Check throttle for K2 extraction (base rules + information-gain gates)."""
@@ -174,6 +229,8 @@ class ExtractionPipeline:
         user_id: str,
         session_id: str,
         claims: list[dict],
+        *,
+        context_tags: list[str] | None = None,
         **kwargs: object,
     ) -> None:
         """Persist extracted claims via the repository layer.
@@ -208,6 +265,7 @@ class ExtractionPipeline:
                     evidence_message_ids=claim.get("evidence_message_ids"),
                     blocked_key_prefixes=self._config.blocked_key_prefixes,
                     allowed_dimensions=allowed,
+                    context_tags=context_tags,
                 )
             except Exception:
                 logger.warning(

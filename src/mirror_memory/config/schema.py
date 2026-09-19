@@ -94,6 +94,20 @@ class PatternRule(BaseModel):
         return v
 
 
+class SuppressionRule(BaseModel):
+    """Suppress extraction in specific contexts.
+
+    Example: during a questionnaire, don't extract topic claims
+    because the user is answering structured items, not chatting.
+    """
+
+    context: str = Field(..., min_length=1, description="Context identifier (e.g. 'assessment', 'exercise')")
+    suppress_dimensions: list[str] = Field(
+        default_factory=list,
+        description="Dimensions to suppress in this context. Empty = suppress all.",
+    )
+
+
 class ExtractionConfig(BaseModel):
     """Keyword lists, regex patterns, and throttle parameters for extraction."""
 
@@ -113,6 +127,10 @@ class ExtractionConfig(BaseModel):
         le=1,
         description="Information-gain score ([0,1]) at or above which extraction fires early, "
         "breaking the uniform every-N schedule",
+    )
+    suppression_rules: list[SuppressionRule] = Field(
+        default_factory=list,
+        description="Context-based extraction suppression rules",
     )
 
 

@@ -42,30 +42,34 @@ def _anchor_prompt_lines(config: MemoryConfig) -> list[str]:
     return lines
 
 
-def _parse_extraction_json(raw: str, allowed_keys: dict[str, frozenset[str]]) -> list[dict]:
-    """Parse LLM output into validated claim dicts.
+def _parse_extraction_full(
+    raw: str, allowed_keys: dict[str, frozenset[str]]
+) -> dict:
+    """Parse LLM output into a structured result with claims, subject, and context_tags.
 
-    Validation rules:
-    - dimension/key must be in allowed_keys (closed set).
-    - relation must be "supports" or "contradicts".
-    - confidence clamped to [0, 1].
-    - Maximum 3 claims.
+    Returns ``{"claims": [...], "subject": "user"|"third_party", "context_tags": [...]}``.
     """
     from mirror_memory.core.utils import parse_llm_json
 
     data = parse_llm_json(raw, expect_array=True)
     if data is None:
-        return []
+        return {"claims": [], "subject": "user", "context_tags": []}
 
-    # Accept both {"claims": [...]} and bare [...] formats.
+    # Accept bare [...] (legacy), {"claims": [...]}, and full structured formats.
     if isinstance(data, list):
         raw_claims = data
+        subject = "user"
+        context_tags = []
     elif isinstance(data, dict):
-        raw_claims = data.get("claims")
+        raw_claims = data.get("claims", [])
+        subject = str(data.get("subject") or "user")
+        raw_tags = data.get("context_tags") or []
+        context_tags = [str(t) for t in raw_tags if isinstance(t, str)][:3] if isinstance(raw_tags, list) else []
     else:
-        raw_claims = None
+        return {"claims": [], "subject": "user", "context_tags": []}
+
     if not isinstance(raw_claims, list):
-        return []
+        raw_claims = []
 
     validated: list[dict] = []
     for item in raw_claims:
@@ -74,12 +78,8 @@ def _parse_extraction_json(raw: str, allowed_keys: dict[str, frozenset[str]]) ->
         dimension = str(item.get("dimension") or "")
         key = str(item.get("key") or "")
         relation = str(item.get("relation") or "supports")
-        # Dimension must be one of the configured dimensions (strict).
-        # Key can be any non-empty string within a valid dimension (lenient --
-        # LLM may extract novel keys beyond the anchor vocabulary).
         if dimension not in allowed_keys or not key:
             continue
-        # Accept "new" as equivalent to "supports" (LLM often uses "new" for first-time facts).
         if relation in {"new", "first_mention"}:
             relation = "supports"
         if relation not in {"supports", "contradicts"}:
@@ -97,7 +97,13 @@ def _parse_extraction_json(raw: str, allowed_keys: dict[str, frozenset[str]]) ->
             "source": "extracted",
             "value": {"via": "llm_semantic"},
         })
-    return validated
+
+    return {"claims": validated, "subject": subject, "context_tags": context_tags}
+
+
+def _parse_extraction_json(raw: str, allowed_keys: dict[str, frozenset[str]]) -> list[dict]:
+    """Backward-compatible wrapper: parse claims only (no side output)."""
+    return _parse_extraction_full(raw, allowed_keys)["claims"]
 
 
 class SemanticExtractor:
@@ -173,6 +179,9 @@ class SemanticExtractor:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info("semantic: LLM call completed in %dms", elapsed_ms)
 
-        claims = _parse_extraction_json(raw, self._allowed_keys)
-        logger.info("semantic: extracted %d claims", len(claims))
-        return claims
+        result = _parse_extraction_full(raw, self._allowed_keys)
+        logger.info(
+            "semantic: extracted %d claims (subject=%s, tags=%s)",
+            len(result["claims"]), result["subject"], result["context_tags"],
+        )
+        return result

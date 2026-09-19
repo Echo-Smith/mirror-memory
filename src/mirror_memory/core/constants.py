@@ -47,6 +47,9 @@ CONTRADICT_FACTOR = 0.8
 
 # -- Time constants ----------------------------------------------------------
 
+# Life events auto-expire after this many days (renders as past, not current).
+LIFE_EVENT_EXPIRY_DAYS = 30
+
 # Belief activity half-life: after this many days without new evidence the
 # activity score halves (exponential decay).
 ACTIVITY_HALF_LIFE_DAYS = 60.0
