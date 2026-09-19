@@ -147,10 +147,20 @@ def render_memory_block(
     # Extract topics from user_message for query-aware relevance scoring.
     query_topics = _extract_query_topics(user_message, config) if user_message else set()
 
+    # Build dimension gate lookup (requires_user_confirmation per dimension).
+    confirm_gates = {d.dimension_id: d.requires_user_confirmation for d in config.dimensions}
+    l4_threshold = render_cfg.l4_render_threshold
+
     all_beliefs = list_active_beliefs(session, user_id)
     now = datetime.now(UTC)
     scored: list[tuple[float, object]] = []
     for belief in all_beliefs:
+        # Gate 1: L4 render watermark — only render extracted beliefs above threshold.
+        if belief.layer == "L4" and belief.confidence < l4_threshold:
+            continue
+        # Gate 2: dimension requires user confirmation — skip unconfirmed beliefs.
+        if confirm_gates.get(belief.dimension, False) and belief.source != "user_confirmed":
+            continue
         s = score_belief(belief, topics=query_topics, now=now)
         if s > 0:
             scored.append((s, belief))

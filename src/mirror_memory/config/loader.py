@@ -136,6 +136,7 @@ def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
     _KNOWN_EXTRACTION_KEYS = {
         "keywords", "patterns", "context_tags",
         "max_claims_per_turn", "llm_every_turns", "llm_min_keyword_hits",
+        "high_value_dimensions", "extraction_value_threshold",
     }
     unknown = set(data.keys()) - _KNOWN_EXTRACTION_KEYS
     if unknown:
@@ -170,11 +171,41 @@ def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
     if not isinstance(context_tags, list):
         context_tags = []
 
+    high_value_dimensions = data.get("high_value_dimensions", [])
+    if not isinstance(high_value_dimensions, list):
+        high_value_dimensions = []
+
+    extraction_value_threshold = data.get("extraction_value_threshold", 0.5)
+    try:
+        extraction_value_threshold = float(extraction_value_threshold)
+    except (TypeError, ValueError):
+        logger.warning("Invalid extraction_value_threshold %r; using default 0.5", extraction_value_threshold)
+        extraction_value_threshold = 0.5
+
     return ExtractionConfig(
         keywords=keywords,
         patterns=patterns,
         context_tags=[str(t) for t in context_tags],
+        max_claims_per_turn=max(1, int(data.get("max_claims_per_turn", 3))),
+        llm_every_turns=max(1, int(data.get("llm_every_turns", 5))),
+        llm_min_keyword_hits=max(1, int(data.get("llm_min_keyword_hits", 2))),
+        high_value_dimensions=[str(d) for d in high_value_dimensions],
+        extraction_value_threshold=extraction_value_threshold,
     )
+
+
+def _parse_question_value_tiers(data: dict[str, Any]) -> dict[str, int]:
+    """Parse the top-level ``question_value_tiers`` mapping (config.yaml)."""
+    raw = data.get("question_value_tiers")
+    if not isinstance(raw, dict):
+        return {}
+    tiers: dict[str, int] = {}
+    for dim, tier in raw.items():
+        try:
+            tiers[str(dim)] = int(tier)
+        except (TypeError, ValueError):
+            logger.warning("Skipping invalid question_value_tiers entry %s=%r", dim, tier)
+    return tiers
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +260,7 @@ def load_config(config_path: str | Path) -> MemoryConfig:
         budget = BudgetConfig(**{k: v for k, v in budget_raw.items() if k in {"base", "floor", "cap"}})
     else:
         budget = BudgetConfig()
+    question_value_tiers = _parse_question_value_tiers(top_data)
 
     # -- Prompt templates from text files -------------------------------------
     prompts_dir = base / "prompts"
@@ -251,6 +283,7 @@ def load_config(config_path: str | Path) -> MemoryConfig:
         extraction=_parse_extraction(extraction_data),
         prompts=prompts,
         budget=budget,
+        question_value_tiers=question_value_tiers,
     )
 
     if config.render.floor > config.render.cap:

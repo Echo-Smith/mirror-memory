@@ -168,3 +168,16 @@ patterns:
   - regex: "(?:I (?:always|usually|often|sometimes|rarely|never))\\s+(.+?)(?:\\.|,|$)"
     dimension: pattern
     key: always
+
+# Dimensions that get a scoring boost for extraction priority
+# (information-gain throttle).  Turns hitting these dimensions extract
+# earlier than the uniform every-N schedule when the value score crosses
+# extraction_value_threshold.
+high_value_dimensions:
+  - fact
+  - goal
+
+# Information-gain threshold ([0, 1]): turns scoring at or above this value
+# extract immediately (breaking uniform throttling); turns whose keyword-hit
+# dimensions are all covered by high-confidence beliefs are suppressed.
+extraction_value_threshold: 0.5

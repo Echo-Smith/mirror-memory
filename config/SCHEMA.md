@@ -32,6 +32,11 @@
   - `dimension`: str (required)
   - `key`: str (required)
 - `context_tags`: list[str]
+- `max_claims_per_turn`: int (default 3) -- max claims per extraction turn
+- `llm_every_turns`: int (default 5) -- LLM extraction fires every N turns at minimum
+- `llm_min_keyword_hits`: int (default 2) -- minimum keyword hits to trigger LLM regardless of turn count (0 is rejected here; set at runtime for always-extract benchmarks)
+- `high_value_dimensions`: list[str] -- dimensions that get a scoring boost for extraction priority (information-gain throttle)
+- `extraction_value_threshold`: float in [0, 1] (default 0.5) -- information-gain score at or above which extraction fires early; turns whose hit dimensions are all covered by high-confidence beliefs are suppressed
 
 ## config.yaml (optional top-level)
 
@@ -39,10 +44,11 @@
   - `base`: int (default 480)
   - `floor`: int (default 160)
   - `cap`: int (default 720)
+- `question_value_tiers`: dict[str, int] -- dimension -> priority tier for verification question candidates (higher = more valuable to verify)
 
 ## prompts/
 
 - `k2_system.txt` -- K2 LLM semantic extraction system prompt
 - `k3_system.txt` -- K3 understanding synthesis system prompt
-- `verification.txt` -- hypothesis verification prompt
+- `verification.txt` -- verification prompt (consumed by the verification loop to judge confirm/deny/unclear)
 - `formulate.txt` -- Worker formulate prompt

@@ -1,8 +1,8 @@
 """Extraction pipeline -- main entry point.
 
-Orchestrates K1 (deterministic) and K2 (LLM semantic) extraction.
-All domain content comes from ``config``.  Fail-open: any exception
-is logged but never blocks the caller.
+Orchestrates the verification judgment half-loop, K1 (deterministic) and
+K2 (LLM semantic) extraction.  All domain content comes from ``config``.
+Fail-open: any exception is logged but never blocks the caller.
 """
 
 from __future__ import annotations
@@ -83,6 +83,17 @@ class ExtractionPipeline:
         """
         all_claims: list[dict] = []
 
+        # -- Verification half-loop (question -> answer) ----------------------
+        # If a previous turn injected a verification question and this turn
+        # answers it, the judgment consumes the turn: its signal belongs to
+        # the hypothesis, not to new topics, so K1/K2 extraction is skipped.
+        try:
+            if self._run_verification(session, user_id, session_id, text):
+                logger.info("pipeline: turn consumed by verification judgment")
+                return all_claims
+        except Exception:
+            logger.warning("pipeline: verification failed; continuing", exc_info=True)
+
         # -- K1: Deterministic extraction ------------------------------------
         try:
             k1_claims = extract_claims(text, self._config)
@@ -93,7 +104,7 @@ class ExtractionPipeline:
 
         # -- K2: LLM semantic extraction (throttled) -------------------------
         try:
-            if self._should_run_k2(text, turn_count):
+            if self._should_run_k2(text, turn_count, session, user_id):
                 # Temporarily override llm_client if provided at init
                 effective_config = self._config
                 if self._llm_client is not self._config.llm_client:
@@ -121,9 +132,22 @@ class ExtractionPipeline:
 
         return all_claims
 
-    def _should_run_k2(self, text: str, turn_count: int) -> bool:
-        """Check throttle for K2 extraction."""
-        return should_extract(text, turn_count, self._config)
+    def _should_run_k2(self, text: str, turn_count: int, session: object, user_id: str) -> bool:
+        """Check throttle for K2 extraction (base rules + information-gain gates)."""
+        return should_extract(text, turn_count, self._config, session=session, user_id=user_id)
+
+    def _run_verification(self, session: object, user_id: str, session_id: str, text: str) -> bool:
+        """Run the verification judgment half-loop (no-op when disabled)."""
+        from mirror_memory.extraction.verification import run_verification_judgment
+
+        return run_verification_judgment(
+            session,
+            user_id,
+            session_id,
+            text,
+            self._config,
+            self._llm_client,
+        )
 
     def _store_snippet(
         self,

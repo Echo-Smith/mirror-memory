@@ -25,6 +25,10 @@ class DimensionConfig(BaseModel):
     name: dict[str, str] = Field(default_factory=lambda: {"zh": "", "en": ""})
     description: str = ""
     render_priority: int = Field(default=0, ge=0)
+    requires_user_confirmation: bool = Field(
+        default=False,
+        description="Beliefs in this dimension must have source='user_confirmed' to render",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +103,17 @@ class ExtractionConfig(BaseModel):
     max_claims_per_turn: int = Field(default=3, ge=1)
     llm_every_turns: int = Field(default=5, ge=1, description="LLM extraction fires every N turns at minimum")
     llm_min_keyword_hits: int = Field(default=2, ge=1, description="Minimum keyword hits to trigger LLM regardless of turn count")
+    high_value_dimensions: list[str] = Field(
+        default_factory=list,
+        description="Dimensions that get a scoring boost for extraction priority",
+    )
+    extraction_value_threshold: float = Field(
+        default=0.5,
+        ge=0,
+        le=1,
+        description="Information-gain score ([0,1]) at or above which extraction fires early, "
+        "breaking the uniform every-N schedule",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +183,12 @@ class MemoryConfig(BaseModel):
     blocked_key_prefixes: list[str] = Field(default_factory=list)
     render: RenderConfig = Field(default_factory=RenderConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    question_value_tiers: dict[str, int] = Field(
+        default_factory=dict,
+        description="Dimension -> priority tier for verification question candidates "
+        "(higher = more valuable to verify). Dimensions absent from the map use "
+        "DEFAULT_QUESTION_TIER.",
+    )
     session_summary_enabled: bool = Field(
         default=False,
         description="Enable unstructured session summary storage for factual recall. "

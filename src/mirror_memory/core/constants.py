@@ -40,7 +40,10 @@ CONFIDENCE_CEILING = 0.95
 SUPPORT_GAIN = 0.15
 
 # Contradiction attenuation factor (multiplied with current confidence).
-CONTRADICT_FACTOR = 0.5
+# 0.8 preserves the contradicted belief at 80% confidence rather than
+# halving it — keeps both sides alive for verification instead of
+# silently discarding user statements that may still be valid.
+CONTRADICT_FACTOR = 0.8
 
 # -- Time constants ----------------------------------------------------------
 

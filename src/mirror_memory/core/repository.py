@@ -46,6 +46,7 @@ from mirror_memory.core.models import (
     BeliefEvent,
     EvolutionJob,
     ExtractionStats,
+    InterventionEvent,
     MemoryPreference,
     Snapshot,
     User,
@@ -442,6 +443,126 @@ def list_question_candidates(
 
 
 # ---------------------------------------------------------------------------
+# Intervention events (verification loop)
+# ---------------------------------------------------------------------------
+
+QUESTION_INJECTED_KIND = "question_injected"
+QUESTION_ANSWERED_KIND = "question_answered"
+
+
+def record_intervention_event(
+    session: Session,
+    user_id: str,
+    session_id: str,
+    *,
+    kind: str,
+    detail: dict | None = None,
+) -> InterventionEvent | None:
+    """Record a question injection or answer event.
+
+    Only action metadata is stored (belief label/key, verdict) -- never the
+    conversation content.  Returns ``None`` when memory is disabled for the
+    user.
+    """
+    if not is_memory_enabled(session, user_id):
+        return None
+    row = InterventionEvent(
+        user_id=user_id,
+        session_id=session_id,
+        kind=kind,
+        detail_json=json.dumps(detail or {}, ensure_ascii=False),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def get_pending_verification(
+    session: Session,
+    user_id: str,
+    session_id: str,
+    *,
+    max_window_turns: int = 3,
+) -> InterventionEvent | None:
+    """Get the pending question injection within the N-turn window.
+
+    Returns the InterventionEvent with kind='question_injected' that:
+    - is the most recent injection for the user,
+    - has NOT been answered yet (no later ``question_answered`` event),
+    - is within the last N sessions (approximate turn window): the injection
+      was made in the current session or in one of the last ``N-1`` sessions
+      with recorded activity.  Intervention events are the generic
+      session-activity proxy (this library has no message table).
+
+    Returns None if no pending verification exists.
+    """
+    injection = session.scalar(
+        select(InterventionEvent)
+        .where(InterventionEvent.user_id == user_id, InterventionEvent.kind == QUESTION_INJECTED_KIND)
+        .order_by(desc(InterventionEvent.id))
+        .limit(1)
+    )
+    if injection is None:
+        return None
+
+    answered = session.scalar(
+        select(InterventionEvent)
+        .where(InterventionEvent.user_id == user_id, InterventionEvent.kind == QUESTION_ANSWERED_KIND)
+        .order_by(desc(InterventionEvent.id))
+        .limit(1)
+    )
+    if answered is not None and answered.id > injection.id:
+        return None
+
+    if injection.session_id == session_id:
+        return injection
+
+    if max_window_turns <= 0:
+        return None
+
+    # Collect the most recent session ids from the event stream; the current
+    # session counts as the first entry of the window.
+    window: list[str] = [session_id]
+    seen = {session_id}
+    for sid in session.scalars(
+        select(InterventionEvent.session_id)
+        .where(InterventionEvent.user_id == user_id)
+        .order_by(desc(InterventionEvent.id))
+    ):
+        if len(window) >= max_window_turns:
+            break
+        if sid not in seen:
+            seen.add(sid)
+            window.append(sid)
+    return injection if injection.session_id in seen else None
+
+
+def has_unanswered_injection(session: Session, user_id: str) -> bool:
+    """Check if there's an unanswered question injection (prevents double-inject).
+
+    Only one hypothesis may be pending at a time: when the latest
+    ``question_injected`` has no later ``question_answered``, injecting a new
+    question would shadow the previous one and the verification loop could
+    never close.
+    """
+    last_injected = session.scalar(
+        select(InterventionEvent)
+        .where(InterventionEvent.user_id == user_id, InterventionEvent.kind == QUESTION_INJECTED_KIND)
+        .order_by(desc(InterventionEvent.id))
+        .limit(1)
+    )
+    if last_injected is None:
+        return False
+    last_answered = session.scalar(
+        select(InterventionEvent)
+        .where(InterventionEvent.user_id == user_id, InterventionEvent.kind == QUESTION_ANSWERED_KIND)
+        .order_by(desc(InterventionEvent.id))
+        .limit(1)
+    )
+    return last_answered is None or last_answered.id < last_injected.id
+
+
+# ---------------------------------------------------------------------------
 # Extraction stats
 # ---------------------------------------------------------------------------
 
@@ -484,8 +605,9 @@ def record_extraction_stats(
 
 
 def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
-    """Cascade-delete all inferred beliefs, events, stats, snapshots, and
-    evolution jobs for a user.  Returns counts of deleted rows per table.
+    """Cascade-delete all inferred beliefs, events, stats, snapshots,
+    intervention events, and evolution jobs for a user.  Returns counts of
+    deleted rows per table.
     """
     events_deleted = (
         session.query(BeliefEvent)
@@ -508,12 +630,18 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     snapshots_deleted = (
         session.query(Snapshot).filter(Snapshot.user_id == user_id).delete(synchronize_session=False)
     )
+    interventions_deleted = (
+        session.query(InterventionEvent)
+        .filter(InterventionEvent.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
     return {
         "beliefs": int(beliefs_deleted),
         "belief_events": int(events_deleted),
         "extraction_stats": int(stats_deleted),
         "evolution_jobs": int(jobs_deleted),
         "snapshots": int(snapshots_deleted),
+        "intervention_events": int(interventions_deleted),
     }
 
 

@@ -1,8 +1,9 @@
 """Mirror Memory ORM models (SQLAlchemy 2.0 mapped_column style).
 
 All tables use the ``mm_`` prefix.  Dimensions are free-form strings
-(not hard-coded D1-D8).  Domain-specific models (intervention events,
-domain profile fields) are intentionally excluded.
+(not hard-coded D1-D8).  Domain-specific profile fields are intentionally
+excluded; the verification-loop event log (:class:`InterventionEvent`) is
+generic and ships with the engine.
 """
 
 from __future__ import annotations
@@ -215,4 +216,29 @@ class SessionSummary(Base):
     session_id: Mapped[str] = mapped_column(String(128), index=True)
     summary_text: Mapped[str] = mapped_column(Text, default="")
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Intervention event (verification loop)
+# ---------------------------------------------------------------------------
+
+
+class InterventionEvent(Base):
+    """Intervention event for verification loop (question injection/answer).
+
+    kind values: ``question_injected`` (a verification question was surfaced
+    to the user; detail carries ``belief_label`` / ``belief_key``) and
+    ``question_answered`` (the reply was judged; detail carries ``verdict``).
+    Only inserted, never updated -- the pending state is derived from the
+    event sequence, not from a mutable flag.
+    """
+
+    __tablename__ = "mm_intervention_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    session_id: Mapped[str] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(32))  # "question_injected" / "question_answered"
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")  # belief_label, belief_key, verdict
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

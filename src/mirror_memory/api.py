@@ -287,6 +287,128 @@ class MemoryEngine:
                 for b in beliefs
             ]
 
+    def get_verification_candidates(self, *, user_id: str, limit: int = 1, session_id: str = "") -> list[dict]:
+        """Get beliefs eligible for verification questioning.
+
+        Selects L4 beliefs (confidence >= question threshold, cross-session
+        evidence) sorted by ``question_value_tiers * confirm_rate_weight``,
+        and records a ``question_injected`` intervention event for the top
+        candidate so that :meth:`run_verification` can judge the user's reply
+        on a later turn.  A new question is never injected while a previous
+        one is still unanswered.
+
+        Parameters
+        ----------
+        user_id:
+            The user identifier.
+        limit:
+            Maximum number of candidates to return.
+        session_id:
+            Optional session the question is surfaced in (recorded on the
+            injection event for the pending-verification window).
+
+        Returns
+        -------
+        list[dict]
+            Candidate dicts with ``belief_id``, ``dimension``, ``key``,
+            ``claim_text``, ``confidence``, ``question`` and ``injected``.
+            Empty when the loop is disabled (no LLM client or empty
+            ``verification`` prompt) or on any error -- fail-open.
+
+        Raises
+        ------
+        ValidationError
+            If user_id is empty or limit is out of range.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        if limit < 1 or limit > 200:
+            raise ValidationError("limit must be between 1 and 200")
+        if self._llm_client is None or not (self._config.prompts.verification or "").strip():
+            logger.info("verification: disabled (no LLM client or empty verification prompt)")
+            return []
+
+        self._ensure_db()
+        from mirror_memory.extraction.verification import (
+            build_verification_question,
+            get_question_candidates,
+            record_question_injection,
+        )
+
+        with self._session() as session:
+            try:
+                beliefs = get_question_candidates(session, user_id, self._config, limit=limit)
+                results: list[dict] = []
+                injected = False
+                for belief in beliefs:
+                    recorded = False
+                    if not injected:
+                        event = record_question_injection(
+                            session, user_id, session_id, belief, self._config
+                        )
+                        if event is not None:
+                            recorded = True
+                            injected = True
+                    results.append(
+                        {
+                            "belief_id": int(belief.id),
+                            "dimension": belief.dimension,
+                            "key": belief.key,
+                            "claim_text": belief.claim_text,
+                            "confidence": float(belief.confidence),
+                            "question": build_verification_question(belief, self._config),
+                            "injected": recorded,
+                        }
+                    )
+                session.commit()
+                return results
+            except Exception:
+                logger.warning("get_verification_candidates failed; returning []", exc_info=True)
+                session.rollback()
+                return []
+
+    def run_verification(self, *, user_id: str, session_id: str, user_text: str) -> bool:
+        """Run verification judgment for this turn. Returns True if turn consumed.
+
+        Judges the user's reply against the pending verification question
+        (if any) and drives the belief lifecycle: confirm -> L4 -> L2,
+        deny -> rejected, unclear -> event only.  Fail-open: errors never
+        propagate; the caller should proceed with normal extraction when
+        ``False`` is returned.
+
+        Raises
+        ------
+        ValidationError
+            If user_id or session_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        if not session_id or not session_id.strip():
+            raise ValidationError("session_id must be a non-empty string")
+        if not user_text or not user_text.strip():
+            logger.debug("run_verification: empty user_text -- nothing to judge")
+            return False
+
+        self._ensure_db()
+        from mirror_memory.extraction.verification import run_verification_judgment
+
+        with self._session() as session:
+            try:
+                consumed = run_verification_judgment(
+                    session,
+                    user_id,
+                    session_id,
+                    user_text,
+                    self._config,
+                    self._llm_client,
+                )
+                session.commit()
+                return consumed
+            except Exception:
+                logger.warning("run_verification failed; fail-open", exc_info=True)
+                session.rollback()
+                return False
+
     def set_enabled(self, *, user_id: str, enabled: bool) -> None:
         """Enable or disable memory for a user.
 

@@ -339,10 +339,18 @@ def _validate(
 
     # Build evidence index.
     belief_keys: set[str] = set()
+    contradicted_keys: set[str] = set()
     distinct_sessions = 1
     if evidence and "beliefs" in evidence:
         for b in evidence["beliefs"]:
             belief_keys.add(b.get("key", ""))
+            # Counter-evidence: needs_clarification marks a contradicted belief.
+            try:
+                val = json.loads(b.get("value", "{}") or "{}")
+                if val.get("clarification_status") == "needs_clarification":
+                    contradicted_keys.add(b.get("key", ""))
+            except (TypeError, ValueError):
+                pass
         distinct_sessions = evidence.get("distinct_sessions", 1)
 
     for p in patterns:
@@ -362,6 +370,9 @@ def _validate(
         p_keys = set(p.get("evidence_keys") or [])
         if p_keys and not p_keys.issubset(belief_keys):
             continue
+        # Counter-evidence: any contradicted belief forces needs_verification
+        if contradicted_keys:
+            p["needs_verification"] = True
         # Single-session evidence forces needs_verification
         if distinct_sessions < 2:
             p["needs_verification"] = True
