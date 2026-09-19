@@ -44,6 +44,7 @@ from mirror_memory.core.constants import (
 from mirror_memory.core.models import (
     Belief,
     BeliefEvent,
+    ConsentGrant,
     EvolutionJob,
     ExtractionStats,
     InterventionEvent,
@@ -77,6 +78,25 @@ def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryP
     pref.updated_at = utcnow()
     session.flush()
     return pref
+
+
+def is_feature_enabled(session: Session, user_id: str, feature: str) -> bool:
+    """Check feature-level consent; falls back to global memory preference."""
+    grant = session.get(ConsentGrant, (user_id, feature))
+    if grant is not None:
+        return grant.granted
+    return is_memory_enabled(session, user_id)
+
+
+def set_feature_consent(session: Session, user_id: str, feature: str, granted: bool) -> None:
+    """Set feature-level consent for a user."""
+    existing = session.get(ConsentGrant, (user_id, feature))
+    if existing is not None:
+        existing.granted = granted
+        existing.updated_at = utcnow()
+    else:
+        session.add(ConsentGrant(user_id=user_id, feature=feature, granted=granted))
+    session.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +207,7 @@ def record_claim(
     origin_slice_id: str | None = None,
     context_tags: list[str] | None = None,
     blocked_key_prefixes: tuple[str, ...] = (),
+    allowed_dimensions: set[str] | None = None,
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -200,12 +221,20 @@ def record_claim(
         Key prefixes that are structurally forbidden from persisting
         (e.g. ``("distortion.",)``).  The caller supplies this list so
         the repository layer stays domain-agnostic.
+    allowed_dimensions:
+        If provided, *dimension* must be in this set or a ``ValueError``
+        is raised (strict closed-set validation).
     """
     if not is_memory_enabled(session, user_id):
         return None, "profile_memory_disabled"
 
     if relation not in {"supports", "contradicts"}:
         raise ValueError(f"invalid claim relation: {relation!r}")
+
+    if allowed_dimensions is not None and dimension not in allowed_dimensions:
+        raise ValueError(
+            f"dimension {dimension!r} not in allowed set {sorted(allowed_dimensions)}"
+        )
 
     for prefix in blocked_key_prefixes:
         if key.startswith(prefix):
@@ -433,7 +462,9 @@ def list_question_candidates(
     pending.sort(
         key=lambda b: (
             _needs_clarification_boost(b),
-            tiers.get(b.dimension, DEFAULT_QUESTION_TIER) * 1.0,  # learn_weight=1.0 default
+            tiers.get(b.dimension, DEFAULT_QUESTION_TIER) * _question_confirm_rate_weight(
+                safe_json(b.value_json).get("confirm_rate", 0.5)
+            ),
             b.confidence,
             b.last_evidence_at,
         ),
@@ -635,6 +666,11 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         .filter(InterventionEvent.user_id == user_id)
         .delete(synchronize_session=False)
     )
+    consent_deleted = (
+        session.query(ConsentGrant)
+        .filter(ConsentGrant.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
     return {
         "beliefs": int(beliefs_deleted),
         "belief_events": int(events_deleted),
@@ -642,6 +678,7 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "evolution_jobs": int(jobs_deleted),
         "snapshots": int(snapshots_deleted),
         "intervention_events": int(interventions_deleted),
+        "consent_grants": int(consent_deleted),
     }
 
 

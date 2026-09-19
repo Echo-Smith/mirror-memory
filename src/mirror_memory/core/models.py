@@ -61,6 +61,22 @@ class MemoryPreference(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
+class ConsentGrant(Base):
+    """Feature-level consent grant (finer-grained than MemoryPreference).
+
+    A missing row means the feature inherits the global MemoryPreference
+    setting.  Feature names are free-form strings (e.g. ``"extraction"``,
+    ``"recall"``, ``"verification"``, ``"panel"``).
+    """
+
+    __tablename__ = "mm_consent_grants"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    feature: Mapped[str] = mapped_column(String(64), primary_key=True)
+    granted: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 # ---------------------------------------------------------------------------
 # Belief
 # ---------------------------------------------------------------------------

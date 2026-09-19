@@ -231,6 +231,38 @@ def parse_verdict(raw: str) -> str:
     return "unclear"
 
 
+def _update_confirm_rate(session: object, belief: object, verdict: str) -> None:
+    """Update belief's confirm_rate using Beta(1,1) shrinkage.
+
+    Called after every verdict (including unclear, which is a no-op for
+    counts but keeps the rate computation consistent).
+    """
+    import json as _json
+
+    from mirror_memory.core.constants import BETA_PRIOR_ALPHA, BETA_PRIOR_BETA
+
+    try:
+        val = _json.loads(belief.value_json or "{}")
+    except (TypeError, ValueError):
+        val = {}
+
+    alpha = val.get("confirm_alpha", BETA_PRIOR_ALPHA)
+    beta = val.get("confirm_beta", BETA_PRIOR_BETA)
+
+    if verdict == "confirm":
+        alpha += 1
+    elif verdict == "deny":
+        beta += 1
+    # unclear: no count update
+
+    total = alpha + beta
+    val["confirm_alpha"] = alpha
+    val["confirm_beta"] = beta
+    val["confirm_rate"] = round(alpha / total, 4) if total > 0 else 0.5
+    belief.value_json = _json.dumps(val, ensure_ascii=False)
+    session.flush()
+
+
 def run_verification_judgment(
     session: object,
     user_id: str,
@@ -312,8 +344,12 @@ def run_verification_judgment(
         verdict = parse_verdict(raw)
         if verdict == "confirm":
             confirm_belief(session, user_id, belief.id)
+            _update_confirm_rate(session, belief, "confirm")
         elif verdict == "deny":
             reject_belief(session, user_id, belief.id)
+            _update_confirm_rate(session, belief, "deny")
+        else:
+            _update_confirm_rate(session, belief, "unclear")
         # unclear: record event only -- belief state unchanged.
 
         record_intervention_event(

@@ -37,6 +37,11 @@ _STOP_WORDS_EN = frozenset({
 })
 
 
+def _is_rejected_line(text: str) -> bool:
+    """Check if a rendered item is the rejected (D8 boundary) line."""
+    return text.startswith("Avoid:") or text.startswith("\u5e94\u56de\u907f")
+
+
 def _extract_query_nouns(query: str) -> set[str]:
     """Extract meaningful query terms for relevance matching.
 
@@ -180,13 +185,17 @@ def render_memory_block(
             dim_counts[dim] = count + 1
 
     # -- Budget packing: whole-item, never truncate --------------------------
+    # The rejected (D8 boundary) line in items[0] is exempt from the budget —
+    # it is the strongest user signal and must never be dropped for space.
     rendered: list[str] = []
     used = 0
-    for text in items:
-        prefix_cost = len(joiner) if rendered else 0
-        if used + prefix_cost + len(text) > budget:
-            continue
-        used += prefix_cost + len(text)
+    for i, text in enumerate(items):
+        is_exempt = i == 0 and _is_rejected_line(items[0])
+        if not is_exempt:
+            prefix_cost = len(joiner) if rendered else 0
+            if used + prefix_cost + len(text) > budget:
+                continue
+            used += prefix_cost + len(text)
         rendered.append(text)
 
     block = joiner.join(rendered)

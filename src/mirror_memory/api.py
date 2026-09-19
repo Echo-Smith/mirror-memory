@@ -431,6 +431,35 @@ class MemoryEngine:
             set_memory_enabled(session, user_id, enabled)
             session.commit()
 
+    def set_consent(self, *, user_id: str, feature: str, granted: bool) -> None:
+        """Set feature-level consent for a user.
+
+        Parameters
+        ----------
+        user_id:
+            The user identifier.
+        feature:
+            Feature name (e.g. ``"extraction"``, ``"recall"``, ``"verification"``).
+        granted:
+            Whether the feature is allowed.
+
+        Raises
+        ------
+        ValidationError
+            If user_id or feature is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        if not feature or not feature.strip():
+            raise ValidationError("feature must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.repository import set_feature_consent
+
+        with self._session() as session:
+            set_feature_consent(session, user_id, feature.strip(), granted)
+            session.commit()
+
     def delete_memories(self, *, user_id: str) -> DeleteResult:
         """Delete all memory data for a user.
 

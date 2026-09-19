@@ -188,6 +188,11 @@ class ExtractionPipeline:
 
         for claim in claims:
             try:
+                allowed = (
+                    {d.dimension_id for d in self._config.dimensions}
+                    if self._config.strict_dimensions
+                    else None
+                )
                 record_claim(
                     session,
                     user_id,
@@ -202,6 +207,7 @@ class ExtractionPipeline:
                     session_id=session_id,
                     evidence_message_ids=claim.get("evidence_message_ids"),
                     blocked_key_prefixes=self._config.blocked_key_prefixes,
+                    allowed_dimensions=allowed,
                 )
             except Exception:
                 logger.warning(

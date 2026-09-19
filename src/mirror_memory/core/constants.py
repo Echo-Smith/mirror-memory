@@ -96,6 +96,12 @@ MAX_EVIDENCE_REFS = 8
 # ``question_value_tiers`` config key.
 DEFAULT_QUESTION_TIER = 1
 
+# Beta prior for confirm-rate shrinkage (Laplace smoothing).
+# confirm_rate = (confirm_alpha) / (confirm_alpha + confirm_beta),
+# starting at 0.5 with a weak prior that requires evidence to move.
+BETA_PRIOR_ALPHA = 1
+BETA_PRIOR_BETA = 1
+
 # Confirm-rate feedback weight range (static tier * learning weight).
 QUESTION_TIER_WEIGHT_MIN = 0.6
 QUESTION_TIER_WEIGHT_MAX = 1.4

@@ -194,6 +194,11 @@ class MemoryConfig(BaseModel):
         description="Enable unstructured session summary storage for factual recall. "
         "Off by default — structured beliefs suffice for most use cases.",
     )
+    strict_dimensions: bool = Field(
+        default=False,
+        description="If True, record_claim raises ValueError for dimensions "
+        "not present in config.dimensions.",
+    )
     llm_client: Any = Field(default=None, description="LLM client; must expose generate()")
     session_factory: Any = Field(default=None, description="Callable returning a new SQLAlchemy Session")
 
