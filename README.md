@@ -123,9 +123,9 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 
 ### LongMemEval (500 QA, oracle dataset)
 
-| Metric | Phase 1 (baseline) | Phase 1-2 (identity) | Improvement |
-|--------|-------------------|---------------------|-------------|
-| Has answer | 33.2% | **50.0%** | +50% |
+| Metric | Baseline | Identity Engine (mimo) | Identity Engine (DeepSeek) |
+|--------|----------|----------------------|---------------------------|
+| Has answer | 33.2% | **50.0%** | **43.8%** |
 
 See [docs/benchmarks.md](docs/benchmarks.md) for detailed results and comparison.
 
