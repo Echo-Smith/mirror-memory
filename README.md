@@ -51,7 +51,8 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 - **Shadow lifecycle** — single-session → shadow, multi-session → auto-promote
 - **Privacy-first** — cascade deletion, consent gating, sensitive data codenames
 - **Built-in LLM adapter** — one-liner startup with any OpenAI-compatible API
-- **248 tests** — 0 failures, core paths fully covered
+- **Identity semantics** — SINGLE/MULTI/EVENT cardinality, canonicalization, contradiction handling
+- **349 tests** — 0 failures, core paths fully covered
 
 ## Architecture / 架构
 
@@ -92,11 +93,11 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 | Hit rate | 34.6% |
 | Top F1 | 0.870 |
 
-### LongMemEval (500 QA)
+### LongMemEval (500 QA, oracle dataset)
 
-| Metric | Value |
-|--------|-------|
-| Has answer | 33.2% |
+| Metric | Phase 1 (baseline) | Phase 1-2 (identity) | Improvement |
+|--------|-------------------|---------------------|-------------|
+| Has answer | 33.2% | **50.0%** | +50% |
 
 See [docs/benchmarks.md](docs/benchmarks.md) for detailed results and comparison.
 

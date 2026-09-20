@@ -487,3 +487,47 @@ class MemoryEngine:
             counts = delete_user_memories(session, user_id)
             session.commit()
             return DeleteResult(**counts)
+
+    def forget_belief(self, *, user_id: str, belief_id: int) -> bool:
+        """Targeted forget: delete a single belief and its event history.
+
+        Returns ``True`` if the belief was found and deleted.
+
+        Raises
+        ------
+        ValidationError
+            If user_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.repository import forget_belief
+
+        with self._session() as session:
+            result = forget_belief(session, user_id, belief_id)
+            session.commit()
+            return result
+
+    def forget_session(self, *, user_id: str, session_id: str) -> bool:
+        """Targeted forget: delete a session summary by session_id.
+
+        Returns ``True`` if the summary was found and deleted.
+
+        Raises
+        ------
+        ValidationError
+            If user_id or session_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        if not session_id or not session_id.strip():
+            raise ValidationError("session_id must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.repository import forget_session_summary
+
+        with self._session() as session:
+            result = forget_session_summary(session, user_id, session_id)
+            session.commit()
+            return result

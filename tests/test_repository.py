@@ -324,3 +324,58 @@ class TestUpdateRevival:
         assert val.get("predicate") == "lives_in"
         assert val.get("object") == "c"
         assert val.get("temporal") == "current"
+
+
+class TestForget:
+    """Targeted forget: delete specific beliefs and session summaries."""
+
+    def test_forget_belief(self, db_session):
+        set_memory_enabled(db_session, "u_forget", True)
+        b, _ = record_claim(
+            db_session, "u_forget", dimension="topic", key="sleep",
+            claim_text="trouble sleeping", confidence=0.8,
+        )
+        assert get_belief(db_session, "u_forget", "sleep") is not None
+
+        from mirror_memory.core.repository import forget_belief
+        result = forget_belief(db_session, "u_forget", b.id)
+        assert result is True
+        assert get_belief(db_session, "u_forget", "sleep") is None
+
+    def test_forget_belief_wrong_user(self, db_session):
+        set_memory_enabled(db_session, "u1", True)
+        b, _ = record_claim(
+            db_session, "u1", dimension="topic", key="sleep",
+            claim_text="test", confidence=0.5,
+        )
+        from mirror_memory.core.repository import forget_belief
+        result = forget_belief(db_session, "u2", b.id)
+        assert result is False
+
+    def test_forget_session_summary(self, db_session):
+        from mirror_memory.core.repository import forget_session_summary, store_session_summary
+        store_session_summary(db_session, "u1", "s1", "hello world", 1)
+
+        result = forget_session_summary(db_session, "u1", "s1")
+        assert result is True
+
+        # Verify deleted
+        from mirror_memory.core.models import SessionSummary
+        row = db_session.query(SessionSummary).filter_by(user_id="u1", session_id="s1").first()
+        assert row is None
+
+    def test_forget_nonexistent_session(self, db_session):
+        from mirror_memory.core.repository import forget_session_summary
+        result = forget_session_summary(db_session, "u1", "nonexistent")
+        assert result is False
+
+    def test_delete_user_memories_includes_summaries(self, db_session):
+        from mirror_memory.core.repository import store_session_summary
+        set_memory_enabled(db_session, "u_del", True)
+        record_claim(db_session, "u_del", dimension="topic", key="sleep",
+                     claim_text="test", confidence=0.5)
+        store_session_summary(db_session, "u_del", "s1", "snippet", 1)
+
+        counts = delete_user_memories(db_session, "u_del")
+        assert counts["beliefs"] >= 1
+        assert counts["session_summaries"] >= 1

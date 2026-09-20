@@ -50,6 +50,7 @@ from mirror_memory.core.models import (
     ExtractionStats,
     InterventionEvent,
     MemoryPreference,
+    SessionSummary,
     Snapshot,
     User,
     utcnow,
@@ -867,13 +868,22 @@ def record_extraction_stats(
 
 
 def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
-    """Cascade-delete all inferred beliefs, events, stats, snapshots,
-    intervention events, and evolution jobs for a user.  Returns counts of
-    deleted rows per table.
+    """Cascade-delete all memory data for a user.
+
+    Deletes beliefs, events, stats, snapshots, intervention events,
+    evolution jobs, consent grants, and session summaries.
+
+    Returns counts of deleted rows per table.
     """
+    # Order matters: child tables first.
     events_deleted = (
         session.query(BeliefEvent)
         .filter(BeliefEvent.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
+    interventions_deleted = (
+        session.query(InterventionEvent)
+        .filter(InterventionEvent.user_id == user_id)
         .delete(synchronize_session=False)
     )
     beliefs_deleted = (
@@ -892,14 +902,14 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     snapshots_deleted = (
         session.query(Snapshot).filter(Snapshot.user_id == user_id).delete(synchronize_session=False)
     )
-    interventions_deleted = (
-        session.query(InterventionEvent)
-        .filter(InterventionEvent.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
     consent_deleted = (
         session.query(ConsentGrant)
         .filter(ConsentGrant.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
+    summaries_deleted = (
+        session.query(SessionSummary)
+        .filter(SessionSummary.user_id == user_id)
         .delete(synchronize_session=False)
     )
     return {
@@ -910,7 +920,46 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "snapshots": int(snapshots_deleted),
         "intervention_events": int(interventions_deleted),
         "consent_grants": int(consent_deleted),
+        "session_summaries": int(summaries_deleted),
     }
+
+
+def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
+    """Targeted forget: delete a single belief and its event history.
+
+    Returns ``True`` if the belief was found and deleted.
+    """
+    belief = session.get(Belief, belief_id)
+    if belief is None or belief.user_id != user_id:
+        return False
+
+    # Delete events first.
+    session.query(BeliefEvent).filter(BeliefEvent.belief_id == belief_id).delete(
+        synchronize_session=False
+    )
+    session.delete(belief)
+    session.flush()
+    return True
+
+
+def forget_session_summary(session: Session, user_id: str, session_id: str) -> bool:
+    """Targeted forget: delete a session summary by session_id.
+
+    Returns ``True`` if the summary was found and deleted.
+    """
+    summary = (
+        session.query(SessionSummary)
+        .filter(
+            SessionSummary.user_id == user_id,
+            SessionSummary.session_id == session_id,
+        )
+        .first()
+    )
+    if summary is None:
+        return False
+    session.delete(summary)
+    session.flush()
+    return True
 
 
 # ---------------------------------------------------------------------------

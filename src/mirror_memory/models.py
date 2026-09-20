@@ -40,6 +40,7 @@ class DeleteResult:
     snapshots: int = 0
     intervention_events: int = 0
     consent_grants: int = 0
+    session_summaries: int = 0
 
     def as_dict(self) -> dict[str, int]:
         """Return as a plain dict for backward compatibility."""
@@ -50,6 +51,8 @@ class DeleteResult:
             "evolution_jobs": self.evolution_jobs,
             "snapshots": self.snapshots,
             "intervention_events": self.intervention_events,
+            "consent_grants": self.consent_grants,
+            "session_summaries": self.session_summaries,
             "consent_grants": self.consent_grants,
         }
 
