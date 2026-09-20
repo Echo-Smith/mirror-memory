@@ -78,6 +78,70 @@ def _extract_query_topics(query: str, config: MemoryConfig) -> set[str]:
     return topics
 
 
+# Query-to-predicate mapping for cognitive triple retrieval.
+_QUERY_PREDICATE_PATTERNS: dict[str, set[str]] = {
+    # English patterns
+    "what does": {"likes", "prefers", "has", "wants_to"},
+    "what do": {"likes", "prefers", "has"},
+    "what did": {"went_to", "attended", "bought", "experienced"},
+    "what is": {"is", "has", "lives_in", "works_at"},
+    "where does": {"lives_in", "works_at", "went_to"},
+    "where did": {"went_to", "attended"},
+    "who does": {"knows", "friends_with"},
+    "what are": {"likes", "skills", "has"},
+    "what's": {"is", "has", "likes"},
+    "likes": {"likes"},
+    "loves": {"likes"},
+    "enjoys": {"likes"},
+    "prefers": {"prefers"},
+    "wants": {"wants_to"},
+    "needs": {"has"},
+    "lives": {"lives_in"},
+    "works": {"works_at"},
+    "went": {"went_to"},
+    "bought": {"bought"},
+    # Chinese patterns
+    "喜欢": {"likes"},
+    "爱": {"likes"},
+    "住": {"lives_in"},
+    "工作": {"works_at"},
+    "去了": {"went_to"},
+    "买了": {"bought"},
+    "想要": {"wants_to"},
+    "需要": {"has"},
+}
+
+
+def _extract_query_triples(
+    query: str,
+    config: MemoryConfig,
+) -> tuple[set[str], set[str]]:
+    """Extract predicate and object signals from a query.
+
+    Returns ``(predicates, objects)`` sets for ``score_belief`` matching.
+    """
+    if not query:
+        return set(), set()
+
+    lowered = query.lower().strip()
+    predicates: set[str] = set()
+    objects: set[str] = set()
+
+    # Pattern-based predicate extraction.
+    for pattern, preds in _QUERY_PREDICATE_PATTERNS.items():
+        if pattern in lowered:
+            predicates.update(preds)
+
+    # Object extraction: check if any anchor key appears in the query.
+    for anchor in config.anchors:
+        for phrase in anchor.phrases:
+            if phrase.lower() in lowered:
+                objects.add(anchor.key)
+                break
+
+    return predicates, objects
+
+
 def render_memory_block(
     session: object,
     user_id: str,
@@ -149,8 +213,13 @@ def render_memory_block(
                 items.append(f"\u5e94\u56de\u907f\uff08\u7528\u6237\u5df2\u660e\u786e\u6401\u7f6e\uff09\uff1a{joined}")
 
     # -- Active beliefs: scored and sorted -----------------------------------
-    # Extract topics from user_message for query-aware relevance scoring.
+    # Extract topics, predicates, and objects from user_message for
+    # query-aware relevance scoring.
     query_topics = _extract_query_topics(user_message, config) if user_message else set()
+    query_predicates: set[str] = set()
+    query_objects: set[str] = set()
+    if user_message:
+        query_predicates, query_objects = _extract_query_triples(user_message, config)
 
     # Build dimension gate lookup (requires_user_confirmation per dimension).
     confirm_gates = {d.dimension_id: d.requires_user_confirmation for d in config.dimensions}
@@ -166,7 +235,13 @@ def render_memory_block(
         # Gate 2: dimension requires user confirmation — skip unconfirmed beliefs.
         if confirm_gates.get(belief.dimension, False) and belief.source != "user_confirmed":
             continue
-        s = score_belief(belief, topics=query_topics, now=now)
+        s = score_belief(
+            belief,
+            topics=query_topics,
+            query_predicates=query_predicates,
+            query_objects=query_objects,
+            now=now,
+        )
         if s > 0:
             scored.append((s, belief))
     scored.sort(key=lambda x: (x[0], getattr(x[1], "last_evidence_at", None) or ""), reverse=True)

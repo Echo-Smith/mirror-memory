@@ -58,9 +58,13 @@ def assemble_claims(
         scarcity = counts.get(dim, 0)
         priority = priorities.get(dim, 0)
         confidence = claim.get("confidence", 0.0)
+        # Bonus for cognitive triple structure (predicate+object present).
+        value = claim.get("value") or {}
+        has_triple = 1 if (value.get("predicate") and value.get("object")) else 0
         # Ascending sort: lower scarcity (fewer existing) = comes first.
-        # Negated priority/confidence: higher values come first.
-        return (scarcity, -priority, -confidence)
+        # has_triple negated: claims with triples come first.
+        # priority/confidence negated: higher values come first.
+        return (scarcity, -has_triple, -priority, -confidence)
 
     ordered = sorted(claims, key=_sort_key)
     result = ordered[:max_claims]
