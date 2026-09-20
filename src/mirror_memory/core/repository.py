@@ -100,20 +100,27 @@ def get_state_revision(session: Session, user_id: str) -> int:
 
 
 def bump_state_revision(session: Session, user_id: str) -> int:
-    """Increment and return the new state revision.
+    """Atomic increment of the memory state revision.
 
-    Called by forget/correct to invalidate stale worker computations.
-    Creates the MemoryPreference row if it doesn't exist.
+    Uses SQL UPDATE ... SET state_revision = state_revision + 1
+    to guarantee no lost updates when two sessions bump concurrently.
     """
+    from sqlalchemy import update as sa_update
     pref = session.get(MemoryPreference, user_id)
     if pref is None:
-        pref = MemoryPreference(user_id=user_id)
+        pref = MemoryPreference(user_id=user_id, state_revision=1)
         session.add(pref)
         session.flush()
-    pref.state_revision = (pref.state_revision or 1) + 1
-    pref.updated_at = utcnow()
+    result = session.execute(
+        sa_update(MemoryPreference)
+        .where(MemoryPreference.user_id == user_id)
+        .values(state_revision=MemoryPreference.state_revision + 1, updated_at=utcnow())
+        .returning(MemoryPreference.state_revision)
+    )
+    new_rev = result.scalar_one_or_none()
     session.flush()
-    return pref.state_revision
+    session.refresh(pref)
+    return new_rev
 
 
 def touch_memory_state(session: Session, user_id: str) -> int:

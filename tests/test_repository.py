@@ -652,14 +652,43 @@ class TestConcurrentStaleWrite:
         eng.dispose()
 
     def test_atomic_increment_no_lost_updates(self, db_session):
-        """Atomic bump: multiple concurrent bumps all produce unique revisions."""
-        from mirror_memory.core.repository import bump_state_revision, get_state_revision
+        """Atomic bump: 10 concurrent threads each bump once → 10 unique revisions."""
+        import threading
+        import tempfile
+        import os
+        from sqlalchemy import create_engine as ce
+        from sqlalchemy.orm import Session as SASession
+        from mirror_memory.core.models import Base as MemBase
 
-        set_memory_enabled(db_session, "u_atomic", True)
-        revs = set()
-        for _ in range(20):
-            revs.add(bump_state_revision(db_session, "u_atomic"))
-        # All 20 bumps should produce 20 distinct revision values
-        assert len(revs) == 20
-        final = get_state_revision(db_session, "u_atomic")
-        assert final == max(revs)
+        db_path = os.path.join(tempfile.mkdtemp(), "atomic.db")
+        eng = ce(f"sqlite:///{db_path}")
+        MemBase.metadata.create_all(eng)
+
+        # Setup user
+        with SASession(eng) as s:
+            from mirror_memory.core.repository import set_memory_enabled as sme
+            sme(s, "u_atomic", True)
+            s.commit()
+
+        results = []
+        def bump():
+            from mirror_memory.core.repository import bump_state_revision as bsr
+            e = ce(f"sqlite:///{db_path}")
+            with SASession(e) as s:
+                r = bsr(s, "u_atomic")
+                s.commit()
+                results.append(r)
+            e.dispose()
+
+        threads = [threading.Thread(target=bump) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(set(results)) == 10, f"Expected 10 unique revisions, got {len(set(results))}"
+        from mirror_memory.core.repository import get_state_revision as gsr
+        with SASession(eng) as s:
+            final = gsr(s, "u_atomic")
+            assert final == 11, f"Expected 11, got {final}"
+        eng.dispose()
