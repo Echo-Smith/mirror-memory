@@ -100,14 +100,23 @@ def resolve_identity(
 
     # ── EVENT cardinality ────────────────────────────────────────────────
     if cardinality == CARDINALITY_EVENT:
-        # Events are always new unless they're exact duplicates.
+        # Events are unique by predicate + object + temporal.
+        # Same predicate+object but different time = different events.
         same_object = [b for b in same_predicate if _is_same_object(b, candidate)]
         if same_object:
-            return Resolution(
-                action=ACTION_SUPPORT,
-                target_belief_id=same_object[0].get("id"),
-                reason="exact duplicate event → support",
-            )
+            # Check temporal: if both have temporal info and they differ, it's a new event.
+            candidate_temporal = candidate.temporal or ""
+            for b in same_object:
+                b_temporal = b.get("temporal") or ""
+                if candidate_temporal and b_temporal and candidate_temporal != b_temporal:
+                    continue  # Different time → different event, keep looking
+                # Same predicate + object + compatible temporal → SUPPORT
+                return Resolution(
+                    action=ACTION_SUPPORT,
+                    target_belief_id=b.get("id"),
+                    reason="exact duplicate event (pred+obj+temporal) → support",
+                )
+        # No exact match → CREATE new event.
         return Resolution(action=ACTION_CREATE, reason="EVENT: new occurrence")
 
     # Fallback: treat as MULTI.

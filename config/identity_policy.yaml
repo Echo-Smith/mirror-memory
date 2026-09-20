@@ -34,7 +34,7 @@ predicates:
   age:
     cardinality: single
     temporal: current_state
-  is:
+  profession:
     cardinality: single
     temporal: current_state
 
@@ -120,6 +120,7 @@ synonym_map:
   reside_in: lives_in
   living_in: lives_in
   stay_in: lives_in
+  moved_to: lives_in
 
   work_at: works_at
   working_at: works_at

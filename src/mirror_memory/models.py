@@ -22,6 +22,11 @@ class BeliefInfo:
     layer: str
     source: str
     last_evidence_at: datetime | None = None
+    # Cognitive triple fields
+    subject: str = "user"
+    predicate: str = ""
+    object: str = ""
+    cardinality: str = "multi"
 
 
 @dataclass(frozen=True)

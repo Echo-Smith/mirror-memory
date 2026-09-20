@@ -240,6 +240,12 @@ def record_claim(
     context_tags: list[str] | None = None,
     blocked_key_prefixes: tuple[str, ...] = (),
     allowed_dimensions: set[str] | None = None,
+    # Cognitive triple fields (Phase 1: Memory Atom).
+    subject: str = "user",
+    predicate: str = "",
+    object: str = "",
+    cardinality: str = "multi",
+    superseded_by: int | None = None,
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -256,6 +262,16 @@ def record_claim(
     allowed_dimensions:
         If provided, *dimension* must be in this set or a ``ValueError``
         is raised (strict closed-set validation).
+    subject:
+        Who the claim is about (default ``"user"``).
+    predicate:
+        The relationship verb (``likes``, ``lives_in``, etc.).
+    object:
+        What the predicate applies to (``coffee``, ``Shanghai``, etc.).
+    cardinality:
+        ``"single"`` / ``"multi"`` / ``"event"`` — controls identity resolution.
+    superseded_by:
+        If this claim supersedes an existing belief, set to the old belief's ID.
     """
     if not is_memory_enabled(session, user_id):
         return None, "profile_memory_disabled"
@@ -311,6 +327,13 @@ def record_claim(
             confidence=min(CONFIDENCE_CEILING, max(0.0, confidence)),
             source=source,
             evidence_json=json.dumps(evidence[-MAX_EVIDENCE_REFS:]),
+            # Cognitive triple fields.
+            subject=subject,
+            predicate=predicate,
+            object=object,
+            cardinality=cardinality,
+            superseded_by=superseded_by,
+            # Provenance.
             origin_stats_id=stats_id,
             origin_slice_id=origin_slice_id,
             origin_session_id=session_id,
@@ -412,6 +435,113 @@ def reject_belief(session: Session, user_id: str, belief_id: int) -> Belief | No
     belief.confidence = 0.0
     _append_event(session, belief, "rejected", evidence=[], detail={"reason": "user_denied"})
     return belief
+
+
+# ---------------------------------------------------------------------------
+# ID-based operations (for IdentityResolver integration)
+# ---------------------------------------------------------------------------
+
+
+def support_belief_by_id(
+    session: Session,
+    belief_id: int,
+    *,
+    claim_text: str = "",
+    confidence_gain: float | None = None,
+    session_id: str | None = None,
+    evidence_message_ids: list[int] | None = None,
+) -> Belief | None:
+    """Strengthen an existing belief by ID (SUPPORT action).
+
+    Unlike ``record_claim(relation='supports')`` which matches by
+    ``(user_id, key)``, this operates directly on a belief ID as
+    determined by the IdentityResolver.
+    """
+    from mirror_memory.core.constants import SUPPORT_GAIN
+
+    belief = session.get(Belief, belief_id)
+    if belief is None or belief.status != "active":
+        return None
+
+    evidence = [int(mid) for mid in (evidence_message_ids or [])]
+    merged_evidence = json.loads(belief.evidence_json or "[]")
+    for mid in evidence:
+        if mid not in merged_evidence:
+            merged_evidence.append(mid)
+    belief.evidence_json = json.dumps(merged_evidence[-MAX_EVIDENCE_REFS:])
+    belief.last_evidence_session_id = session_id
+    belief.last_evidence_at = datetime.now(UTC)
+
+    if claim_text and len(claim_text) > len(belief.claim_text or ""):
+        belief.claim_text = claim_text
+
+    # Confidence boost with 7-factor weighting.
+    if confidence_gain is None:
+        confidence_gain = SUPPORT_GAIN
+    belief.confidence = min(CONFIDENCE_CEILING, belief.confidence + confidence_gain)
+    session.flush()
+    _append_event(session, belief, "supported", evidence=evidence)
+    return belief
+
+
+def update_belief_by_id(
+    session: Session,
+    old_belief_id: int,
+    *,
+    new_subject: str = "user",
+    new_predicate: str = "",
+    new_object: str = "",
+    new_dimension: str = "",
+    new_key: str = "",
+    new_claim_text: str = "",
+    new_confidence: float = 0.0,
+    new_cardinality: str = "multi",
+    session_id: str | None = None,
+    evidence_message_ids: list[int] | None = None,
+) -> tuple[Belief | None, Belief | None]:
+    """SINGLE cardinality update: supersede old belief, create new one.
+
+    Returns ``(old_belief, new_belief)``.  Old belief gets status='superseded'
+    and superseded_by points to new belief's ID.
+    """
+    old = session.get(Belief, old_belief_id)
+    if old is None or old.status != "active":
+        return None, None
+
+    evidence = [int(mid) for mid in (evidence_message_ids or [])]
+
+    # Create new belief.
+    new_belief = Belief(
+        user_id=old.user_id,
+        dimension=new_dimension or old.dimension,
+        key=new_key or old.key,
+        claim_text=new_claim_text,
+        value_json="{}",
+        layer="L4",
+        status="active",
+        confidence=min(CONFIDENCE_CEILING, max(0.0, new_confidence)),
+        source="extracted",
+        evidence_json=json.dumps(evidence[-MAX_EVIDENCE_REFS:]),
+        subject=new_subject,
+        predicate=new_predicate or old.predicate,
+        object=new_object,
+        cardinality=new_cardinality,
+        origin_session_id=session_id,
+        last_evidence_session_id=session_id,
+    )
+    session.add(new_belief)
+    session.flush()
+
+    # Supersede old belief.
+    old.status = "superseded"
+    old.superseded_by = new_belief.id
+    session.flush()
+
+    _append_event(session, old, "superseded", evidence=evidence,
+                  detail={"superseded_by": new_belief.id})
+    _append_event(session, new_belief, "created", evidence=evidence,
+                  detail={"supersedes": old.id})
+    return old, new_belief
 
 
 def update_belief_value(

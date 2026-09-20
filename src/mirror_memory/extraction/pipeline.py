@@ -15,6 +15,7 @@ from mirror_memory.core.constants import (
     SNIPPET_MAX_LENGTH,
     SNIPPET_MIN_LENGTH,
 )
+from mirror_memory.core.utils import safe_json
 from mirror_memory.extraction.deterministic import extract_claims
 from mirror_memory.extraction.semantic import SemanticExtractor
 from mirror_memory.extraction.throttle import should_extract
@@ -242,7 +243,7 @@ class ExtractionPipeline:
             return
 
         from mirror_memory.core.repository import list_active_beliefs, record_claim
-        from mirror_memory.memory.atom import ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
+        from mirror_memory.memory.atom import ACTION_CONTRADICT, ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
         from mirror_memory.memory.canonicalize import canonicalize_atom
         from mirror_memory.memory.identity import resolve_identity
 
@@ -259,6 +260,8 @@ class ExtractionPipeline:
                 value = claim.get("value") or {}
                 pred = value.get("predicate", "")
                 obj = value.get("object", "")
+                canon_pred = pred
+                canon_obj = obj
 
                 # If claim has cognitive triple fields, run identity resolution.
                 if pred and obj and policy:
@@ -287,6 +290,7 @@ class ExtractionPipeline:
                             "object": getattr(b, "object", ""),
                             "status": b.status,
                             "confidence": b.confidence,
+                            "temporal": safe_json(getattr(b, "value_json", "{}")).get("temporal", ""),
                         }
                         for b in existing
                     ]
@@ -297,24 +301,50 @@ class ExtractionPipeline:
                         resolution.action, canon_pred, canon_obj, resolution.reason,
                     )
 
-                    if resolution.action == ACTION_UPDATE and resolution.target_belief_id:
-                        # Supersede old belief, then create new one.
-                        from mirror_memory.core.repository import get_belief
+                    # Dispatch based on resolver action.
+                    if resolution.action == ACTION_SUPPORT and resolution.target_belief_id:
+                        from mirror_memory.core.repository import support_belief_by_id
 
-                        old = session.get(
-                            __import__('mirror_memory.core.models', fromlist=['Belief']).Belief,
+                        support_belief_by_id(
+                            session,
                             resolution.target_belief_id,
+                            claim_text=claim.get("claim_text", ""),
+                            session_id=session_id,
+                            evidence_message_ids=claim.get("evidence_message_ids"),
                         )
-                        if old:
-                            old.status = "superseded"
-                            old.superseded_by = None  # will be set after new claim
-                            session.flush()
+                        continue  # SUPPORT handled, skip record_claim
+
+                    if resolution.action == ACTION_UPDATE and resolution.target_belief_id:
+                        from mirror_memory.core.repository import update_belief_by_id
+
+                        old, new = update_belief_by_id(
+                            session,
+                            resolution.target_belief_id,
+                            new_subject=claim.get("subject", "user"),
+                            new_predicate=canon_pred,
+                            new_object=canon_obj,
+                            new_dimension=claim.get("dimension", ""),
+                            new_key=claim.get("key", ""),
+                            new_claim_text=claim.get("claim_text", ""),
+                            new_confidence=claim.get("confidence", 0.0),
+                            new_cardinality=policy.get(canon_pred, "multi"),
+                            session_id=session_id,
+                            evidence_message_ids=claim.get("evidence_message_ids"),
+                        )
+                        if new:
+                            logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)
+                        continue  # UPDATE handled, skip record_claim
+
+                    if resolution.action == ACTION_CONTRADICT and resolution.target_belief_id:
+                        # CONTRADICT: fall through to record_claim with relation=contradicts
+                        claim["relation"] = "contradicts"
 
                     # Update claim value with canonical triple.
                     value["predicate"] = canon_pred
                     value["object"] = canon_obj
                     claim["value"] = value
 
+                # CREATE / CONTRADICT: persist via record_claim.
                 record_claim(
                     session,
                     user_id,
@@ -331,6 +361,11 @@ class ExtractionPipeline:
                     blocked_key_prefixes=self._config.blocked_key_prefixes,
                     allowed_dimensions=allowed,
                     context_tags=context_tags,
+                    # Triple fields.
+                    subject=claim.get("subject", "user"),
+                    predicate=canon_pred,
+                    object=canon_obj,
+                    cardinality=policy.get(canon_pred, "multi"),
                 )
             except Exception:
                 logger.warning(

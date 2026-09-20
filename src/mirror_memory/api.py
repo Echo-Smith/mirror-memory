@@ -283,6 +283,10 @@ class MemoryEngine:
                     layer=b.layer,
                     source=b.source,
                     last_evidence_at=b.last_evidence_at,
+                    subject=getattr(b, "subject", "user"),
+                    predicate=getattr(b, "predicate", ""),
+                    object=getattr(b, "object", ""),
+                    cardinality=getattr(b, "cardinality", "multi"),
                 )
                 for b in beliefs
             ]
