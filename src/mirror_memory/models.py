@@ -53,7 +53,6 @@ class DeleteResult:
             "intervention_events": self.intervention_events,
             "consent_grants": self.consent_grants,
             "session_summaries": self.session_summaries,
-            "consent_grants": self.consent_grants,
         }
 
 

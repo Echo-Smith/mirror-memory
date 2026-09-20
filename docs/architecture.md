@@ -4,6 +4,31 @@
 
 mirror-memory is a structured memory engine for AI agents. It extracts, stores, retrieves, and renders user memories across conversations using a **cognitive triple** model (subject → predicate → object) with identity resolution.
 
+### Cognitive Triple Model
+
+Every piece of user knowledge is represented as a cognitive triple: **subject → predicate → object** (e.g., `user → likes → painting`). This model provides a uniform structure for extraction, storage, and retrieval across all dimensions (topic, preference, fact, event, goal, pattern, boundary).
+
+### Identity Resolution and Cardinality
+
+The **IdentityResolver** determines how new observations relate to existing beliefs. Each predicate is assigned a **cardinality** type:
+
+| Cardinality | Behavior | Example |
+|-------------|----------|---------|
+| SINGLE | Only one active value; new value supersedes old | `lives_in`, `age` |
+| MULTI | Multiple values coexist | `likes`, `has`, `skills` |
+| EVENT | Each occurrence is distinct (temporal fingerprint) | `went_to`, `attended` |
+
+### State Transitions
+
+When a new CandidateAtom arrives, the IdentityResolver produces one of these transitions:
+
+| Transition | Effect |
+|------------|--------|
+| CREATE | New belief created (active) |
+| SUPPORT | Existing belief confidence increased (weighted gain) |
+| UPDATE | Old belief superseded; new belief becomes active |
+| CONTRADICT | Existing belief confidence reduced; marked for clarification |
+
 ## Core Abstractions
 
 ### CandidateAtom (extraction output)

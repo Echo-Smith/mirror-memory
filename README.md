@@ -52,7 +52,7 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 - **Privacy-first** — cascade deletion, consent gating, sensitive data codenames
 - **Built-in LLM adapter** — one-liner startup with any OpenAI-compatible API
 - **Identity semantics** — SINGLE/MULTI/EVENT cardinality, canonicalization, contradiction handling
-- **349 tests** — 0 failures, core paths fully covered
+- **368 tests** — 0 failures, core paths fully covered
 
 ## Architecture / 架构
 
@@ -130,7 +130,7 @@ See [docs/api-reference.md](docs/api-reference.md).
 ```bash
 pip install "mirror-memory[dev]"
 pytest tests/ -q
-# 248 passed in 0.35s
+# 368 passed in 0.35s
 ```
 
 ## License
