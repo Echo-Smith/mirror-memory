@@ -47,6 +47,15 @@ class AnchorConfig(BaseModel):
         default=False,
         description="If true, the anchor triggers identification but no automatic claim creation",
     )
+    source: str = Field(
+        default="",
+        description="Provenance reference for the anchor phrases (e.g. 'act:core_process:typical_phrases')",
+    )
+    live_bind: bool = Field(
+        default=False,
+        description="If true, the anchor key is also accepted in K2 extraction even when "
+        "no static phrases match — the anchor is 'alive' because the user has beliefs with this key",
+    )
 
     @field_validator("anchor_id", mode="before")
     @classmethod
