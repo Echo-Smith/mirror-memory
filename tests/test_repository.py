@@ -17,6 +17,7 @@ from mirror_memory.core.repository import (
     reject_belief,
     set_memory_enabled,
     store_session_summary,
+    update_belief_by_id,
 )
 
 
@@ -250,3 +251,76 @@ class TestRecordExtractionStats:
         rows = db_session.query(ExtractionStats).filter_by(user_id="u1").all()
         assert len(rows) == 1
         assert rows[0].trigger == "topic_flow"
+
+
+class TestUpdateRevival:
+    """Shanghai → Beijing → Shanghai: revive the superseded row."""
+
+    def test_round_trip_no_unique_violation(self, db_session):
+        """Key collision regression: reviving a superseded key must not violate UNIQUE."""
+        set_memory_enabled(db_session, "u_revive", True)
+
+        # Simulate pipeline: create Shanghai, then UPDATE to Beijing (superseded).
+        from mirror_memory.core.repository import update_belief_by_id
+
+        b1, _ = record_claim(
+            db_session, "u_revive", dimension="fact", key="loc_shanghai",
+            claim_text="lives in Shanghai", confidence=0.8,
+            predicate="lives_in", object="shanghai", cardinality="single",
+        )
+        old, b2 = update_belief_by_id(
+            db_session, b1.id, new_key="loc_beijing", new_object="beijing",
+            new_claim_text="lives in Beijing",
+            new_value={"predicate": "lives_in", "object": "beijing"},
+        )
+        db_session.commit()
+        assert old.status == "superseded"
+        assert b2.status == "active"
+
+        # Round trip: UPDATE back to Shanghai → should revive, not collide.
+        old2, new2 = update_belief_by_id(
+            db_session, b2.id,  # Beijing is active
+            new_key="loc_shanghai",
+            new_object="shanghai",
+            new_claim_text="lives in Shanghai again",
+            new_predicate="lives_in",
+            new_confidence=0.7,
+            new_value={"via": "llm_semantic", "predicate": "lives_in", "object": "shanghai"},
+        )
+        db_session.commit()
+
+        assert new2 is not None
+        assert new2.object == "shanghai"
+        assert new2.status == "active"
+        assert old2.id == b2.id
+        assert old2.status == "superseded"
+        # The original Shanghai row should be revived (same id).
+        assert new2.id == b1.id
+
+    def test_update_preserves_metadata(self, db_session):
+        """UPDATE path should preserve value metadata (temporal, context_tags)."""
+        set_memory_enabled(db_session, "u_meta", True)
+
+        b1, _ = record_claim(
+            db_session, "u_meta", dimension="fact", key="loc_a",
+            claim_text="lives in A", confidence=0.8,
+            predicate="lives_in", object="a", cardinality="single",
+        )
+        b2, _ = record_claim(
+            db_session, "u_meta", dimension="fact", key="loc_b",
+            claim_text="lives in B", confidence=0.8,
+            predicate="lives_in", object="b", cardinality="single",
+        )
+
+        old, new = update_belief_by_id(
+            db_session, b2.id,
+            new_key="loc_c",
+            new_object="c",
+            new_claim_text="lives in C",
+            new_value={"via": "llm_semantic", "predicate": "lives_in", "object": "c", "temporal": "current"},
+        )
+        db_session.commit()
+        val = json.loads(new.value_json)
+        assert val.get("predicate") == "lives_in"
+        assert val.get("object") == "c"
+        assert val.get("temporal") == "current"

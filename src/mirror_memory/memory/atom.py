@@ -50,6 +50,7 @@ class CandidateAtom:
     context_tags: list[str] = field(default_factory=list)
     temporal: str | None = None
     source: str = "extracted"
+    relation: str = "supports"  # supports / contradicts / updates / new
 
 
 # ── Atom state transitions ────────────────────────────────────────────────

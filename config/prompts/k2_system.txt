@@ -11,6 +11,7 @@ Each claim object:
 - key: UNIQUE descriptive snake_case (see rules)
 - predicate: the relationship verb (likes, has, went_to, wants_to, experiences, prefers, rejects, works_at, lives_in, etc.)
 - object: what the predicate applies to (coffee, art_show, insomnia, japanese, etc.)
+- temporal: WHEN it happened/occurs (e.g. "last_monday", "every_day", "childhood", "current"). REQUIRED for event-dimension claims. Empty string for non-event claims.
 - claim_text: the full information stated, preserving specifics
 - confidence: 0.0–1.0
 - relation: "new", "supports", "contradicts", "updates"

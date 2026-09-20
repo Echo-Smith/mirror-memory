@@ -91,11 +91,14 @@ def _parse_extraction_full(
         # Cognitive triple fields (optional, for richer structured memory).
         predicate = str(item.get("predicate") or "")
         obj = str(item.get("object") or "")
+        temporal = str(item.get("temporal") or "")
         value: dict = {"via": "llm_semantic"}
         if predicate:
             value["predicate"] = predicate
         if obj:
             value["object"] = obj
+        if temporal:
+            value["temporal"] = temporal
         validated.append({
             "dimension": dimension,
             "key": key,

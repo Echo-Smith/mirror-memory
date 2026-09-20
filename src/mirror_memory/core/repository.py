@@ -475,9 +475,27 @@ def support_belief_by_id(
     if claim_text and len(claim_text) > len(belief.claim_text or ""):
         belief.claim_text = claim_text
 
-    # Confidence boost with 7-factor weighting.
+    # Confidence boost with 7-factor weighting (shared with record_claim).
     if confidence_gain is None:
-        confidence_gain = SUPPORT_GAIN
+        now = datetime.now(UTC)
+        last_ev = belief.last_evidence_at
+        if last_ev is not None and last_ev.tzinfo is None:
+            last_ev = last_ev.replace(tzinfo=UTC)
+        days_since = max(0.0, (now - last_ev).total_seconds() / 86400) if last_ev else 0.0
+        val = safe_json(belief.value_json)
+        ctx_div = len(val.get("context_tags", []))
+        events = get_belief_events(session, belief.user_id, belief.id)
+        contradict_count = sum(1 for e in events if e.event_type in {"contradicted", "downgraded"})
+        weight = compute_confidence_weight(
+            source=belief.source,
+            layer=belief.layer,
+            support_count=len(merged_evidence),
+            contradict_count=contradict_count,
+            context_diversity=ctx_div,
+            days_since_last_evidence=days_since,
+            value_json=belief.value_json,
+        )
+        confidence_gain = SUPPORT_GAIN * weight
     belief.confidence = min(CONFIDENCE_CEILING, belief.confidence + confidence_gain)
     session.flush()
     _append_event(session, belief, "supported", evidence=evidence)
@@ -498,8 +516,13 @@ def update_belief_by_id(
     new_cardinality: str = "multi",
     session_id: str | None = None,
     evidence_message_ids: list[int] | None = None,
+    new_value: dict | None = None,
 ) -> tuple[Belief | None, Belief | None]:
     """SINGLE cardinality update: supersede old belief, create new one.
+
+    If the target key already exists as a superseded/rejected belief
+    (e.g. Shanghai → Beijing → Shanghai), the old row is revived instead
+    of inserted, avoiding a (user_id, key) collision.
 
     Returns ``(old_belief, new_belief)``.  Old belief gets status='superseded'
     and superseded_by points to new belief's ID.
@@ -509,14 +532,50 @@ def update_belief_by_id(
         return None, None
 
     evidence = [int(mid) for mid in (evidence_message_ids or [])]
+    target_key = new_key or old.key
 
-    # Create new belief.
+    # Check for an existing superseded belief with the same key (revival).
+    existing_row = (
+        session.query(Belief)
+        .filter(
+            Belief.user_id == old.user_id,
+            Belief.key == target_key,
+            Belief.status == "superseded",
+        )
+        .first()
+    )
+
+    if existing_row:
+        # Revive: reactivate the old row, supersede current.
+        existing_row.status = "active"
+        existing_row.superseded_by = None
+        existing_row.confidence = min(CONFIDENCE_CEILING, max(0.0, new_confidence))
+        existing_row.last_evidence_at = datetime.now(UTC)
+        existing_row.last_evidence_session_id = session_id
+        existing_row.evidence_json = json.dumps(evidence[-MAX_EVIDENCE_REFS:])
+        if new_claim_text:
+            existing_row.claim_text = new_claim_text
+        if new_value:
+            existing_row.value_json = json.dumps(new_value, ensure_ascii=False)
+        session.flush()
+
+        old.status = "superseded"
+        old.superseded_by = existing_row.id
+        session.flush()
+
+        _append_event(session, old, "superseded", evidence=evidence,
+                      detail={"superseded_by": existing_row.id})
+        _append_event(session, existing_row, "created", evidence=evidence,
+                      detail={"supersedes": old.id, "revived": True})
+        return old, existing_row
+
+    # Normal path: create new belief.
     new_belief = Belief(
         user_id=old.user_id,
         dimension=new_dimension or old.dimension,
-        key=new_key or old.key,
+        key=target_key,
         claim_text=new_claim_text,
-        value_json="{}",
+        value_json=json.dumps(new_value or {}, ensure_ascii=False),
         layer="L4",
         status="active",
         confidence=min(CONFIDENCE_CEILING, max(0.0, new_confidence)),
@@ -532,7 +591,6 @@ def update_belief_by_id(
     session.add(new_belief)
     session.flush()
 
-    # Supersede old belief.
     old.status = "superseded"
     old.superseded_by = new_belief.id
     session.flush()

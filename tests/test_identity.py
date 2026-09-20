@@ -124,6 +124,86 @@ class TestEventCardinality:
         assert result.action == ACTION_SUPPORT
 
 
+class TestEventTemporal:
+    """Same predicate+object but different temporal = different events."""
+
+    def test_different_temporal_create(self):
+        """went_to museum Monday vs Friday → different events → CREATE."""
+        candidate = CandidateAtom(predicate="went_to", object="museum", temporal="monday", dimension="event")
+        existing = [{"id": 1, "predicate": "went_to", "object": "museum", "status": "active", "temporal": "friday"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_CREATE
+
+    def test_same_temporal_supports(self):
+        """went_to museum Monday vs Monday → same event → SUPPORT."""
+        candidate = CandidateAtom(predicate="went_to", object="museum", temporal="monday", dimension="event")
+        existing = [{"id": 1, "predicate": "went_to", "object": "museum", "status": "active", "temporal": "monday"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_SUPPORT
+
+    def test_no_temporal_supports(self):
+        """Both lack temporal → fall back to object matching → SUPPORT."""
+        candidate = CandidateAtom(predicate="went_to", object="museum", dimension="event")
+        existing = [{"id": 1, "predicate": "went_to", "object": "museum", "status": "active"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_SUPPORT
+
+
+class TestContradiction:
+    """relation=contradicts on same identity → CONTRADICT."""
+
+    def test_contradiction_multi(self):
+        """MULTI: likes coffee + relation=contradicts → CONTRADICT."""
+        candidate = CandidateAtom(predicate="likes", object="coffee", relation="contradicts")
+        existing = [{"id": 1, "predicate": "likes", "object": "coffee", "status": "active"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_CONTRADICT
+        assert result.target_belief_id == 1
+
+    def test_contradiction_single(self):
+        """SINGLE: same object + contradicts → CONTRADICT."""
+        candidate = CandidateAtom(predicate="lives_in", object="shanghai", relation="contradicts")
+        existing = [{"id": 1, "predicate": "lives_in", "object": "shanghai", "status": "active"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_CONTRADICT
+
+    def test_contradiction_no_existing_creates(self):
+        """Contradiction with no existing belief → CREATE."""
+        candidate = CandidateAtom(predicate="likes", object="coffee", relation="contradicts")
+        existing = []
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_CREATE
+
+    def test_contradiction_different_object_still_update(self):
+        """SINGLE + different object + contradicts → still UPDATE."""
+        candidate = CandidateAtom(predicate="lives_in", object="beijing", relation="contradicts")
+        existing = [{"id": 1, "predicate": "lives_in", "object": "shanghai", "status": "active"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_UPDATE
+
+    def test_support_not_strengthened_by_contradiction(self):
+        """CRITICAL: contradicts must NEVER be treated as SUPPORT."""
+        candidate = CandidateAtom(predicate="likes", object="coffee", relation="contradicts")
+        existing = [{"id": 1, "predicate": "likes", "object": "coffee", "status": "active", "confidence": 0.9}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action != "SUPPORT"
+        assert result.action == ACTION_CONTRADICT
+
+
+class TestCityRoundTrip:
+    """Shanghai → Beijing → Shanghai (key collision regression)."""
+
+    def test_resolver_round_trip(self):
+        """Round trip: resolver correctly identifies UPDATE back to Shanghai."""
+        # Current: Beijing active, Shanghai superseded.
+        # New claim: I live in Shanghai again → should UPDATE Beijing → Shanghai
+        candidate = CandidateAtom(predicate="lives_in", object="shanghai")
+        existing = [{"id": 2, "predicate": "lives_in", "object": "beijing", "status": "active"}]
+        result = resolve_identity(candidate, existing, POLICY)
+        assert result.action == ACTION_UPDATE
+        assert result.target_belief_id == 2
+
+
 class TestEdgeCases:
     """Edge cases and boundary conditions."""
 

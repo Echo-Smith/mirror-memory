@@ -55,6 +55,7 @@ def resolve_identity(
         return Resolution(action=ACTION_NOOP, reason="empty predicate")
 
     cardinality = policy.get(candidate.predicate, CARDINALITY_MULTI)
+    is_contradiction = candidate.relation == "contradicts"
 
     # Find active beliefs with the same predicate.
     same_predicate = [
@@ -64,12 +65,24 @@ def resolve_identity(
     ]
 
     # ── No existing belief with this predicate → CREATE ──────────────────
+    # (even contradictions create — there's nothing to contradict yet)
     if not same_predicate:
         return Resolution(action=ACTION_CREATE, reason="first claim for this predicate")
 
+    # ── CONTRADICT: same identity + relation=contradicts ──────────────────
+    # This must be checked BEFORE SUPPORT so contradictory evidence does
+    # not accidentally strengthen an existing belief.
+    if is_contradiction:
+        same_object = [b for b in same_predicate if _is_same_object(b, candidate)]
+        if same_object:
+            return Resolution(
+                action=ACTION_CONTRADICT,
+                target_belief_id=same_object[0].get("id"),
+                reason="contradiction on existing belief",
+            )
+
     # ── SINGLE cardinality ───────────────────────────────────────────────
     if cardinality == CARDINALITY_SINGLE:
-        # There should be at most one active belief for SINGLE predicates.
         current = same_predicate[0]
         if _is_same_object(current, candidate):
             return Resolution(
@@ -78,7 +91,6 @@ def resolve_identity(
                 reason="same predicate + same object → support",
             )
         else:
-            # New value supersedes old value.
             return Resolution(
                 action=ACTION_UPDATE,
                 target_belief_id=current.get("id"),
@@ -87,7 +99,6 @@ def resolve_identity(
 
     # ── MULTI cardinality ────────────────────────────────────────────────
     if cardinality == CARDINALITY_MULTI:
-        # Check if there's already a belief with the same object.
         same_object = [b for b in same_predicate if _is_same_object(b, candidate)]
         if same_object:
             return Resolution(
@@ -95,31 +106,30 @@ def resolve_identity(
                 target_belief_id=same_object[0].get("id"),
                 reason="same predicate + same object → support",
             )
-        # Different object → CREATE a new belief (MULTI allows coexistence).
         return Resolution(action=ACTION_CREATE, reason="MULTI: new object for this predicate")
 
     # ── EVENT cardinality ────────────────────────────────────────────────
     if cardinality == CARDINALITY_EVENT:
-        # Events are unique by predicate + object + temporal.
-        # Same predicate+object but different time = different events.
         same_object = [b for b in same_predicate if _is_same_object(b, candidate)]
-        if same_object:
-            # Check temporal: if both have temporal info and they differ, it's a new event.
+        if same_object and not is_contradiction:
             candidate_temporal = candidate.temporal or ""
             for b in same_object:
                 b_temporal = b.get("temporal") or ""
                 if candidate_temporal and b_temporal and candidate_temporal != b_temporal:
-                    continue  # Different time → different event, keep looking
-                # Same predicate + object + compatible temporal → SUPPORT
+                    continue
                 return Resolution(
                     action=ACTION_SUPPORT,
                     target_belief_id=b.get("id"),
                     reason="exact duplicate event (pred+obj+temporal) → support",
                 )
-        # No exact match → CREATE new event.
+        if same_object and is_contradiction:
+            return Resolution(
+                action=ACTION_CONTRADICT,
+                target_belief_id=same_object[0].get("id"),
+                reason="contradiction on event",
+            )
         return Resolution(action=ACTION_CREATE, reason="EVENT: new occurrence")
 
-    # Fallback: treat as MULTI.
     return Resolution(action=ACTION_CREATE, reason="unknown cardinality, default CREATE")
 
 

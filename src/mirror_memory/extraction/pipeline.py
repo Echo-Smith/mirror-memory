@@ -279,6 +279,8 @@ class ExtractionPipeline:
                         claim_text=claim.get("claim_text", ""),
                         confidence=claim.get("confidence", 0.0),
                         context_tags=context_tags or [],
+                        temporal=value.get("temporal", ""),
+                        relation=claim.get("relation", "supports"),
                     )
 
                     # Get existing beliefs for this user
@@ -317,6 +319,11 @@ class ExtractionPipeline:
                     if resolution.action == ACTION_UPDATE and resolution.target_belief_id:
                         from mirror_memory.core.repository import update_belief_by_id
 
+                        # Preserve metadata through the update.
+                        value["predicate"] = canon_pred
+                        value["object"] = canon_obj
+                        claim["value"] = value
+
                         old, new = update_belief_by_id(
                             session,
                             resolution.target_belief_id,
@@ -330,18 +337,27 @@ class ExtractionPipeline:
                             new_cardinality=policy.get(canon_pred, "multi"),
                             session_id=session_id,
                             evidence_message_ids=claim.get("evidence_message_ids"),
+                            new_value=value,
                         )
                         if new:
                             logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)
                         continue  # UPDATE handled, skip record_claim
 
                     if resolution.action == ACTION_CONTRADICT and resolution.target_belief_id:
-                        # CONTRADICT: fall through to record_claim with relation=contradicts
+                        # CONTRADICT: use target belief's key so record_claim
+                        # finds the right belief to attenuate.
+                        from mirror_memory.core.models import Belief as _Belief
+
+                        target = session.get(_Belief, resolution.target_belief_id)
+                        if target:
+                            claim["key"] = target.key
                         claim["relation"] = "contradicts"
 
                     # Update claim value with canonical triple.
                     value["predicate"] = canon_pred
                     value["object"] = canon_obj
+                    if value.get("temporal"):
+                        value["temporal"] = value["temporal"]
                     claim["value"] = value
 
                 # CREATE / CONTRADICT: persist via record_claim.
