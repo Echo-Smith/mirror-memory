@@ -88,6 +88,14 @@ def _parse_extraction_full(
             confidence = min(1.0, max(0.0, float(item.get("confidence") or 0.0)))
         except (TypeError, ValueError):
             confidence = 0.0
+        # Cognitive triple fields (optional, for richer structured memory).
+        predicate = str(item.get("predicate") or "")
+        obj = str(item.get("object") or "")
+        value: dict = {"via": "llm_semantic"}
+        if predicate:
+            value["predicate"] = predicate
+        if obj:
+            value["object"] = obj
         validated.append({
             "dimension": dimension,
             "key": key,
@@ -95,7 +103,7 @@ def _parse_extraction_full(
             "confidence": confidence,
             "relation": relation,
             "source": "extracted",
-            "value": {"via": "llm_semantic"},
+            "value": value,
         })
 
     return {"claims": validated, "subject": subject, "context_tags": context_tags}

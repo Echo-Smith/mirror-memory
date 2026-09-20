@@ -52,7 +52,9 @@ def extract_claims(text: str, config: MemoryConfig) -> list[dict]:
             if kw.lower() in lowered:
                 parts = category.split(".", 1)
                 dimension = parts[0] if len(parts) > 1 else "topic"
-                key = parts[1] if len(parts) > 1 else parts[0]
+                # Content-specific key: "category:keyword" instead of generic category.
+                base_key = parts[1] if len(parts) > 1 else parts[0]
+                key = f"{base_key}:{kw.replace(' ', '_')}"
                 claims.append({
                     "dimension": dimension,
                     "key": key,
@@ -69,10 +71,15 @@ def extract_claims(text: str, config: MemoryConfig) -> list[dict]:
         try:
             m = re.search(pattern_rule.regex, text)
             if m:
+                import hashlib
+
                 match_text = m.group(0)[:CLAIM_TEXT_MAX_LENGTH // 2] if m.group(0) else snippet
+                # Content-specific key: "pattern_key:content_hash".
+                content_hash = hashlib.sha256(match_text.encode()).hexdigest()[:6]
+                key = f"{pattern_rule.key}:{content_hash}"
                 claims.append({
                     "dimension": pattern_rule.dimension,
-                    "key": pattern_rule.key,
+                    "key": key,
                     "claim_text": match_text,
                     "confidence": PATTERN_CONFIDENCE,
                     "relation": "supports",
