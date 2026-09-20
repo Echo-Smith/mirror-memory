@@ -37,10 +37,23 @@
 **Dataset**: 500 QA questions, oracle dataset
 **Source**: [xiaowu0162/LongMemEval](https://github.com/xiaowu0162/LongMemEval)
 
+### Phase 1: Baseline (K1 + K2 extraction)
+
 | Metric | Value |
 |--------|-------|
 | Has answer | 33.2% |
 | No info | 66.8% |
+
+### Phase 1-2: Identity-Resolved (cognitive triple + IdentityResolver)
+
+| Metric | Phase 1 | Phase 1-2 | Δ |
+|--------|---------|-----------|---|
+| Has answer | 33.2% | **50.0%** | **+50.6%** |
+
+Identity-resolved extraction using cognitive triples (subject→predicate→object) with SINGLE/MULTI/EVENT cardinality and canonicalization. The +50.6% improvement comes from:
+- **Content-specific keys**: `like_coffee` / `like_painting` instead of generic `like`
+- **Automatic UPDATE on CONTRADICT**: `lives_in Shanghai` → `lives_in Beijing` replaces instead of appending
+- **Support consolidation**: repeated claims boost confidence instead of creating duplicates
 
 ## Comparison with Mainstream
 

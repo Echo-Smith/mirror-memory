@@ -185,3 +185,50 @@ All domain-specific content is loaded from YAML files:
 - `extraction.yaml` — keywords + regex patterns
 - `identity_policy.yaml` — predicate → cardinality mapping (24 predicates)
 - `prompts/` — K2/K3/verification/worker prompt templates
+
+## State Revision Atomics
+
+Every memory mutation (correct, forget) bumps `state_revision` atomically:
+
+```
+User corrects belief    Worker computes snapshot
+         │                        │
+         ▼                        ▼
+  correct_belief()         compute_and_publish()
+         │                        │
+         ▼                        ▼
+  bump_state_revision()    reads state_revision = 5
+  → SQL: SET rev = 6       (before correction)
+         │                        │
+         ▼                        ▼
+  commit → rev = 6         snapshot published with rev = 5
+                                    │
+                                    ▼
+                             persist_snapshot() checks:
+                             snapshot.revision (5) < current_revision (6)
+                             → discard stale snapshot
+```
+
+Implementation: SQL `UPDATE SET state_revision = state_revision + 1 RETURNING state_revision` — guaranteed atomic, no lost updates even under concurrent transactions.
+
+## Correct Belief Consistency
+
+`correct_belief()` updates all cognitive triple fields atomically:
+
+```python
+old.claim_text = new_claim_text     # text
+old.predicate = new_predicate       # triple: predicate
+old.object = new_object             # triple: object
+old.source = "user_corrected"
+session.flush()                     # atomic commit
+```
+
+Before/after provenance is logged as a BeliefEvent:
+```json
+{
+  "before": {"claim_text": "...", "predicate": "...", "object": "..."},
+  "after":  {"claim_text": "...", "predicate": "...", "object": "..."},
+  "correction": "new claim text",
+  "note": "user correction reason"
+}
+```
