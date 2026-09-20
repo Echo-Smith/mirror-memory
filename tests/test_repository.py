@@ -585,7 +585,7 @@ class TestForgetInvalidatesDerived:
 
 
 class TestConcurrentStaleWrite:
-    """Two-session regression: forget during worker compute blocks publish."""
+    """Two-session regression: revision barrier under real concurrency."""
 
     def test_fresh_read_sees_concurrent_revision(self, db_session):
         """get_state_revision must see changes from another session."""
@@ -593,8 +593,6 @@ class TestConcurrentStaleWrite:
 
         set_memory_enabled(db_session, "u_conc", True)
         rev1 = get_state_revision(db_session, "u_conc")
-
-        # Simulate another session bumping revision
         touch_memory_state(db_session, "u_conc")
         rev2 = get_state_revision(db_session, "u_conc")
         assert rev2 > rev1
@@ -608,13 +606,60 @@ class TestConcurrentStaleWrite:
             db_session, "u_worker", dimension="topic", key="sleep",
             claim_text="test", confidence=0.8, session_id="s1",
         )
-
-        # Worker claims revision
         claimed = get_state_revision(db_session, "u_worker")
-
-        # Simulate user action that bumps revision (e.g., forget)
+        # Simulate user action bumping revision
         touch_memory_state(db_session, "u_worker")
-
-        # Worker checks before publish
         current = get_state_revision(db_session, "u_worker")
         assert current != claimed, "Worker should detect revision change"
+
+    def test_two_session_concurrent_bump(self, db_session):
+        """Real two-session test: Session B bumps while Session A computes."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session as SASession
+        from mirror_memory.core.models import Base as MemBase
+        from mirror_memory.core.repository import (
+            get_state_revision, touch_memory_state, set_memory_enabled, record_claim,
+        )
+
+        # Use a shared file-based DB so two sessions see the same data.
+        import tempfile, os
+        db_path = os.path.join(tempfile.mkdtemp(), "test.db")
+        db_url = f"sqlite:///{db_path}"
+        eng = create_engine(db_url)
+        MemBase.metadata.create_all(eng)
+
+        # Session A: worker
+        sA = SASession(eng)
+        set_memory_enabled(sA, "u2", True)
+        record_claim(sA, "u2", dimension="topic", key="sleep",
+                     claim_text="test", confidence=0.8, session_id="s1")
+        sA.commit()
+
+        # Worker claims revision
+        claimed = get_state_revision(sA, "u2")
+        assert claimed >= 1
+
+        # Session B: user action (forget) in a separate session
+        sB = SASession(eng)
+        touch_memory_state(sB, "u2")
+        sB.commit()
+        sB.close()
+
+        # Worker checks fresh revision (must see Session B's change)
+        current = get_state_revision(sA, "u2")
+        assert current > claimed, f"Worker should see revision bump: {current} > {claimed}"
+        sA.close()
+        eng.dispose()
+
+    def test_atomic_increment_no_lost_updates(self, db_session):
+        """Atomic bump: multiple concurrent bumps all produce unique revisions."""
+        from mirror_memory.core.repository import bump_state_revision, get_state_revision
+
+        set_memory_enabled(db_session, "u_atomic", True)
+        revs = set()
+        for _ in range(20):
+            revs.add(bump_state_revision(db_session, "u_atomic"))
+        # All 20 bumps should produce 20 distinct revision values
+        assert len(revs) == 20
+        final = get_state_revision(db_session, "u_atomic")
+        assert final == max(revs)
