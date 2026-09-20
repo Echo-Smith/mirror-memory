@@ -85,10 +85,18 @@ def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryP
 def get_state_revision(session: Session, user_id: str) -> int:
     """Return the current memory state revision for a user.
 
+    Uses a direct SELECT to bypass SQLAlchemy identity map cache,
+    ensuring we always read the latest committed value even if
+    another session has bumped the revision.
+
     Missing rows return revision 1 (default).
     """
-    pref = session.get(MemoryPreference, user_id)
-    return pref.state_revision if pref is not None else 1
+    result = session.execute(
+        select(MemoryPreference.state_revision).where(
+            MemoryPreference.user_id == user_id
+        )
+    ).scalar()
+    return result if result is not None else 1
 
 
 def bump_state_revision(session: Session, user_id: str) -> int:
@@ -106,6 +114,15 @@ def bump_state_revision(session: Session, user_id: str) -> int:
     pref.updated_at = utcnow()
     session.flush()
     return pref.state_revision
+
+
+def touch_memory_state(session: Session, user_id: str) -> int:
+    """Bump the memory state revision after any state-changing mutation.
+
+    Call this at the end of: CREATE, SUPPORT, UPDATE, CONTRADICT,
+    CONFIRM, REJECT, CORRECT, FORGET operations.
+    """
+    return bump_state_revision(session, user_id)
 
 
 def is_feature_enabled(session: Session, user_id: str, feature: str) -> bool:
@@ -369,6 +386,7 @@ def record_claim(
         session.add(belief)
         session.flush()
         _append_event(session, belief, "created", evidence=evidence, stats_id=stats_id)
+        touch_memory_state(session, user_id)
         return belief, "created"
 
     if relation == "supports":
@@ -422,6 +440,7 @@ def record_claim(
             detail={"confidence": existing.confidence},
             stats_id=stats_id,
         )
+        touch_memory_state(session, user_id)
         return existing, "supported"
 
     # Contradicts: attenuate confidence, mark needs_clarification.
@@ -433,6 +452,7 @@ def record_claim(
     existing.value_json = json.dumps(val, ensure_ascii=False)
     detail: dict = {"confidence": existing.confidence, "clarification_status": "needs_clarification"}
     _append_event(session, existing, "contradicted", evidence=evidence, detail=detail, stats_id=stats_id)
+    touch_memory_state(session, user_id)
     return existing, "contradicted"
 
 
@@ -450,6 +470,7 @@ def confirm_belief(session: Session, user_id: str, belief_id: int) -> Belief | N
     belief.source = "user_confirmed"
     belief.confidence = max(belief.confidence, 0.9)
     _append_event(session, belief, "confirmed", evidence=[], detail={"layer": "L2"})
+    touch_memory_state(session, user_id)
     return belief
 
 
@@ -461,6 +482,7 @@ def reject_belief(session: Session, user_id: str, belief_id: int) -> Belief | No
     belief.status = "rejected"
     belief.confidence = 0.0
     _append_event(session, belief, "rejected", evidence=[], detail={"reason": "user_denied"})
+    touch_memory_state(session, user_id)
     return belief
 
 
@@ -526,6 +548,7 @@ def support_belief_by_id(
     belief.confidence = min(CONFIDENCE_CEILING, belief.confidence + confidence_gain)
     session.flush()
     _append_event(session, belief, "supported", evidence=evidence)
+    touch_memory_state(session, belief.user_id)
     return belief
 
 
@@ -594,6 +617,7 @@ def update_belief_by_id(
                       detail={"superseded_by": existing_row.id})
         _append_event(session, existing_row, "created", evidence=evidence,
                       detail={"supersedes": old.id, "revived": True})
+        touch_memory_state(session, old.user_id)
         return old, existing_row
 
     # Normal path: create new belief.
@@ -626,6 +650,7 @@ def update_belief_by_id(
                   detail={"superseded_by": new_belief.id})
     _append_event(session, new_belief, "created", evidence=evidence,
                   detail={"supersedes": old.id})
+    touch_memory_state(session, old.user_id)
     return old, new_belief
 
 
@@ -938,7 +963,7 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         .filter(SessionSummary.user_id == user_id)
         .delete(synchronize_session=False)
     )
-    bump_state_revision(session, user_id)
+    touch_memory_state(session, user_id)
     return {
         "beliefs": int(beliefs_deleted),
         "belief_events": int(events_deleted),
@@ -981,7 +1006,7 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
         {"status": "cancelled", "error_code": "belief_forgotten"},
         synchronize_session=False,
     )
-    bump_state_revision(session, user_id)
+    touch_memory_state(session, user_id)
     return True
 
 
@@ -1037,6 +1062,12 @@ def correct_belief(
     if old is None or old.user_id != user_id or old.status != "active":
         return None
 
+    # For structured triple beliefs, correction must update all fields.
+    has_triple = getattr(old, "predicate", "") and getattr(old, "object", "")
+    if has_triple and new_object is None:
+        logger.warning("correct_belief: structured belief requires new_object; refusing inconsistent correction")
+        return None
+
     # Save before state for the event log.
     before = {
         "claim_text": old.claim_text,
@@ -1074,7 +1105,7 @@ def correct_belief(
     if correction_note:
         detail["note"] = correction_note
     _append_event(session, old, "corrected", evidence=[], detail=detail)
-    bump_state_revision(session, user_id)
+    touch_memory_state(session, user_id)
     return old
 
 

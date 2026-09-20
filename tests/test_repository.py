@@ -396,6 +396,7 @@ class TestCorrect:
         result = correct_belief(
             db_session, "u_corr", b.id,
             new_claim_text="User is actually 30 years old",
+            new_object="30",
             correction_note="user corrected age",
         )
         db_session.commit()
@@ -404,6 +405,7 @@ class TestCorrect:
         assert result.id == b.id  # same belief, updated in-place
         assert result.claim_text == "User is actually 30 years old"
         assert result.source == "user_corrected"
+        assert result.object == "30"
 
         # Check correction event was logged
         from mirror_memory.core.repository import get_belief_events
@@ -580,3 +582,39 @@ class TestForgetInvalidatesDerived:
         db_session.refresh(job)
         assert job.status == "cancelled"
         assert job.error_code == "belief_forgotten"
+
+
+class TestConcurrentStaleWrite:
+    """Two-session regression: forget during worker compute blocks publish."""
+
+    def test_fresh_read_sees_concurrent_revision(self, db_session):
+        """get_state_revision must see changes from another session."""
+        from mirror_memory.core.repository import get_state_revision, touch_memory_state
+
+        set_memory_enabled(db_session, "u_conc", True)
+        rev1 = get_state_revision(db_session, "u_conc")
+
+        # Simulate another session bumping revision
+        touch_memory_state(db_session, "u_conc")
+        rev2 = get_state_revision(db_session, "u_conc")
+        assert rev2 > rev1
+
+    def test_worker_blocks_on_revision_mismatch(self, db_session):
+        """Worker publish must be blocked when revision changes mid-compute."""
+        from mirror_memory.core.repository import get_state_revision, touch_memory_state
+
+        set_memory_enabled(db_session, "u_worker", True)
+        record_claim(
+            db_session, "u_worker", dimension="topic", key="sleep",
+            claim_text="test", confidence=0.8, session_id="s1",
+        )
+
+        # Worker claims revision
+        claimed = get_state_revision(db_session, "u_worker")
+
+        # Simulate user action that bumps revision (e.g., forget)
+        touch_memory_state(db_session, "u_worker")
+
+        # Worker checks before publish
+        current = get_state_revision(db_session, "u_worker")
+        assert current != claimed, "Worker should detect revision change"

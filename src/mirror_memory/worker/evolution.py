@@ -46,12 +46,11 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
     one pending job.  Returns the job row, or ``None`` if the user
     has no active beliefs.
     """
-    from mirror_memory.core.repository import get_state_revision, is_memory_enabled
+    from mirror_memory.core.repository import is_memory_enabled
 
     if not is_memory_enabled(session, user_id):
         return None
 
-    claimed_revision = get_state_revision(session, user_id)
     watermark = _current_watermark(session, user_id)
     idempotency_key = f"{user_id}:{watermark}:{config.worker.prompt_version}"
 
@@ -99,7 +98,6 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         evidence_watermark=json.dumps({"latest_update": watermark}),
         prompt_version=config.worker.prompt_version,
         idempotency_key=idempotency_key,
-        claimed_revision=claimed_revision,
         status="pending",
     )
     session.add(job)
@@ -181,6 +179,10 @@ def _process_single_job(
     """Process a single evolution job through the 6-node pipeline."""
     try:
         from mirror_memory.core.repository import get_state_revision
+        # We intentionally ignore job.claimed_revision here (a snapshot from
+        # enqueue time).  The revision may have been bumped by state mutations
+        # between enqueue and compute, so we re-read the current value to
+        # compare against the post-compute revision at Node 6.
         claimed_revision = get_state_revision(session, job.user_id)
 
         # Node 1: load_evidence
