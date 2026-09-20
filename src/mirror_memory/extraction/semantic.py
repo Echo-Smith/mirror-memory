@@ -16,8 +16,17 @@ logger = logging.getLogger(__name__)
 
 
 def _build_allowed_keys(config: MemoryConfig) -> dict[str, frozenset[str]]:
-    """Build dimension -> allowed keys mapping from config anchors."""
+    """Build dimension -> allowed keys mapping from config anchors.
+
+    All configured dimensions are included, even if they have no anchors.
+    Dimensions without anchors have an empty key set, which means the
+    parser accepts any key within that dimension.
+    """
     allowed: dict[str, set[str]] = {}
+    # Include all configured dimensions (even without anchors).
+    for dim in config.dimensions:
+        allowed.setdefault(dim.dimension_id, set())
+    # Populate keys from anchors.
     for anchor in config.anchors:
         if anchor.identify_only:
             continue
@@ -80,7 +89,10 @@ def _parse_extraction_full(
         relation = str(item.get("relation") or "supports")
         if dimension not in allowed_keys or not key:
             continue
-        if relation in {"new", "first_mention"}:
+        # Normalize relations: "new"/"first_mention"/"updates" → "supports"
+        # "updates" is intentionally excluded from the prompt — state UPDATE
+        # is decided by the IdentityResolver based on cardinality, not the LLM.
+        if relation in {"new", "first_mention", "updates"}:
             relation = "supports"
         if relation not in {"supports", "contradicts"}:
             continue

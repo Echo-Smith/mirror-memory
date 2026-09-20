@@ -177,6 +177,39 @@ class TestContradictionE2E:
         assert conf_after < conf_before
 
 
+class TestEventTemporalE2E:
+    """Same predicate+object, different temporal → 2 active event beliefs."""
+
+    def test_two_museum_visits(self, engine):
+        """went_to museum Monday + went_to museum Friday → 2 events."""
+        eng, llm = engine
+
+        llm._responses["k2"] = json.dumps({
+            "claims": [{"dimension": "event", "key": "went_to_museum",
+                        "predicate": "went_to", "object": "museum",
+                        "temporal": "monday",
+                        "claim_text": "User went to the museum on Monday",
+                        "confidence": 0.9, "relation": "new"}],
+            "subject": "user", "context_tags": [],
+        })
+        eng.observe(user_id="u8", session_id="s1", text="I went to the museum on Monday", turn_count=1)
+
+        llm._responses["k2"] = json.dumps({
+            "claims": [{"dimension": "event", "key": "went_to_museum",
+                        "predicate": "went_to", "object": "museum",
+                        "temporal": "friday",
+                        "claim_text": "User went to the museum on Friday",
+                        "confidence": 0.9, "relation": "new"}],
+            "subject": "user", "context_tags": [],
+        })
+        eng.observe(user_id="u8", session_id="s2", text="I went to the museum on Friday", turn_count=1)
+
+        beliefs = eng.get_beliefs(user_id="u8")
+        went_to = [b for b in beliefs if b.predicate == "went_to"]
+        # Both events should exist as separate active beliefs
+        assert len(went_to) == 2
+
+
 class TestMemoryAtomFields:
     """Verify triple fields are persisted in the database."""
 

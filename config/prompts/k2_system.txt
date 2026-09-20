@@ -14,7 +14,7 @@ Each claim object:
 - temporal: WHEN it happened/occurs (e.g. "last_monday", "every_day", "childhood", "current"). REQUIRED for event-dimension claims. Empty string for non-event claims.
 - claim_text: the full information stated, preserving specifics
 - confidence: 0.0–1.0
-- relation: "new", "supports", "contradicts", "updates"
+- relation: "new", "supports", "contradicts"  (state UPDATE is decided by the system, not the LLM)
 
 Empty: {"claims": [], "subject": "user", "context_tags": []}
 
