@@ -108,12 +108,18 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 
 ### LOCOMO Refined (10 conversations, 1382 QA)
 
-| Metric | Value |
-|--------|-------|
-| F1 mean (all) | 0.080 |
-| F1 mean (answered) | 0.228 |
-| Hit rate | 34.6% |
-| Top F1 | 0.870 |
+| Metric | Baseline (v1) | Identity Engine | Improvement |
+|--------|--------------|-----------------|-------------|
+| F1 mean | 0.019 | **0.084** | **+346%** |
+| Hit rate | 12% | **35.8%** | **+3x** |
+| Top F1 | 0.316 | **1.000** | perfect match |
+
+| Category | Count | F1 |
+|----------|-------|-----|
+| Multi-hop reasoning | 213 | 0.074 |
+| Single-hop reasoning | 299 | 0.042 |
+| Temporal reasoning | 68 | 0.071 |
+| Open-domain knowledge | 802 | 0.103 |
 
 ### LongMemEval (500 QA, oracle dataset)
 
