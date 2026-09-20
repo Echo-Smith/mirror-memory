@@ -109,6 +109,13 @@ class Belief(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     source: Mapped[str] = mapped_column(String(32), default="extracted")
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
+    # Cognitive triple fields (Phase 1: Memory Atom)
+    subject: Mapped[str] = mapped_column(String(64), default="user")
+    predicate: Mapped[str] = mapped_column(String(64), default="")
+    object: Mapped[str] = mapped_column(String(256), default="")
+    cardinality: Mapped[str] = mapped_column(String(16), default="multi")
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Existing provenance fields
     origin_stats_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     origin_slice_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     origin_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

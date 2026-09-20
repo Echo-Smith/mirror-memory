@@ -226,6 +226,16 @@ class MemoryConfig(BaseModel):
         description="If True, record_claim raises ValueError for dimensions "
         "not present in config.dimensions.",
     )
+    # Identity policy — maps predicates to cardinality (single/multi/event).
+    identity_policy: dict[str, str] = Field(
+        default_factory=dict,
+        description="Predicate → cardinality mapping for IdentityResolver",
+    )
+    # Predicate synonym map — canonicalizes variant predicates.
+    predicate_synonyms: dict[str, str] = Field(
+        default_factory=dict,
+        description="Variant predicate → canonical predicate (e.g. loves → likes)",
+    )
     llm_client: Any = Field(default=None, description="LLM client; must expose generate()")
     session_factory: Any = Field(default=None, description="Callable returning a new SQLAlchemy Session")
 

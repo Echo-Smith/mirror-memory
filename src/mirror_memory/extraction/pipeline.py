@@ -235,21 +235,86 @@ class ExtractionPipeline:
     ) -> None:
         """Persist extracted claims via the repository layer.
 
-        Uses lazy import to avoid circular dependency with
-        ``core.repository``.
+        When a claim has predicate/object in its value, the IdentityResolver
+        decides the action (CREATE/SUPPORT/UPDATE) before persistence.
         """
         if not claims:
             return
 
-        from mirror_memory.core.repository import record_claim
+        from mirror_memory.core.repository import list_active_beliefs, record_claim
+        from mirror_memory.memory.atom import ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
+        from mirror_memory.memory.canonicalize import canonicalize_atom
+        from mirror_memory.memory.identity import resolve_identity
+
+        allowed = (
+            {d.dimension_id for d in self._config.dimensions}
+            if self._config.strict_dimensions
+            else None
+        )
+        policy = self._config.identity_policy
+        synonyms = self._config.predicate_synonyms
 
         for claim in claims:
             try:
-                allowed = (
-                    {d.dimension_id for d in self._config.dimensions}
-                    if self._config.strict_dimensions
-                    else None
-                )
+                value = claim.get("value") or {}
+                pred = value.get("predicate", "")
+                obj = value.get("object", "")
+
+                # If claim has cognitive triple fields, run identity resolution.
+                if pred and obj and policy:
+                    # Canonicalize
+                    _, canon_pred, canon_obj = canonicalize_atom(
+                        claim.get("subject", "user"), pred, obj, synonyms
+                    )
+
+                    # Build candidate
+                    candidate = CandidateAtom(
+                        subject=claim.get("subject", "user"),
+                        predicate=canon_pred,
+                        object=canon_obj,
+                        dimension=claim.get("dimension", ""),
+                        claim_text=claim.get("claim_text", ""),
+                        confidence=claim.get("confidence", 0.0),
+                        context_tags=context_tags or [],
+                    )
+
+                    # Get existing beliefs for this user
+                    existing = list_active_beliefs(session, user_id, limit=200)
+                    existing_dicts = [
+                        {
+                            "id": b.id,
+                            "predicate": getattr(b, "predicate", ""),
+                            "object": getattr(b, "object", ""),
+                            "status": b.status,
+                            "confidence": b.confidence,
+                        }
+                        for b in existing
+                    ]
+
+                    resolution = resolve_identity(candidate, existing_dicts, policy)
+                    logger.info(
+                        "pipeline: identity resolution: action=%s pred=%s obj=%s reason=%s",
+                        resolution.action, canon_pred, canon_obj, resolution.reason,
+                    )
+
+                    if resolution.action == ACTION_UPDATE and resolution.target_belief_id:
+                        # Supersede old belief, then create new one.
+                        from mirror_memory.core.repository import get_belief
+
+                        old = session.get(
+                            __import__('mirror_memory.core.models', fromlist=['Belief']).Belief,
+                            resolution.target_belief_id,
+                        )
+                        if old:
+                            old.status = "superseded"
+                            old.superseded_by = None  # will be set after new claim
+                            session.flush()
+
+                    # Update claim value with canonical triple.
+                    value["predicate"] = canon_pred
+                    value["object"] = canon_obj
+                    claim["value"] = value
+
                 record_claim(
                     session,
                     user_id,

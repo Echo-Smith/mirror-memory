@@ -281,6 +281,22 @@ def load_config(config_path: str | Path) -> MemoryConfig:
     if not prompts.k2_system:
         logger.info("k2_system prompt is empty — K2 semantic extraction is disabled")
 
+    # -- Identity policy ------------------------------------------------------
+    identity_data = _read_yaml(base / "identity_policy.yaml")
+    identity_policy: dict[str, str] = {}
+    predicate_synonyms: dict[str, str] = {}
+    if isinstance(identity_data, dict):
+        raw_predicates = identity_data.get("predicates", {})
+        if isinstance(raw_predicates, dict):
+            for pred, cfg in raw_predicates.items():
+                if isinstance(cfg, dict):
+                    card = cfg.get("cardinality", "multi")
+                    if card in ("single", "multi", "event"):
+                        identity_policy[pred] = card
+        raw_synonyms = identity_data.get("synonym_map", {})
+        if isinstance(raw_synonyms, dict):
+            predicate_synonyms = {str(k): str(v) for k, v in raw_synonyms.items()}
+
     # -- Assemble -------------------------------------------------------------
     config = MemoryConfig(
         dimensions=_parse_dimensions(dim_data),
@@ -290,6 +306,8 @@ def load_config(config_path: str | Path) -> MemoryConfig:
         prompts=prompts,
         budget=budget,
         question_value_tiers=question_value_tiers,
+        identity_policy=identity_policy,
+        predicate_synonyms=predicate_synonyms,
     )
 
     if config.render.floor > config.render.cap:

@@ -1,0 +1,132 @@
+# Identity policy — defines how each predicate handles atom identity.
+#
+# cardinality:
+#   single  — only one active value at a time (lives_in, age, works_at)
+#   multi   — multiple values coexist (likes, has, skills)
+#   event   — each occurrence is a distinct event (went_to, attended)
+#
+# temporal:
+#   current_state  — the value represents the current state
+#   persistent     — the value is a lasting attribute
+#   episodic       — the value is a one-time event
+#
+# This file is loaded by config/loader.py and consumed by IdentityResolver.
+# Domain adapters can override predicates.
+
+predicates:
+  # Location
+  lives_in:
+    cardinality: single
+    temporal: current_state
+  moved_to:
+    cardinality: single
+    temporal: current_state
+
+  # Work
+  works_at:
+    cardinality: single
+    temporal: current_state
+  studies_at:
+    cardinality: single
+    temporal: current_state
+
+  # Age / identity
+  age:
+    cardinality: single
+    temporal: current_state
+  is:
+    cardinality: single
+    temporal: current_state
+
+  # Preferences (multi — coffee and painting coexist)
+  likes:
+    cardinality: multi
+    temporal: persistent
+  loves:
+    cardinality: multi
+    temporal: persistent
+  enjoys:
+    cardinality: multi
+    temporal: persistent
+  prefers:
+    cardinality: multi
+    temporal: persistent
+  dislikes:
+    cardinality: multi
+    temporal: persistent
+
+  # Possessions / attributes
+  has:
+    cardinality: multi
+    temporal: persistent
+  owns:
+    cardinality: multi
+    temporal: persistent
+  skills:
+    cardinality: multi
+    temporal: persistent
+
+  # Events
+  went_to:
+    cardinality: event
+    temporal: episodic
+  attended:
+    cardinality: event
+    temporal: episodic
+  bought:
+    cardinality: event
+    temporal: episodic
+  experienced:
+    cardinality: event
+    temporal: episodic
+  said:
+    cardinality: event
+    temporal: episodic
+
+  # Goals / intentions
+  wants_to:
+    cardinality: multi
+    temporal: persistent
+  plans_to:
+    cardinality: multi
+    temporal: persistent
+  hopes_to:
+    cardinality: multi
+    temporal: persistent
+
+  # Relationships
+  knows:
+    cardinality: multi
+    temporal: persistent
+  friends_with:
+    cardinality: multi
+    temporal: persistent
+
+# Predicate synonym map — maps variants to canonical forms.
+# "loves coffee" and "likes coffee" both become predicate=likes.
+synonym_map:
+  love: likes
+  loves: likes
+  enjoy: likes
+  enjoys: likes
+  fond_of: likes
+  adore: likes
+  adores: likes
+
+  hate: dislikes
+  hates: dislikes
+  dislike: dislikes
+
+  reside_in: lives_in
+  living_in: lives_in
+  stay_in: lives_in
+
+  work_at: works_at
+  working_at: works_at
+
+  go_to: went_to
+  visits: went_to
+  visited: went_to
+
+  buy: bought
+  purchased: bought
