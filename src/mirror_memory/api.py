@@ -531,3 +531,68 @@ class MemoryEngine:
             result = forget_session_summary(session, user_id, session_id)
             session.commit()
             return result
+
+    def correct(
+        self,
+        *,
+        user_id: str,
+        belief_id: int,
+        new_claim_text: str,
+        correction_note: str = "",
+    ) -> dict | None:
+        """User-initiated correction: supersede a belief with corrected text.
+
+        Unlike a normal UPDATE (driven by IdentityResolver), this is an
+        explicit user action: "this memory is wrong, it should be X."
+
+        Returns the new corrected belief as a dict, or ``None`` if the
+        target is invalid.
+
+        Raises
+        ------
+        ValidationError
+            If user_id or new_claim_text is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        if not new_claim_text or not new_claim_text.strip():
+            raise ValidationError("new_claim_text must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.repository import correct_belief
+
+        with self._session() as session:
+            result = correct_belief(
+                session, user_id, belief_id,
+                new_claim_text=new_claim_text,
+                correction_note=correction_note,
+            )
+            session.commit()
+            if result is None:
+                return None
+            return {
+                "belief_id": result.id,
+                "claim_text": result.claim_text,
+                "status": result.status,
+                "confidence": result.confidence,
+            }
+
+    def explain(self, *, user_id: str, belief_id: int) -> dict | None:
+        """Return the provenance chain for a belief.
+
+        Returns a dict with belief state, event history, evidence sources,
+        and supersession chain.  Returns ``None`` if the belief is not found.
+
+        Raises
+        ------
+        ValidationError
+            If user_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.repository import explain_belief
+
+        with self._session() as session:
+            return explain_belief(session, user_id, belief_id)

@@ -963,8 +963,99 @@ def forget_session_summary(session: Session, user_id: str, session_id: str) -> b
 
 
 # ---------------------------------------------------------------------------
-# Session summary (unstructured fallback storage)
+# Correct + Provenance
 # ---------------------------------------------------------------------------
+
+
+def correct_belief(
+    session: Session,
+    user_id: str,
+    belief_id: int,
+    *,
+    new_claim_text: str,
+    correction_note: str = "",
+) -> Belief | None:
+    """User-initiated correction: supersede old belief with corrected version.
+
+    Unlike a normal UPDATE (which is driven by the IdentityResolver),
+    ``correct_belief`` is an explicit user action: "this memory is wrong,
+    it should be X."
+
+    The old belief is superseded and a correction event is logged.
+    The new belief carries the corrected claim_text.
+
+    Returns the new (corrected) belief, or ``None`` if the target is invalid.
+    """
+    old = session.get(Belief, belief_id)
+    if old is None or old.user_id != user_id or old.status != "active":
+        return None
+
+    # In-place correction: update claim_text and mark as user_corrected.
+    # The UNIQUE constraint on (user_id, key) prevents creating a second
+    # row with the same key, so we update the existing one and log the
+    # correction as a BeliefEvent for provenance.
+    old.claim_text = new_claim_text
+    old.source = "user_corrected"
+    old.confidence = min(CONFIDENCE_CEILING, max(old.confidence, 0.5))
+    old.last_evidence_at = datetime.now(UTC)
+    session.flush()
+
+    detail = {"correction": new_claim_text[:200]}
+    if correction_note:
+        detail["note"] = correction_note
+    _append_event(session, old, "corrected", evidence=[], detail=detail)
+    return old
+
+
+def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | None:
+    """Return the provenance chain for a belief.
+
+    Returns a dict with:
+    - belief: current state
+    - events: chronological event history
+    - source_evidence: evidence IDs
+    - superseded_by: ID of the belief that replaced this one (if any)
+    - correction_of: ID of the belief this one corrects (if any)
+
+    Returns ``None`` if the belief is not found.
+    """
+    belief = session.get(Belief, belief_id)
+    if belief is None or belief.user_id != user_id:
+        return None
+
+    events = get_belief_events(session, user_id, belief_id)
+    evidence_ids = safe_json(belief.evidence_json)
+    if isinstance(evidence_ids, str):
+        try:
+            evidence_ids = json.loads(evidence_ids)
+        except (json.JSONDecodeError, TypeError):
+            evidence_ids = []
+
+    return {
+        "belief_id": belief.id,
+        "dimension": belief.dimension,
+        "key": belief.key,
+        "claim_text": belief.claim_text,
+        "predicate": getattr(belief, "predicate", ""),
+        "object": getattr(belief, "object", ""),
+        "confidence": belief.confidence,
+        "layer": belief.layer,
+        "status": belief.status,
+        "source": belief.source,
+        "subject": getattr(belief, "subject", "user"),
+        "evidence_ids": evidence_ids if isinstance(evidence_ids, list) else [],
+        "superseded_by": belief.superseded_by,
+        "first_seen_at": belief.first_seen_at.isoformat() if belief.first_seen_at else None,
+        "last_evidence_at": belief.last_evidence_at.isoformat() if belief.last_evidence_at else None,
+        "events": [
+            {
+                "event_type": e.event_type,
+                "detail": safe_json(e.detail_json),
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in events
+        ],
+    }
 
 
 def store_session_summary(

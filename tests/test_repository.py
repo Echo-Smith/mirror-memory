@@ -379,3 +379,76 @@ class TestForget:
         counts = delete_user_memories(db_session, "u_del")
         assert counts["beliefs"] >= 1
         assert counts["session_summaries"] >= 1
+
+
+class TestCorrect:
+    """User-initiated correction: update belief in-place with corrected text."""
+
+    def test_correct_updates_belief(self, db_session):
+        set_memory_enabled(db_session, "u_corr", True)
+        b, _ = record_claim(
+            db_session, "u_corr", dimension="fact", key="age",
+            claim_text="User is 28 years old", confidence=0.9,
+            predicate="age", object="28", cardinality="single",
+        )
+
+        from mirror_memory.core.repository import correct_belief
+        result = correct_belief(
+            db_session, "u_corr", b.id,
+            new_claim_text="User is actually 30 years old",
+            correction_note="user corrected age",
+        )
+        db_session.commit()
+
+        assert result is not None
+        assert result.id == b.id  # same belief, updated in-place
+        assert result.claim_text == "User is actually 30 years old"
+        assert result.source == "user_corrected"
+
+        # Check correction event was logged
+        from mirror_memory.core.repository import get_belief_events
+        events = get_belief_events(db_session, "u_corr", b.id)
+        correction_events = [e for e in events if e.event_type == "corrected"]
+        assert len(correction_events) >= 1
+
+    def test_correct_wrong_user_returns_none(self, db_session):
+        set_memory_enabled(db_session, "u1", True)
+        b, _ = record_claim(
+            db_session, "u1", dimension="fact", key="age",
+            claim_text="28", confidence=0.9,
+        )
+        from mirror_memory.core.repository import correct_belief
+        result = correct_belief(db_session, "u2", b.id, new_claim_text="30")
+        assert result is None
+
+
+class TestExplain:
+    """Provenance chain for a belief."""
+
+    def test_explain_returns_chain(self, db_session):
+        set_memory_enabled(db_session, "u_explain", True)
+        b, _ = record_claim(
+            db_session, "u_explain", dimension="topic", key="sleep",
+            claim_text="trouble sleeping", confidence=0.8,
+            predicate="has", object="insomnia", cardinality="multi",
+        )
+
+        from mirror_memory.core.repository import explain_belief
+        result = explain_belief(db_session, "u_explain", b.id)
+        assert result is not None
+        assert result["belief_id"] == b.id
+        assert result["claim_text"] == "trouble sleeping"
+        assert result["predicate"] == "has"
+        assert result["object"] == "insomnia"
+        assert result["status"] == "active"
+        assert isinstance(result["events"], list)
+
+    def test_explain_wrong_user_returns_none(self, db_session):
+        set_memory_enabled(db_session, "u1", True)
+        b, _ = record_claim(
+            db_session, "u1", dimension="topic", key="sleep",
+            claim_text="test", confidence=0.5,
+        )
+        from mirror_memory.core.repository import explain_belief
+        result = explain_belief(db_session, "u2", b.id)
+        assert result is None
