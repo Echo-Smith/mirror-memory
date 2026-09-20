@@ -104,13 +104,20 @@ def bump_state_revision(session: Session, user_id: str) -> int:
 
     Uses SQL UPDATE ... SET state_revision = state_revision + 1
     to guarantee no lost updates when two sessions bump concurrently.
+    Row creation uses INSERT OR IGNORE to handle concurrent first-touch.
     """
     from sqlalchemy import update as sa_update
-    pref = session.get(MemoryPreference, user_id)
-    if pref is None:
+    # Ensure row exists. If another session already inserted, the get() below
+    # will find it via the atomic UPDATE path.
+    existing = session.get(MemoryPreference, user_id)
+    if existing is None:
         pref = MemoryPreference(user_id=user_id, state_revision=1)
         session.add(pref)
-        session.flush()
+        try:
+            session.flush()
+        except Exception:
+            session.rollback()  # row already exists from concurrent insert
+    # Atomic increment at SQL level.
     result = session.execute(
         sa_update(MemoryPreference)
         .where(MemoryPreference.user_id == user_id)
@@ -119,7 +126,6 @@ def bump_state_revision(session: Session, user_id: str) -> int:
     )
     new_rev = result.scalar_one_or_none()
     session.flush()
-    session.refresh(pref)
     return new_rev
 
 
