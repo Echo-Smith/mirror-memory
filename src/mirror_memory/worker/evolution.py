@@ -46,11 +46,12 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
     one pending job.  Returns the job row, or ``None`` if the user
     has no active beliefs.
     """
-    from mirror_memory.core.repository import is_memory_enabled
+    from mirror_memory.core.repository import get_state_revision, is_memory_enabled
 
     if not is_memory_enabled(session, user_id):
         return None
 
+    claimed_revision = get_state_revision(session, user_id)
     watermark = _current_watermark(session, user_id)
     idempotency_key = f"{user_id}:{watermark}:{config.worker.prompt_version}"
 
@@ -98,6 +99,7 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         evidence_watermark=json.dumps({"latest_update": watermark}),
         prompt_version=config.worker.prompt_version,
         idempotency_key=idempotency_key,
+        claimed_revision=claimed_revision,
         status="pending",
     )
     session.add(job)
@@ -178,6 +180,9 @@ def _process_single_job(
 ) -> None:
     """Process a single evolution job through the 6-node pipeline."""
     try:
+        from mirror_memory.core.repository import get_state_revision
+        claimed_revision = get_state_revision(session, job.user_id)
+
         # Node 1: load_evidence
         evidence = _load_evidence(session, job.user_id)
 
@@ -199,7 +204,18 @@ def _process_single_job(
         except Exception:
             logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job.id))
 
-        # Node 6: persist_snapshot
+        # Node 6: persist_snapshot with revision guard
+        from mirror_memory.core.repository import get_state_revision
+        current_revision = get_state_revision(session, job.user_id)
+        if current_revision != claimed_revision:
+            logger.warning("evolution: stale write blocked (job=%s claimed=%d current=%d)",
+                           truncate_id(job.id), claimed_revision, current_revision)
+            job.status = "completed"  # mark done but don't persist
+            job.completed_at = datetime.now(UTC)
+            job.error_code = "stale_revision"
+            session.commit()
+            return
+
         is_shadow = evidence.get("distinct_sessions", 1) < 2
         persist_snapshot(
             session,

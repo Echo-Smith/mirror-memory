@@ -539,6 +539,9 @@ class MemoryEngine:
         belief_id: int,
         new_claim_text: str,
         correction_note: str = "",
+        new_predicate: str | None = None,
+        new_object: str | None = None,
+        new_value: dict | None = None,
     ) -> dict | None:
         """User-initiated correction: supersede a belief with corrected text.
 
@@ -566,6 +569,9 @@ class MemoryEngine:
                 session, user_id, belief_id,
                 new_claim_text=new_claim_text,
                 correction_note=correction_note,
+                new_predicate=new_predicate,
+                new_object=new_object,
+                new_value=new_value,
             )
             session.commit()
             if result is None:

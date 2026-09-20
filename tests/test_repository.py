@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from mirror_memory.core.models import Base, Belief, BeliefEvent
+from mirror_memory.core.models import Base, Belief, BeliefEvent, EvolutionJob, Snapshot
 from mirror_memory.core.repository import (
     confirm_belief,
     delete_user_memories,
@@ -452,3 +452,131 @@ class TestExplain:
         from mirror_memory.core.repository import explain_belief
         result = explain_belief(db_session, "u2", b.id)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Safety Closure regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestStaleWritePrevention:
+    """Worker publish must be blocked when memory state has changed."""
+
+    def test_revision_bumps_on_forget(self, db_session):
+        """forget_belief bumps state_revision, invalidating stale workers."""
+        from mirror_memory.core.repository import get_state_revision, forget_belief
+
+        set_memory_enabled(db_session, "u_stale", True)
+        b, _ = record_claim(
+            db_session, "u_stale", dimension="topic", key="sleep",
+            claim_text="trouble sleeping", confidence=0.8,
+        )
+        rev_before = get_state_revision(db_session, "u_stale")
+        forget_belief(db_session, "u_stale", b.id)
+        rev_after = get_state_revision(db_session, "u_stale")
+        assert rev_after > rev_before
+
+    def test_revision_bumps_on_correct(self, db_session):
+        """correct_belief bumps state_revision."""
+        from mirror_memory.core.repository import get_state_revision, correct_belief
+
+        set_memory_enabled(db_session, "u_rev", True)
+        b, _ = record_claim(
+            db_session, "u_rev", dimension="fact", key="age",
+            claim_text="28", confidence=0.9,
+            predicate="age", object="28",
+        )
+        rev_before = get_state_revision(db_session, "u_rev")
+        correct_belief(db_session, "u_rev", b.id, new_claim_text="30",
+                        new_object="30")
+        rev_after = get_state_revision(db_session, "u_rev")
+        assert rev_after > rev_before
+
+
+class TestCorrectTripleConsistency:
+    """correct_belief must update claim_text AND structured triple fields."""
+
+    def test_correct_updates_object(self, db_session):
+        """age 28 → 30: claim_text=30 AND object=30."""
+        set_memory_enabled(db_session, "u_trip", True)
+        b, _ = record_claim(
+            db_session, "u_trip", dimension="fact", key="age",
+            claim_text="User is 28", confidence=0.9,
+            predicate="age", object="28", cardinality="single",
+        )
+        from mirror_memory.core.repository import correct_belief
+        correct_belief(
+            db_session, "u_trip", b.id,
+            new_claim_text="User is 30",
+            new_object="30",
+        )
+        db_session.refresh(b)
+        assert b.claim_text == "User is 30"
+        assert b.object == "30"
+
+    def test_correct_preserves_before_state_in_event(self, db_session):
+        """Correction event must record the previous state."""
+        set_memory_enabled(db_session, "u_prov", True)
+        b, _ = record_claim(
+            db_session, "u_prov", dimension="fact", key="loc",
+            claim_text="lives in Shanghai", confidence=0.9,
+            predicate="lives_in", object="shanghai",
+        )
+        from mirror_memory.core.repository import correct_belief, get_belief_events
+        correct_belief(
+            db_session, "u_prov", b.id,
+            new_claim_text="lives in Beijing",
+            new_object="beijing",
+            new_predicate="lives_in",
+        )
+        events = get_belief_events(db_session, "u_prov", b.id)
+        correction = [e for e in events if e.event_type == "corrected"]
+        assert len(correction) >= 1
+        detail = json.loads(correction[-1].detail_json)
+        assert detail.get("before", {}).get("object") == "shanghai"
+        assert detail.get("after", {}).get("object") == "beijing"
+
+
+class TestForgetInvalidatesDerived:
+    """forget_belief must invalidate snapshots and cancel worker jobs."""
+
+    def test_forget_deletes_snapshots(self, db_session):
+        from mirror_memory.core.repository import forget_belief
+        from mirror_memory.worker.snapshot import persist_snapshot
+
+        set_memory_enabled(db_session, "u_snap", True)
+        b, _ = record_claim(
+            db_session, "u_snap", dimension="topic", key="sleep",
+            claim_text="trouble sleeping", confidence=0.8,
+        )
+        persist_snapshot(db_session, "u_snap", {"patterns": []}, {}, "wm1")
+        # Verify snapshot exists
+        snaps = db_session.query(Snapshot).filter_by(user_id="u_snap").all()
+        assert len(snaps) >= 1
+
+        forget_belief(db_session, "u_snap", b.id)
+        # Snapshot should be deleted
+        snaps = db_session.query(Snapshot).filter_by(user_id="u_snap").all()
+        assert len(snaps) == 0
+
+    def test_forget_cancels_pending_jobs(self, db_session):
+        from mirror_memory.core.repository import forget_belief
+
+        set_memory_enabled(db_session, "u_job", True)
+        b, _ = record_claim(
+            db_session, "u_job", dimension="topic", key="sleep",
+            claim_text="test", confidence=0.5,
+        )
+        # Create a pending job
+        job = EvolutionJob(
+            id="test-job-1", user_id="u_job",
+            evidence_watermark="{}", prompt_version="v1",
+            idempotency_key="u_job:none:v1", status="pending",
+        )
+        db_session.add(job)
+        db_session.commit()
+
+        forget_belief(db_session, "u_job", b.id)
+        db_session.refresh(job)
+        assert job.status == "cancelled"
+        assert job.error_code == "belief_forgotten"

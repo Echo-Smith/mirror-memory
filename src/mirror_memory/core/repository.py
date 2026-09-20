@@ -82,6 +82,32 @@ def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryP
     return pref
 
 
+def get_state_revision(session: Session, user_id: str) -> int:
+    """Return the current memory state revision for a user.
+
+    Missing rows return revision 1 (default).
+    """
+    pref = session.get(MemoryPreference, user_id)
+    return pref.state_revision if pref is not None else 1
+
+
+def bump_state_revision(session: Session, user_id: str) -> int:
+    """Increment and return the new state revision.
+
+    Called by forget/correct to invalidate stale worker computations.
+    Creates the MemoryPreference row if it doesn't exist.
+    """
+    pref = session.get(MemoryPreference, user_id)
+    if pref is None:
+        pref = MemoryPreference(user_id=user_id)
+        session.add(pref)
+        session.flush()
+    pref.state_revision = (pref.state_revision or 1) + 1
+    pref.updated_at = utcnow()
+    session.flush()
+    return pref.state_revision
+
+
 def is_feature_enabled(session: Session, user_id: str, feature: str) -> bool:
     """Check feature-level consent; falls back to global memory preference."""
     grant = session.get(ConsentGrant, (user_id, feature))
@@ -912,6 +938,7 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         .filter(SessionSummary.user_id == user_id)
         .delete(synchronize_session=False)
     )
+    bump_state_revision(session, user_id)
     return {
         "beliefs": int(beliefs_deleted),
         "belief_events": int(events_deleted),
@@ -927,6 +954,9 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
 def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
     """Targeted forget: delete a single belief and its event history.
 
+    Also invalidates derived state: snapshots, pending evolution jobs,
+    and bumps the state revision to block stale worker writes.
+
     Returns ``True`` if the belief was found and deleted.
     """
     belief = session.get(Belief, belief_id)
@@ -939,6 +969,19 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
     )
     session.delete(belief)
     session.flush()
+
+    # Invalidate derived state: source memory was deleted, so
+    # snapshots (derived understanding) and pending evolution jobs
+    # are no longer valid.
+    session.query(Snapshot).filter(Snapshot.user_id == user_id).delete(synchronize_session=False)
+    session.query(EvolutionJob).filter(
+        EvolutionJob.user_id == user_id,
+        EvolutionJob.status.in_(("pending", "running")),
+    ).update(
+        {"status": "cancelled", "error_code": "belief_forgotten"},
+        synchronize_session=False,
+    )
+    bump_state_revision(session, user_id)
     return True
 
 
@@ -974,6 +1017,9 @@ def correct_belief(
     *,
     new_claim_text: str,
     correction_note: str = "",
+    new_predicate: str | None = None,
+    new_object: str | None = None,
+    new_value: dict | None = None,
 ) -> Belief | None:
     """User-initiated correction: supersede old belief with corrected version.
 
@@ -982,13 +1028,22 @@ def correct_belief(
     it should be X."
 
     The old belief is superseded and a correction event is logged.
-    The new belief carries the corrected claim_text.
+    The new belief carries the corrected claim_text and optionally
+    updated predicate, object, and value_json.
 
     Returns the new (corrected) belief, or ``None`` if the target is invalid.
     """
     old = session.get(Belief, belief_id)
     if old is None or old.user_id != user_id or old.status != "active":
         return None
+
+    # Save before state for the event log.
+    before = {
+        "claim_text": old.claim_text,
+        "predicate": getattr(old, "predicate", ""),
+        "object": getattr(old, "object", ""),
+        "value_json": old.value_json,
+    }
 
     # In-place correction: update claim_text and mark as user_corrected.
     # The UNIQUE constraint on (user_id, key) prevents creating a second
@@ -998,12 +1053,28 @@ def correct_belief(
     old.source = "user_corrected"
     old.confidence = min(CONFIDENCE_CEILING, max(old.confidence, 0.5))
     old.last_evidence_at = datetime.now(UTC)
+
+    # Update cognitive triple fields if provided.
+    if new_predicate is not None:
+        old.predicate = new_predicate
+    if new_object is not None:
+        old.object = new_object
+    if new_value is not None:
+        old.value_json = json.dumps(new_value, ensure_ascii=False)
+
     session.flush()
 
-    detail = {"correction": new_claim_text[:200]}
+    after = {
+        "claim_text": old.claim_text,
+        "predicate": getattr(old, "predicate", ""),
+        "object": getattr(old, "object", ""),
+        "value_json": old.value_json,
+    }
+    detail: dict = {"before": before, "after": after, "correction": new_claim_text[:200]}
     if correction_note:
         detail["note"] = correction_note
     _append_event(session, old, "corrected", evidence=[], detail=detail)
+    bump_state_revision(session, user_id)
     return old
 
 

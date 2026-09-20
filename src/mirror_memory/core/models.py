@@ -57,6 +57,7 @@ class MemoryPreference(Base):
 
     user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    state_revision: Mapped[int] = mapped_column(Integer, default=1)
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -210,6 +211,7 @@ class EvolutionJob(Base):
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
     idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    claimed_revision: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str] = mapped_column(String(64), default="")
