@@ -30,8 +30,38 @@ def canonicalize_predicate(predicate: str, synonym_map: dict[str, str] | None = 
         return ""
     norm = predicate.lower().strip()
     norm = re.sub(r"[\s\-]+", "_", norm)
-    if synonym_map:
-        return synonym_map.get(norm, norm)
+    if not synonym_map:
+        return norm
+    direct = synonym_map.get(norm)
+    if direct:
+        return direct
+    # Auxiliary-verb stripping: "was_hired_by" is the same slot as "hired_by".
+    # Without this every tense/voice variant needs its own synonym entry, and
+    # each miss silently splits one attribute into two unrelated beliefs.
+    for prefix in ("was_", "is_", "are_", "been_", "being_", "have_", "has_",
+                   "had_", "will_", "would_", "do_", "does_", "did_"):
+        if norm.startswith(prefix):
+            stripped = norm[len(prefix):]
+            hit = synonym_map.get(stripped)
+            return hit or _tense_fallback(stripped, synonym_map)
+    return _tense_fallback(norm, synonym_map)
+
+
+def _tense_fallback(norm: str, synonym_map: dict[str, str]) -> str:
+    """Strip a trailing -ed from the verb root and retry the lookup.
+
+    "worked_at" is the same employment slot as "works_at"; without this the
+    past-tense form becomes its own predicate and never gets superseded, so
+    a current-state query keeps returning the employer the user left.
+    """
+    head, sep, tail = norm.partition("_")
+    for candidate in (head + sep + tail, head[:-2] + sep + tail if head.endswith("ed") else None):
+        if candidate and candidate in synonym_map:
+            return synonym_map[candidate]
+    if head.endswith("ed") and not sep:
+        stem = head[:-2]
+        if stem in synonym_map:
+            return synonym_map[stem]
     return norm
 
 

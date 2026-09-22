@@ -130,6 +130,18 @@ def resolve_identity(
             detail={"close_belief_ids": closed},
         )
 
+    # One current polarity per object: "I like spicy food" and "I avoided
+    # spicy food" about the same food cannot both be current.  Whichever side
+    # the new claim falls on, the opposite-polarity row about the same object
+    # stops being current.  Without this the withdrawal phase leaks into
+    # every later current-state query.
+    polarity_conflicts = [
+        b["id"] for b in existing_beliefs
+        if b.get("status") == "active"
+        and (b.get("object") or "").strip().lower() == cand_obj
+        and (b.get("predicate") or "").strip().lower() != candidate.predicate.strip().lower()
+    ]
+
     candidate_window = _candidate_window(candidate)
     target = _pick_target(same_predicate, candidate_window, candidate)
 
@@ -155,12 +167,14 @@ def resolve_identity(
     lifecycle = lifecycle_policy.decide(judgement, candidate.predicate)
     reason = _explain(candidate, target, judgement, lifecycle)
 
+    close_ids = [i for i in polarity_conflicts if i != target.get("id")]
     return Resolution(
         action=to_action(lifecycle),
         target_belief_id=target.get("id") if lifecycle is not None else None,
         reason=reason,
         lifecycle=lifecycle.value,
         temporal_relation=judgement.temporal_relation.value,
+        detail={"close_belief_ids": close_ids} if close_ids else {},
     )
 
 

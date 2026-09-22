@@ -551,7 +551,9 @@ def recall_candidates(
         merged.append(belief)
 
     merged = [b for b in merged if not _is_expired(b)]
-    return _filter_by_temporal_mode(merged, temporal_mode)
+    merged = _filter_by_temporal_mode(merged, temporal_mode)
+    merged = _keep_newest_per_single_slot(merged, temporal_mode, _SINGLE_VALUED_PREDICATES)
+    return _filter_withdrawn(merged, temporal_mode)
 
 
 def _recency_key(belief: Belief) -> tuple[int, datetime]:
@@ -568,6 +570,83 @@ def _recency_key(belief: Belief) -> tuple[int, datetime]:
     if ts.tzinfo is not None:
         ts = ts.astimezone(UTC).replace(tzinfo=None)
     return (1, ts)
+
+
+# Predicates that hold at most one value at a time.  Used at the read side to
+# drop stale values regardless of which verb the extractor used for the update:
+# "I am at Cedar Bank" and "I began working at Orion Foods" must not both
+# render as current, even when their surface predicates never matched and the
+# resolver therefore could not close the earlier one.
+_SINGLE_VALUED_PREDICATES = frozenset({
+    "lives_in", "works_at", "works_as", "profession", "age",
+    "studies_at", "lives_at", "resides_in",
+})
+
+
+def _keep_newest_per_single_slot(
+    beliefs: list[Belief], temporal_mode: str, single_valued: frozenset[str]
+) -> list[Belief]:
+    """For single-valued slots, keep only the newest active value.
+
+    A "now?" query must not see two values of an attribute that holds one at a
+    time.  The read-side rule closes the gap the write side cannot: extraction
+    invents verbs ("at", "began working at") that never match the existing
+    belief's predicate, so no UPDATE fires and the stale value stays active
+    with an open interval.  History queries keep everything.
+    """
+    if temporal_mode == "historical":
+        return beliefs
+    newest: dict[str, tuple[int, datetime]] = {}
+    for belief in beliefs:
+        predicate = (belief.predicate or "").strip().lower()
+        if predicate not in single_valued or belief.status != "active":
+            continue
+        ts = belief.last_evidence_at
+        if ts is not None and ts.tzinfo is not None:
+            ts = ts.astimezone(UTC).replace(tzinfo=None)
+        ts = ts or datetime.min
+        current = newest.get(predicate)
+        if current is None or ts >= current[1]:
+            newest[predicate] = (belief.id, ts)
+    keep = {item[0] for item in newest.values()}
+    if not keep:
+        return beliefs
+    return [
+        b for b in beliefs
+        if b.predicate.strip().lower() not in single_valued
+        or b.status != "active"
+        or b.id in keep
+    ]
+
+
+# Words that mark a preference or goal as ended.  A claim carrying one is a
+# state termination (P0-2): it must never surface as current state, even
+# though the belief row itself may still be active -- K1 rows have no
+# predicate to supersede, so the write side cannot close them.
+_WITHDRAWAL_MARKERS = (
+    "avoided", "avoid", "stopped", "gave up", "dropped", "lost interest",
+    "cancelled", "canceled", "no longer", "not want", "don't want",
+    "do not want", "no longer want", "quit", "ended", "discontinued",
+    "stopped enjoying", "don't like", "do not like", "don't enjoy",
+)
+
+
+def _filter_withdrawn(beliefs: list[Belief], temporal_mode: str) -> list[Belief]:
+    """Drop claims that state a preference or goal as ended.
+
+    Only current-state queries filter: a historical question is entitled to
+    see that the user *used to* avoid spicy food.  The markers are matched
+    against the claim text, since a K1 row has no predicate to key on.
+    """
+    if temporal_mode != "current":
+        return beliefs
+    kept = []
+    for belief in beliefs:
+        text = (belief.claim_text or "").lower()
+        if any(marker in text for marker in _WITHDRAWAL_MARKERS):
+            continue
+        kept.append(belief)
+    return kept
 
 
 def _escape_like(token: str) -> str:

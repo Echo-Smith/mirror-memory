@@ -142,6 +142,13 @@ synonym_map:
   hired_by: works_at
   works_for: works_at
   began_at: works_at
+  # Bare prepositions and past-tense forms the extractor emits for the same
+  # employment slot.  `at` is ambiguous ("at Cedar Bank" vs "at home") and
+  # read as employment, which is the more common reading in these contexts.
+  at: works_at
+  worked_at: works_at
+  worked_for: works_at
+  work_for: works_at
 
   # Residence: the extractor also emits `lived_in` for the same attribute.
   # `returned_to` is deliberately NOT mapped here: it means "went back to" in
