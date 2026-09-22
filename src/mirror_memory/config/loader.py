@@ -19,10 +19,10 @@ from mirror_memory.exceptions import ConfigError
 from .schema import (
     AnchorConfig,
     BudgetConfig,
+    DimensionConfig,
     DisplayLabel,
     ExtractionConfig,
     MemoryConfig,
-    DimensionConfig,
     PatternRule,
     PromptTemplates,
     SuppressionRule,
@@ -133,6 +133,10 @@ def _parse_display(data: dict[str, Any]) -> list[DisplayLabel]:
     return result
 
 
+# Single source of truth for the per-turn claim cap.
+_DEFAULT_MAX_CLAIMS_PER_TURN = ExtractionConfig().max_claims_per_turn
+
+
 def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
     _KNOWN_EXTRACTION_KEYS = {
         "keywords", "patterns", "context_tags",
@@ -188,9 +192,16 @@ def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
         keywords=keywords,
         patterns=patterns,
         context_tags=[str(t) for t in context_tags],
-        max_claims_per_turn=max(1, int(data.get("max_claims_per_turn", 3))),
+        # Defer to the schema's default rather than restating it here: a second
+        # hardcoded copy silently overrides the field and the two drift apart.
+        max_claims_per_turn=max(
+            1, int(data.get("max_claims_per_turn", _DEFAULT_MAX_CLAIMS_PER_TURN))
+        ),
         llm_every_turns=max(1, int(data.get("llm_every_turns", 5))),
-        llm_min_keyword_hits=max(1, int(data.get("llm_min_keyword_hits", 2))),
+        # Zero is the explicit benchmark mode: run semantic extraction on
+        # every turn so lifecycle quality is measured independently of the
+        # production cost throttle.
+        llm_min_keyword_hits=max(0, int(data.get("llm_min_keyword_hits", 2))),
         high_value_dimensions=[str(d) for d in high_value_dimensions],
         extraction_value_threshold=extraction_value_threshold,
         suppression_rules=[
@@ -284,6 +295,7 @@ def load_config(config_path: str | Path) -> MemoryConfig:
     # -- Identity policy ------------------------------------------------------
     identity_data = _read_yaml(base / "identity_policy.yaml")
     identity_policy: dict[str, str] = {}
+    temporal_policy: dict[str, str] = {}
     predicate_synonyms: dict[str, str] = {}
     if isinstance(identity_data, dict):
         raw_predicates = identity_data.get("predicates", {})
@@ -293,6 +305,9 @@ def load_config(config_path: str | Path) -> MemoryConfig:
                     card = cfg.get("cardinality", "multi")
                     if card in ("single", "multi", "event"):
                         identity_policy[pred] = card
+                    scope = cfg.get("temporal", "")
+                    if scope in ("current_state", "persistent", "episodic"):
+                        temporal_policy[pred] = scope
         raw_synonyms = identity_data.get("synonym_map", {})
         if isinstance(raw_synonyms, dict):
             predicate_synonyms = {str(k): str(v) for k, v in raw_synonyms.items()}
@@ -307,6 +322,7 @@ def load_config(config_path: str | Path) -> MemoryConfig:
         budget=budget,
         question_value_tiers=question_value_tiers,
         identity_policy=identity_policy,
+        temporal_policy=temporal_policy,
         predicate_synonyms=predicate_synonyms,
     )
 

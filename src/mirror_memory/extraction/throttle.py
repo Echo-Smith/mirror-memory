@@ -20,9 +20,11 @@ Throttling = base rules (uniform discipline) + information-gain gates:
 from __future__ import annotations
 
 import logging
+import re
 
 from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.core.constants import L4_RENDER_THRESHOLD
+from mirror_memory.core.utils import content_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,29 @@ W_VALUE = 0.30     # hit on high-value dimensions
 # cross-session evidence items).  Below it, the belief is still a hypothesis
 # and more evidence remains valuable.
 _MATURE_COVERAGE_CONFIDENCE = L4_RENDER_THRESHOLD
+
+# Words that make a turn informative regardless of how well covered its
+# dimensions already are.  A dimension being mature says nothing about whether
+# *this* turn changes it: a negation, a revival, a replacement or a new event
+# time all land in an already-covered dimension and all change state.
+_STATE_CHANGE_MARKERS = frozenset({
+    # negation / withdrawal
+    "not", "no", "never", "cannot", "dont", "doesnt", "didnt", "isnt", "arent",
+    "dislike", "dislikes", "hate", "hates", "avoid", "avoids", "stopped",
+    "quit", "gave", "dropped", "cancelled", "canceled", "ended", "left",
+    # revival / return
+    "again", "back", "returned", "return", "restarted", "resumed", "rekindled",
+    "picked", "renewed", "revisited",
+    # replacement / update
+    "now", "currently", "moved", "move", "relocated", "started", "joined",
+    "became", "turned", "transferred", "promoted", "retrained", "switched",
+    "replaced", "new",
+    # temporal qualifiers that make an event a new occurrence
+    "yesterday", "today", "tomorrow", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "saturday", "sunday", "week", "month", "year",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "last", "next", "ago",
+})
 
 
 def _count_keyword_hits(text: str, config: MemoryConfig) -> int:
@@ -68,23 +93,40 @@ def _hit_dimensions(text: str, config: MemoryConfig) -> set[str]:
     return dims
 
 
+def _key_namespaces(key: str) -> list[str]:
+    """The candidate dimension namespaces a belief key may belong to.
+
+    Keys are namespaced in more than one way across the engine: ``topic:sleep``
+    and ``age:30`` (K1 keyword), ``always:abc123`` (K1 pattern),
+    ``fact.age`` (config style).  Splitting on both separators and offering
+    each prefix is what lets a key be mapped back onto the dimension it came
+    from -- without it, a stored belief is invisible to coverage and the
+    throttle can never tell that a dimension is already known.
+    """
+    return [key, *re.split(r"[.:]", key)]
+
+
 def _belief_dimensions(active_belief_keys: set[str] | None, config: MemoryConfig) -> set[str]:
     """Map active belief keys onto the set of dimensions they cover.
 
     Generic key -> dimension matching (no domain knowledge required):
     - the key is a configured anchor key (anchors carry the dimension);
-    - the key itself is a dimension id (``"topic"``);
-    - the key is namespaced under a dimension (``"fact.age"`` covers ``fact``).
+    - a namespace prefix of the key is a configured anchor key
+      (``topic:sleep`` -> anchor ``topic``);
+    - the key, or one of its prefixes, is itself a dimension id.
     """
     if not active_belief_keys:
         return set()
     anchor_dim_by_key = {a.key: a.dimension for a in config.anchors}
+    dim_ids = {d.dimension_id for d in config.dimensions}
     covered: set[str] = set()
     for key in active_belief_keys:
-        dim = anchor_dim_by_key.get(key)
-        if dim:
-            covered.add(dim)
-        covered.add(key.split(".", 1)[0])
+        for candidate in _key_namespaces(key):
+            dim = anchor_dim_by_key.get(candidate)
+            if dim:
+                covered.add(dim)
+            if candidate in dim_ids:
+                covered.add(candidate)
     return covered
 
 
@@ -215,6 +257,21 @@ def should_extract(
     mature_dims = _belief_dimensions(mature_keys, config)
     fully_covered = bool(hit_dims) and hit_dims <= mature_dims
 
+    # Content novelty: does this turn say anything the stored beliefs do not
+    # already contain?  `compute_extraction_value` measures novelty at the
+    # *dimension* level, so a second value of a multi-value predicate -- "I
+    # also like painting" after "I like coffee" -- scores zero novelty and
+    # falls below the threshold.  The same blind spot hides a second occurrence
+    # of an event.  Both are exactly the information the engine exists to keep.
+    turn_tokens = content_tokens(text)
+    known_text = " ".join(
+        (b.claim_text or "") + " " + (b.object or "") + " " + (b.key or "")
+        for b in active
+    )
+    has_new_content = bool(turn_tokens - content_tokens(known_text))
+    has_state_marker = bool(turn_tokens & _STATE_CHANGE_MARKERS)
+    turn_is_novel = has_new_content or has_state_marker
+
     logger.info(
         "throttle: value=%.2f threshold=%.2f hits=%d hit_dims=%s fully_covered=%s base=%s turn=%d",
         value,
@@ -226,16 +283,27 @@ def should_extract(
         turn_count,
     )
 
-    # Suppression first: if everything this turn touches is already known at
-    # high confidence, the marginal gain is ~0 even when the scalar score is
-    # inflated by scarcity elsewhere.
-    if fully_covered:
+    # Suppression is only sound when the turn really is a re-statement.  Three
+    # signals say it is not, and each one used to lose state:
+    #
+    # - a state-change marker (negation, revival, replacement, event time);
+    # - a content word the mature beliefs do not already contain, which is how
+    #   a second multi-value object or a second event occurrence looks;
+    # - both together cover the "only the first value survived" failure.
+    # Suppression: only when the turn really is a re-statement.
+    if fully_covered and not turn_is_novel:
         logger.info("throttle: all hit dimensions mature-covered -> suppress extraction")
         return False
 
-    # High-value gate: break the uniform schedule for high-gain turns.
-    if value >= config.extraction.extraction_value_threshold:
-        logger.info("throttle: value >= threshold -> extract early")
+    # High-value gate: break the uniform schedule for high-gain turns.  A turn
+    # carrying content no stored belief has is high-gain by definition, whether
+    # or not its dimension is already covered -- that is what a second
+    # multi-value object and a second event occurrence look like.
+    if value >= config.extraction.extraction_value_threshold or turn_is_novel:
+        logger.info(
+            "throttle: extract (value=%.2f new_content=%s marker=%s)",
+            value, has_new_content, has_state_marker,
+        )
         return True
 
     return base

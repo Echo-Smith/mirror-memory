@@ -12,6 +12,7 @@ Each claim object:
 - predicate: the relationship verb (likes, has, went_to, wants_to, experiences, prefers, rejects, works_at, lives_in, etc.)
 - object: what the predicate applies to (coffee, art_show, insomnia, japanese, etc.)
 - temporal: WHEN it happened/occurs (e.g. "last_monday", "every_day", "childhood", "current"). REQUIRED for event-dimension claims. Empty string for non-event claims.
+- valid_from / valid_to: ISO-8601 dates (YYYY-MM-DD) delimiting when the fact was TRUE. Use valid_to=null for "still true". These are what let the engine answer "where do they live now" vs "where did they live before", so fill them whenever the message implies a time. Example: "I moved to Berlin last month" -> valid_from=<first of last month>, valid_to=null. "I lived in Shanghai until 2024" -> valid_from=null, valid_to=2024-12-31. Omit both only when the message gives no time at all.
 - claim_text: the full information stated, preserving specifics
 - confidence: 0.0–1.0
 - relation: "new", "supports", "contradicts"  (state UPDATE is decided by the system, not the LLM)

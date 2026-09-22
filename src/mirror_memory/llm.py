@@ -53,6 +53,14 @@ class OpenAILLM:
         Number of retries on transient errors.  Default ``2``.
     timeout:
         Request timeout in seconds.  Default ``60``.
+    extra_body:
+        Provider-specific request fields passed through verbatim to
+        ``chat.completions.create``.  Use this for extensions that are not
+        part of the OpenAI schema -- for example
+        ``{"thinking": {"type": "disabled"}}`` to switch off a reasoning
+        model's thinking mode.  Reasoning models otherwise spend their token
+        budget on thinking and can return an empty completion, which silently
+        yields zero extracted claims.
     """
 
     def __init__(
@@ -65,6 +73,7 @@ class OpenAILLM:
         max_tokens: int = 800,
         max_retries: int = 2,
         timeout: float = 60.0,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         try:
             from openai import OpenAI
@@ -83,6 +92,7 @@ class OpenAILLM:
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._extra_body = extra_body
 
     def generate(
         self,
@@ -115,15 +125,18 @@ class OpenAILLM:
         """
         try:
             started = time.monotonic()
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[
+            request: dict[str, Any] = {
+                "model": self._model,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": payload_text},
                 ],
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-            )
+                "temperature": self._temperature,
+                "max_tokens": self._max_tokens,
+            }
+            if self._extra_body:
+                request["extra_body"] = self._extra_body
+            response = self._client.chat.completions.create(**request)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             content = (response.choices[0].message.content or "").strip()
 

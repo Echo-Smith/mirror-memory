@@ -1,0 +1,5142 @@
+{
+  "name": "StateBench",
+  "version": "1.0.0",
+  "language": "en",
+  "description": "A deterministic benchmark for evolving memory state: replacement, round trips, multi-value coexistence, contradiction, temporal events, preference evolution, and stale-state retrieval.",
+  "case_count": 200,
+  "split_counts": {
+    "development": 140,
+    "evaluation": 60
+  },
+  "category_counts": {
+    "replacement": 30,
+    "round_trip": 30,
+    "multi_value": 30,
+    "contradiction": 30,
+    "temporal_event": 30,
+    "preference_evolution": 30,
+    "stale_state": 20
+  },
+  "scoring": {
+    "expect_current": "Every string must appear on the rendered current-state surface.",
+    "expect_history": "Every string must appear for a historical query.",
+    "forbidden": "No string may appear in the rendered result.",
+    "expect_any": "At least one string from every alternative group must appear."
+  },
+  "cases": [
+    {
+      "case_id": "sb-replacement-001",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I live in Shanghai.",
+        "I moved to Berlin in May 2026."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Berlin"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Shanghai"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-002",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "My home is in Toronto.",
+        "I relocated to Lisbon this spring."
+      ],
+      "question": "What city do they currently live in?",
+      "expect_current": [
+        "Lisbon"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Toronto"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-003",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I have been living in Nairobi.",
+        "As of July, I live in Oslo."
+      ],
+      "question": "Where are they based now?",
+      "expect_current": [
+        "Oslo"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Nairobi"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-004",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I live in Seoul.",
+        "I settled in Melbourne last month."
+      ],
+      "question": "Which city is their current home?",
+      "expect_current": [
+        "Melbourne"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Seoul"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-005",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "My apartment is in Madrid.",
+        "I moved to Kyoto two weeks ago."
+      ],
+      "question": "Where do they currently reside?",
+      "expect_current": [
+        "Kyoto"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Madrid"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-006",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I work at Acme Corp.",
+        "I joined Globex in June 2026."
+      ],
+      "question": "Where do they work now?",
+      "expect_current": [
+        "Globex"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Acme"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-007",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "My employer is Northstar Labs.",
+        "I started at Redwood Health last Monday."
+      ],
+      "question": "Who is their current employer?",
+      "expect_current": [
+        "Redwood"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Northstar"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-008",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I work for Blue Harbor.",
+        "I was hired by Atlas Robotics this month."
+      ],
+      "question": "Where are they employed now?",
+      "expect_current": [
+        "Atlas"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Blue Harbor"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-009",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I am at Cedar Bank.",
+        "I began working at Orion Foods in August."
+      ],
+      "question": "Which company do they currently work for?",
+      "expect_current": [
+        "Orion"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Cedar"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-010",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I work at Nimbus Media.",
+        "I now work for Solace Energy."
+      ],
+      "question": "What is their present workplace?",
+      "expect_current": [
+        "Solace"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Nimbus"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-011",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I study at Easton College.",
+        "I transferred to Westbridge University."
+      ],
+      "question": "Where do they study now?",
+      "expect_current": [
+        "Westbridge"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Easton"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-012",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I am enrolled at Lakeview Institute.",
+        "I now attend Meridian Academy."
+      ],
+      "question": "What school are they currently attending?",
+      "expect_current": [
+        "Meridian"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Lakeview"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-013",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I study at Harbor Tech.",
+        "I transferred to Pinecrest University in September."
+      ],
+      "question": "Which institution do they study at now?",
+      "expect_current": [
+        "Pinecrest"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Harbor"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-014",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I attend Kingsley College.",
+        "This semester I started at Aurora University."
+      ],
+      "question": "Where are they enrolled now?",
+      "expect_current": [
+        "Aurora"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Kingsley"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-015",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I am a student at Briar School.",
+        "I switched to Summit Polytechnic."
+      ],
+      "question": "What is their current school?",
+      "expect_current": [
+        "Summit"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Briar"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-016",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I am a graphic designer.",
+        "I retrained and now work as a data analyst."
+      ],
+      "question": "What is their profession now?",
+      "expect_current": [
+        "data analyst"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "graphic designer"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-017",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I work as a teacher.",
+        "I became a product manager this year."
+      ],
+      "question": "What do they do professionally now?",
+      "expect_current": [
+        "product manager"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "teacher"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-018",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "My job is nursing.",
+        "I am now a software engineer."
+      ],
+      "question": "What is their current occupation?",
+      "expect_current": [
+        "software engineer"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "nursing"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-019",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I am an accountant.",
+        "I changed careers and became a UX researcher."
+      ],
+      "question": "What career do they have now?",
+      "expect_current": [
+        "UX researcher"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "accountant"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-020",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I work as a journalist.",
+        "I now work as a policy adviser."
+      ],
+      "question": "What is their current profession?",
+      "expect_current": [
+        "policy adviser"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "journalist"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-021",
+      "category": "replacement",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I am 29 years old.",
+        "I turned 30 yesterday."
+      ],
+      "question": "How old are they now?",
+      "expect_current": [
+        "30"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "29"
+      ],
+      "expect_any": [],
+      "tags": [
+        "age",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-022",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I am 34.",
+        "Today is my birthday, so I am 35 now."
+      ],
+      "question": "What is their current age?",
+      "expect_current": [
+        "35"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "34"
+      ],
+      "expect_any": [],
+      "tags": [
+        "age",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-023",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I was 41 when we last spoke.",
+        "I just turned 42."
+      ],
+      "question": "How old are they now?",
+      "expect_current": [
+        "42"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "41"
+      ],
+      "expect_any": [],
+      "tags": [
+        "age",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-024",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I am 26 years old.",
+        "My birthday was last week; I am 27."
+      ],
+      "question": "What age are they currently?",
+      "expect_current": [
+        "27"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "26"
+      ],
+      "expect_any": [],
+      "tags": [
+        "age",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-025",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I am 52.",
+        "I turned 53 in March."
+      ],
+      "question": "How old are they at present?",
+      "expect_current": [
+        "53"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "52"
+      ],
+      "expect_any": [],
+      "tags": [
+        "age",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-026",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I live in Prague.",
+        "I still like jazz.",
+        "I moved to Tallinn in October."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Tallinn"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Prague"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence_distractor",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-027",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I work at Lunar Systems.",
+        "I bought a bicycle.",
+        "I joined Meadow Labs yesterday."
+      ],
+      "question": "Who employs them now?",
+      "expect_current": [
+        "Meadow"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Lunar"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment_distractor",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-028",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I study at Elm College.",
+        "My favorite drink is tea.",
+        "I transferred to Granite University."
+      ],
+      "question": "Where do they study now?",
+      "expect_current": [
+        "Granite"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Elm"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education_distractor",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-029",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I am a photographer.",
+        "I visited Rome.",
+        "I became an operations manager."
+      ],
+      "question": "What is their profession now?",
+      "expect_current": [
+        "operations manager"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "photographer"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession_distractor",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-replacement-030",
+      "category": "replacement",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I am 37.",
+        "I enjoy chess.",
+        "I turned 38 this week."
+      ],
+      "question": "How old are they now?",
+      "expect_current": [
+        "38"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "37"
+      ],
+      "expect_any": [],
+      "tags": [
+        "age_distractor",
+        "current_state"
+      ],
+      "note": "The newer value must supersede the earlier current-state value."
+    },
+    {
+      "case_id": "sb-round-trip-001",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I live in Shanghai.",
+        "I moved to Berlin.",
+        "I returned to Shanghai this month."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Shanghai"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Berlin"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-002",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I live in Toronto.",
+        "I relocated to Dublin.",
+        "I am back in Toronto now."
+      ],
+      "question": "What city do they currently live in?",
+      "expect_current": [
+        "Toronto"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Dublin"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-003",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "My home is in Nairobi.",
+        "I moved to Cairo.",
+        "I have moved back to Nairobi."
+      ],
+      "question": "Where are they based now?",
+      "expect_current": [
+        "Nairobi"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Cairo"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-004",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I live in Oslo.",
+        "I settled in Helsinki.",
+        "I returned to Oslo in June."
+      ],
+      "question": "Which city is their current home?",
+      "expect_current": [
+        "Oslo"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Helsinki"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-005",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I live in Kyoto.",
+        "I moved to Osaka.",
+        "I am living in Kyoto again."
+      ],
+      "question": "Where do they currently reside?",
+      "expect_current": [
+        "Kyoto"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Osaka"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-006",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "My apartment is in Lisbon.",
+        "I relocated to Porto.",
+        "I moved back to Lisbon."
+      ],
+      "question": "What is their current city?",
+      "expect_current": [
+        "Lisbon"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Porto"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-007",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I live in Sydney.",
+        "I moved to Perth.",
+        "I have returned to Sydney."
+      ],
+      "question": "Where are they living now?",
+      "expect_current": [
+        "Sydney"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Perth"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-008",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I am based in Madrid.",
+        "I moved to Valencia.",
+        "Madrid is my home again."
+      ],
+      "question": "Where are they based now?",
+      "expect_current": [
+        "Madrid"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Valencia"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-009",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I work at Acme.",
+        "I joined Globex.",
+        "I returned to Acme for a new role."
+      ],
+      "question": "Where do they work now?",
+      "expect_current": [
+        "Acme"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Globex"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-010",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "My employer is Northstar.",
+        "I moved to Redwood Health.",
+        "Northstar hired me back."
+      ],
+      "question": "Who is their current employer?",
+      "expect_current": [
+        "Northstar"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Redwood"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-011",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I work for Blue Harbor.",
+        "I joined Atlas Robotics.",
+        "I am back at Blue Harbor."
+      ],
+      "question": "Where are they employed now?",
+      "expect_current": [
+        "Blue Harbor"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Atlas"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-012",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I work at Cedar Bank.",
+        "I started at Orion Foods.",
+        "I returned to Cedar Bank."
+      ],
+      "question": "Which company do they work for now?",
+      "expect_current": [
+        "Cedar"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Orion"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-013",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I am at Nimbus Media.",
+        "I joined Solace Energy.",
+        "I now work at Nimbus Media again."
+      ],
+      "question": "What is their current workplace?",
+      "expect_current": [
+        "Nimbus"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Solace"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-014",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I work for Lunar Systems.",
+        "I switched to Meadow Labs.",
+        "Lunar Systems rehired me."
+      ],
+      "question": "Who employs them now?",
+      "expect_current": [
+        "Lunar"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Meadow"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-015",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I am employed by Falcon Works.",
+        "I joined Riverstone.",
+        "I went back to Falcon Works."
+      ],
+      "question": "Where do they currently work?",
+      "expect_current": [
+        "Falcon"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Riverstone"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-016",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I work at Copper Cloud.",
+        "I moved to Juniper AI.",
+        "I have returned to Copper Cloud."
+      ],
+      "question": "What company are they with now?",
+      "expect_current": [
+        "Copper"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Juniper"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-017",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I study at Easton College.",
+        "I transferred to Westbridge.",
+        "I transferred back to Easton."
+      ],
+      "question": "Where do they study now?",
+      "expect_current": [
+        "Easton"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Westbridge"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-018",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I attend Lakeview Institute.",
+        "I moved to Meridian Academy.",
+        "I am enrolled at Lakeview again."
+      ],
+      "question": "What school do they attend now?",
+      "expect_current": [
+        "Lakeview"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Meridian"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-019",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I study at Harbor Tech.",
+        "I transferred to Pinecrest.",
+        "I returned to Harbor Tech."
+      ],
+      "question": "Which institution are they at now?",
+      "expect_current": [
+        "Harbor"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Pinecrest"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-020",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I attend Kingsley College.",
+        "I started at Aurora University.",
+        "I switched back to Kingsley."
+      ],
+      "question": "Where are they enrolled now?",
+      "expect_current": [
+        "Kingsley"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Aurora"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-021",
+      "category": "round_trip",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I study at Briar School.",
+        "I moved to Summit Polytechnic.",
+        "I am a Briar student again."
+      ],
+      "question": "What is their current school?",
+      "expect_current": [
+        "Briar"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Summit"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-022",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I attend Maple Conservatory.",
+        "I transferred to Coastline Arts.",
+        "I returned to Maple Conservatory."
+      ],
+      "question": "Where do they study now?",
+      "expect_current": [
+        "Maple"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Coastline"
+      ],
+      "expect_any": [],
+      "tags": [
+        "education",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-023",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I am a graphic designer.",
+        "I became a data analyst.",
+        "I returned to graphic design."
+      ],
+      "question": "What is their profession now?",
+      "expect_current": [
+        "graphic designer"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "data analyst"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-024",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I work as a teacher.",
+        "I became a product manager.",
+        "I am teaching again."
+      ],
+      "question": "What do they do professionally now?",
+      "expect_current": [
+        "teacher"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "product manager"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-025",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I am a nurse.",
+        "I retrained as a software engineer.",
+        "I have returned to nursing."
+      ],
+      "question": "What is their current occupation?",
+      "expect_current": [
+        "nurse"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "software engineer"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-026",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I am an accountant.",
+        "I became a UX researcher.",
+        "I went back to accounting."
+      ],
+      "question": "What career do they have now?",
+      "expect_current": [
+        "accountant"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "UX researcher"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-027",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I work as a journalist.",
+        "I became a policy adviser.",
+        "I am a journalist again."
+      ],
+      "question": "What is their current profession?",
+      "expect_current": [
+        "journalist"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "policy adviser"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-028",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I am a chef.",
+        "I became a restaurant manager.",
+        "I returned to being a chef."
+      ],
+      "question": "What is their job now?",
+      "expect_current": [
+        "chef"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "restaurant manager"
+      ],
+      "expect_any": [],
+      "tags": [
+        "profession",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-029",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I live in Prague.",
+        "I moved to Vienna.",
+        "I adopted a cat.",
+        "I returned to Prague."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Prague"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Vienna"
+      ],
+      "expect_any": [],
+      "tags": [
+        "residence_distractor",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-round-trip-030",
+      "category": "round_trip",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I work at Amber Studio.",
+        "I joined Quartz Labs.",
+        "I learned Spanish.",
+        "I returned to Amber Studio."
+      ],
+      "question": "Who is their current employer?",
+      "expect_current": [
+        "Amber"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Quartz"
+      ],
+      "expect_any": [],
+      "tags": [
+        "employment_distractor",
+        "revival"
+      ],
+      "note": "The first value returns and must be current without duplicating its identity."
+    },
+    {
+      "case_id": "sb-multi-value-001",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I like coffee.",
+        "I also like painting."
+      ],
+      "question": "What do they like?",
+      "expect_current": [
+        "coffee",
+        "painting"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-002",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I enjoy jazz.",
+        "I also enjoy hiking."
+      ],
+      "question": "What activities do they enjoy?",
+      "expect_current": [
+        "jazz",
+        "hiking"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-003",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I love mangoes.",
+        "I also love dark chocolate."
+      ],
+      "question": "What foods do they love?",
+      "expect_current": [
+        "mangoes",
+        "dark chocolate"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-004",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I like science fiction.",
+        "I also like historical novels."
+      ],
+      "question": "What kinds of books do they like?",
+      "expect_current": [
+        "science fiction",
+        "historical novels"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-005",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I enjoy swimming.",
+        "I also enjoy pottery."
+      ],
+      "question": "What hobbies do they enjoy?",
+      "expect_current": [
+        "swimming",
+        "pottery"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-006",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I like green tea.",
+        "I also like espresso.",
+        "I enjoy cocoa too."
+      ],
+      "question": "What drinks do they like?",
+      "expect_current": [
+        "green tea",
+        "espresso",
+        "cocoa"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-007",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I love dogs.",
+        "I also love parrots."
+      ],
+      "question": "What animals do they love?",
+      "expect_current": [
+        "dogs",
+        "parrots"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-008",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I enjoy documentaries.",
+        "I also enjoy live theater."
+      ],
+      "question": "What entertainment do they enjoy?",
+      "expect_current": [
+        "documentaries",
+        "theater"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-009",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I like cycling.",
+        "I also like gardening."
+      ],
+      "question": "What do they like doing?",
+      "expect_current": [
+        "cycling",
+        "gardening"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-010",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I enjoy Korean food.",
+        "I also enjoy Mexican food."
+      ],
+      "question": "What cuisines do they enjoy?",
+      "expect_current": [
+        "Korean",
+        "Mexican"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "likes",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-011",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I speak Japanese.",
+        "I also speak Korean."
+      ],
+      "question": "Which languages can they speak?",
+      "expect_current": [
+        "Japanese",
+        "Korean"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-012",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I can program in Python.",
+        "I also know Rust."
+      ],
+      "question": "Which programming languages do they know?",
+      "expect_current": [
+        "Python",
+        "Rust"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-013",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I am skilled at illustration.",
+        "I also edit video."
+      ],
+      "question": "What skills do they have?",
+      "expect_current": [
+        "illustration",
+        "video"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-014",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I can play piano.",
+        "I also play the cello."
+      ],
+      "question": "Which instruments can they play?",
+      "expect_current": [
+        "piano",
+        "cello"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-015",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I speak Spanish.",
+        "I also learned Portuguese.",
+        "I know Italian too."
+      ],
+      "question": "Which languages do they know?",
+      "expect_current": [
+        "Spanish",
+        "Portuguese",
+        "Italian"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-016",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I can do data analysis.",
+        "I also know user research."
+      ],
+      "question": "What professional skills do they have?",
+      "expect_current": [
+        "data analysis",
+        "user research"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-017",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I know first aid.",
+        "I also know wilderness navigation."
+      ],
+      "question": "What practical skills do they have?",
+      "expect_current": [
+        "first aid",
+        "navigation"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-018",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I can bake bread.",
+        "I also make fresh pasta."
+      ],
+      "question": "What cooking skills do they have?",
+      "expect_current": [
+        "bread",
+        "pasta"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "skills",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-019",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I own a bicycle.",
+        "I also own a camera."
+      ],
+      "question": "What do they own?",
+      "expect_current": [
+        "bicycle",
+        "camera"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "possessions",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-020",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I have a cat named Luna.",
+        "I also have a dog named Max."
+      ],
+      "question": "What pets do they have?",
+      "expect_current": [
+        "Luna",
+        "Max"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "possessions",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-021",
+      "category": "multi_value",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I own a laptop.",
+        "I also have a tablet."
+      ],
+      "question": "Which devices do they own?",
+      "expect_current": [
+        "laptop",
+        "tablet"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "possessions",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-022",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I have a blue guitar.",
+        "I also own a violin."
+      ],
+      "question": "What instruments do they own?",
+      "expect_current": [
+        "guitar",
+        "violin"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "possessions",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-023",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I own an apartment in Rome.",
+        "I also have a cabin near Turin."
+      ],
+      "question": "What properties do they have?",
+      "expect_current": [
+        "Rome",
+        "Turin"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "possessions",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-024",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I have a road bike.",
+        "I also own a folding bike."
+      ],
+      "question": "What bicycles do they have?",
+      "expect_current": [
+        "road bike",
+        "folding bike"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "possessions",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-025",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I am friends with Maya.",
+        "I am also friends with Theo."
+      ],
+      "question": "Who are their friends?",
+      "expect_current": [
+        "Maya",
+        "Theo"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "relationships",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-026",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I know Dr. Chen.",
+        "I also know Professor Singh."
+      ],
+      "question": "Who do they know?",
+      "expect_current": [
+        "Chen",
+        "Singh"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "relationships",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-027",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I am friends with Ana.",
+        "I also became friends with Luis."
+      ],
+      "question": "Who are they friends with?",
+      "expect_current": [
+        "Ana",
+        "Luis"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "relationships",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-028",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I plan to visit Iceland.",
+        "I also plan to learn diving."
+      ],
+      "question": "What do they plan to do?",
+      "expect_current": [
+        "Iceland",
+        "diving"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "goals",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-029",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I want to write a novel.",
+        "I also want to run a marathon."
+      ],
+      "question": "What do they want to do?",
+      "expect_current": [
+        "novel",
+        "marathon"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "goals",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-multi-value-030",
+      "category": "multi_value",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I hope to study astronomy.",
+        "I also plan to volunteer at a shelter."
+      ],
+      "question": "What are their goals?",
+      "expect_current": [
+        "astronomy",
+        "shelter"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "goals",
+        "coexistence"
+      ],
+      "note": "All values of the multi-cardinality predicate must coexist."
+    },
+    {
+      "case_id": "sb-contradiction-001",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I like coffee.",
+        "Actually, I do not like coffee."
+      ],
+      "question": "Do they like coffee?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "do not like coffee",
+          "dislike coffee",
+          "not like coffee"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-002",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I love hiking.",
+        "I have grown to dislike hiking."
+      ],
+      "question": "How do they feel about hiking now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "dislike hiking",
+          "do not like hiking"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-003",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I enjoy jazz.",
+        "I no longer enjoy jazz."
+      ],
+      "question": "Do they currently enjoy jazz?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "no longer enjoy jazz",
+          "do not enjoy jazz"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-004",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I like spicy food.",
+        "Spicy food now makes me uncomfortable, so I avoid it."
+      ],
+      "question": "Do they like spicy food now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "avoid spicy food",
+          "do not like spicy food",
+          "makes me uncomfortable"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-005",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I love running.",
+        "I have come to hate running."
+      ],
+      "question": "How do they feel about running now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "hate running",
+          "dislike running"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-006",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I enjoy horror movies.",
+        "I realized I dislike horror movies."
+      ],
+      "question": "Do they enjoy horror movies?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "dislike horror movies",
+          "do not enjoy horror movies"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-007",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I like crowded concerts.",
+        "I cannot stand crowded concerts anymore."
+      ],
+      "question": "Do they like crowded concerts now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "cannot stand crowded concerts",
+          "dislike crowded concerts"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-008",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I love early meetings.",
+        "I now dislike early meetings."
+      ],
+      "question": "How do they feel about early meetings?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "dislike early meetings"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-009",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I enjoy flying.",
+        "I have become afraid of flying and avoid it."
+      ],
+      "question": "Do they enjoy flying now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "avoid flying",
+          "afraid of flying",
+          "do not enjoy flying"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-010",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I like public speaking.",
+        "I no longer like public speaking."
+      ],
+      "question": "Do they currently like public speaking?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "no longer like public speaking",
+          "do not like public speaking"
+        ]
+      ],
+      "tags": [
+        "likes",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-011",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I want to learn Japanese.",
+        "I decided not to learn Japanese after all."
+      ],
+      "question": "Do they still want to learn Japanese?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "not to learn Japanese",
+          "no longer want to learn Japanese"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-012",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I plan to move to Canada.",
+        "I cancelled the plan to move to Canada."
+      ],
+      "question": "Do they still plan to move to Canada?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "cancelled",
+          "no longer plan to move to Canada"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-013",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I want to run a marathon.",
+        "I gave up the marathon goal."
+      ],
+      "question": "Do they still want to run a marathon?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "gave up",
+          "no longer want to run a marathon"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-014",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I hope to become a manager.",
+        "I no longer want a management role."
+      ],
+      "question": "Do they want to become a manager?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "no longer want",
+          "do not want"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-015",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I plan to buy a house.",
+        "I abandoned the plan to buy a house."
+      ],
+      "question": "Do they still plan to buy a house?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "abandoned",
+          "no longer plan"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-016",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I want to study law.",
+        "I decided against studying law."
+      ],
+      "question": "Do they still want to study law?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "decided against",
+          "do not want to study law"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-017",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I plan to visit Brazil.",
+        "I cancelled my Brazil trip."
+      ],
+      "question": "Do they still plan to visit Brazil?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "cancelled",
+          "no longer plan"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-018",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I hope to start a podcast.",
+        "I dropped the podcast idea."
+      ],
+      "question": "Do they still want to start a podcast?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "dropped",
+          "no longer want"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-019",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I own a red bicycle.",
+        "I sold the red bicycle last week."
+      ],
+      "question": "Do they still own the red bicycle?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "sold",
+          "no longer own"
+        ]
+      ],
+      "tags": [
+        "possession",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-020",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I have a cabin near Turin.",
+        "I sold the Turin cabin."
+      ],
+      "question": "Do they still have the cabin?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "sold",
+          "no longer have"
+        ]
+      ],
+      "tags": [
+        "possession",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-021",
+      "category": "contradiction",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I own a film camera.",
+        "I gave the film camera away."
+      ],
+      "question": "Do they still own the film camera?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "gave",
+          "no longer own"
+        ]
+      ],
+      "tags": [
+        "possession",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-022",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I have a blue guitar.",
+        "The blue guitar was stolen and I no longer have it."
+      ],
+      "question": "Do they still have the blue guitar?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "no longer have",
+          "stolen"
+        ]
+      ],
+      "tags": [
+        "possession",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-023",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I own an old laptop.",
+        "I recycled the old laptop."
+      ],
+      "question": "Do they still own the old laptop?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "recycled",
+          "no longer own"
+        ]
+      ],
+      "tags": [
+        "possession",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-024",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I speak fluent Korean.",
+        "Correction: I only know a few Korean phrases."
+      ],
+      "question": "Are they fluent in Korean?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "few Korean phrases",
+          "not fluent"
+        ]
+      ],
+      "tags": [
+        "skill_correction",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-025",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I can code in Rust.",
+        "Correction: I have never learned Rust."
+      ],
+      "question": "Can they code in Rust?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "never learned Rust",
+          "cannot code in Rust"
+        ]
+      ],
+      "tags": [
+        "skill_correction",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-026",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I am a certified diver.",
+        "That was mistaken; I am not certified to dive."
+      ],
+      "question": "Are they a certified diver?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "not certified",
+          "not a certified diver"
+        ]
+      ],
+      "tags": [
+        "skill_correction",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-027",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I speak Italian.",
+        "I need to correct that: I do not speak Italian."
+      ],
+      "question": "Do they speak Italian?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "do not speak Italian",
+          "cannot speak Italian"
+        ]
+      ],
+      "tags": [
+        "skill_correction",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-028",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I am friends with Maya.",
+        "Maya and I are no longer friends."
+      ],
+      "question": "Are they still friends with Maya?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "no longer friends"
+        ]
+      ],
+      "tags": [
+        "relationship",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-029",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I work closely with Theo.",
+        "Theo and I no longer work together."
+      ],
+      "question": "Do they still work with Theo?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "no longer work together"
+        ]
+      ],
+      "tags": [
+        "relationship",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-contradiction-030",
+      "category": "contradiction",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I know Professor Singh personally.",
+        "Correction: I have never met Professor Singh."
+      ],
+      "question": "Do they know Professor Singh personally?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [
+        [
+          "never met",
+          "do not know"
+        ]
+      ],
+      "tags": [
+        "relationship",
+        "negation",
+        "conflict"
+      ],
+      "note": "The opposing statement must not be treated as support for the earlier claim."
+    },
+    {
+      "case_id": "sb-temporal-event-001",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I went to the museum on Monday.",
+        "I went to the museum again on Friday."
+      ],
+      "question": "When did they go to the museum?",
+      "expect_current": [
+        "Monday",
+        "Friday",
+        "museum"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_visit",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-002",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I visited the dentist on January 8.",
+        "I visited the dentist again on April 3."
+      ],
+      "question": "When were their dentist visits?",
+      "expect_current": [
+        "January 8",
+        "April 3",
+        "dentist"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_visit",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-003",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I went to Kyoto in March.",
+        "I went to Kyoto again in November."
+      ],
+      "question": "When did they go to Kyoto?",
+      "expect_current": [
+        "March",
+        "November",
+        "Kyoto"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_visit",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-004",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I attended a yoga class on Tuesday.",
+        "I attended another yoga class on Saturday."
+      ],
+      "question": "When did they attend yoga classes?",
+      "expect_current": [
+        "Tuesday",
+        "Saturday",
+        "yoga"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_event",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-005",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I saw Dr. Patel on June 2.",
+        "I saw Dr. Patel again on June 16."
+      ],
+      "question": "When did they see Dr. Patel?",
+      "expect_current": [
+        "June 2",
+        "June 16",
+        "Patel"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_event",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-006",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I flew to Paris in February.",
+        "I flew to Paris again in September."
+      ],
+      "question": "When did they travel to Paris?",
+      "expect_current": [
+        "February",
+        "September",
+        "Paris"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_visit",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-007",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I volunteered at the shelter on May 4.",
+        "I volunteered there again on May 18."
+      ],
+      "question": "When did they volunteer at the shelter?",
+      "expect_current": [
+        "May 4",
+        "May 18",
+        "shelter"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_event",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-008",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I attended the book club on Wednesday.",
+        "I attended it again the next Wednesday."
+      ],
+      "question": "How many book club meetings did they attend?",
+      "expect_current": [
+        "book club",
+        "Wednesday",
+        "next Wednesday"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_event",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-009",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I hiked Mount Wilson in 2024.",
+        "I hiked Mount Wilson again in 2026."
+      ],
+      "question": "When did they hike Mount Wilson?",
+      "expect_current": [
+        "2024",
+        "2026",
+        "Wilson"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_event",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-010",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I took the train to Boston on July 1.",
+        "I took the train to Boston again on July 20."
+      ],
+      "question": "When did they take the train to Boston?",
+      "expect_current": [
+        "July 1",
+        "July 20",
+        "Boston"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "repeated_visit",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-011",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I bought a laptop in January.",
+        "I bought a monitor in March."
+      ],
+      "question": "What did they buy and when?",
+      "expect_current": [
+        "laptop",
+        "January",
+        "monitor",
+        "March"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "purchase",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-012",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I bought a camera on Monday.",
+        "I bought a tripod on Thursday."
+      ],
+      "question": "What purchases did they make?",
+      "expect_current": [
+        "camera",
+        "Monday",
+        "tripod",
+        "Thursday"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "purchase",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-013",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I purchased a bicycle in April.",
+        "I purchased a helmet in May."
+      ],
+      "question": "What did they purchase?",
+      "expect_current": [
+        "bicycle",
+        "April",
+        "helmet",
+        "May"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "purchase",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-014",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I bought a piano in 2023.",
+        "I bought a cello in 2025."
+      ],
+      "question": "Which instruments did they buy and when?",
+      "expect_current": [
+        "piano",
+        "2023",
+        "cello",
+        "2025"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "purchase",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-015",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I purchased a tablet last week.",
+        "I bought a stylus yesterday."
+      ],
+      "question": "What did they buy recently?",
+      "expect_current": [
+        "tablet",
+        "last week",
+        "stylus",
+        "yesterday"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "purchase",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-016",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I attended the AI Summit in May.",
+        "I attended the Design Forum in August."
+      ],
+      "question": "Which events did they attend?",
+      "expect_current": [
+        "AI Summit",
+        "May",
+        "Design Forum",
+        "August"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "attendance",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-017",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I attended Maya's wedding on June 10.",
+        "I attended Theo's wedding on September 2."
+      ],
+      "question": "Which weddings did they attend?",
+      "expect_current": [
+        "Maya",
+        "June 10",
+        "Theo",
+        "September 2"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "attendance",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-018",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I went to a jazz concert on Friday.",
+        "I attended a theater premiere on Sunday."
+      ],
+      "question": "What performances did they attend?",
+      "expect_current": [
+        "jazz",
+        "Friday",
+        "theater",
+        "Sunday"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "attendance",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-019",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I attended a Python workshop in March.",
+        "I attended a Rust workshop in July."
+      ],
+      "question": "Which workshops did they attend?",
+      "expect_current": [
+        "Python",
+        "March",
+        "Rust",
+        "July"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "attendance",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-020",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I attended the spring conference.",
+        "I also attended the autumn conference."
+      ],
+      "question": "Which conferences did they attend?",
+      "expect_current": [
+        "spring",
+        "autumn",
+        "conference"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "attendance",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-021",
+      "category": "temporal_event",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I went to Rome in April.",
+        "I traveled to Madrid in June."
+      ],
+      "question": "Where did they travel and when?",
+      "expect_current": [
+        "Rome",
+        "April",
+        "Madrid",
+        "June"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "travel",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-022",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I visited Seoul in 2024.",
+        "I went to Taipei in 2025."
+      ],
+      "question": "Which cities did they visit?",
+      "expect_current": [
+        "Seoul",
+        "2024",
+        "Taipei",
+        "2025"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "travel",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-023",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I went to the coast last weekend.",
+        "I visited the mountains this weekend."
+      ],
+      "question": "Where did they go on the two weekends?",
+      "expect_current": [
+        "coast",
+        "last weekend",
+        "mountains",
+        "this weekend"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "travel",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-024",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I traveled to Oslo in winter.",
+        "I visited Athens in summer."
+      ],
+      "question": "Where did they travel by season?",
+      "expect_current": [
+        "Oslo",
+        "winter",
+        "Athens",
+        "summer"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "travel",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-025",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I went to the library on Tuesday.",
+        "I visited the gallery on Thursday."
+      ],
+      "question": "Where did they go this week?",
+      "expect_current": [
+        "library",
+        "Tuesday",
+        "gallery",
+        "Thursday"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "travel",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-026",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I had a migraine on Monday.",
+        "I had another migraine on Friday."
+      ],
+      "question": "When did they experience migraines?",
+      "expect_current": [
+        "Monday",
+        "Friday",
+        "migraine"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "experience",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-027",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I experienced a power outage in January.",
+        "There was another outage in March."
+      ],
+      "question": "When did they experience power outages?",
+      "expect_current": [
+        "January",
+        "March",
+        "outage"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "experience",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-028",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I completed a 5K race in May.",
+        "I completed a 10K race in October."
+      ],
+      "question": "Which races did they complete?",
+      "expect_current": [
+        "5K",
+        "May",
+        "10K",
+        "October"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "experience",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-029",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I gave a talk at the meetup on April 4.",
+        "I gave another talk on August 9."
+      ],
+      "question": "When did they give talks?",
+      "expect_current": [
+        "April 4",
+        "August 9",
+        "talk"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "experience",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-temporal-event-030",
+      "category": "temporal_event",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I received an award in 2022.",
+        "I received another award in 2025."
+      ],
+      "question": "When did they receive awards?",
+      "expect_current": [
+        "2022",
+        "2025",
+        "award"
+      ],
+      "expect_history": [],
+      "forbidden": [],
+      "expect_any": [],
+      "tags": [
+        "experience",
+        "episodic",
+        "time"
+      ],
+      "note": "Each dated occurrence must remain separately retrievable."
+    },
+    {
+      "case_id": "sb-preference-evolution-001",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I love coffee.",
+        "I stopped drinking coffee and disliked it for a while.",
+        "I enjoy coffee again now."
+      ],
+      "question": "How do they feel about coffee now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "disliked"
+      ],
+      "expect_any": [
+        [
+          "enjoy coffee again",
+          "like coffee again"
+        ]
+      ],
+      "tags": [
+        "coffee",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-002",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I enjoy running.",
+        "I gave up running last year.",
+        "I have started enjoying running again."
+      ],
+      "question": "Do they enjoy running now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "gave up"
+      ],
+      "expect_any": [
+        [
+          "enjoying running again",
+          "enjoy running"
+        ]
+      ],
+      "tags": [
+        "exercise",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-003",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I like painting.",
+        "I lost interest in painting.",
+        "Recently I started loving painting again."
+      ],
+      "question": "Do they like painting now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "lost interest"
+      ],
+      "expect_any": [
+        [
+          "loving painting again",
+          "like painting"
+        ]
+      ],
+      "tags": [
+        "hobby",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-004",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I love jazz.",
+        "I stopped listening to jazz.",
+        "These days I enjoy jazz again."
+      ],
+      "question": "Do they currently enjoy jazz?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "stopped listening"
+      ],
+      "expect_any": [
+        [
+          "enjoy jazz again",
+          "love jazz"
+        ]
+      ],
+      "tags": [
+        "music",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-005",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I enjoy hiking.",
+        "I avoided hiking after an injury.",
+        "I have returned to hiking and enjoy it again."
+      ],
+      "question": "How do they feel about hiking now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "avoided hiking"
+      ],
+      "expect_any": [
+        [
+          "enjoy it again",
+          "enjoy hiking"
+        ]
+      ],
+      "tags": [
+        "exercise",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-006",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I like spicy food.",
+        "I avoided spicy food for a year.",
+        "I have started liking spicy food again."
+      ],
+      "question": "Do they like spicy food now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "avoided spicy food"
+      ],
+      "expect_any": [
+        [
+          "liking spicy food again",
+          "like spicy food"
+        ]
+      ],
+      "tags": [
+        "food",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-007",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I love traveling.",
+        "I stopped enjoying travel.",
+        "I am excited about traveling again."
+      ],
+      "question": "Do they like traveling now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "stopped enjoying"
+      ],
+      "expect_any": [
+        [
+          "excited about traveling",
+          "love traveling"
+        ]
+      ],
+      "tags": [
+        "travel",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-008",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I enjoy public speaking.",
+        "I became afraid of it.",
+        "I now enjoy speaking in public again."
+      ],
+      "question": "How do they feel about public speaking now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "afraid"
+      ],
+      "expect_any": [
+        [
+          "enjoy speaking in public again",
+          "enjoy public speaking"
+        ]
+      ],
+      "tags": [
+        "activity",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-009",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I like gardening.",
+        "I abandoned gardening.",
+        "I recently took it up again and love it."
+      ],
+      "question": "Do they like gardening now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "abandoned"
+      ],
+      "expect_any": [
+        [
+          "love it",
+          "like gardening"
+        ]
+      ],
+      "tags": [
+        "hobby",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-010",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I enjoy cooking.",
+        "I stopped cooking for months.",
+        "I am enjoying cooking again."
+      ],
+      "question": "Do they enjoy cooking now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "stopped cooking"
+      ],
+      "expect_any": [
+        [
+          "enjoying cooking again",
+          "enjoy cooking"
+        ]
+      ],
+      "tags": [
+        "hobby",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-011",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I dislike cycling.",
+        "I began cycling to work.",
+        "I now enjoy cycling most days."
+      ],
+      "question": "How do they feel about cycling now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "dislike cycling"
+      ],
+      "expect_any": [
+        [
+          "enjoy cycling",
+          "like cycling"
+        ]
+      ],
+      "tags": [
+        "exercise",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-012",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I hate tea.",
+        "I tried oolong several times.",
+        "I now prefer tea to coffee."
+      ],
+      "question": "What drink do they prefer now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "hate tea"
+      ],
+      "expect_any": [
+        [
+          "prefer tea",
+          "tea"
+        ]
+      ],
+      "tags": [
+        "drink",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-013",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I dislike museums.",
+        "I started visiting art museums.",
+        "I now enjoy museum trips."
+      ],
+      "question": "Do they enjoy museums now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "dislike museums"
+      ],
+      "expect_any": [
+        [
+          "enjoy museum",
+          "like museums"
+        ]
+      ],
+      "tags": [
+        "culture",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-014",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I do not like dogs.",
+        "I adopted a calm dog.",
+        "I now love dogs."
+      ],
+      "question": "How do they feel about dogs now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "do not like dogs"
+      ],
+      "expect_any": [
+        [
+          "love dogs",
+          "like dogs"
+        ]
+      ],
+      "tags": [
+        "animals",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-015",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I hate early mornings.",
+        "I changed my sleep schedule.",
+        "I now enjoy waking up early."
+      ],
+      "question": "Do they like early mornings now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "hate early mornings"
+      ],
+      "expect_any": [
+        [
+          "enjoy waking up early",
+          "like early mornings"
+        ]
+      ],
+      "tags": [
+        "routine",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-016",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I dislike reading fiction.",
+        "I joined a novel club.",
+        "I now enjoy fiction."
+      ],
+      "question": "Do they enjoy fiction now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "dislike reading fiction"
+      ],
+      "expect_any": [
+        [
+          "enjoy fiction",
+          "like fiction"
+        ]
+      ],
+      "tags": [
+        "books",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-017",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I do not enjoy swimming.",
+        "I took swimming lessons.",
+        "I now love swimming."
+      ],
+      "question": "How do they feel about swimming now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "do not enjoy swimming"
+      ],
+      "expect_any": [
+        [
+          "love swimming",
+          "enjoy swimming"
+        ]
+      ],
+      "tags": [
+        "exercise",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-018",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I dislike remote work.",
+        "I tried working from home twice a week.",
+        "I now prefer remote work."
+      ],
+      "question": "What work style do they prefer now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "dislike remote work"
+      ],
+      "expect_any": [
+        [
+          "prefer remote work",
+          "like remote work"
+        ]
+      ],
+      "tags": [
+        "work_style",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-019",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I hate documentaries.",
+        "A friend recommended several good ones.",
+        "I now enjoy documentaries."
+      ],
+      "question": "Do they like documentaries now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "hate documentaries"
+      ],
+      "expect_any": [
+        [
+          "enjoy documentaries",
+          "like documentaries"
+        ]
+      ],
+      "tags": [
+        "media",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-020",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I dislike learning languages.",
+        "I started a Spanish class.",
+        "I now enjoy language study."
+      ],
+      "question": "Do they enjoy studying languages now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "dislike learning languages"
+      ],
+      "expect_any": [
+        [
+          "enjoy language study",
+          "like learning languages"
+        ]
+      ],
+      "tags": [
+        "learning",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-021",
+      "category": "preference_evolution",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I want to run a marathon.",
+        "I gave up on the goal.",
+        "I have started marathon training again."
+      ],
+      "question": "Do they currently want to run a marathon?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "gave up"
+      ],
+      "expect_any": [
+        [
+          "training again",
+          "want to run a marathon"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-022",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I plan to learn Japanese.",
+        "I cancelled that plan.",
+        "I enrolled in Japanese classes after all."
+      ],
+      "question": "Do they currently plan to learn Japanese?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "cancelled"
+      ],
+      "expect_any": [
+        [
+          "enrolled in Japanese",
+          "plan to learn Japanese"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-023",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I want to write a novel.",
+        "I abandoned the manuscript.",
+        "I have resumed writing the novel."
+      ],
+      "question": "Do they still want to write a novel?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "abandoned"
+      ],
+      "expect_any": [
+        [
+          "resumed writing",
+          "want to write a novel"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-024",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I plan to move to Canada.",
+        "I decided to stay put.",
+        "I have restarted the Canada move process."
+      ],
+      "question": "Do they currently plan to move to Canada?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "stay put"
+      ],
+      "expect_any": [
+        [
+          "restarted",
+          "plan to move to Canada"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-025",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I want to become a manager.",
+        "I rejected management roles.",
+        "I am applying for manager positions again."
+      ],
+      "question": "Do they want a management role now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "rejected"
+      ],
+      "expect_any": [
+        [
+          "applying for manager",
+          "want a management role"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-026",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I hope to study astronomy.",
+        "I dropped the idea.",
+        "I have applied to an astronomy program."
+      ],
+      "question": "Do they currently want to study astronomy?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "dropped"
+      ],
+      "expect_any": [
+        [
+          "applied",
+          "study astronomy"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-027",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I plan to buy a house.",
+        "I postponed buying indefinitely.",
+        "I am viewing houses again."
+      ],
+      "question": "Do they plan to buy a house now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "postponed"
+      ],
+      "expect_any": [
+        [
+          "viewing houses",
+          "plan to buy a house"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-028",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I want to start a podcast.",
+        "I cancelled the project.",
+        "I recorded a new pilot episode."
+      ],
+      "question": "Do they want to make a podcast now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "cancelled"
+      ],
+      "expect_any": [
+        [
+          "recorded",
+          "podcast"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-029",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I hope to visit Iceland.",
+        "I removed Iceland from my plans.",
+        "I booked an Iceland trip."
+      ],
+      "question": "Do they plan to visit Iceland now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "removed"
+      ],
+      "expect_any": [
+        [
+          "booked",
+          "Iceland trip"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-preference-evolution-030",
+      "category": "preference_evolution",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I want to volunteer at a shelter.",
+        "I decided I had no time.",
+        "I signed up for shelter shifts."
+      ],
+      "question": "Do they want to volunteer now?",
+      "expect_current": [],
+      "expect_history": [],
+      "forbidden": [
+        "no time"
+      ],
+      "expect_any": [
+        [
+          "signed up",
+          "shelter"
+        ]
+      ],
+      "tags": [
+        "goal",
+        "evolution",
+        "current_preference"
+      ],
+      "note": "The final preference or goal must be current while the intermediate reversal remains historical."
+    },
+    {
+      "case_id": "sb-stale-state-001",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I live in Shanghai.",
+        "I moved to Berlin.",
+        "I moved again to Tokyo."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Tokyo"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Shanghai",
+        "Berlin"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-002",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I lived in Toronto.",
+        "I moved to Lisbon.",
+        "I now live in Oslo."
+      ],
+      "question": "What is their current city?",
+      "expect_current": [
+        "Oslo"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Toronto",
+        "Lisbon"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-003",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I lived in Nairobi.",
+        "I moved to Cairo.",
+        "I settled in Madrid."
+      ],
+      "question": "Where are they currently based?",
+      "expect_current": [
+        "Madrid"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Nairobi",
+        "Cairo"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-004",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I lived in Seoul.",
+        "I relocated to Melbourne.",
+        "I now live in Kyoto."
+      ],
+      "question": "Which city is their home now?",
+      "expect_current": [
+        "Kyoto"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Seoul",
+        "Melbourne"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-005",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I lived in Prague.",
+        "I moved to Vienna.",
+        "I currently live in Tallinn."
+      ],
+      "question": "Where do they reside now?",
+      "expect_current": [
+        "Tallinn"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Prague",
+        "Vienna"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-006",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I worked at Acme.",
+        "I joined Globex.",
+        "I now work at Initech."
+      ],
+      "question": "Where do they work now?",
+      "expect_current": [
+        "Initech"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Acme",
+        "Globex"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_employer",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-007",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I worked for Northstar.",
+        "I moved to Redwood.",
+        "I currently work at Atlas."
+      ],
+      "question": "Who is their current employer?",
+      "expect_current": [
+        "Atlas"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Northstar",
+        "Redwood"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_employer",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-008",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I was at Blue Harbor.",
+        "I joined Cedar Bank.",
+        "I now work for Orion Foods."
+      ],
+      "question": "Where are they employed now?",
+      "expect_current": [
+        "Orion"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Blue Harbor",
+        "Cedar"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_employer",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-009",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I worked at Nimbus.",
+        "I switched to Solace.",
+        "I currently work at Lunar Systems."
+      ],
+      "question": "What is their present workplace?",
+      "expect_current": [
+        "Lunar"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Nimbus",
+        "Solace"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_employer",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-010",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I was employed by Falcon.",
+        "I joined Riverstone.",
+        "I now work at Copper Cloud."
+      ],
+      "question": "Which company do they work for now?",
+      "expect_current": [
+        "Copper"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Falcon",
+        "Riverstone"
+      ],
+      "expect_any": [],
+      "tags": [
+        "current_employer",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-011",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I lived in Shanghai for five years.",
+        "I moved to Berlin last year."
+      ],
+      "question": "Where did they live before Berlin?",
+      "expect_current": [],
+      "expect_history": [
+        "Shanghai"
+      ],
+      "forbidden": [
+        "Berlin"
+      ],
+      "expect_any": [],
+      "tags": [
+        "history_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-012",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "distractor",
+      "turns": [
+        "I lived in Toronto.",
+        "I now live in Lisbon."
+      ],
+      "question": "Where did they live previously?",
+      "expect_current": [],
+      "expect_history": [
+        "Toronto"
+      ],
+      "forbidden": [
+        "Lisbon"
+      ],
+      "expect_any": [],
+      "tags": [
+        "history_residence",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-013",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "basic",
+      "turns": [
+        "I worked at Acme.",
+        "I later joined Globex."
+      ],
+      "question": "Where did they work before Globex?",
+      "expect_current": [],
+      "expect_history": [
+        "Acme"
+      ],
+      "forbidden": [
+        "Globex"
+      ],
+      "expect_any": [],
+      "tags": [
+        "history_employer",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-014",
+      "category": "stale_state",
+      "split": "development",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I studied at Easton College.",
+        "I transferred to Westbridge University."
+      ],
+      "question": "Where did they study before Westbridge?",
+      "expect_current": [],
+      "expect_history": [
+        "Easton"
+      ],
+      "forbidden": [
+        "Westbridge"
+      ],
+      "expect_any": [],
+      "tags": [
+        "history_education",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-015",
+      "category": "stale_state",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I was a teacher.",
+        "I am now a product manager."
+      ],
+      "question": "What was their profession before product management?",
+      "expect_current": [],
+      "expect_history": [
+        "teacher"
+      ],
+      "forbidden": [
+        "product manager"
+      ],
+      "expect_any": [],
+      "tags": [
+        "history_profession",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-016",
+      "category": "stale_state",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I lived in Rome.",
+        "I like jazz.",
+        "I moved to Athens."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Athens"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Rome"
+      ],
+      "expect_any": [],
+      "tags": [
+        "distractor_current",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-017",
+      "category": "stale_state",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I worked at Amber Studio.",
+        "I bought a bicycle.",
+        "I joined Quartz Labs."
+      ],
+      "question": "Who employs them now?",
+      "expect_current": [
+        "Quartz"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Amber"
+      ],
+      "expect_any": [],
+      "tags": [
+        "distractor_current",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-018",
+      "category": "stale_state",
+      "split": "evaluation",
+      "difficulty": "distractor",
+      "turns": [
+        "I studied at Maple College.",
+        "I enjoy hiking.",
+        "I transferred to Coastline Arts."
+      ],
+      "question": "Where do they study now?",
+      "expect_current": [
+        "Coastline"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Maple"
+      ],
+      "expect_any": [],
+      "tags": [
+        "distractor_current",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-019",
+      "category": "stale_state",
+      "split": "evaluation",
+      "difficulty": "basic",
+      "turns": [
+        "I was a nurse.",
+        "I visited Paris.",
+        "I became a software engineer."
+      ],
+      "question": "What is their current occupation?",
+      "expect_current": [
+        "software engineer"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "nurse"
+      ],
+      "expect_any": [],
+      "tags": [
+        "distractor_current",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    },
+    {
+      "case_id": "sb-stale-state-020",
+      "category": "stale_state",
+      "split": "evaluation",
+      "difficulty": "paraphrase",
+      "turns": [
+        "I lived in Oslo.",
+        "I own a camera.",
+        "I moved to Helsinki.",
+        "I bought a tripod.",
+        "I now live in Stockholm."
+      ],
+      "question": "Where do they live now?",
+      "expect_current": [
+        "Stockholm"
+      ],
+      "expect_history": [],
+      "forbidden": [
+        "Oslo",
+        "Helsinki"
+      ],
+      "expect_any": [],
+      "tags": [
+        "distractor_current",
+        "temporal_query",
+        "stale_guard"
+      ],
+      "note": "The query must select the correct validity interval and exclude stale values."
+    }
+  ]
+}

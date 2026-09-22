@@ -44,11 +44,28 @@ class ExtractionPipeline:
         precedence over ``config.llm_client``.
     """
 
-    def __init__(self, config: MemoryConfig, llm_client: object | None = None) -> None:
+    def __init__(
+        self,
+        config: MemoryConfig,
+        llm_client: object | None = None,
+        trace_hook: object | None = None,
+    ) -> None:
         self._config = config
         self._llm_client = llm_client or config.llm_client
         # Build a SemanticExtractor; it reads allowed keys from config.
         self._semantic = SemanticExtractor(config)
+        # Optional observability hook: called as ``trace_hook(stage, **fields)``
+        # at each funnel stage.  Never affects behaviour -- purely additive.
+        self._trace_hook = trace_hook
+
+    def _trace(self, stage: str, **fields: object) -> None:
+        """Emit one funnel-stage event to the observability hook, if any."""
+        if self._trace_hook is None:
+            return
+        try:
+            self._trace_hook(stage, **fields)
+        except Exception:
+            logger.debug("pipeline: trace hook failed at stage=%s", stage, exc_info=True)
 
     def observe(
         self,
@@ -109,6 +126,14 @@ class ExtractionPipeline:
             k1_claims = extract_claims(text, self._config)
             all_claims.extend(k1_claims)
             logger.info("pipeline: K1 extracted %d claims", len(k1_claims))
+            self._trace(
+                "extraction",
+                source="k1",
+                count=len(k1_claims),
+                predicates=[(c.get("value") or {}).get("predicate", "") for c in k1_claims],
+                objects=[(c.get("value") or {}).get("object", "") for c in k1_claims],
+                claim_texts=[c.get("claim_text", "") for c in k1_claims],
+            )
         except Exception:
             logger.warning("pipeline: K1 extraction failed; continuing", exc_info=True)
 
@@ -133,6 +158,22 @@ class ExtractionPipeline:
                     else:
                         all_claims.extend(k2_result["claims"])
                         logger.info("pipeline: K2 extracted %d claims", len(k2_result["claims"]))
+                        self._trace(
+                            "extraction",
+                            source="k2",
+                            count=len(k2_result["claims"]),
+                            predicates=[
+                                (c.get("value") or {}).get("predicate", "")
+                                for c in k2_result["claims"]
+                            ],
+                            objects=[
+                                (c.get("value") or {}).get("object", "")
+                                for c in k2_result["claims"]
+                            ],
+                            claim_texts=[
+                                c.get("claim_text", "") for c in k2_result["claims"]
+                            ],
+                        )
                 elif isinstance(k2_result, list):
                     # Legacy list format from _parse_extraction_json.
                     all_claims.extend(k2_result)
@@ -150,6 +191,8 @@ class ExtractionPipeline:
             self._persist_claims(
                 session, user_id, session_id, all_claims,
                 context_tags=k2_context_tags or None,
+                source_text=text,
+                turn_ref=f"{session_id}:{turn_count}",
                 **kwargs,
             )
         except Exception:
@@ -163,6 +206,59 @@ class ExtractionPipeline:
                 logger.warning("pipeline: snippet storage failed", exc_info=True)
 
         return all_claims
+
+    def _attach_evidence_rows(
+        self,
+        session: object,
+        user_id: str,
+        session_id: str,
+        claim: dict,
+        belief_id: int | None,
+        *,
+        relation: str,
+        source_text: str = "",
+        turn_ref: str = "",
+    ) -> None:
+        """Record a claim's source messages as Evidence and link them.
+
+        The claim's ``evidence_message_ids`` name the source messages; each
+        becomes one :class:`Evidence` row keyed on that id, so re-observing
+        the same message reuses the row instead of duplicating it.  When the
+        claim names no messages, *turn_ref* stands in for the turn it came
+        from, which is what keeps K1-only extraction attributable.
+
+        Links are typed by *relation*, which is what lets one message support
+        one belief and contradict another.
+        """
+        if belief_id is None:
+            return
+        from mirror_memory.core.repository import link_evidence, record_evidence
+
+        refs = [str(mid) for mid in (claim.get("evidence_message_ids") or [])]
+        if not refs and turn_ref:
+            refs = [turn_ref]
+        if not refs:
+            return
+
+        method = claim.get("source") or "extracted"
+        for ref in refs:
+            try:
+                evidence = record_evidence(
+                    session,
+                    user_id,
+                    ref=ref,
+                    content=source_text,
+                    session_id=session_id,
+                    source_type="message",
+                    extraction_method=method,
+                    authority="user",
+                )
+                link_evidence(session, belief_id, evidence.id, relation=relation)
+            except Exception:
+                logger.debug(
+                    "pipeline: evidence attach failed for belief=%s ref=%s",
+                    belief_id, ref, exc_info=True,
+                )
 
     def _is_suppressed(self, context: str) -> bool:
         """Check if extraction is suppressed in the given context."""
@@ -232,20 +328,41 @@ class ExtractionPipeline:
         claims: list[dict],
         *,
         context_tags: list[str] | None = None,
+        source_text: str = "",
+        turn_ref: str = "",
         **kwargs: object,
     ) -> None:
         """Persist extracted claims via the repository layer.
 
         When a claim has predicate/object in its value, the IdentityResolver
         decides the action (CREATE/SUPPORT/UPDATE) before persistence.
+
+        Every persisted claim also records its source as a first-class
+        :class:`Evidence` row and links it to the belief with a typed
+        relation, so provenance survives independently of the belief row.
         """
         if not claims:
             return
 
-        from mirror_memory.core.repository import list_active_beliefs, record_claim
+        from mirror_memory.core.repository import beliefs_with_predicates, record_claim
         from mirror_memory.memory.atom import ACTION_CONTRADICT, ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
         from mirror_memory.memory.canonicalize import canonicalize_atom
         from mirror_memory.memory.identity import resolve_identity
+
+        stored: list[dict] = []
+
+        def _record_store(**fields: object) -> None:
+            stored.append(dict(fields))
+            self._trace("store", **fields)
+
+        def _attach_evidence(claim: dict, belief_id: int | None, relation: str) -> None:
+            """Record the claim's source as Evidence and link it to the belief."""
+            if belief_id is None:
+                return
+            self._attach_evidence_rows(
+                session, user_id, session_id, claim, belief_id,
+                relation=relation, source_text=source_text, turn_ref=turn_ref,
+            )
 
         allowed = (
             {d.dimension_id for d in self._config.dimensions}
@@ -253,6 +370,7 @@ class ExtractionPipeline:
             else None
         )
         policy = self._config.identity_policy
+        temporal_policy = self._config.temporal_policy
         synonyms = self._config.predicate_synonyms
 
         for claim in claims:
@@ -262,6 +380,19 @@ class ExtractionPipeline:
                 obj = value.get("object", "")
                 canon_pred = pred
                 canon_obj = obj
+
+                # Claims with no cognitive triple (e.g. K1 keyword hits) bypass
+                # identity resolution entirely.  Recording the skip is what makes
+                # it visible in the funnel: a claim with no predicate/object
+                # cannot be matched by query-aware retrieval either.
+                if not (pred and obj and policy):
+                    self._trace(
+                        "identity",
+                        action="SKIPPED_NO_TRIPLE",
+                        predicate=pred,
+                        object=obj,
+                        reason="claim carries no cognitive triple",
+                    )
 
                 # If claim has cognitive triple fields, run identity resolution.
                 if pred and obj and policy:
@@ -280,11 +411,19 @@ class ExtractionPipeline:
                         confidence=claim.get("confidence", 0.0),
                         context_tags=context_tags or [],
                         temporal=value.get("temporal", ""),
+                        observed_at=value.get("observed_at"),
+                        valid_from=value.get("valid_from"),
+                        valid_to=value.get("valid_to"),
+                        temporal_scope=temporal_policy.get(canon_pred, ""),
                         relation=claim.get("relation", "supports"),
                     )
 
-                    # Get existing beliefs for this user
-                    existing = list_active_beliefs(session, user_id, limit=200)
+                    # Get the beliefs this candidate could match.  The set is
+                    # determined by the predicate, not by recency: asking for
+                    # "the 200 most recent" silently hid older predicates past
+                    # that bound, and the resolver then turned what should have
+                    # been a SUPPORT or UPDATE into a CREATE.
+                    existing = beliefs_with_predicates(session, user_id, {canon_pred})
                     existing_dicts = [
                         {
                             "id": b.id,
@@ -293,27 +432,50 @@ class ExtractionPipeline:
                             "status": b.status,
                             "confidence": b.confidence,
                             "temporal": safe_json(getattr(b, "value_json", "{}")).get("temporal", ""),
+                            "valid_from": getattr(b, "valid_from", None),
+                            "valid_to": getattr(b, "valid_to", None),
                         }
                         for b in existing
                     ]
 
-                    resolution = resolve_identity(candidate, existing_dicts, policy)
+                    resolution = resolve_identity(
+                        candidate, existing_dicts, policy, temporal_policy
+                    )
                     logger.info(
                         "pipeline: identity resolution: action=%s pred=%s obj=%s reason=%s",
                         resolution.action, canon_pred, canon_obj, resolution.reason,
+                    )
+                    self._trace(
+                        "identity",
+                        action=resolution.action,
+                        lifecycle=resolution.lifecycle,
+                        temporal_relation=resolution.temporal_relation,
+                        predicate=canon_pred,
+                        object=canon_obj,
+                        target_belief_id=resolution.target_belief_id,
+                        reason=resolution.reason,
                     )
 
                     # Dispatch based on resolver action.
                     if resolution.action == ACTION_SUPPORT and resolution.target_belief_id:
                         from mirror_memory.core.repository import support_belief_by_id
 
-                        support_belief_by_id(
+                        supported = support_belief_by_id(
                             session,
                             resolution.target_belief_id,
                             claim_text=claim.get("claim_text", ""),
                             session_id=session_id,
                             evidence_message_ids=claim.get("evidence_message_ids"),
                         )
+                        _record_store(
+                            action="SUPPORT",
+                            belief_id=resolution.target_belief_id,
+                            persisted=supported is not None,
+                            predicate=canon_pred,
+                            object=canon_obj,
+                            claim_text=claim.get("claim_text", ""),
+                        )
+                        _attach_evidence(claim, resolution.target_belief_id, "support")
                         continue  # SUPPORT handled, skip record_claim
 
                     if resolution.action == ACTION_UPDATE and resolution.target_belief_id:
@@ -338,9 +500,28 @@ class ExtractionPipeline:
                             session_id=session_id,
                             evidence_message_ids=claim.get("evidence_message_ids"),
                             new_value=value,
+                            observed_at=candidate.observed_at,
+                            valid_from=candidate.valid_from,
+                            valid_to=candidate.valid_to,
+                            temporal_scope=temporal_policy.get(canon_pred, ""),
                         )
                         if new:
                             logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)
+                        _record_store(
+                            action="UPDATE",
+                            belief_id=new.id if new else None,
+                            persisted=new is not None,
+                            predicate=canon_pred,
+                            object=canon_obj,
+                            claim_text=claim.get("claim_text", ""),
+                        )
+                        _attach_evidence(
+                            claim, new.id if new else None, "support"
+                        )
+                        if old is not None:
+                            # The superseded value stays in the graph, marked as
+                            # what it now is: replaced.
+                            _attach_evidence(claim, old.id, "correct")
                         continue  # UPDATE handled, skip record_claim
 
                     if resolution.action == ACTION_CONTRADICT and resolution.target_belief_id:
@@ -361,7 +542,7 @@ class ExtractionPipeline:
                     claim["value"] = value
 
                 # CREATE / CONTRADICT: persist via record_claim.
-                record_claim(
+                belief, event_type = record_claim(
                     session,
                     user_id,
                     dimension=claim.get("dimension", ""),
@@ -382,6 +563,19 @@ class ExtractionPipeline:
                     predicate=canon_pred,
                     object=canon_obj,
                     cardinality=policy.get(canon_pred, "multi"),
+                )
+                _record_store(
+                    action=event_type.upper(),
+                    belief_id=belief.id if belief is not None else None,
+                    persisted=belief is not None,
+                    predicate=canon_pred,
+                    object=canon_obj,
+                    claim_text=claim.get("claim_text", ""),
+                )
+                _attach_evidence(
+                    claim,
+                    belief.id if belief is not None else None,
+                    "contradict" if event_type == "contradicted" else "support",
                 )
             except Exception:
                 logger.warning(

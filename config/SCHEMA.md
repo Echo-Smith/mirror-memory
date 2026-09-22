@@ -32,7 +32,7 @@
   - `dimension`: str (required)
   - `key`: str (required)
 - `context_tags`: list[str]
-- `max_claims_per_turn`: int (default 3) -- max claims per extraction turn
+- `max_claims_per_turn`: int (default 6) -- max claims per extraction turn; must exceed the K2 parser's self-cap of 3 or K1 claims are structurally excluded when K2 returns its maximum
 - `llm_every_turns`: int (default 5) -- LLM extraction fires every N turns at minimum
 - `llm_min_keyword_hits`: int (default 2) -- minimum keyword hits to trigger LLM regardless of turn count (0 is rejected here; set at runtime for always-extract benchmarks)
 - `high_value_dimensions`: list[str] -- dimensions that get a scoring boost for extraction priority (information-gain throttle)

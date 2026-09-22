@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import UTC, datetime
 
 from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.core.constants import CLAIM_TEXT_MAX_LENGTH, MAX_CLAIMS_PER_TURN
@@ -104,6 +105,12 @@ def _parse_extraction_full(
         predicate = str(item.get("predicate") or "")
         obj = str(item.get("object") or "")
         temporal = str(item.get("temporal") or "")
+        # Validity window.  Without these the whole Temporal V2 path is inert:
+        # every belief gets valid_from=valid_to=None, no interval is ever
+        # closed, and a current-state question cannot be told apart from a
+        # historical one.
+        valid_from = str(item.get("valid_from") or "")
+        valid_to = str(item.get("valid_to") or "")
         value: dict = {"via": "llm_semantic"}
         if predicate:
             value["predicate"] = predicate
@@ -111,6 +118,10 @@ def _parse_extraction_full(
             value["object"] = obj
         if temporal:
             value["temporal"] = temporal
+        if valid_from:
+            value["valid_from"] = valid_from
+        if valid_to:
+            value["valid_to"] = valid_to
         validated.append({
             "dimension": dimension,
             "key": key,
@@ -179,11 +190,16 @@ class SemanticExtractor:
             logger.warning("semantic: k2_system prompt is empty, skipping")
             return []
 
-        # Build payload: allowed keys + user text
+        # Build payload: allowed keys + today's date + user text.
+        # The date is required, not decorative: without it the model resolves
+        # "last month" against its own training cutoff, so every relative date
+        # lands years in the past and no interval is ever closed correctly.
         anchor_lines = _anchor_prompt_lines(config)
+        today = datetime.now(UTC).date().isoformat()
         payload = (
             "[Allowed keys]\n"
             + "\n".join(anchor_lines)
+            + f"\n\n[Current date]\n{today}"
             + "\n\n[User utterance]\n"
             + (text or "").strip()
         )

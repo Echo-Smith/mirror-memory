@@ -1,7 +1,5 @@
 """Tests for config/loader.py and config/schema.py."""
 
-import tempfile
-from pathlib import Path
 
 import pytest
 import yaml
@@ -11,10 +9,8 @@ from mirror_memory.config.schema import (
     AnchorConfig,
     BudgetConfig,
     DimensionConfig,
-    ExtractionConfig,
     MemoryConfig,
     PatternRule,
-    RenderConfig,
 )
 from mirror_memory.exceptions import ConfigError
 
@@ -154,3 +150,49 @@ class TestMemoryConfig:
     def test_session_summary_default_false(self):
         cfg = MemoryConfig()
         assert cfg.session_summary_enabled is False
+
+
+class TestOpenAILLMExtraBody:
+    """extra_body passes provider-specific fields through to the API.
+
+    Reasoning models spend their token budget on thinking and can return an
+    empty completion, which the extractor's fallback silently turns into
+    "no claims" -- so a misconfigured thinking mode looks like a model that
+    finds nothing.
+    """
+
+    @staticmethod
+    def _mock_openai():
+        from unittest.mock import MagicMock, patch
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="ok"))],
+            usage=None,
+        )
+        return patch("openai.OpenAI", return_value=mock_client), mock_client
+
+    def test_extra_body_is_forwarded(self):
+        from mirror_memory.llm import OpenAILLM
+
+        patcher, mock_client = self._mock_openai()
+        with patcher:
+            llm = OpenAILLM(
+                api_key="k", model="mimo-v2.5",
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            llm.generate(system_prompt="s", payload_text="p")
+
+            kwargs = mock_client.chat.completions.create.call_args.kwargs
+            assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    def test_no_extra_body_omits_the_field(self):
+        from mirror_memory.llm import OpenAILLM
+
+        patcher, mock_client = self._mock_openai()
+        with patcher:
+            llm = OpenAILLM(api_key="k", model="m")
+            llm.generate(system_prompt="s", payload_text="p")
+
+            kwargs = mock_client.chat.completions.create.call_args.kwargs
+            assert "extra_body" not in kwargs

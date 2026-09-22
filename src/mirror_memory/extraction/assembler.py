@@ -61,10 +61,13 @@ def assemble_claims(
         # Bonus for cognitive triple structure (predicate+object present).
         value = claim.get("value") or {}
         has_triple = 1 if (value.get("predicate") and value.get("object")) else 0
-        # Ascending sort: lower scarcity (fewer existing) = comes first.
-        # has_triple negated: claims with triples come first.
-        # priority/confidence negated: higher values come first.
-        return (scarcity, -has_triple, -priority, -confidence)
+        # Quality first: a structured, high-confidence claim is the one worth
+        # persisting.  Scarcity used to be the primary key, which meant a fact
+        # in an already-populated dimension lost to low-confidence filler in an
+        # empty one -- the answer claim was dropped precisely because its
+        # dimension was well covered.  Scarcity now only breaks ties between
+        # claims of equal quality, which is where breadth-seeking belongs.
+        return (-has_triple, -confidence, -priority, scarcity)
 
     ordered = sorted(claims, key=_sort_key)
     result = ordered[:max_claims]

@@ -20,6 +20,7 @@ from mirror_memory.core.constants import (
     TIME_LABEL_MONTHLY_DAYS,
     TIME_LABEL_WEEKLY_DAYS,
 )
+from mirror_memory.core.utils import content_tokens
 from mirror_memory.render.display import DisplayDict
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,39 @@ def _extract_query_triples(
     return predicates, objects
 
 
+# Query intent → which validity intervals to draw from.  "Where do they live
+# now?" and "where did they live before?" are different questions about the
+# same predicate, and only the interval filter tells them apart.
+_TEMPORAL_CURRENT_MARKERS = (
+    "now", "currently", "these days", "at the moment", "right now",
+    "\u73b0\u5728", "\u76ee\u524d", "\u5f53\u524d",
+)
+_TEMPORAL_HISTORICAL_MARKERS = (
+    "used to", "previously", "before", "earlier", "in the past", "formerly",
+    "no longer", "used to live", "did they", "did you",
+    "\u4ee5\u524d", "\u66fe\u7ecf", "\u4e4b\u524d", "\u8fc7\u53bb", "\u66fe\u7ecf\u4f4f",
+)
+
+
+def _detect_temporal_mode(query: str) -> str:
+    """Map a query onto a validity-interval filter.
+
+    Returns ``"current"``, ``"historical"``, or ``"all"``.  Historical wins on
+    a tie: "where did you used to live" asks about the past even though it
+    contains "did".
+    """
+    if not query:
+        return "all"
+    lowered = query.lower()
+    for marker in _TEMPORAL_HISTORICAL_MARKERS:
+        if marker in lowered:
+            return "historical"
+    for marker in _TEMPORAL_CURRENT_MARKERS:
+        if marker in lowered:
+            return "current"
+    return "all"
+
+
 def render_memory_block(
     session: object,
     user_id: str,
@@ -150,6 +184,7 @@ def render_memory_block(
     user_message: str = "",
     language: str = "zh",
     tail_load: int = 0,
+    trace_hook: object | None = None,
 ) -> str | None:
     """Render a memory block for prompt injection.
 
@@ -168,17 +203,28 @@ def render_memory_block(
         ``"zh"`` or ``"en"``.
     tail_load:
         Character count of content already in the prompt.
+    trace_hook:
+        Optional observability callable ``trace_hook(stage, **fields)``.
+        Purely additive: it observes the retrieve/context stages and never
+        changes what is rendered.
 
     Returns
     -------
     str or None
-        The rendered memory block, or ``None`` if there is nothing
-        to render.
+        The rendered memory block, or ``None`` if there is nothing to
+        render.
     """
+    def _trace(stage: str, **fields: object) -> None:
+        if trace_hook is None:
+            return
+        try:
+            trace_hook(stage, **fields)
+        except Exception:
+            logger.debug("render: trace hook failed at stage=%s", stage, exc_info=True)
     # Lazy imports to avoid circular dependencies.
     from mirror_memory.core.activity import belief_activity
     from mirror_memory.core.budget import compute_profile_budget
-    from mirror_memory.core.repository import list_active_beliefs, list_rejected_beliefs
+    from mirror_memory.core.repository import list_rejected_beliefs
     from mirror_memory.core.retrieval import score_belief
 
     display = DisplayDict(config)
@@ -225,15 +271,34 @@ def render_memory_block(
     confirm_gates = {d.dimension_id: d.requires_user_confirmation for d in config.dimensions}
     l4_threshold = render_cfg.l4_render_threshold
 
-    all_beliefs = list_active_beliefs(session, user_id)
+    # Query-aware admission.  The old path took the N most recent beliefs and
+    # scored those, which makes recency a stand-in for relevance and discards
+    # a fact stated early in a long conversation before any relevance signal
+    # runs.  ``recall_candidates`` unions the lexically relevant slice with a
+    # small recent floor, so the context is never empty either.
+    from mirror_memory.core.repository import recall_candidates
+
+    query_tokens = content_tokens(user_message)
+    all_beliefs = recall_candidates(
+        session, user_id, query=user_message,
+        temporal_mode=_detect_temporal_mode(user_message),
+    )
     now = datetime.now(UTC)
+    # Evidence is a first-class entity now, so the multi-evidence bonus counts
+    # typed links rather than a blob of ids on the belief row.
+    from mirror_memory.core.repository import evidence_counts_for_beliefs
+
+    evidence_counts = evidence_counts_for_beliefs(session, [b.id for b in all_beliefs])
     scored: list[tuple[float, object]] = []
+    gated_out: list[str] = []
     for belief in all_beliefs:
         # Gate 1: L4 render watermark — only render extracted beliefs above threshold.
         if belief.layer == "L4" and belief.confidence < l4_threshold:
+            gated_out.append(f"l4_watermark:{belief.key}")
             continue
         # Gate 2: dimension requires user confirmation — skip unconfirmed beliefs.
         if confirm_gates.get(belief.dimension, False) and belief.source != "user_confirmed":
+            gated_out.append(f"needs_confirmation:{belief.key}")
             continue
         s = score_belief(
             belief,
@@ -241,10 +306,21 @@ def render_memory_block(
             query_predicates=query_predicates,
             query_objects=query_objects,
             now=now,
+            evidence_count=evidence_counts.get(belief.id),
+            query_tokens=query_tokens,
         )
         if s > 0:
             scored.append((s, belief))
+        else:
+            gated_out.append(f"zero_score:{belief.key}")
     scored.sort(key=lambda x: (x[0], getattr(x[1], "last_evidence_at", None) or ""), reverse=True)
+    _trace(
+        "retrieve",
+        candidates=len(all_beliefs),
+        temporal_mode=_detect_temporal_mode(user_message),
+        scored=[b.key for _s, b in scored],
+        gated_out=gated_out,
+    )
 
     # Diversity: max N items per dimension
     max_per = render_cfg.max_per_dimension
@@ -298,6 +374,15 @@ def render_memory_block(
                     block = snippet_text
 
     logger.info("render: chars=%d budget=%d items=%d", len(block or ""), budget, len(rendered))
+    _trace(
+        "context",
+        rendered_keys=[b.key for _s, b in scored][: len(rendered)],
+        rendered_items=len(rendered),
+        dropped_for_budget=len(scored) - len(rendered),
+        chars=len(block or ""),
+        budget=budget,
+        used_snippet_fallback=bool(user_message and config.session_summary_enabled and "[context]" in (block or "")),
+    )
     return block or None
 
 

@@ -37,6 +37,12 @@ predicates:
   profession:
     cardinality: single
     temporal: current_state
+  # The extractor emits `works_as` for the profession attribute; without it
+  # here the predicate defaults to multi, so "I am a data analyst now" creates
+  # a second belief instead of superseding "I am a graphic designer".
+  works_as:
+    cardinality: single
+    temporal: current_state
 
   # Preferences (multi — coffee and painting coexist)
   likes:
@@ -124,6 +130,29 @@ synonym_map:
 
   work_at: works_at
   working_at: works_at
+  # Verb variants the extractor actually produces for the same slot.  Without
+  # these, "I started at Globex" canonicalises to `started_at`, matches no
+  # existing `works_at` belief, and is stored as a new belief instead of
+  # superseding the old employer -- the old value then stays active with no
+  # validity interval, and a current-state question returns it as current.
+  started_at: works_at
+  joined: works_at
+  returned_to: works_at
+  employed_at: works_at
+  employed_by: works_at
+  hired_by: works_at
+  works_for: works_at
+  began_at: works_at
+
+  # Residence: the extractor also emits `lived_in` for the same attribute.
+  lived_in: lives_in
+  relocated_to: lives_in
+  settled_in: lives_in
+
+  # Profession.
+  retrained: profession
+  became: profession
+  career_is: profession
 
   go_to: went_to
   visits: went_to

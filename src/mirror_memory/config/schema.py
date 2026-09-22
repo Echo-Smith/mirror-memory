@@ -7,11 +7,9 @@ Zero domain coupling -- all fields are generic and reusable.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
-
 
 # ---------------------------------------------------------------------------
 # Dimension
@@ -123,9 +121,20 @@ class ExtractionConfig(BaseModel):
     keywords: dict[str, list[str]] = Field(default_factory=dict)
     patterns: list[PatternRule] = Field(default_factory=list)
     context_tags: list[str] = Field(default_factory=list)
-    max_claims_per_turn: int = Field(default=3, ge=1)
+    # Must exceed the K2 parser's own self-cap (MAX_CLAIMS_PER_TURN = 3).  At 3
+    # the two caps coincided, so a full K2 batch consumed the entire budget and
+    # every K1 claim was structurally excluded -- including any carrying the
+    # answer.  Raising it cut the assembler's drop rate from 16.3% to 0.9%; it
+    # did not by itself move the benchmark, because most of the apparent
+    # extraction loss turned out to be a measurement artifact rather than
+    # claims being discarded.
+    max_claims_per_turn: int = Field(default=6, ge=1)
     llm_every_turns: int = Field(default=5, ge=1, description="LLM extraction fires every N turns at minimum")
-    llm_min_keyword_hits: int = Field(default=2, ge=1, description="Minimum keyword hits to trigger LLM regardless of turn count")
+    llm_min_keyword_hits: int = Field(
+        default=2,
+        ge=0,
+        description="Minimum keyword hits to trigger LLM; zero forces extraction every turn",
+    )
     high_value_dimensions: list[str] = Field(
         default_factory=list,
         description="Dimensions that get a scoring boost for extraction priority",
@@ -230,6 +239,13 @@ class MemoryConfig(BaseModel):
     identity_policy: dict[str, str] = Field(
         default_factory=dict,
         description="Predicate → cardinality mapping for IdentityResolver",
+    )
+    # Predicate → temporal scope (current_state / persistent / episodic).
+    # Read from identity_policy.yaml's `temporal` key alongside cardinality;
+    # drives the lifecycle transition instead of the old "SINGLE → UPDATE".
+    temporal_policy: dict[str, str] = Field(
+        default_factory=dict,
+        description="Predicate → temporal scope mapping for the lifecycle policy",
     )
     # Predicate synonym map — canonicalizes variant predicates.
     predicate_synonyms: dict[str, str] = Field(

@@ -269,7 +269,7 @@ class TestShouldExtractValueGates:
         config.extraction.llm_min_keyword_hits = 2
         record_claim(
             db_session, "u1",
-            dimension="goal", key="goal", claim_text="user goals",
+            dimension="goal", key="goal", claim_text="I want to learn Japanese",
             confidence=0.9, session_id="s1",
         )
         assert (
@@ -281,7 +281,7 @@ class TestShouldExtractValueGates:
         config.extraction.llm_min_keyword_hits = 2
         record_claim(
             db_session, "u1",
-            dimension="goal", key="goal", claim_text="user goals",
+            dimension="goal", key="goal", claim_text="I want to learn Japanese",
             confidence=0.9, session_id="s1",
         )
         # Scarcity in the other dimensions keeps the scalar above the
