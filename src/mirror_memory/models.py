@@ -41,6 +41,8 @@ class DeleteResult:
     intervention_events: int = 0
     consent_grants: int = 0
     session_summaries: int = 0
+    evidence: int = 0
+    belief_evidence_links: int = 0
 
     def as_dict(self) -> dict[str, int]:
         """Return as a plain dict for backward compatibility."""
@@ -53,6 +55,8 @@ class DeleteResult:
             "intervention_events": self.intervention_events,
             "consent_grants": self.consent_grants,
             "session_summaries": self.session_summaries,
+            "evidence": self.evidence,
+            "belief_evidence_links": self.belief_evidence_links,
         }
 
 

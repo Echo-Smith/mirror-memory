@@ -27,11 +27,16 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from mirror_memory.core.confidence import compute_confidence_weight
-from mirror_memory.core.utils import safe_json
+from mirror_memory.core.utils import (
+    belief_evidence_ids,
+    content_tokens,
+    coerce_datetime,
+    safe_json,
+)
 from mirror_memory.core.constants import (
     CONFIDENCE_CEILING,
     DEFAULT_QUESTION_TIER,
@@ -44,15 +49,16 @@ from mirror_memory.core.constants import (
 )
 from mirror_memory.core.models import (
     Belief,
+    BeliefEvidenceLink,
     BeliefEvent,
     ConsentGrant,
     EvolutionJob,
+    Evidence,
     ExtractionStats,
     InterventionEvent,
     MemoryPreference,
     SessionSummary,
     Snapshot,
-    User,
     utcnow,
 )
 
@@ -71,7 +77,18 @@ def is_memory_enabled(session: Session, user_id: str) -> bool:
 
 
 def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryPreference:
+    """Enable or disable memory for a user.
+
+    Toggling the switch is a state change, so it bumps the state revision:
+    a job that read the user's evidence while memory was still enabled must
+    not be allowed to publish after the switch was turned off.  A no-op call
+    does not bump -- including writing ``enabled=True`` for a user with no
+    preference row, since a missing row already means enabled.
+    """
     pref = session.get(MemoryPreference, user_id)
+    changed = (pref is None and not enabled) or (
+        pref is not None and bool(pref.enabled) != bool(enabled)
+    )
     if pref is None:
         pref = MemoryPreference(user_id=user_id)
         session.add(pref)
@@ -79,6 +96,8 @@ def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryP
     pref.disabled_at = None if enabled else utcnow()
     pref.updated_at = utcnow()
     session.flush()
+    if changed:
+        bump_state_revision(session, user_id)
     return pref
 
 
@@ -107,16 +126,13 @@ def bump_state_revision(session: Session, user_id: str) -> int:
     Row creation uses INSERT OR IGNORE to handle concurrent first-touch.
     """
     from sqlalchemy import update as sa_update
-    # Ensure row exists. If another session already inserted, the get() below
-    # will find it via the atomic UPDATE path.
+    # Ensure row exists.  The insert runs inside a savepoint so that losing a
+    # race with a concurrent first-touch cannot roll back the caller's whole
+    # pending transaction.
     existing = session.get(MemoryPreference, user_id)
     if existing is None:
-        pref = MemoryPreference(user_id=user_id, state_revision=1)
-        session.add(pref)
-        try:
-            session.flush()
-        except Exception:
-            session.rollback()  # row already exists from concurrent insert
+        with session.begin_nested():
+            session.add(MemoryPreference(user_id=user_id, state_revision=1))
     # Atomic increment at SQL level.
     result = session.execute(
         sa_update(MemoryPreference)
@@ -155,6 +171,194 @@ def set_feature_consent(session: Session, user_id: str, feature: str, granted: b
     else:
         session.add(ConsentGrant(user_id=user_id, feature=feature, granted=granted))
     session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Evidence -- first-class provenance
+# ---------------------------------------------------------------------------
+
+# Valid link relations.  ``support`` and ``contradict`` are opposites on the
+# same axis; ``verify`` is neutral confirmation; ``correct`` is an explicit
+# user override that supersedes whatever the evidence originally implied.
+EVIDENCE_RELATIONS = ("support", "contradict", "verify", "correct")
+
+# Recognised evidence authorities, strongest first.  A user's own statement
+# outranks a derived one; the engine never invents authority on its own.
+EVIDENCE_AUTHORITIES = ("user", "assistant", "system", "derived")
+
+
+def record_evidence(
+    session: Session,
+    user_id: str,
+    *,
+    ref: str,
+    content: str = "",
+    session_id: str | None = None,
+    source_type: str = "message",
+    extraction_method: str = "",
+    authority: str = "user",
+    observed_at: datetime | None = None,
+) -> Evidence:
+    """Record (or re-find) one piece of evidence for *user_id*.
+
+    Idempotent on ``(user_id, ref)``: observing the same message twice returns
+    the existing row with its provenance refreshed, so evidence is never
+    duplicated by re-ingestion.
+
+    Returns ``None``-free: always an :class:`Evidence`.
+    """
+    existing = session.scalar(
+        select(Evidence).where(Evidence.user_id == user_id, Evidence.ref == ref)
+    )
+    if existing is not None:
+        # Refresh the mutable provenance fields; identity fields stay put.
+        if content and len(content) > len(existing.content or ""):
+            existing.content = content
+        if session_id:
+            existing.session_id = session_id
+        if extraction_method:
+            existing.extraction_method = extraction_method
+        if authority:
+            existing.authority = authority
+        if observed_at is not None:
+            existing.observed_at = observed_at
+        session.flush()
+        return existing
+
+    row = Evidence(
+        user_id=user_id,
+        session_id=session_id,
+        ref=ref,
+        content=content,
+        source_type=source_type,
+        extraction_method=extraction_method,
+        authority=authority,
+        observed_at=observed_at or utcnow(),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def link_evidence(
+    session: Session,
+    belief_id: int,
+    evidence_id: int,
+    *,
+    relation: str = "support",
+) -> BeliefEvidenceLink | None:
+    """Attach one evidence row to one belief with a typed relation.
+
+    Idempotent on ``(belief_id, evidence_id, relation)``.  Returns the link,
+    or ``None`` if the relation is not recognised.
+    """
+    if relation not in EVIDENCE_RELATIONS:
+        raise ValueError(f"invalid evidence relation: {relation!r}")
+
+    existing = session.scalar(
+        select(BeliefEvidenceLink).where(
+            BeliefEvidenceLink.belief_id == belief_id,
+            BeliefEvidenceLink.evidence_id == evidence_id,
+            BeliefEvidenceLink.relation == relation,
+        )
+    )
+    if existing is not None:
+        return existing
+
+    link = BeliefEvidenceLink(
+        belief_id=belief_id,
+        evidence_id=evidence_id,
+        relation=relation,
+    )
+    session.add(link)
+    session.flush()
+    return link
+
+
+def evidence_for_belief(
+    session: Session,
+    belief_id: int,
+    *,
+    relations: tuple[str, ...] | None = None,
+) -> list[tuple[Evidence, str]]:
+    """Return ``(evidence, relation)`` pairs attached to *belief_id*.
+
+    Ordered newest-observed first.  *relations* narrows the result to a subset
+    of link types (e.g. only ``("support",)`` to see what backs a belief).
+    """
+    stmt = (
+        select(Evidence, BeliefEvidenceLink.relation)
+        .join(BeliefEvidenceLink, BeliefEvidenceLink.evidence_id == Evidence.id)
+        .where(BeliefEvidenceLink.belief_id == belief_id)
+        .order_by(desc(Evidence.observed_at), desc(Evidence.id))
+    )
+    if relations is not None:
+        stmt = stmt.where(BeliefEvidenceLink.relation.in_(relations))
+    return [(row[0], row[1]) for row in session.execute(stmt).all()]
+
+
+def evidence_summary(session: Session, user_id: str, belief_id: int) -> dict:
+    """Explainability view of a belief's evidence, grouped by relation.
+
+    Returns counts per relation plus the supporting evidence's provenance, so
+    a caller can answer "what backs this belief, and how was it obtained?"
+    without walking the link table itself.
+    """
+    pairs = evidence_for_belief(session, belief_id)
+    grouped: dict[str, list[dict]] = {}
+    for evidence, relation in pairs:
+        grouped.setdefault(relation, []).append(
+            {
+                "evidence_id": evidence.id,
+                "ref": evidence.ref,
+                "source_type": evidence.source_type,
+                "extraction_method": evidence.extraction_method,
+                "authority": evidence.authority,
+                "observed_at": evidence.observed_at.isoformat() if evidence.observed_at else None,
+                "session_id": evidence.session_id,
+            }
+        )
+    return {
+        "belief_id": belief_id,
+        "user_id": user_id,
+        "counts": {relation: len(items) for relation, items in grouped.items()},
+        "by_relation": grouped,
+    }
+
+
+def _prune_orphan_evidence(session: Session, user_id: str) -> int:
+    """Delete evidence rows for *user_id* that no belief points at any more.
+
+    Evidence is shared: one message can back several beliefs, so a row only
+    becomes garbage once its last link is gone.
+    """
+    linked_ids = select(BeliefEvidenceLink.evidence_id).where(
+        BeliefEvidenceLink.evidence_id.in_(
+            select(Evidence.id).where(Evidence.user_id == user_id)
+        )
+    )
+    deleted = (
+        session.query(Evidence)
+        .filter(Evidence.user_id == user_id, Evidence.id.not_in(linked_ids))
+        .delete(synchronize_session=False)
+    )
+    return int(deleted)
+
+
+def evidence_counts_for_beliefs(session: Session, belief_ids: list[int]) -> dict[int, int]:
+    """Return ``{belief_id: evidence_count}`` for the given beliefs.
+
+    Counts links, so one message that both supports and contradicts a belief
+    counts once per typed edge -- which is the point of typed links.
+    """
+    if not belief_ids:
+        return {}
+    rows = session.execute(
+        select(BeliefEvidenceLink.belief_id, func.count(BeliefEvidenceLink.id))
+        .where(BeliefEvidenceLink.belief_id.in_(belief_ids))
+        .group_by(BeliefEvidenceLink.belief_id)
+    ).all()
+    return {row[0]: int(row[1]) for row in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -206,19 +410,223 @@ def list_active_beliefs(
     *,
     dimensions: tuple[str, ...] | None = None,
     limit: int = 50,
+    temporal_mode: str = "all",
 ) -> list[Belief]:
     """Active beliefs, ordered by most-recent evidence.  Returns [] if memory
     is disabled for the user.
+
+    ``temporal_mode`` filters on the belief's validity interval, which is what
+    separates "where do they live now?" from "where did they live before?":
+
+    - ``"all"`` (default): every active belief, current and historical.
+    - ``"current"``: only beliefs whose interval covers now (``valid_to`` is
+      NULL or in the future).
+    - ``"historical"``: only beliefs whose interval has closed.  Superseded
+      rows are included here -- a closed interval *is* the history.
     """
     if not is_memory_enabled(session, user_id):
         return []
-    conditions = [Belief.user_id == user_id, Belief.status == "active"]
+    conditions = [Belief.user_id == user_id]
+    if temporal_mode == "historical":
+        # A superseded belief is exactly a closed interval; excluding it would
+        # make "where did they live before?" unanswerable.
+        conditions.append(Belief.status.in_(("active", "superseded")))
+    else:
+        conditions.append(Belief.status == "active")
     if dimensions:
         conditions.append(Belief.dimension.in_(dimensions))
     stmt = select(Belief).where(*conditions).order_by(desc(Belief.last_evidence_at)).limit(limit)
     results = list(session.scalars(stmt))
     # Filter out expired life events.
+    results = [b for b in results if not _is_expired(b)]
+    return _filter_by_temporal_mode(results, temporal_mode)
+
+
+def _filter_by_temporal_mode(beliefs: list[Belief], temporal_mode: str) -> list[Belief]:
+    """Keep the beliefs whose validity interval matches *temporal_mode*.
+
+    A belief with no interval information at all (no ``valid_from`` and no
+    ``valid_to``) is *undated*, not current-or-historical.  It passes both
+    filters: an undated episodic event ("went to the museum") is exactly what
+    a question about the past needs, and excluding it would make every
+    historical query return nothing.
+    """
+    if temporal_mode == "all":
+        return beliefs
+    now = datetime.now(UTC)
+    if temporal_mode == "current":
+        return [
+            b for b in beliefs
+            if _is_undated(b) or _interval_is_current(b, now)
+        ]
+    if temporal_mode == "historical":
+        return [
+            b for b in beliefs
+            if _is_undated(b) or not _interval_is_current(b, now)
+        ]
+    return beliefs
+
+
+def _is_undated(belief: Belief) -> bool:
+    """Does the belief carry no validity interval at all?"""
+    return belief.valid_from is None and belief.valid_to is None
+
+
+def recall_candidates(
+    session: Session,
+    user_id: str,
+    *,
+    query: str = "",
+    dimensions: tuple[str, ...] | None = None,
+    temporal_mode: str = "all",
+    relevant_limit: int = 150,
+    recent_limit: int = 25,
+) -> list[Belief]:
+    """Query-aware admission: which beliefs could matter for *query*?
+
+    The old renderer path took the N most recently evidenced beliefs and
+    scored those.  That makes recency a stand-in for relevance, so a fact
+    stated early in a long conversation is discarded before any relevance
+    signal runs -- measured on LOCOMo, the answer belief sat at recency rank
+    153 of 161 and never reached the scorer at all.
+
+    Admission here is the union of two bounded slices:
+
+    - **relevant** -- beliefs whose key, object, or claim_text contains one of
+      the query's content tokens.
+    - **recent** -- the most recently evidenced beliefs, so the context is
+      never empty for a question nothing lexically matches.
+
+    Both slices are bounded; the character budget downstream is what actually
+    limits what reaches the prompt, and it is enforced independently.
+    """
+    if not is_memory_enabled(session, user_id):
+        return []
+
+    # A superseded row is exactly a closed interval, so a question about the
+    # past must be able to reach it -- same rule list_active_beliefs follows.
+    statuses = ("active", "superseded") if temporal_mode == "historical" else ("active",)
+
+    tokens = content_tokens(query)
+    relevant: list[Belief] = []
+    if tokens and relevant_limit > 0:
+        # Parameterised LIKE -- no string concatenation into SQL.
+        pattern = or_(*[
+            Belief.claim_text.ilike(f"%{_escape_like(token)}%", escape="\\")
+            for token in sorted(tokens)
+        ] + [
+            Belief.object.ilike(f"%{_escape_like(token)}%", escape="\\")
+            for token in sorted(tokens)
+        ] + [
+            Belief.key.ilike(f"%{_escape_like(token)}%", escape="\\")
+            for token in sorted(tokens)
+        ])
+        conditions = [Belief.user_id == user_id, Belief.status.in_(statuses), pattern]
+        if dimensions:
+            conditions.append(Belief.dimension.in_(dimensions))
+        relevant = list(session.scalars(
+            select(Belief).where(*conditions)
+            .order_by(desc(Belief.last_evidence_at))
+            .limit(relevant_limit)
+        ))
+
+    recent: list[Belief] = []
+    if recent_limit > 0:
+        conditions = [Belief.user_id == user_id, Belief.status == "active"]
+        if dimensions:
+            conditions.append(Belief.dimension.in_(dimensions))
+        recent = list(session.scalars(
+            select(Belief).where(*conditions)
+            .order_by(desc(Belief.last_evidence_at))
+            .limit(recent_limit)
+        ))
+
+    # Union, preserving recency order and dropping duplicates by identity.
+    seen: set[int] = set()
+    merged: list[Belief] = []
+    for belief in sorted(relevant + recent, key=_recency_key, reverse=True):
+        if belief.id in seen:
+            continue
+        seen.add(belief.id)
+        merged.append(belief)
+
+    merged = [b for b in merged if not _is_expired(b)]
+    return _filter_by_temporal_mode(merged, temporal_mode)
+
+
+def _recency_key(belief: Belief) -> tuple[int, datetime]:
+    """Sort key that never mixes naive and aware datetimes.
+
+    SQLite hands back naive datetimes while ``utcnow()`` is aware, so comparing
+    them directly raises.  Everything is normalised to naive UTC, and a belief
+    with no timestamp sorts below those that have one -- the leading flag keeps
+    it from ever being compared against a datetime constant.
+    """
+    ts = belief.last_evidence_at
+    if ts is None:
+        return (0, datetime.min)
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(UTC).replace(tzinfo=None)
+    return (1, ts)
+
+
+def _escape_like(token: str) -> str:
+    """Escape LIKE wildcards so a token matches itself, not a pattern."""
+    return token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def beliefs_with_predicates(
+    session: Session,
+    user_id: str,
+    predicates: set[str] | tuple[str, ...],
+    *,
+    limit: int = 500,
+) -> list[Belief]:
+    """Active beliefs whose predicate is in *predicates*.
+
+    Identity resolution needs the beliefs a candidate could possibly match,
+    and that set is determined by the predicate -- not by how recently the
+    belief was touched.  The old code asked for the 200 most recent beliefs,
+    so a user past 200 active beliefs silently lost the older predicates: the
+    resolver could not see them and turned what should have been a SUPPORT or
+    UPDATE into a CREATE.
+    """
+    wanted = {p for p in predicates if p}
+    if not wanted or not is_memory_enabled(session, user_id):
+        return []
+    stmt = (
+        select(Belief)
+        .where(
+            Belief.user_id == user_id,
+            Belief.status == "active",
+            Belief.predicate.in_(wanted),
+        )
+        .order_by(desc(Belief.last_evidence_at))
+        .limit(limit)
+    )
+    results = list(session.scalars(stmt))
     return [b for b in results if not _is_expired(b)]
+
+
+def _interval_is_current(belief: Belief, now: datetime) -> bool:
+    """Does the belief's validity interval cover *now*?
+
+    An open ``valid_to`` means "still true".  A NULL ``valid_from`` means
+    "since always", so it never excludes a belief.
+    """
+    valid_from = belief.valid_from
+    if valid_from is not None:
+        if valid_from.tzinfo is None:
+            valid_from = valid_from.replace(tzinfo=UTC)
+        if now < valid_from:
+            return False
+    valid_to = belief.valid_to
+    if valid_to is not None:
+        if valid_to.tzinfo is None:
+            valid_to = valid_to.replace(tzinfo=UTC)
+        if now >= valid_to:
+            return False
+    return True
 
 
 def list_rejected_beliefs(session: Session, user_id: str, *, limit: int = 5) -> list[Belief]:
@@ -276,6 +684,34 @@ def _is_expired(belief: Belief) -> bool:
         return datetime.now(UTC) > expiry
     except (ValueError, TypeError):
         return False
+
+
+def _is_elaboration(new_text: str, old_text: str | None) -> bool:
+    """Is *new_text* a fuller statement of what *old_text* already says?
+
+    Requires both that it is longer and that it does not drop the old text's
+    distinctive words.  Length alone is not enough, and neither is sharing a
+    generic word: "user" appears in nearly every claim, so matching on it let
+    a longer sentence about a different aspect of the same belief key pass as
+    an elaboration and throw away the wording that answered the question.
+
+    Distinctive means six characters or more.  Below that, ordinary English
+    words ("short", "likes", "works") look specific without carrying any
+    content, and treating them as content is what made a generic placeholder
+    block a legitimate update.  Real specifics -- charity, berlin, painting,
+    insomnia -- are all longer.
+    """
+    if not new_text:
+        return False
+    if not old_text:
+        return True
+    if len(new_text) <= len(old_text):
+        return False
+    old_distinctive = content_tokens(old_text, min_length=6)
+    if not old_distinctive:
+        # Nothing specific to preserve; take the fuller wording.
+        return True
+    return bool(old_distinctive & content_tokens(new_text, min_length=6))
 
 
 def record_claim(
@@ -412,9 +848,13 @@ def record_claim(
         existing.last_evidence_session_id = session_id
         existing.last_evidence_at = datetime.now(UTC)
 
-        # Update claim_text with the latest version (preserves specific details
-        # like dates, names, numbers that may be more precise in later mentions).
-        if claim_text and len(claim_text) > len(existing.claim_text or ""):
+        # Update claim_text when the new version is a genuine elaboration of
+        # what is already stored -- later mentions often carry the date, name
+        # or number an earlier one left out.  Replacing unconditionally with
+        # "the longest so far" silently swapped in a longer text about a
+        # different aspect of the same key, and the answer-bearing wording
+        # vanished from the rendered surface.
+        if claim_text and _is_elaboration(claim_text, existing.claim_text):
             existing.claim_text = claim_text
 
         if context_tags:
@@ -534,7 +974,9 @@ def support_belief_by_id(
     belief.last_evidence_session_id = session_id
     belief.last_evidence_at = datetime.now(UTC)
 
-    if claim_text and len(claim_text) > len(belief.claim_text or ""):
+    # Same elaboration rule as record_claim: replace only when the new text is
+    # a fuller statement of the same fact, never merely because it is longer.
+    if claim_text and _is_elaboration(claim_text, belief.claim_text):
         belief.claim_text = claim_text
 
     # Confidence boost with 7-factor weighting (shared with record_claim).
@@ -565,6 +1007,60 @@ def support_belief_by_id(
     return belief
 
 
+def _derive_updated_key(old: Belief, new_object: str) -> str:
+    """Pick the key for a belief whose object changed.
+
+    ``(user_id, key)`` is unique, so a value change must move to a new key or
+    the insert collides with the row being superseded.  The base namespace is
+    kept (``lives_in`` stays ``lives_in``) and the object becomes the suffix,
+    which also makes the superseded row findable again on a round trip.
+    """
+    if not new_object or new_object == old.object:
+        return old.key
+    base = old.key.split(":", 1)[0]
+    return f"{base}:{new_object.strip().lower().replace(' ', '_')}"
+
+
+def _target_key_for_update(old: Belief, new_key: str, new_object: str) -> str:
+    """The key the superseding row should take.
+
+    A caller-supplied ``new_key`` is normally respected, but not when it is the
+    key the row being superseded still holds: ``(user_id, key)`` is unique
+    regardless of status, so reusing it collides on insert.  That is exactly
+    what happened when the extractor invented the same key for two different
+    values of a single-cardinality predicate -- 19 LongMemEval users were lost
+    to it.
+    """
+    target = new_key or old.key
+    if target == old.key and new_object and new_object != old.object:
+        return _derive_updated_key(old, new_object)
+    return target
+
+
+def _disambiguate_key(session: Session, user_id: str, key: str, *, exclude_id: int) -> str:
+    """Return a key that is free for *user_id*, suffixing if necessary.
+
+    The UNIQUE constraint ignores ``status``, so a key taken by any other row
+    -- active, superseded, or rejected -- cannot be reused.  ``exclude_id`` is
+    the row being replaced, which is about to be superseded and so does not
+    count as a collision.
+    """
+    candidate = key
+    suffix = 2
+    while True:
+        taken = session.scalar(
+            select(Belief.id).where(
+                Belief.user_id == user_id,
+                Belief.key == candidate,
+                Belief.id != exclude_id,
+            )
+        )
+        if taken is None:
+            return candidate
+        candidate = f"{key}~{suffix}"
+        suffix += 1
+
+
 def update_belief_by_id(
     session: Session,
     old_belief_id: int,
@@ -580,8 +1076,18 @@ def update_belief_by_id(
     session_id: str | None = None,
     evidence_message_ids: list[int] | None = None,
     new_value: dict | None = None,
+    observed_at: datetime | None = None,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+    temporal_scope: str = "",
 ) -> tuple[Belief | None, Belief | None]:
     """SINGLE cardinality update: supersede old belief, create new one.
+
+    When the new fact carries a ``valid_from``, the old belief's interval is
+    **closed** at that instant (``valid_to = valid_from``) rather than
+    discarded.  That is what keeps "where did they live before?" answerable
+    after "they live in Beijing now" arrives -- the old value becomes history
+    instead of being deleted.
 
     If the target key already exists as a superseded/rejected belief
     (e.g. Shanghai → Beijing → Shanghai), the old row is revived instead
@@ -595,7 +1101,14 @@ def update_belief_by_id(
         return None, None
 
     evidence = [int(mid) for mid in (evidence_message_ids or [])]
-    target_key = new_key or old.key
+    new_from = _as_utc(valid_from)
+    target_key = _target_key_for_update(old, new_key, new_object)
+
+    # Close the old interval when the new fact starts a new period.  Without
+    # this the superseded row stays "current" forever and temporal questions
+    # cannot tell history from the present.
+    if new_from is not None and old.valid_to is None:
+        old.valid_to = new_from
 
     # Check for an existing superseded belief with the same key (revival).
     existing_row = (
@@ -616,6 +1129,11 @@ def update_belief_by_id(
         existing_row.last_evidence_at = datetime.now(UTC)
         existing_row.last_evidence_session_id = session_id
         existing_row.evidence_json = json.dumps(evidence[-MAX_EVIDENCE_REFS:])
+        existing_row.valid_from = new_from or existing_row.valid_from
+        existing_row.valid_to = _as_utc(valid_to)
+        existing_row.observed_at = observed_at or utcnow()
+        if temporal_scope:
+            existing_row.temporal_scope = temporal_scope
         if new_claim_text:
             existing_row.claim_text = new_claim_text
         if new_value:
@@ -633,7 +1151,10 @@ def update_belief_by_id(
         touch_memory_state(session, old.user_id)
         return old, existing_row
 
-    # Normal path: create new belief.
+    # Normal path: create new belief.  The key must be free for this user
+    # regardless of status -- the UNIQUE constraint does not care that the
+    # row currently holding it is about to be superseded.
+    target_key = _disambiguate_key(session, old.user_id, target_key, exclude_id=old.id)
     new_belief = Belief(
         user_id=old.user_id,
         dimension=new_dimension or old.dimension,
@@ -651,6 +1172,10 @@ def update_belief_by_id(
         cardinality=new_cardinality,
         origin_session_id=session_id,
         last_evidence_session_id=session_id,
+        observed_at=observed_at or utcnow(),
+        valid_from=new_from,
+        valid_to=_as_utc(valid_to),
+        temporal_scope=temporal_scope or old.temporal_scope,
     )
     session.add(new_belief)
     session.flush()
@@ -660,11 +1185,31 @@ def update_belief_by_id(
     session.flush()
 
     _append_event(session, old, "superseded", evidence=evidence,
-                  detail={"superseded_by": new_belief.id})
+                  detail={"superseded_by": new_belief.id, "valid_to": _iso(old.valid_to)})
     _append_event(session, new_belief, "created", evidence=evidence,
-                  detail={"supersedes": old.id})
+                  detail={"supersedes": old.id, "valid_from": _iso(new_belief.valid_from)})
     touch_memory_state(session, old.user_id)
     return old, new_belief
+
+
+def _as_utc(value) -> datetime | None:
+    """Normalise a datetime to naive UTC for consistent storage and comparison.
+
+    Extraction hands back ISO strings from the LLM, so anything that is not
+    already a datetime is coerced rather than rejected: a string reaching here
+    used to raise AttributeError and abort the whole UPDATE, which left the
+    superseded value in place and the new one never created.
+    """
+    value = coerce_datetime(value)
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(UTC).replace(tzinfo=None)
+    return value
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def update_belief_value(
@@ -953,6 +1498,23 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     beliefs_deleted = (
         session.query(Belief).filter(Belief.user_id == user_id).delete(synchronize_session=False)
     )
+    # Evidence links hang off belief ids, so they go with the beliefs.
+    evidence_ids = [
+        row[0]
+        for row in session.execute(
+            select(Evidence.id).where(Evidence.user_id == user_id)
+        ).all()
+    ]
+    links_deleted = 0
+    if evidence_ids:
+        links_deleted = (
+            session.query(BeliefEvidenceLink)
+            .filter(BeliefEvidenceLink.evidence_id.in_(evidence_ids))
+            .delete(synchronize_session=False)
+        )
+    evidence_deleted = (
+        session.query(Evidence).filter(Evidence.user_id == user_id).delete(synchronize_session=False)
+    )
     stats_deleted = (
         session.query(ExtractionStats)
         .filter(ExtractionStats.user_id == user_id)
@@ -986,6 +1548,8 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "intervention_events": int(interventions_deleted),
         "consent_grants": int(consent_deleted),
         "session_summaries": int(summaries_deleted),
+        "evidence": int(evidence_deleted),
+        "belief_evidence_links": int(links_deleted),
     }
 
 
@@ -1005,8 +1569,14 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
     session.query(BeliefEvent).filter(BeliefEvent.belief_id == belief_id).delete(
         synchronize_session=False
     )
+    # Drop this belief's edges into the evidence graph.
+    session.query(BeliefEvidenceLink).filter(
+        BeliefEvidenceLink.belief_id == belief_id
+    ).delete(synchronize_session=False)
     session.delete(belief)
     session.flush()
+    # Evidence no belief points at is garbage, not provenance.
+    _prune_orphan_evidence(session, user_id)
 
     # Invalidate derived state: source memory was deleted, so
     # snapshots (derived understanding) and pending evolution jobs
@@ -1129,6 +1699,7 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
     - belief: current state
     - events: chronological event history
     - source_evidence: evidence IDs
+    - evidence_graph: typed ``(evidence, relation)`` links
     - superseded_by: ID of the belief that replaced this one (if any)
     - correction_of: ID of the belief this one corrects (if any)
 
@@ -1139,13 +1710,6 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
         return None
 
     events = get_belief_events(session, user_id, belief_id)
-    evidence_ids = safe_json(belief.evidence_json)
-    if isinstance(evidence_ids, str):
-        try:
-            evidence_ids = json.loads(evidence_ids)
-        except (json.JSONDecodeError, TypeError):
-            evidence_ids = []
-
     return {
         "belief_id": belief.id,
         "dimension": belief.dimension,
@@ -1158,7 +1722,8 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
         "status": belief.status,
         "source": belief.source,
         "subject": getattr(belief, "subject", "user"),
-        "evidence_ids": evidence_ids if isinstance(evidence_ids, list) else [],
+        "evidence_ids": belief_evidence_ids(belief),
+        "evidence_graph": evidence_summary(session, user_id, belief_id),
         "superseded_by": belief.superseded_by,
         "first_seen_at": belief.first_seen_at.isoformat() if belief.first_seen_at else None,
         "last_evidence_at": belief.last_evidence_at.isoformat() if belief.last_evidence_at else None,

@@ -27,9 +27,9 @@ from mirror_memory.core.constants import (
     JOB_BATCH_LIMIT,
     LOAD_EVIDENCE_LIMIT,
 )
+from mirror_memory.core.models import Belief, EvolutionJob
 from mirror_memory.core.utils import truncate_id
-from mirror_memory.core.models import Belief, EvolutionJob, Snapshot
-from mirror_memory.worker.snapshot import persist_snapshot, promote_shadow_if_ready
+from mirror_memory.worker.snapshot import promote_shadow_if_ready
 
 logger = logging.getLogger(__name__)
 
@@ -176,9 +176,22 @@ def _process_single_job(
     job: EvolutionJob,
     config: MemoryConfig,
 ) -> None:
-    """Process a single evolution job through the 6-node pipeline."""
+    """Process a single evolution job through the 6-node pipeline.
+
+    Only Node 6 writes.  Nodes 1-5 are pure Compute over a snapshot of the
+    evidence read at the start; the revision guard and the memory-enabled
+    check sit immediately before the write, so any state change that happened
+    during the compute aborts the publish and leaves the database untouched.
+    """
     try:
-        from mirror_memory.core.repository import get_state_revision
+        from mirror_memory.core.repository import get_state_revision, is_memory_enabled
+
+        # Consent gate: a disabled user's beliefs must not even be read into
+        # a compute payload, let alone published.
+        if not is_memory_enabled(session, job.user_id):
+            _block_job(session, job, "memory_disabled")
+            return
+
         # We intentionally ignore job.claimed_revision here (a snapshot from
         # enqueue time).  The revision may have been bumped by state mutations
         # between enqueue and compute, so we re-read the current value to
@@ -197,36 +210,49 @@ def _process_single_job(
         # Node 4: compile_policy
         policy = _compile_policy(validated)
 
-        # Node 5: synthesize (K3 -- fail-open)
+        # Node 5: synthesize (K3 -- pure Compute, fail-open, writes nothing)
+        understanding = None
         try:
             from mirror_memory.extraction.synthesis import Synthesizer
 
-            synthesizer = Synthesizer(config)
-            synthesizer.synthesize(session, job.user_id, config)
+            understanding = Synthesizer(config).synthesize(session, job.user_id, config)
         except Exception:
             logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job.id))
 
-        # Node 6: persist_snapshot with revision guard
-        from mirror_memory.core.repository import get_state_revision
-        current_revision = get_state_revision(session, job.user_id)
-        if current_revision != claimed_revision:
-            logger.warning("evolution: stale write blocked (job=%s claimed=%d current=%d)",
-                           truncate_id(job.id), claimed_revision, current_revision)
-            job.status = "completed"  # mark done but don't persist
-            job.completed_at = datetime.now(UTC)
-            job.error_code = "stale_revision"
-            session.commit()
-            return
+        # The published content is the validated candidate, with K3's
+        # understanding folded in when it produced one.
+        content = dict(validated)
+        if understanding is not None:
+            content["understanding"] = understanding
+
+        # Node 6: publish.  The Publisher is the only component allowed to
+        # write derived state, and it re-checks consent, revision, and
+        # authority itself -- so a change that landed during the compute is
+        # caught here rather than trusted.
+        from mirror_memory.core.proposal import TRANSITION_SYNTHESIZE, StateTransitionProposal
+        from mirror_memory.core.publisher import Publisher
 
         is_shadow = evidence.get("distinct_sessions", 1) < 2
-        persist_snapshot(
-            session,
-            job.user_id,
-            validated,
-            policy,
-            job.evidence_watermark,
-            shadow=is_shadow,
+        proposal = StateTransitionProposal(
+            transition=TRANSITION_SYNTHESIZE,
+            user_id=job.user_id,
+            session_id=None,
+            claimed_revision=claimed_revision,
+            payload={
+                "content": content,
+                "policy": policy,
+                "watermark": job.evidence_watermark,
+                "shadow": is_shadow,
+            },
         )
+        decision = Publisher(session).publish(proposal)
+        if not decision.committed:
+            logger.info(
+                "evolution: publish refused (job=%s reason=%s)",
+                truncate_id(job.id), decision.reason,
+            )
+            _block_job(session, job, decision.reason)
+            return
 
         job.status = "completed"
         job.completed_at = datetime.now(UTC)
@@ -239,6 +265,18 @@ def _process_single_job(
         job.error_code = type(exc).__name__
         session.commit()
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job.id), type(exc).__name__)
+
+
+def _block_job(session: object, job: EvolutionJob, reason: str) -> None:
+    """Terminal-state a job whose publish was refused.
+
+    The job is marked ``cancelled`` rather than ``completed``: nothing was
+    written, and the next ``enqueue_job`` for the user must be free to run.
+    """
+    job.status = "cancelled"
+    job.completed_at = datetime.now(UTC)
+    job.error_code = reason
+    session.commit()
 
 
 # ---------------------------------------------------------------------------

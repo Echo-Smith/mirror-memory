@@ -36,6 +36,16 @@ class CandidateAtom:
         Life-context tags (``work``, ``family``, etc.).
     temporal:
         Temporal qualifier (``current``, ``past``, a date string, or ``None``).
+    observed_at:
+        When the engine learned this fact (ingestion time).
+    valid_from / valid_to:
+        When the fact itself was true.  ``None`` means open-ended: no
+        ``valid_to`` is "still true", which is what lets a later fact close
+        the interval instead of replacing the row.
+    temporal_scope:
+        One of ``current_state`` / ``persistent`` / ``episodic`` from the
+        predicate policy.  Drives the lifecycle transition together with the
+        temporal relation.
     source:
         How this atom was produced (``k1_keyword``, ``k1_regex``, ``k2_llm``).
     """
@@ -49,6 +59,10 @@ class CandidateAtom:
     evidence_ids: list[str] = field(default_factory=list)
     context_tags: list[str] = field(default_factory=list)
     temporal: str | None = None
+    observed_at: Any | None = None
+    valid_from: Any | None = None
+    valid_to: Any | None = None
+    temporal_scope: str = "current_state"
     source: str = "extracted"
     relation: str = "supports"  # supports / contradicts / updates / new
 
@@ -65,11 +79,23 @@ ACTION_NOOP = "NOOP"             # Rejected / resurrection guard / no change
 
 @dataclass
 class Resolution:
-    """Result of identity resolution for a single CandidateAtom."""
+    """Result of identity resolution for a single CandidateAtom.
+
+    ``lifecycle`` is the action to take; ``action`` is kept as an alias so
+    existing callers keep working.  ``temporal_relation`` records how the
+    candidate's validity window related to the target's, which is what makes
+    a TEMPORAL_UPDATE auditable rather than a guess.
+    """
 
     action: str  # One of ACTION_CREATE / SUPPORT / UPDATE / CONTRADICT / NOOP
     target_belief_id: int | None = None  # Existing belief to act on (None for CREATE)
     reason: str = ""  # Human-readable explanation
+    lifecycle: str = ""  # LifecycleAction value; defaults to `action`
+    temporal_relation: str = ""  # TemporalRelation value, when decided
+
+    def __post_init__(self) -> None:
+        if not self.lifecycle:
+            self.lifecycle = self.action
 
 
 # ── Cardinality types ─────────────────────────────────────────────────────

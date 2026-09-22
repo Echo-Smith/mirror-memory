@@ -116,6 +116,15 @@ class Belief(Base):
     object: Mapped[str] = mapped_column(String(256), default="")
     cardinality: Mapped[str] = mapped_column(String(16), default="multi")
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Temporal validity (Temporal V2).  ``observed_at`` is when the engine
+    # learned the fact; ``valid_from``/``valid_to`` delimit when the fact
+    # itself was true.  A NULL ``valid_to`` means "still true" -- which is
+    # what makes "where do they live now?" answerable separately from
+    # "where did they live before?".
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    temporal_scope: Mapped[str] = mapped_column(String(16), default="current_state")
     # Existing provenance fields
     origin_stats_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     origin_slice_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -125,6 +134,77 @@ class Belief(Base):
     last_evidence_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Evidence (first-class provenance entity)
+# ---------------------------------------------------------------------------
+
+
+class Evidence(Base):
+    """A first-class piece of provenance a belief was derived from.
+
+    Before this table, a belief carried a bare list of message ids in
+    ``evidence_json`` -- enough to say *which* messages, but nothing about
+    *what kind* of source they were, who said it, or how it was extracted.
+    Evidence as its own row carries that, so the same message can support one
+    belief and contradict another, and so "where did this belief come from"
+    is answerable without re-parsing the belief.
+
+    ``ref`` is the caller's own identifier for the source (a message id, a
+    document path, an event id).  It is unique per user, so re-observing the
+    same message yields the same Evidence row rather than a duplicate.
+    """
+
+    __tablename__ = "mm_evidence"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    session_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    ref: Mapped[str] = mapped_column(String(128), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    # What kind of source this is: "message" / "session" / "document" / "system".
+    source_type: Mapped[str] = mapped_column(String(32), default="message")
+    # How the belief was pulled out of it: "k1_keyword" / "k1_regex" /
+    # "k2_llm" / "k3_synthesis" / "user_confirmed" / "user_corrected".
+    extraction_method: Mapped[str] = mapped_column(String(32), default="")
+    # Who the statement is attributable to: "user" / "assistant" / "system" /
+    # "derived".  Drives how much weight the evidence can carry.
+    authority: Mapped[str] = mapped_column(String(32), default="user")
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "ref", name="uq_mm_evidence_user_ref"),)
+
+
+# ---------------------------------------------------------------------------
+# Belief <-> Evidence link (typed relation, not a blob of ids)
+# ---------------------------------------------------------------------------
+
+
+class BeliefEvidenceLink(Base):
+    """A typed edge between a belief and one piece of evidence.
+
+    The relation is what makes this more than a join table: the same evidence
+    can ``support`` one belief and ``contradict`` another, which is the
+    primitive conflict resolution needs.  A belief no longer owns a list of
+    message ids -- it owns the set of edges that point at it.
+
+    relation values: ``support`` / ``contradict`` / ``verify`` / ``correct``.
+    """
+
+    __tablename__ = "mm_belief_evidence_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    belief_id: Mapped[int] = mapped_column(Integer, index=True)
+    evidence_id: Mapped[int] = mapped_column(Integer, index=True)
+    relation: Mapped[str] = mapped_column(String(16), default="support")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("belief_id", "evidence_id", "relation",
+                         name="uq_mm_belief_evidence_link"),
+    )
 
 
 # ---------------------------------------------------------------------------

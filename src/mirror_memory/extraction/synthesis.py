@@ -2,11 +2,15 @@
 
 Domain-agnostic.  The system prompt is loaded from ``config.prompts.k3_system``.
 Zero psychology-specific terminology in engine code.
+
+K3 is a **Compute** node: it reads beliefs and summaries and returns a
+structured understanding dict.  It never writes to the database -- persisting
+that understanding is the Publisher's job (see ``worker.evolution``), which
+alone may commit a snapshot and which does so only after the revision guard.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 from mirror_memory.config.schema import MemoryConfig
@@ -83,7 +87,8 @@ class Synthesizer:
         Parameters
         ----------
         session:
-            SQLAlchemy database session.
+            SQLAlchemy database session.  **Read-only** -- this method
+            performs no writes and issues no commits.
         user_id:
             The user identifier.
         config:
@@ -93,7 +98,8 @@ class Synthesizer:
         -------
         dict or None
             The structured understanding, or ``None`` if data is
-            insufficient or the LLM call fails.
+            insufficient or the LLM call fails.  Persisting the result is
+            the caller's responsibility.
         """
         # Lazy imports to avoid circular dependencies.
         from mirror_memory.core.repository import list_active_beliefs
@@ -136,10 +142,7 @@ class Synthesizer:
             logger.warning("synthesis: LLM call failed for user %s", truncate_id(user_id))
             return None
 
-        understanding = _parse_understanding(raw)
-        if understanding is not None:
-            _persist_understanding(session, user_id, understanding)
-        return understanding
+        return _parse_understanding(raw)
 
 
 def _parse_understanding(raw: str) -> dict | None:
@@ -189,40 +192,3 @@ def _get_current_understanding(session: object, user_id: str) -> str:
     except Exception:
         pass
     return ""
-
-
-def _persist_understanding(session: object, user_id: str, understanding: dict) -> None:
-    """Write the understanding into the latest snapshot's content_json.
-
-    If no snapshot exists, create a shadow one.
-    """
-    try:
-        from mirror_memory.core.models import Snapshot
-
-        snap = (
-            session.query(Snapshot)
-            .filter(Snapshot.user_id == user_id, Snapshot.status.in_(("active", "shadow")))
-            .order_by(Snapshot.version.desc())
-            .limit(1)
-            .first()
-        )
-        if snap:
-            snap.content_json = json.dumps(understanding, ensure_ascii=False)
-        else:
-            import uuid
-
-            session.add(
-                Snapshot(
-                    id=uuid.uuid4().hex[:16],
-                    user_id=user_id,
-                    version=1,
-                    status="shadow",
-                    content_json=json.dumps(understanding, ensure_ascii=False),
-                    support_policy_json="{}",
-                    evidence_watermark="{}",
-                    prompt_version="k3",
-                )
-            )
-        session.flush()
-    except Exception:
-        logger.warning("synthesis: failed to persist understanding for user %s", truncate_id(user_id))

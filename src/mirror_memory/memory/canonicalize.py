@@ -16,7 +16,6 @@ Only the rule layer is used by default.  The LLM layer is opt-in.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 def canonicalize_predicate(predicate: str, synonym_map: dict[str, str] | None = None) -> str:

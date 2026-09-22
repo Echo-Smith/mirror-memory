@@ -174,8 +174,24 @@ class MemoryEngine:
         query: str = "",
         language: str = "en",
         tail_load: int = 0,
+        trace_hook: Any | None = None,
     ) -> str | None:
         """Retrieve a rendered memory block for prompt injection.
+
+        Parameters
+        ----------
+        user_id:
+            The user identifier.
+        query:
+            The current user message, used for query-aware scoring.
+        language:
+            ``"zh"`` or ``"en"``.
+        tail_load:
+            Character count of content already in the prompt.
+        trace_hook:
+            Optional observability callable ``trace_hook(stage, **fields)``
+            receiving the retrieve/context stages.  Purely additive -- it
+            never changes what is rendered.
 
         Returns
         -------
@@ -203,6 +219,7 @@ class MemoryEngine:
                 language=language,
                 user_message=query,
                 tail_load=tail_load,
+                trace_hook=trace_hook,
             )
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
