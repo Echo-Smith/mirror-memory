@@ -88,3 +88,14 @@ PYTHONPATH="src" python -c 'from evaluate import main; main()' \
   --predictions-path /tmp/locomo_predictions.jsonl \
   --metrics f1 bleu
 ```
+
+## StateBench v1.1
+
+StateBench is Mirror's 200-case benchmark for evolving memory state. v1.1
+separates persisted state, recalled context, and final-answer scoring. It keeps
+140 public development cases and renames the visible 60-case reporting boundary
+to `public_evaluation` so it is not mistaken for a private held-out set.
+
+See [StateBench v1.1](statebench-v1.1.md) for the schema, extraction modes,
+baseline rules, manifest requirements, and run examples. v1.0 remains
+[archived](statebench.md) for historical comparisons.

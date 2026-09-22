@@ -8,26 +8,89 @@ mirror-memory is a structured memory engine for AI agents. It extracts, stores, 
 
 Every piece of user knowledge is represented as a cognitive triple: **subject → predicate → object** (e.g., `user → likes → painting`). This model provides a uniform structure for extraction, storage, and retrieval across all dimensions (topic, preference, fact, event, goal, pattern, boundary).
 
-### Identity Resolution and Cardinality
+### Identity, Relation, and Lifecycle
 
-The **IdentityResolver** determines how new observations relate to existing beliefs. Each predicate is assigned a **cardinality** type:
+Three concerns, deliberately separate:
+
+| Module | Question it answers |
+|--------|---------------------|
+| `memory/identity.py` | Which existing belief should this be compared against? |
+| `memory/relation.py` | What *is* the relationship between the two facts? |
+| `memory/lifecycle.py` | Given that relationship, what should happen? |
+
+The old `IdentityResolver` answered all three in one function, which is what
+produced the `SINGLE = UPDATE` rule. Each predicate is assigned a **cardinality**
+and a **temporal scope**:
 
 | Cardinality | Behavior | Example |
 |-------------|----------|---------|
-| SINGLE | Only one active value; new value supersedes old | `lives_in`, `age` |
+| SINGLE | Only one value is true at a time | `lives_in`, `age` |
 | MULTI | Multiple values coexist | `likes`, `has`, `skills` |
 | EVENT | Each occurrence is distinct (temporal fingerprint) | `went_to`, `attended` |
 
+| Scope | Behavior | Example |
+|-------|----------|---------|
+| `current_state` | A later observation closes the earlier interval | `lives_in`, `works_at` |
+| `persistent` | True until something explicitly ends it | `has`, `is_married` |
+| `episodic` | Each occurrence is its own fact | `went_to`, `attended` |
+
 ### State Transitions
 
-When a new CandidateAtom arrives, the IdentityResolver produces one of these transitions:
+The lifecycle decision comes from identity **plus** the temporal relation
+between the two validity intervals, not from cardinality alone:
 
-| Transition | Effect |
-|------------|--------|
+| Lifecycle | Effect |
+|-----------|--------|
 | CREATE | New belief created (active) |
 | SUPPORT | Existing belief confidence increased (weighted gain) |
-| UPDATE | Old belief superseded; new belief becomes active |
+| TEMPORAL_UPDATE | Old interval **closed** at the new fact's start; new belief becomes current |
+| COEXIST | Overlapping or different period: both stay active |
 | CONTRADICT | Existing belief confidence reduced; marked for clarification |
+
+`TEMPORAL_UPDATE` is the important difference from the old `UPDATE`. The old
+rule replaced the row, so "where did they live before?" became unanswerable.
+Now `lives_in Shanghai` gets `valid_to = 2026-05` and `lives_in Berlin` gets
+`valid_from = 2026-05`, so both questions are answerable.
+
+### Evidence
+
+Evidence is a first-class entity, not a blob of ids on the belief row:
+
+```
+Evidence
+├── id, user_id, session_id
+├── ref          (caller's own id for the source, unique per user)
+├── content
+├── source_type  (message / session / document / system)
+├── extraction_method (k1_keyword / k1_regex / k2_llm / user_confirmed)
+├── authority    (user / assistant / system / derived)
+└── observed_at
+
+BeliefEvidenceLink
+├── belief_id
+├── evidence_id
+└── relation  →  support | contradict | verify | correct
+```
+
+The relation is what makes this more than a join table: the same message can
+support one belief and contradict another, which is the primitive conflict
+resolution needs. See `tests/test_evidence_graph.py`.
+
+### The Publisher
+
+Every state change is a `StateTransitionProposal` — decided, not committed.
+The `Publisher` is the only component allowed to write, and it checks:
+
+| Gate | Refusal reason |
+|------|----------------|
+| consent | `memory_disabled` |
+| revision | `stale_revision(claimed=…, current=…)` |
+| scope | `target_belief_scope_mismatch` |
+| authority | `evidence_authority_mismatch` |
+| invariants | `resurrection_guard`, `target_belief_superseded`, `target_belief_missing` |
+
+A refusal is a no-op: the database is byte-for-byte what it was. See
+`tests/test_publisher.py` and `tests/test_runtime_invariants.py`.
 
 ## Core Abstractions
 
@@ -44,6 +107,9 @@ A structured observation awaiting identity resolution:
 | `claim_text` | The specific information stated |
 | `confidence` | Extraction confidence [0, 1] |
 | `temporal` | When it happened/occurs (for events) |
+| `observed_at` | When the engine learned the fact |
+| `valid_from` / `valid_to` | When the fact itself was true; open `valid_to` = "still true" |
+| `temporal_scope` | current_state / persistent / episodic |
 | `relation` | supports / contradicts |
 
 ### Belief (persisted state)
@@ -167,13 +233,21 @@ Multi-session evidence → auto-promote to active
 ## Worker Pipeline
 
 ```
-1. load_evidence    → Read active beliefs
-2. formulate        → LLM candidate understanding
-3. validate         → Deterministic checks (forbidden labels, third-party, contradiction)
-4. compile_policy   → Controlled policy enums
-5. synthesize       → K3 understanding
-6. persist_snapshot → Versioned snapshot (shadow/active)
+1. load_evidence    → Read active beliefs            (Compute)
+2. formulate        → LLM candidate understanding   (Compute)
+3. validate         → Deterministic checks          (Compute)
+4. compile_policy   → Controlled policy enums       (Compute)
+5. synthesize       → K3 understanding              (Compute — writes nothing)
+6. publish          → StateTransitionProposal → Publisher
+                       Publisher re-checks consent,
+                       revision and authority, then
+                       commits the snapshot
 ```
+
+Nodes 1–5 are pure Compute. Only Node 6 writes, and it writes through the
+Publisher — so a state change that lands during the compute is caught at the
+gate rather than silently overwritten. A refusal leaves the database
+byte-for-byte unchanged; see `tests/test_runtime_invariants.py`.
 
 ## Configuration
 
@@ -183,7 +257,7 @@ All domain-specific content is loaded from YAML files:
 - `anchors.yaml` — keyword anchors (41 anchors)
 - `display.yaml` — user-facing labels
 - `extraction.yaml` — keywords + regex patterns
-- `identity_policy.yaml` — predicate → cardinality mapping (24 predicates)
+- `identity_policy.yaml` — predicate → cardinality **and** temporal scope mapping (24 predicates)
 - `prompts/` — K2/K3/verification/worker prompt templates
 
 ## State Revision Atomics
@@ -210,6 +284,11 @@ User corrects belief    Worker computes snapshot
 ```
 
 Implementation: SQL `UPDATE SET state_revision = state_revision + 1 RETURNING state_revision` — guaranteed atomic, no lost updates even under concurrent transactions.
+
+Toggling the memory switch (`set_memory_enabled`) also bumps the revision, so
+a job that read evidence while memory was still enabled cannot publish after
+the switch is turned off. Writing the *default* value (enabling a user with no
+preference row) is a no-op and does not bump.
 
 ## Correct Belief Consistency
 
