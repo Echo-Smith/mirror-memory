@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260922T060438566Z-40552-9727ddae823d",
+  "runId": "20260922T060438566Z-40552-9727ddae823d",
+  "runStatus": "completed",
+  "coverage": {
+    "status": "complete",
+    "reasons": []
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "d52c47510026911d4b39dacc89b58cf6530df226",
+  "diffHash": "4e8ee585b24f5895e4765ddbe804aa55a08b6f4d14806f3b629e1de1cb586ece",
+  "rulesVersion": "unavailable",
+  "sessionHash": "2b9422f0febba9867bc09e429260354da224c74fc39bbc876340ac229c4c9a05",
+  "reportRef": ".mimosa/reports/task-review-sess_10ecd717-2720-400b-9e50-45b1b73e85ec-20260922T060438566Z-40552-9727ddae823d.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [
+    {
+      "file": "src/mirror_memory/extraction/throttle.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-09-22T06:04:38.853Z"
+}

@@ -45,15 +45,20 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 ## Features / 特性
 
 - **Structured beliefs** — dimension/key/confidence/layer with 7-factor weighted scoring
-- **Cognitive triples** — subject → predicate → object, with temporal support
+- **Cognitive triples** — subject → predicate → object, with temporal validity intervals
 - **Identity semantics** — SINGLE/MULTI/EVENT cardinality, canonicalization, contradiction handling
-- **Three-layer extraction** — K1 deterministic + K2 LLM semantic + K3 synthesis
-- **Query-aware retrieval** — predicate/object matching, not just time-based sorting
+- **Temporal lifecycle** — `valid_from`/`valid_to` intervals; a superseded value is closed, not deleted
+- **Evidence as an entity** — typed `support`/`contradict`/`verify`/`correct` links, not a blob of message ids
+- **Three-layer extraction** — K1 deterministic + K2 LLM semantic + K3 synthesis (Compute only)
+- **Query-aware retrieval** — predicate/object matching, plus current-vs-historical interval filtering
 - **Dual-channel** — structured beliefs + session summary fallback
 - **Shadow lifecycle** — single-session → shadow, multi-session → auto-promote
+- **Single-writer publish** — every state change is a proposal; only the Publisher commits
 - **Built-in LLM adapter** — one-liner startup with any OpenAI-compatible API
 - **FastAPI server** — auth, CORS, health check, Swagger UI
-- **349 tests** — 0 failures, core paths fully covered
+- **Benchmark funnel** — 5 stage metrics + failure attribution, not just a score
+- **631 tests** — 0 failures, core paths fully covered
+- **Ingestion hardening** — key-collision-safe updates; a throttle that actually throttles
 
 ## Architecture / 架构
 
@@ -67,23 +72,42 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘              │
 │       ▼              ▼              ▼                    │
 │  ┌──────────────────────────────────────────┐           │
-│  │         IdentityResolver                 │           │
-│  │  (subject, predicate, object, cardinality)│           │
+│  │  Evidence (id, ref, source_type,          │           │
+│  │  extraction_method, authority, observed_at)│          │
+│  └──────────────────┬───────────────────────┘           │
+│                     ▼                                   │
+│  ┌──────────────────────────────────────────┐           │
+│  │  IdentityResolver  (编排，不做决定)        │           │
+│  │   └─ RelationReasoner  关系是什么？        │           │
+│  │   └─ LifecyclePolicy   应该怎样？          │           │
 │  │                                          │           │
-│  │  SINGLE: lives_in Shanghai → Beijing     │           │
-│  │          = UPDATE (旧值 superseded)      │           │
+│  │  lives_in Shanghai [2020,2026-05)         │           │
+│  │  lives_in Berlin  [2026-05, ∞)            │           │
+│  │    = TEMPORAL_UPDATE (旧区间被关闭，       │           │
+│  │      而非删除 → "以前住哪" 仍可回答)       │           │
 │  │  MULTI:  likes coffee + likes painting   │           │
 │  │          = CREATE (两条共存)              │           │
 │  │  EVENT:  went_to museum Mon + Fri        │           │
 │  │          = CREATE (两条独立)              │           │
 │  │  同 pred+obj → SUPPORT (增强置信度)      │           │
-│  │  relation=contradicts → CONTRADICT       │           │
 │  └──────────────────┬───────────────────────┘           │
 │                     ▼                                   │
 │  ┌──────────────────────────────────────────┐           │
-│  │  Belief Store                            │           │
+│  │  StateTransitionProposal  (决定，未提交)  │           │
+│  └──────────────────┬───────────────────────┘           │
+│                     ▼                                   │
+│  ┌──────────────────────────────────────────┐           │
+│  │  Publisher  ← 唯一允许写库的组件           │           │
+│  │  检查: revision / consent / scope /       │           │
+│  │        authority / invariants             │           │
+│  │  拒绝 = 数据库完全不变                     │           │
+│  └──────────────────┬───────────────────────┘           │
+│                     ▼                                   │
+│  ┌──────────────────────────────────────────┐           │
+│  │  Belief Store + BeliefEvidenceLink       │           │
 │  │  (user_id, key) → subject/predicate/     │           │
 │  │  object/dimension/confidence/layer       │           │
+│  │  + observed_at/valid_from/valid_to       │           │
 │  │  + 7-factor weighted scoring             │           │
 │  └──────────────────────────────────────────┘           │
 │  ┌──────────────────────────────────────────┐           │
@@ -93,10 +117,11 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 
 ┌─────────────────────────────────────────────────────────┐
 │                   MemoryEngine.recall()                  │
-│  1. Score beliefs (topic/predicate/object/layer/activity)│
-│  2. Filter zero-relevance + diversity cap                │
-│  3. If no match → search session summaries               │
-│  4. Budget-packed output                                 │
+│  1. Detect temporal intent → current / historical / all  │
+│  2. Score beliefs (topic/predicate/object/layer/activity)│
+│  3. Filter zero-relevance + diversity cap                │
+│  4. If no match → search session summaries               │
+│  5. Budget-packed output                                 │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -124,6 +149,25 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 | Has answer | 33.2% | **50.0%** | **43.8%** |
 
 See [docs/benchmarks.md](docs/benchmarks.md) for detailed results and comparison.
+
+### Where the score is lost (LOCOMO single-hop, 841 questions)
+
+The headline number hides *where* the answer dies. `python -m mirror_memory.bench.run`
+splits the chain into measured stages and attributes every failure to the first
+stage that lost it — see [docs/benchmark-funnel.md](docs/benchmark-funnel.md):
+
+| Stage | Value | Reading |
+|-------|-------|---------|
+| Extraction recall | 0.759 | 24% of answer facts never became a claim |
+| Identity accuracy | 0.000 | K1-only run: no cognitive triples, so the resolver never fires |
+| Retrieval recall@5 | 1.000 | retrieval is not the bottleneck |
+| Context coverage | 0.024 | only 3–4 of ~34 scored beliefs survive the diversity cap |
+
+With a **working** extractor (mimo-v2.5): identity 1.000, extraction 0.775,
+**retrieval recall 1.000** — retrieval was never the bottleneck. Query-aware
+admission plus a content-overlap ranking signal took Answer F1 from 0.070 to
+**0.238** and context coverage from 0.000 to 0.250. See
+[docs/benchmark-funnel.md](docs/benchmark-funnel.md).
 
 ## Installation / 安装
 
@@ -154,7 +198,7 @@ See [docs/api-reference.md](docs/api-reference.md).
 ```bash
 pip install "mirror-memory[dev]"
 pytest tests/ -q
-# 349 passed in 3s
+# 631 passed in 54s
 ```
 
 ## License

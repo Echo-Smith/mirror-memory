@@ -1,0 +1,363 @@
+{
+  "schema_version": "mimosa-task-review/v2",
+  "run_id": "20260921T151946914Z-91311-9296292928f5",
+  "run_status": "inconclusive",
+  "errors": [
+    {
+      "stage": "scan",
+      "target": "src/mirror_memory/core/utils.py",
+      "reason": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mirror_memory/core/repository.py",
+      "reason": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mirror_memory/core/retrieval.py",
+      "reason": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mirror_memory/render/renderer.py",
+      "reason": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "tests/test_query_aware_retrieval.py",
+      "reason": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mirror_memory/extraction/pipeline.py",
+      "reason": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+    }
+  ],
+  "coverage": {
+    "schema_version": "mimosa-hook-coverage/v1",
+    "status": "partial",
+    "scope": "hook_observed_diff",
+    "baseline": {
+      "complete": true,
+      "captured_files": 79,
+      "candidate_limit": 5000,
+      "truncated": false,
+      "enumeration_error_count": 0,
+      "snapshot_error_count": 0,
+      "compensated_target_count": 6
+    },
+    "change_tracking": {
+      "touched_observed": 5,
+      "touched_retained": 5,
+      "truncated": false,
+      "bash_mutation": true,
+      "bash_discovered": 6,
+      "bash_discovery_limit": 80,
+      "bash_discovery_truncated": false
+    },
+    "candidates": {
+      "eligible_files": 6,
+      "selected_files": 6,
+      "limit": 20,
+      "truncated": false
+    },
+    "scanning": {
+      "required_files": 6,
+      "scanned_files": 0,
+      "skipped_files": 0,
+      "failed_files": 6,
+      "project_checks_required": 0,
+      "project_checks_completed": 0
+    },
+    "notification": {
+      "eligible_findings": 0,
+      "detailed_findings": 0,
+      "detail_limit": 3,
+      "truncated": false
+    },
+    "reason_counts": {
+      "scanner_failed": 6,
+      "project_check_failed": 6
+    },
+    "reasons": [
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/utils.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/repository.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/retrieval.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/render/renderer.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tests/test_query_aware_retrieval.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/extraction/pipeline.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/utils.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/repository.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/retrieval.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/render/renderer.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tests/test_query_aware_retrieval.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/extraction/pipeline.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affects_completion": true
+      }
+    ],
+    "reasons_truncated": false
+  },
+  "generated_at": "2026-09-21T15:19:46.914Z",
+  "session_id": "sess_10ecd717-2720-400b-9e50-45b1b73e85ec",
+  "target": ".",
+  "revision": "d52c47510026911d4b39dacc89b58cf6530df226",
+  "rules_version": "unavailable",
+  "diff_hash": "f5063b3caf4b5f45caaf5c2dbd50a289f686686d95338542281104a1078aa338",
+  "diff": {
+    "algorithm": "sha256",
+    "changed_file_count": 6,
+    "changed_files": [
+      {
+        "file": "src/mirror_memory/core/repository.py",
+        "ranges": [
+          {
+            "start": 30,
+            "end": 30
+          },
+          {
+            "start": 34,
+            "end": 34
+          },
+          {
+            "start": 470,
+            "end": 605
+          }
+        ],
+        "before_hash": "9bbb360a2258d88fae77605e5d630e6775c48645bb63edf8d12dbed5757b7ef4",
+        "after_hash": "9b430aff593af70a8204544fec725927879921c53e6d8a91050ebc5d124baf6f"
+      },
+      {
+        "file": "src/mirror_memory/core/retrieval.py",
+        "ranges": [
+          {
+            "start": 11,
+            "end": 11
+          },
+          {
+            "start": 17,
+            "end": 23
+          },
+          {
+            "start": 32,
+            "end": 32
+          },
+          {
+            "start": 39,
+            "end": 39
+          },
+          {
+            "start": 46,
+            "end": 61
+          },
+          {
+            "start": 71,
+            "end": 72
+          },
+          {
+            "start": 98,
+            "end": 102
+          },
+          {
+            "start": 131,
+            "end": 137
+          }
+        ],
+        "before_hash": "064334dbf282781008301c37dc6209f9e4eaaffb1930ec7915fdeb4a85a082f1",
+        "after_hash": "79b45d940c1cd0c886ca1b92b0ab2666b5f46afe0d567c8222fdf41e03ea5a12"
+      },
+      {
+        "file": "src/mirror_memory/core/utils.py",
+        "ranges": [
+          {
+            "start": 9,
+            "end": 9
+          },
+          {
+            "start": 16,
+            "end": 16
+          },
+          {
+            "start": 20,
+            "end": 33
+          },
+          {
+            "start": 146,
+            "end": 180
+          }
+        ],
+        "before_hash": "79fa92add1d4c1e4d41a6de4d2b6b59105bab7decb7b560b7bb76d6156858677",
+        "after_hash": "a9bca6a217d3e86313f77ba42f8c2a272f92f88cb83eaa214f88b5f708714209"
+      },
+      {
+        "file": "src/mirror_memory/extraction/pipeline.py",
+        "ranges": [
+          {
+            "start": 347,
+            "end": 347
+          },
+          {
+            "start": 421,
+            "end": 426
+          }
+        ],
+        "before_hash": "45648445fda08b32517b9ff162fbed45363403f5d91753c4eddb8f0544976d22",
+        "after_hash": "a111e6650ce48e4c47b433b6b5e3130aaf7f7b2d3811e7936bd481940a9c1e91"
+      },
+      {
+        "file": "src/mirror_memory/render/renderer.py",
+        "ranges": [
+          {
+            "start": 23,
+            "end": 23
+          },
+          {
+            "start": 227,
+            "end": 227
+          },
+          {
+            "start": 274,
+            "end": 284
+          },
+          {
+            "start": 310,
+            "end": 310
+          }
+        ],
+        "before_hash": "940d8d608cbbd7a819c1d2386f6e857c8f5c858141e52e52667add774e9c5a0f",
+        "after_hash": "ac343c314d7e79d7f4a725caaffcb1f4c03a3191d4b18c278c6a709ebc27f108"
+      },
+      {
+        "file": "tests/test_query_aware_retrieval.py",
+        "ranges": [
+          {
+            "start": 1,
+            "end": 329
+          }
+        ],
+        "before_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "after_hash": "aba9687d73d8d6c4a449275a0d07d4c04676cca7b789da893bb79ef2330e95c7"
+      }
+    ]
+  },
+  "timing": {
+    "started_at": "2026-09-21T15:19:44.669Z",
+    "completed_at": "2026-09-21T15:19:46.914Z",
+    "duration_ms": 2245,
+    "measurement": "hook_wall_clock"
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "model_calls": 0,
+    "measurement": "known-zero"
+  },
+  "telemetry": {
+    "schemaVersion": "mimosa-gate-telemetry/v1",
+    "profile": "gate",
+    "operation": "Stop",
+    "outcome": "partial/INCONCLUSIVE",
+    "latencyMs": 2245,
+    "peakMemoryBytes": 115113984,
+    "memoryMeasurement": "max-observed-process-rss",
+    "scannedFiles": 0,
+    "cache": {
+      "hits": 0,
+      "misses": 0,
+      "measurement": "not-applicable"
+    },
+    "denyCount": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "total": 0,
+      "modelCalls": 0,
+      "measurement": "known-zero"
+    }
+  },
+  "finding_count": 0,
+  "rewake_finding_count": 0,
+  "evidence_boundary": {
+    "scan": "candidate",
+    "static_fix_verification": "observed_static_only",
+    "runtime_verification": "not_performed"
+  },
+  "finding_events": [],
+  "findings": [],
+  "artifacts": {
+    "immutable_report": ".mimosa/reports/task-review-sess_10ecd717-2720-400b-9e50-45b1b73e85ec-20260921T151946914Z-91311-9296292928f5.json",
+    "latest_report": ".mimosa/reports/task-review-sess_10ecd717-2720-400b-9e50-45b1b73e85ec.json",
+    "history_summary": ".mimosa/history/run-20260921T151946914Z-91311-9296292928f5.json"
+  }
+}

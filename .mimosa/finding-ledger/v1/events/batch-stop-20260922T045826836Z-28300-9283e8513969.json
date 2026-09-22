@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260922T045826836Z-28300-9283e8513969",
+  "runId": "20260922T045826836Z-28300-9283e8513969",
+  "runStatus": "completed",
+  "coverage": {
+    "status": "complete",
+    "reasons": []
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "d52c47510026911d4b39dacc89b58cf6530df226",
+  "diffHash": "4e5d3649628e44c9005baa8fb604b2b0efdbec2e1f03217fb51ae89233b706b5",
+  "rulesVersion": "unavailable",
+  "sessionHash": "2b9422f0febba9867bc09e429260354da224c74fc39bbc876340ac229c4c9a05",
+  "reportRef": ".mimosa/reports/task-review-sess_10ecd717-2720-400b-9e50-45b1b73e85ec-20260922T045826836Z-28300-9283e8513969.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [
+    {
+      "file": "tests/test_extraction.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "tests/test_longmemeval_regressions.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/mirror_memory/extraction/throttle.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-09-22T04:58:27.052Z"
+}
