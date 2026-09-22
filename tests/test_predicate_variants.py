@@ -37,7 +37,6 @@ class TestPredicateVariantSynonyms:
         # Globex", "Acme offered me my old role back".
         ("started_at", "works_at"),
         ("joined", "works_at"),
-        ("returned_to", "works_at"),
         ("employed_at", "works_at"),
         ("employed_by", "works_at"),
         ("hired_by", "works_at"),
@@ -76,6 +75,14 @@ class TestPredicateVariantSynonyms:
         works at their previous job -- worse than not closing the interval.
         """
         assert "left" not in config.predicate_synonyms
+
+    def test_returned_to_is_not_domain_pinned(self, config):
+        """"returned to" crosses domains: "returned to Shanghai" is residence,
+        "returned to Acme" is employment.  Folding it into either slot
+        corrupts the other -- measured as the round-trip regression -- so the
+        resolver's same-attribute fallback handles it instead of a synonym.
+        """
+        assert "returned_to" not in config.predicate_synonyms
 
 
 # ---------------------------------------------------------------------------

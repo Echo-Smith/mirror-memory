@@ -203,15 +203,39 @@ class TestBeliefsWithPredicates:
         set_memory_enabled(session, "u1", False)
         assert beliefs_with_predicates(session, "u1", {"likes"}) == []
 
-    def test_superseded_beliefs_excluded(self, session):
-        """Identity resolution acts on current values, not closed history."""
+    def test_superseded_beliefs_included_for_revival(self, session):
+        """Superseded rows stay visible to the resolver.
+
+        A return to a previous value ("moved back to Shanghai") is a revival
+        of exactly such a row; hiding the history here would turn every
+        round-trip into a duplicate active belief with no interval closed.
+        Rejected rows remain excluded -- that guard is a user decision.
+        """
         from mirror_memory.core.repository import update_belief_by_id
 
         old = _belief(session, "lives_in:shanghai", "shanghai", pred="lives_in",
                       text="lives in Shanghai")
         update_belief_by_id(session, old.id, new_object="beijing",
                             new_claim_text="lives in Berlin", new_confidence=0.8)
-        assert old.id not in {b.id for b in beliefs_with_predicates(session, "u1", {"lives_in"})}
+        assert old.id in {
+            b.id for b in beliefs_with_predicates(session, "u1", {"lives_in"})
+        }
+        assert old.status == "superseded"
+
+    def test_same_object_sibling_beliefs_visible(self, session):
+        """The values a return passes over must be visible, so the revival
+        can close them."""
+        from mirror_memory.core.repository import update_belief_by_id
+
+        old = _belief(session, "lives_in:shanghai", "shanghai", pred="lives_in",
+                      text="lives in Shanghai")
+        update_belief_by_id(session, old.id, new_object="beijing",
+                            new_claim_text="lives in Berlin", new_confidence=0.8)
+        visible = beliefs_with_predicates(
+            session, "u1", {"returned_to"}, candidate_objects={"shanghai"},
+        )
+        ids = {b.id for b in visible}
+        assert old.id in ids, "the revival target must be reachable"
 
 
 # ---------------------------------------------------------------------------

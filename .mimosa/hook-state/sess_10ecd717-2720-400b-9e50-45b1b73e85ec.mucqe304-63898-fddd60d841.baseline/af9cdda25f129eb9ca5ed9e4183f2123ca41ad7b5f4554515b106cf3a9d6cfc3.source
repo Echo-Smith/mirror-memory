@@ -268,10 +268,38 @@ class TestThrottleActuallyThrottles:
             "I want to learn Japanese", 1, config, session=session, user_id="u1"
         ) is True
 
-    def test_no_keyword_hit_never_calls(self, session, config):
+    def test_no_keyword_hit_nonsense_still_skipped_after_cold_start(self, session, config):
+        """Zero-signal nonsense skips once the profile is no longer cold.
+
+        The cold-start escape deliberately tries a few early zero-keyword
+        turns -- "My home is in Toronto" has no keyword hits while "I live in
+        Toronto" has one, so a strict gate permanently misses a user's first
+        facts.  Nonsense like "xyzzy plugh" carries no content either way, so
+        past the escape window it must not trigger.
+        """
         config.extraction.llm_min_keyword_hits = 2
         assert should_extract(
-            "xyzzy plugh", 1, config, session=session, user_id="u1"
+            "xyzzy plugh", 20, config, session=session, user_id="u1"
+        ) is False
+
+    def test_cold_start_attempts_zero_signal_turns(self, session, config):
+        """A thin profile gets K2 attempts on early zero-keyword turns."""
+        config.extraction.llm_min_keyword_hits = 2
+        assert should_extract(
+            "My home is in Toronto", 0, config, session=session, user_id="u1"
+        ) is True
+
+    def test_cold_start_stops_once_profile_is_full(self, session, config):
+        """Past the belief floor the escape stops firing."""
+        config.extraction.llm_min_keyword_hits = 2
+        for i in range(6):
+            record_claim(
+                session, "u1", dimension="topic", key=f"topic:n{i}",
+                claim_text=f"user mentioned filler {i}", confidence=0.9,
+                session_id=f"s{i}",
+            )
+        assert should_extract(
+            "My home is in Toronto", 1, config, session=session, user_id="u1"
         ) is False
 
     def test_benchmark_escape_hatch_is_untouched(self, session, config):

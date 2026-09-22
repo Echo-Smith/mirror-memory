@@ -27,6 +27,7 @@ from mirror_memory.memory.atom import (
     ACTION_CONTRADICT,
     ACTION_CREATE,
     ACTION_NOOP,
+    ACTION_UPDATE,
     CandidateAtom,
     Resolution,
 )
@@ -76,16 +77,58 @@ def resolve_identity(
 
     lifecycle_policy = LifecyclePolicy(cardinality=policy, scopes=temporal_policy)
 
+    cand_obj = (candidate.object or "").strip().lower()
     same_predicate = [
         b for b in existing_beliefs
         if b.get("predicate") == candidate.predicate
         and b.get("status") == "active"
     ]
+    # Same value through a different verb: "I returned to Shanghai" against a
+    # lives_in belief.  A verb is not identity -- the attribute (the value)
+    # is.  Superseded rows are included because returning to a previous value
+    # is exactly a revival of one of them; the lifecycle decides below.
+    same_attribute_any = [
+        b for b in existing_beliefs
+        if b.get("status") in ("active", "superseded")
+        and (b.get("object") or "").strip().lower() == cand_obj
+        and (b.get("predicate") or "").strip().lower() != candidate.predicate.strip().lower()
+    ]
 
     # ── No existing belief with this predicate → CREATE ──────────────────
-    # (even contradictions create — there's nothing to contradict yet)
-    if not same_predicate:
+    # (even contradictions create — there's nothing to contradict yet),
+    # unless a different-verb belief about the same value exists, in which
+    # case the round-trip revival path below handles it.
+    if not same_predicate and not same_attribute_any:
         return Resolution(action=ACTION_CREATE, reason="first claim for this predicate")
+
+    # ── Round-trip revival ────────────────────────────────────────────────
+    # "I live in Shanghai" → "moved to Berlin" → "returned to Shanghai".
+    # The returned value's newest row is revived; every *other* active belief
+    # of the revived row's attribute (berlin, above) gets closed -- they are
+    # the values the user left and has now returned past.  Keyed on the
+    # candidate's own predicate so the revived row keeps the vocabulary of
+    # the turn that re-stated it.
+    if not same_predicate and same_attribute_any:
+        revived = max(same_attribute_any, key=lambda x: x.get("id") or 0)
+        revived_attr_pred = (revived.get("predicate") or "").strip().lower()
+        closed = [
+            b["id"]
+            for b in existing_beliefs
+            if b.get("status") == "active"
+            and b.get("id") != revived.get("id")
+            and (b.get("predicate") or "").strip().lower() == revived_attr_pred
+        ]
+        return Resolution(
+            action=ACTION_UPDATE,
+            target_belief_id=revived.get("id"),
+            reason=(
+                f"round-trip revival: same value ({cand_obj}) via "
+                f"{candidate.predicate!r}; closing {closed}"
+            ),
+            lifecycle="TEMPORAL_UPDATE",
+            temporal_relation="follows",
+            detail={"close_belief_ids": closed},
+        )
 
     candidate_window = _candidate_window(candidate)
     target = _pick_target(same_predicate, candidate_window, candidate)

@@ -137,7 +137,6 @@ synonym_map:
   # validity interval, and a current-state question returns it as current.
   started_at: works_at
   joined: works_at
-  returned_to: works_at
   employed_at: works_at
   employed_by: works_at
   hired_by: works_at
@@ -145,9 +144,15 @@ synonym_map:
   began_at: works_at
 
   # Residence: the extractor also emits `lived_in` for the same attribute.
+  # `returned_to` is deliberately NOT mapped here: it means "went back to" in
+  # whatever domain the object belongs to -- "returned to Shanghai" is a
+  # residence statement, "Acme took me back, I returned to Acme" is
+  # employment -- and folding it into one slot corrupts the other.  The
+  # resolver's object-based fallback handles it instead.
   lived_in: lives_in
   relocated_to: lives_in
   settled_in: lives_in
+  moved_back_to: lives_in
 
   # Profession.
   retrained: profession

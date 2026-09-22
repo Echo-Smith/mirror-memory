@@ -27,7 +27,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, false, func, or_, select
 from sqlalchemy.orm import Session
 
 from mirror_memory.core.confidence import compute_confidence_weight
@@ -580,6 +580,7 @@ def beliefs_with_predicates(
     user_id: str,
     predicates: set[str] | tuple[str, ...],
     *,
+    candidate_objects: set[str] | tuple[str, ...] = (),
     limit: int = 500,
 ) -> list[Belief]:
     """Active beliefs whose predicate is in *predicates*.
@@ -598,8 +599,29 @@ def beliefs_with_predicates(
         select(Belief)
         .where(
             Belief.user_id == user_id,
-            Belief.status == "active",
-            Belief.predicate.in_(wanted),
+            # Superseded rows are included on purpose: a return to a previous
+            # value ("I moved back to Shanghai") is a revival of exactly such
+            # a row, and the resolver cannot offer the revival path if the
+            # history is filtered out here.
+            Belief.status.in_(("active", "superseded")),
+            or_(
+                Belief.predicate.in_(wanted),
+                # Same value under a different verb ("returned to Shanghai"
+                # against a lives_in row) is the same attribute ...
+                Belief.object.in_(candidate_objects),
+                # ... and the values the candidate is returning *past* must
+                # also be visible, because the revival has to close them.
+                (
+                    Belief.predicate.in_(
+                        select(Belief.predicate).where(
+                            Belief.user_id == user_id,
+                            Belief.object.in_(candidate_objects),
+                        )
+                    )
+                    if candidate_objects
+                    else false()
+                ),
+            ),
         )
         .order_by(desc(Belief.last_evidence_at))
         .limit(limit)
@@ -1097,7 +1119,13 @@ def update_belief_by_id(
     and superseded_by points to new belief's ID.
     """
     old = session.get(Belief, old_belief_id)
-    if old is None or old.status != "active":
+    if old is None:
+        return None, None
+    # A round-trip revival targets a *superseded* row -- that is what makes it
+    # a revival.  Rejected rows stay untouchable (the resurrection guard is a
+    # user decision), but superseded history may be reopened when the user
+    # states the value again.
+    if old.status == "rejected":
         return None, None
 
     evidence = [int(mid) for mid in (evidence_message_ids or [])]

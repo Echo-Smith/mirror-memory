@@ -418,3 +418,43 @@ rather than being fitted to the visible cases.
 This is the third time a read-the-code hypothesis was wrong and measurement
 corrected it. The pattern is consistent: this engine's bottlenecks cannot be
 inferred, they have to be located.
+
+---
+
+# P0-1 completed: cold-start escape -- StateBench crosses the baseline
+
+The value-gate novelty fix took the score to 0.425 but two classes stayed
+low. Tracing `sb-replacement-002` ("My home is in Toronto" → "I relocated to
+Lisbon this spring") found the engine stored **zero beliefs** for the whole
+case: the first turn has **no keyword hits** ("home", not "live"), so the
+base rule skips it, and with no beliefs yet the value gate has nothing to
+score. A user's first facts could be permanently missed because of how they
+were phrased.
+
+The cold-start escape gives K2 an attempt on early zero-keyword turns while
+the profile is thin (< 5 active beliefs, first 6 turns), then stops firing.
+
+| | before | after |
+|---|---|---|
+| StateBench overall | 0.425 | **0.605** |
+| vs full-context (0.450) | −0.025 | **+0.155** |
+| multi_value | 0.400 | **0.967** |
+| temporal_event | 0.333 | **0.833** |
+| contradiction | 0.467 | **0.900** |
+| stale_state | 0.400 | 0.450 |
+| replacement | 0.333 | 0.433 |
+| round_trip | 0.567 | 0.333 ⚠ |
+| preference_evolution | 0.467 | 0.267 ⚠ |
+
+**First run above the full-context baseline.** The state-side categories the
+architecture exists for are now carried by the engine, and the recall-side
+categories closed most of the gap to raw context.
+
+Two regressions to investigate next (round_trip 0.567→0.333,
+preference_evolution 0.467→0.267): more extraction means more beliefs, which
+changes identity resolution and the render competition. The multi-hop value
+gains are worth more than the losses, but both need a cause, not a shrug.
+
+State-side remaining: replacement 0.433 and round_trip 0.333 are now the
+weakest, which is where the plan's P0-4 (interval closing on observation
+order) applies.

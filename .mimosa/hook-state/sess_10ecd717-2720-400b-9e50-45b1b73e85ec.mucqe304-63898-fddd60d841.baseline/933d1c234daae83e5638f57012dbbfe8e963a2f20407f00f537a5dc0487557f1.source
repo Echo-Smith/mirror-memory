@@ -260,6 +260,22 @@ class ExtractionPipeline:
                     belief_id, ref, exc_info=True,
                 )
 
+    @staticmethod
+    def _round_trip_close_time(candidate) -> object:
+        """The instant a round-trip's middle value stops being true.
+
+        The candidate's own start when it has one; otherwise now, because the
+        re-stating turn is itself the observation that ended it.
+        """
+        from datetime import UTC, datetime
+
+        from mirror_memory.core.utils import coerce_datetime
+
+        vf = coerce_datetime(candidate.valid_from)
+        if vf is not None:
+            return vf
+        return datetime.now(UTC)
+
     def _is_suppressed(self, context: str) -> bool:
         """Check if extraction is suppressed in the given context."""
         for rule in self._config.extraction.suppression_rules:
@@ -423,7 +439,10 @@ class ExtractionPipeline:
                     # "the 200 most recent" silently hid older predicates past
                     # that bound, and the resolver then turned what should have
                     # been a SUPPORT or UPDATE into a CREATE.
-                    existing = beliefs_with_predicates(session, user_id, {canon_pred})
+                    existing = beliefs_with_predicates(
+                        session, user_id, {canon_pred},
+                        candidate_objects={canon_obj} if canon_obj else set(),
+                    )
                     existing_dicts = [
                         {
                             "id": b.id,
@@ -507,6 +526,27 @@ class ExtractionPipeline:
                         )
                         if new:
                             logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)
+                        # Round-trip revival: the resolver may name other
+                        # same-attribute beliefs to close (the values the user
+                        # left and has now returned past).  Without this the
+                        # middle value of A -> B -> A stays active with an open
+                        # interval and current-state questions return it.
+                        from mirror_memory.core.models import Belief as _Belief
+
+                        cls_close = None
+                        for close_id in resolution.detail.get("close_belief_ids") or []:
+                            if close_id in (None, resolution.target_belief_id):
+                                continue
+                            middle = session.get(_Belief, close_id)
+                            if middle is not None and middle.status == "active":
+                                if middle.valid_to is None:
+                                    middle.valid_to = cls_close or self._round_trip_close_time(candidate)
+                                middle.status = "superseded"
+                                middle.superseded_by = new.id if new else None
+                                logger.info(
+                                    "pipeline: round-trip closed %s (%s)",
+                                    middle.id, middle.object,
+                                )
                         _record_store(
                             action="UPDATE",
                             belief_id=new.id if new else None,

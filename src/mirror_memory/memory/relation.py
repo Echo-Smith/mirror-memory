@@ -46,6 +46,9 @@ class RelationJudgement:
     same_object: bool
     temporal_relation: TemporalRelation
     claims_contradiction: bool
+    # Same object reached through a different verb.  Treated as the same
+    # attribute for lifecycle purposes.
+    same_attribute: bool = False
     # Do both sides carry the same temporal *qualifier* ("monday" vs
     # "friday")?  Only meaningful for episodic predicates, where two
     # occurrences of the same event are distinct facts.
@@ -54,8 +57,12 @@ class RelationJudgement:
 
     @property
     def same_identity(self) -> bool:
-        """Is this the same subject talking about the same predicate?"""
-        return self.same_subject and self.same_predicate
+        """Is this the same subject talking about the same attribute?
+
+        The attribute is (predicate, object); a verb variant ("returned to"
+        against lives_in) is the same attribute when the object matches.
+        """
+        return self.same_subject and (self.same_predicate or self.same_attribute)
 
 
 def judge_relation(
@@ -93,13 +100,25 @@ def judge_relation(
     same_object = (belief.get("object") or "").strip().lower() == (
         candidate.object or ""
     ).strip().lower()
+    # Same value stated through a different verb -- "I returned to Shanghai"
+    # against a belief whose predicate is lives_in.  A verb is not identity:
+    # the pair (subject, object) is.  The temporal scope still comes from the
+    # *policy of the existing belief's predicate*, applied by the caller, so
+    # a returned_to claim about a single-valued attribute supersedes rather
+    # than duplicating.
+    same_attribute = (
+        not same_predicate
+        and same_object
+        and bool((belief.get("predicate") or "").strip())
+        and bool((candidate.predicate or "").strip())
+    )
 
     # Identity is about the subject and the predicate; the object is what the
     # predicate is applied to, not part of "is this the same thing".
     same_subject = True
 
     temporal_relation = TemporalRelation.UNKNOWN
-    if same_subject and same_predicate:
+    if same_subject and (same_predicate or same_attribute):
         temporal_relation = compare_windows(candidate_window, belief_window)
 
     # A qualifier only counts as "the same" when both sides state one and they

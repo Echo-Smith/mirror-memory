@@ -92,6 +92,10 @@ class Resolution:
     reason: str = ""  # Human-readable explanation
     lifecycle: str = ""  # LifecycleAction value; defaults to `action`
     temporal_relation: str = ""  # TemporalRelation value, when decided
+    # Extra wiring for the writer.  The round-trip revival path uses it to
+    # name the same-attribute beliefs whose intervals must close; most
+    # resolutions leave it empty.
+    detail: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.lifecycle:
