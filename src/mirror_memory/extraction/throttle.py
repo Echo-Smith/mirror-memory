@@ -63,6 +63,11 @@ _STATE_CHANGE_MARKERS = frozenset({
     "september", "october", "november", "december", "last", "next", "ago",
 })
 
+# Cold-start escape: with fewer than this many active beliefs, and only in
+# the first few turns, K2 gets an attempt even with zero keyword signal.
+_COLD_START_BELIEF_FLOOR = 5
+_COLD_START_TURN_CEILING = 6
+
 
 def _count_keyword_hits(text: str, config: MemoryConfig) -> int:
     """Count how many distinct keyword categories are hit in *text*."""
@@ -231,6 +236,27 @@ def should_extract(
         return True
 
     base = keyword_hits >= min_hits or (keyword_hits >= 1 and turn_count % every_n == 0)
+
+    # Cold-start escape: a thin profile has almost nothing to lose and
+    # everything to gain from one K2 attempt.  Keyword matching is the gate's
+    # only signal, and it misses ordinary phrasings -- "My home is in Toronto"
+    # has zero keyword hits while "I live in Toronto" has one -- so a user's
+    # *first* facts can be permanently missed before any belief exists to
+    # give the value gate something to score.  A short early turn is cheap to
+    # try; the early profile fills and the escape stops firing.
+    if session is not None and user_id and keyword_hits < 1:
+        try:
+            from mirror_memory.core.repository import list_active_beliefs
+
+            n_active = len(list_active_beliefs(session, user_id))
+        except Exception:
+            n_active = 0
+        if n_active < _COLD_START_BELIEF_FLOOR and turn_count < _COLD_START_TURN_CEILING:
+            logger.info(
+                "throttle: cold-start attempt (beliefs=%d turn=%d hits=0) -> extract",
+                n_active, turn_count,
+            )
+            return True
 
     # Value gates need belief state; without it, fall back to base rules.
     # Zero-signal turns can neither trigger nor be suppressed by the gates.
