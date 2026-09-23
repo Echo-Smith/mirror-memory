@@ -1207,6 +1207,8 @@ def update_belief_by_id(
     valid_from: datetime | None = None,
     valid_to: datetime | None = None,
     temporal_scope: str = "",
+    polarity: str = "",
+    lifecycle_state: str = "",
 ) -> tuple[Belief | None, Belief | None]:
     """SINGLE cardinality update: supersede old belief, create new one.
 
@@ -1267,6 +1269,10 @@ def update_belief_by_id(
         existing_row.observed_at = observed_at or utcnow()
         if temporal_scope:
             existing_row.temporal_scope = temporal_scope
+        if polarity:
+            existing_row.polarity = polarity
+        if lifecycle_state:
+            existing_row.lifecycle_state = lifecycle_state
         if new_claim_text:
             existing_row.claim_text = new_claim_text
         if new_value:
@@ -1314,6 +1320,8 @@ def update_belief_by_id(
         valid_from=new_from,
         valid_to=_as_utc(valid_to),
         temporal_scope=temporal_scope or old.temporal_scope,
+        polarity=polarity or old.polarity,
+        lifecycle_state=lifecycle_state or old.lifecycle_state,
     )
     session.add(new_belief)
     session.flush()

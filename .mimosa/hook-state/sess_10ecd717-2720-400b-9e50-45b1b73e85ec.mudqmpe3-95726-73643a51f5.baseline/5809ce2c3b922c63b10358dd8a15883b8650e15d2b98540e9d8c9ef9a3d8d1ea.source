@@ -840,6 +840,8 @@ def record_claim(
     object: str = "",
     cardinality: str = "multi",
     superseded_by: int | None = None,
+    polarity: str = "",
+    lifecycle_state: str = "",
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -866,6 +868,13 @@ def record_claim(
         ``"single"`` / ``"multi"`` / ``"event"`` — controls identity resolution.
     superseded_by:
         If this claim supersedes an existing belief, set to the old belief's ID.
+    polarity:
+        ``positive`` / ``negative`` / ``neutral``.  Inferred by the caller from
+        the canonical predicate when empty.  A claim and its withdrawal about
+        the same object are opposite polarities and only one may be current.
+    lifecycle_state:
+        For goal predicates: ``active`` / ``paused`` / ``cancelled`` /
+        ``resumed``.  Empty for non-goal claims.
     """
     if not is_memory_enabled(session, user_id):
         return None, "profile_memory_disabled"
@@ -932,6 +941,8 @@ def record_claim(
             object=object,
             cardinality=cardinality,
             superseded_by=superseded_by,
+            polarity=polarity or "neutral",
+            lifecycle_state=lifecycle_state,
             # Provenance.
             origin_stats_id=stats_id,
             origin_slice_id=origin_slice_id,
@@ -1786,37 +1797,63 @@ def correct_belief(
         "value_json": old.value_json,
     }
 
-    # In-place correction: update claim_text and mark as user_corrected.
-    # The UNIQUE constraint on (user_id, key) prevents creating a second
-    # row with the same key, so we update the existing one and log the
-    # correction as a BeliefEvent for provenance.
-    old.claim_text = new_claim_text
-    old.source = "user_corrected"
-    old.confidence = min(CONFIDENCE_CEILING, max(old.confidence, 0.5))
-    old.last_evidence_at = datetime.now(UTC)
+    # Close-and-replace: the user's correction ends the old state and starts
+    # a new one.  Mutating in place -- the previous behaviour -- left the old
+    # value unqueryable, so "what did they say before the correction?" could
+    # only be answered from the event log rather than from the belief store.
+    # The replacement takes a derived key because the UNIQUE constraint on
+    # (user_id, key) does not care about status: the superseded row keeps its
+    # own key for historical lookup.
+    corrected_object = new_object if new_object is not None else getattr(old, "object", "")
+    new_key = _disambiguate_key(
+        session, old.user_id,
+        _derive_updated_key(old, corrected_object),
+    )
+    corrected = Belief(
+        user_id=old.user_id,
+        dimension=old.dimension,
+        key=new_key,
+        claim_text=new_claim_text,
+        value_json=json.dumps(new_value, ensure_ascii=False) if new_value is not None else old.value_json,
+        layer=old.layer,
+        status="active",
+        confidence=min(CONFIDENCE_CEILING, max(old.confidence, 0.5)),
+        source="user_corrected",
+        evidence_json=old.evidence_json,
+        subject=old.subject,
+        predicate=new_predicate if new_predicate is not None else old.predicate,
+        object=corrected_object,
+        cardinality=old.cardinality,
+        polarity=old.polarity,
+        lifecycle_state=old.lifecycle_state,
+        temporal_scope=old.temporal_scope,
+        origin_session_id=old.origin_session_id,
+        last_evidence_session_id=old.last_evidence_session_id,
+        valid_from=datetime.now(UTC),
+    )
+    session.add(corrected)
+    session.flush()
 
-    # Update cognitive triple fields if provided.
-    if new_predicate is not None:
-        old.predicate = new_predicate
-    if new_object is not None:
-        old.object = new_object
-    if new_value is not None:
-        old.value_json = json.dumps(new_value, ensure_ascii=False)
-
+    old.status = "superseded"
+    old.superseded_by = corrected.id
+    if old.valid_to is None:
+        old.valid_to = datetime.now(UTC)
     session.flush()
 
     after = {
-        "claim_text": old.claim_text,
-        "predicate": getattr(old, "predicate", ""),
-        "object": getattr(old, "object", ""),
-        "value_json": old.value_json,
+        "claim_text": corrected.claim_text,
+        "predicate": corrected.predicate,
+        "object": corrected.object,
+        "value_json": corrected.value_json,
     }
     detail: dict = {"before": before, "after": after, "correction": new_claim_text[:200]}
     if correction_note:
         detail["note"] = correction_note
     _append_event(session, old, "corrected", evidence=[], detail=detail)
+    _append_event(session, corrected, "created", evidence=[],
+                  detail={"supersedes": old.id, "via": "user_correction"})
     touch_memory_state(session, user_id)
-    return old
+    return corrected
 
 
 def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | None:

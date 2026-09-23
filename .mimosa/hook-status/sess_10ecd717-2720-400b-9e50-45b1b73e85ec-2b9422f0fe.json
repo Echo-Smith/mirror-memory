@@ -1,9 +1,9 @@
 {
   "schemaVersion": "mimosa-hook-status/v1",
-  "recordedAt": "2026-09-23T03:41:51.632Z",
+  "recordedAt": "2026-09-23T07:12:57.214Z",
   "sessionId": "sess_10ecd717-2720-400b-9e50-45b1b73e85ec",
   "event": "PostToolUse",
-  "toolName": "Write",
+  "toolName": "Edit",
   "file": "tests/test_polarity_lifecycle.py",
   "outcome": "clear",
   "coverage": "complete",

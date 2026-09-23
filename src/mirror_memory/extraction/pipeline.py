@@ -537,6 +537,8 @@ class ExtractionPipeline:
                             valid_from=candidate.valid_from,
                             valid_to=candidate.valid_to,
                             temporal_scope=temporal_policy.get(canon_pred, ""),
+                            polarity=claim_polarity,
+                            lifecycle_state=claim_lifecycle,
                         )
                         if new:
                             logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)

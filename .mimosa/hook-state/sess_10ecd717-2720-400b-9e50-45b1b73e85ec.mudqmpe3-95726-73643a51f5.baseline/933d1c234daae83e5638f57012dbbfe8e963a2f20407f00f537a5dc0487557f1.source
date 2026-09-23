@@ -364,6 +364,10 @@ class ExtractionPipeline:
         from mirror_memory.memory.atom import ACTION_CONTRADICT, ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
         from mirror_memory.memory.canonicalize import canonicalize_atom
         from mirror_memory.memory.identity import resolve_identity
+        from mirror_memory.memory.polarity import (
+            infer_lifecycle,
+            infer_polarity,
+        )
 
         stored: list[dict] = []
 
@@ -396,6 +400,12 @@ class ExtractionPipeline:
                 obj = value.get("object", "")
                 canon_pred = pred
                 canon_obj = obj
+                # Structured polarity and goal lifecycle, inferred from the
+                # canonicalised triple rather than matched against a word list
+                # at read time.  Declared before the triple branch so the
+                # CREATE/CONTRADICT path below can always see them.
+                claim_polarity = ""
+                claim_lifecycle = ""
 
                 # Claims with no cognitive triple (e.g. K1 keyword hits) bypass
                 # identity resolution entirely.  Recording the skip is what makes
@@ -415,6 +425,10 @@ class ExtractionPipeline:
                     # Canonicalize
                     _, canon_pred, canon_obj = canonicalize_atom(
                         claim.get("subject", "user"), pred, obj, synonyms
+                    )
+                    claim_polarity = infer_polarity(canon_pred)
+                    claim_lifecycle = infer_lifecycle(
+                        canon_pred, claim.get("claim_text", "")
                     )
 
                     # Build candidate
@@ -603,6 +617,8 @@ class ExtractionPipeline:
                     predicate=canon_pred,
                     object=canon_obj,
                     cardinality=policy.get(canon_pred, "multi"),
+                    polarity=claim_polarity,
+                    lifecycle_state=claim_lifecycle,
                 )
                 _record_store(
                     action=event_type.upper(),
