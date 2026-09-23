@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "mimosa-finding-history/v1",
+  "runId": "20260922T174749757Z-18486-eefcebea7941",
+  "runStatus": "inconclusive",
+  "errors": [
+    "scan:src/mirror_memory/memory/canonicalize.py: scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+    "scan:src/mirror_memory/memory/identity.py: scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+    "scan:src/mirror_memory/core/repository.py: scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT"
+  ],
+  "target": ".",
+  "revision": "46fabde584e0abcda00ea9a5d0b0e9e021a8f163",
+  "diffHash": "395d1fd6192c75c27e71907cca2ebad083ce55ca48ff004df4d66174aa4cc639",
+  "rulesVersion": "unavailable",
+  "recordedAt": "2026-09-22T17:47:49.757Z",
+  "timing": {
+    "startedAt": "2026-09-22T17:47:47.520Z",
+    "completedAt": "2026-09-22T17:47:49.757Z",
+    "durationMs": 2237
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "modelCalls": 0,
+    "measurement": "known-zero"
+  },
+  "findings": {
+    "total": 0,
+    "bySeverity": {},
+    "byStatus": {}
+  },
+  "coverage": {
+    "status": "partial",
+    "reasonCounts": {
+      "scanner_failed": 3,
+      "project_check_failed": 3
+    }
+  },
+  "evidenceBoundary": "static_only",
+  "immutableReport": ".mimosa/reports/task-review-sess_10ecd717-2720-400b-9e50-45b1b73e85ec-20260922T174749757Z-18486-eefcebea7941.json"
+}
