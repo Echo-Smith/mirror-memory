@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260923T072238915Z-4033-52169f176f4b",
+  "runId": "20260923T072238915Z-4033-52169f176f4b",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tests/test_polarity_lifecycle.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/memory/identity.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/extraction/pipeline.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/repository.py",
+        "detail": "spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tests/test_polarity_lifecycle.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/memory/identity.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/extraction/pipeline.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mirror_memory/core/repository.py",
+        "detail": "scanner_failed: spawnSync /usr/local/bin/node ETIMEDOUT",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "b84afc88da8e48f28f8f9c0070ddfe90e338bf6d",
+  "diffHash": "f824e942ab241b1d88d15cdb8fc2fb8ea1e8e5548006963a1c1d967a9b6b3e40",
+  "rulesVersion": "unavailable",
+  "sessionHash": "2b9422f0febba9867bc09e429260354da224c74fc39bbc876340ac229c4c9a05",
+  "reportRef": ".mimosa/reports/task-review-sess_10ecd717-2720-400b-9e50-45b1b73e85ec-20260923T072238915Z-4033-52169f176f4b.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-09-23T07:22:39.131Z"
+}
