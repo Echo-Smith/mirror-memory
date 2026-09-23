@@ -268,7 +268,7 @@ class TestPolarityPropagation:
     def test_revival_preserves_polarity(self, session):
         """A revived historical row keeps the polarity it was stored with.
 
-        A -> B -> A: the second update targets the superseded A row and
+        A -> B -> A: the third turn targets the superseded A row's key and
         revives it, so the polarity stored on that row must survive.
         """
         from mirror_memory.core.repository import update_belief_by_id
@@ -279,14 +279,15 @@ class TestPolarityPropagation:
             claim_text="User likes coffee", confidence=0.8,
             predicate="likes", object="coffee", polarity="positive",
         )
+        a_key = a.key
         # A -> B
         _old, b = update_belief_by_id(
             session, a.id, new_object="tea",
             new_claim_text="User likes tea", new_confidence=0.8,
         )
-        # B -> A : target the superseded A row again.
+        # B -> A: name A's key so the revival branch finds and reopens it.
         update_belief_by_id(
-            session, a.id, new_object="coffee",
+            session, b.id, new_key=a_key, new_object="coffee",
             new_claim_text="User likes coffee again", new_confidence=0.8,
         )
         revived = session.get(Belief, a.id)
