@@ -360,7 +360,12 @@ class ExtractionPipeline:
         if not claims:
             return
 
-        from mirror_memory.core.repository import beliefs_with_predicates, record_claim
+        from mirror_memory.core.repository import (
+            CONFLICT_SELF_CORRECTION,
+            CONFLICT_SOURCE_CONFLICT,
+            beliefs_with_predicates,
+            record_claim,
+        )
         from mirror_memory.memory.atom import ACTION_CONTRADICT, ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
         from mirror_memory.memory.canonicalize import canonicalize_atom
         from mirror_memory.memory.identity import resolve_identity
@@ -621,6 +626,15 @@ class ExtractionPipeline:
                     cardinality=policy.get(canon_pred, "multi"),
                     polarity=claim_polarity,
                     lifecycle_state=claim_lifecycle,
+                    # Every contradiction the extractor reports is the user
+                    # retracting their own earlier statement -- the two claims
+                    # come from the same subject in the same conversation.  A
+                    # cross-source disagreement never reaches this path.
+                    conflict_kind=(
+                        CONFLICT_SELF_CORRECTION
+                        if claim.get("relation") == "contradicts"
+                        else CONFLICT_SOURCE_CONFLICT
+                    ),
                 )
                 _record_store(
                     action=event_type.upper(),

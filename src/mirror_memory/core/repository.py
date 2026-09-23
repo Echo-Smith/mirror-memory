@@ -182,6 +182,17 @@ def set_feature_consent(session: Session, user_id: str, feature: str, granted: b
 # user override that supersedes whatever the evidence originally implied.
 EVIDENCE_RELATIONS = ("support", "contradict", "verify", "correct")
 
+# How a contradiction arose.  ``self_correction`` is the user changing their
+# own mind: the later statement supersedes the earlier one outright, so the
+# old state closes and the new one becomes current.  ``source_conflict`` is
+# two sources disagreeing with no basis for preferring either: confidence is
+# attenuated and the belief is flagged for clarification rather than
+# overwritten.  Conflating them means a user's "actually I don't like coffee"
+# merely dims the old belief instead of replacing it -- and a genuine
+# unresolved conflict gets silently resolved by whoever spoke last.
+CONFLICT_SELF_CORRECTION = "self_correction"
+CONFLICT_SOURCE_CONFLICT = "source_conflict"
+
 # Recognised evidence authorities, strongest first.  A user's own statement
 # outranks a derived one; the engine never invents authority on its own.
 EVIDENCE_AUTHORITIES = ("user", "assistant", "system", "derived")
@@ -842,6 +853,7 @@ def record_claim(
     superseded_by: int | None = None,
     polarity: str = "",
     lifecycle_state: str = "",
+    conflict_kind: str = CONFLICT_SOURCE_CONFLICT,
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -875,6 +887,11 @@ def record_claim(
     lifecycle_state:
         For goal predicates: ``active`` / ``paused`` / ``cancelled`` /
         ``resumed``.  Empty for non-goal claims.
+    conflict_kind:
+        ``self_correction`` when the user is retracting their own earlier
+        statement (the old state closes); ``source_conflict`` when two
+        sources disagree (confidence is attenuated and clarification is
+        requested).  Only meaningful with ``relation="contradicts"``.
     """
     if not is_memory_enabled(session, user_id):
         return None, "profile_memory_disabled"
@@ -1013,14 +1030,37 @@ def record_claim(
         touch_memory_state(session, user_id)
         return existing, "supported"
 
-    # Contradicts: attenuate confidence, mark needs_clarification.
+    # Contradictions split by kind.
     from mirror_memory.core.constants import CONTRADICT_FACTOR
 
+    if conflict_kind == CONFLICT_SELF_CORRECTION:
+        # The user changed their own mind.  Close the old state and open the
+        # new one; attenuating would leave the retracted claim looking nearly
+        # as credible as its replacement.
+        existing.status = "superseded"
+        existing.superseded_by = None  # the replacement is a separate claim
+        if existing.valid_to is None:
+            existing.valid_to = datetime.now(UTC)
+        detail = {
+            "conflict_kind": CONFLICT_SELF_CORRECTION,
+            "clarification_status": "resolved_by_restatement",
+        }
+        _append_event(session, existing, "contradicted", evidence=evidence,
+                      detail=detail, stats_id=stats_id)
+        touch_memory_state(session, user_id)
+        return existing, "self_corrected"
+
+    # Source conflict: neither side is authoritative, so neither is
+    # overwritten -- the belief is dimmed and flagged for clarification.
     existing.confidence = round(existing.confidence * CONTRADICT_FACTOR, 4)
     val = safe_json(existing.value_json)
     val["clarification_status"] = "needs_clarification"
     existing.value_json = json.dumps(val, ensure_ascii=False)
-    detail: dict = {"confidence": existing.confidence, "clarification_status": "needs_clarification"}
+    detail = {
+        "confidence": existing.confidence,
+        "clarification_status": "needs_clarification",
+        "conflict_kind": CONFLICT_SOURCE_CONFLICT,
+    }
     _append_event(session, existing, "contradicted", evidence=evidence, detail=detail, stats_id=stats_id)
     touch_memory_state(session, user_id)
     return existing, "contradicted"

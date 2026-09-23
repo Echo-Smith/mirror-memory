@@ -294,3 +294,147 @@ class TestPolarityPropagation:
         assert revived.status == "active"
         assert revived.polarity == "positive"
         assert session.get(Belief, b.id).status == "superseded"
+
+
+# ---------------------------------------------------------------------------
+# P0-3-4: behavioural evidence does not upgrade into a preference
+# ---------------------------------------------------------------------------
+
+
+class TestBehaviouralEvidenceDoesNotUpgrade:
+    """A behaviour is not an attitude.
+
+    "I went hiking every weekend" is an event, not a preference.  Two guards
+    keep them apart: the extractor's preference keywords are attitude verbs
+    only, and behavioural predicates infer as neutral polarity so they can
+    never close or merge with a preference row.
+    """
+
+    def test_behavioural_predicates_are_polarity_neutral(self):
+        for predicate in ("went_to", "bought", "attended", "experienced",
+                          "visited", "drank", "says", "has", "owns"):
+            assert infer_polarity(predicate) == "neutral", predicate
+
+    def test_attitude_words_in_a_behavioural_claim_do_not_flip_polarity(self):
+        """The predicate decides polarity, not the claim text.
+
+        "I went to a coffee shop I love" is still an event: its predicate is
+        ``went_to``.  Reading polarity off the text would make every
+        behavioural mention of a liked thing a preference statement.
+        """
+        assert infer_polarity("went_to") == "neutral"
+        assert infer_lifecycle("went_to", "I went to a place I love") == ""
+
+    def test_behavioural_and_attitude_claims_do_not_merge(self, session):
+        """Different predicates never resolve to the same belief."""
+        from mirror_memory.memory.atom import CandidateAtom
+        from mirror_memory.memory.identity import resolve_identity
+
+        set_memory_enabled(session, "u1", True)
+        existing = [{
+            "id": 1, "predicate": "went_to", "object": "hiking",
+            "status": "active", "confidence": 0.7,
+            "valid_from": None, "valid_to": None,
+        }]
+        result = resolve_identity(
+            CandidateAtom(subject="user", predicate="likes", object="hiking"),
+            existing,
+            {"went_to": "event", "likes": "multi"},
+            {"went_to": "episodic", "likes": "persistent"},
+        )
+        # A new belief, not a SUPPORT of the behavioural one.
+        assert result.action == "CREATE"
+
+    def test_k1_preference_keywords_are_attitude_verbs_only(self):
+        """The config must not map behavioural nouns onto preference."""
+        from mirror_memory.config.loader import load_config
+
+        cfg = load_config("config/")
+        preference_words = cfg.extraction.keywords.get("preference", [])
+        behavioural = {"hiking", "coffee", "laptop", "museum", "workshop"}
+        assert not (behavioural & {w.lower() for w in preference_words}), (
+            "a behavioural noun mapped onto the preference dimension would "
+            "turn every mention of it into a long-term preference"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P0-2-4: self-correction vs source conflict
+# ---------------------------------------------------------------------------
+
+
+class TestConflictKinds:
+    """A retraction and a disagreement are different events.
+
+    "Actually I don't like coffee" is the user changing their mind: the old
+    state closes and the new one becomes current.  Two sources disagreeing is
+    unresolved: confidence is attenuated and clarification is requested, and
+    neither side is overwritten -- resolving it by whoever spoke last would
+    silently pick a winner.
+    """
+
+    def test_self_correction_closes_the_old_state(self, session):
+        from mirror_memory.core.repository import (
+            CONFLICT_SELF_CORRECTION,
+            record_claim,
+        )
+
+        set_memory_enabled(session, "u1", True)
+        old, _ = record_claim(
+            session, "u1", dimension="preference", key="likes_coffee",
+            claim_text="User likes coffee", confidence=0.9,
+            predicate="likes", object="coffee", polarity="positive",
+        )
+        _result, event = record_claim(
+            session, "u1", dimension="preference", key="likes_coffee",
+            claim_text="User does not like coffee", confidence=0.9,
+            predicate="likes", object="coffee", polarity="positive",
+            relation="contradicts", conflict_kind=CONFLICT_SELF_CORRECTION,
+        )
+        assert event == "self_corrected"
+        assert old.status == "superseded"
+        assert old.valid_to is not None
+        # The retracted claim is not merely dimmed -- it is closed.
+        assert old.confidence == 0.9
+
+    def test_source_conflict_attenuates_and_flags(self, session):
+        from mirror_memory.core.repository import (
+            CONFLICT_SOURCE_CONFLICT,
+            record_claim,
+        )
+        from mirror_memory.core.utils import safe_json
+
+        set_memory_enabled(session, "u1", True)
+        old, _ = record_claim(
+            session, "u1", dimension="preference", key="likes_coffee",
+            claim_text="User likes coffee", confidence=0.9,
+            predicate="likes", object="coffee", polarity="positive",
+        )
+        _result, event = record_claim(
+            session, "u1", dimension="preference", key="likes_coffee",
+            claim_text="Another source says otherwise", confidence=0.9,
+            predicate="likes", object="coffee", polarity="positive",
+            relation="contradicts", conflict_kind=CONFLICT_SOURCE_CONFLICT,
+        )
+        assert event == "contradicted"
+        # Still active -- neither side wins.
+        assert old.status == "active"
+        assert old.confidence < 0.9
+        assert safe_json(old.value_json)["clarification_status"] == "needs_clarification"
+
+    def test_default_is_source_conflict(self, session):
+        """Backwards compatible: an unspecified kind is treated as unresolved."""
+        from mirror_memory.core.repository import record_claim
+
+        set_memory_enabled(session, "u1", True)
+        old, _ = record_claim(
+            session, "u1", dimension="topic", key="k",
+            claim_text="User said X", confidence=0.9,
+        )
+        _result, event = record_claim(
+            session, "u1", dimension="topic", key="k",
+            claim_text="User said not-X", confidence=0.9,
+            relation="contradicts",
+        )
+        assert event == "contradicted"
+        assert old.status == "active"

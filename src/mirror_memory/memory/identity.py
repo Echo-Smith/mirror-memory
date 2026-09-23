@@ -92,11 +92,16 @@ def resolve_identity(
     # lives_in belief.  A verb is not identity -- the attribute (the value)
     # is.  Superseded rows are included because returning to a previous value
     # is exactly a revival of one of them; the lifecycle decides below.
+    # A behaviour is not an attitude: "went hiking" and "likes hiking" share
+    # an object but are different attributes, so a polarity-bearing predicate
+    # never matches a neutral one through this fallback.
+    cand_polarity_for_attr = infer_polarity(candidate.predicate)
     same_attribute_any = [
         b for b in existing_beliefs
         if b.get("status") in ("active", "superseded")
         and (b.get("object") or "").strip().lower() == cand_obj
         and (b.get("predicate") or "").strip().lower() != candidate.predicate.strip().lower()
+        and infer_polarity(b.get("predicate") or "") == cand_polarity_for_attr
     ]
 
     # ── No existing belief with this predicate → CREATE ──────────────────
