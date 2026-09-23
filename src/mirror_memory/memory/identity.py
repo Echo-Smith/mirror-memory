@@ -32,6 +32,11 @@ from mirror_memory.memory.atom import (
     Resolution,
 )
 from mirror_memory.memory.lifecycle import LifecyclePolicy, to_action
+from mirror_memory.memory.polarity import (
+    infer_lifecycle,
+    infer_polarity,
+    opposite_polarity,
+)
 from mirror_memory.memory.relation import judge_relation
 from mirror_memory.memory.temporal import (
     TemporalWindow,
@@ -130,16 +135,34 @@ def resolve_identity(
             detail={"close_belief_ids": closed},
         )
 
-    # One current polarity per object: "I like spicy food" and "I avoided
-    # spicy food" about the same food cannot both be current.  Whichever side
-    # the new claim falls on, the opposite-polarity row about the same object
-    # stops being current.  Without this the withdrawal phase leaks into
-    # every later current-state query.
+    # One current polarity per object, decided structurally: the candidate's
+    # canonical predicate maps onto a polarity, and only rows of the *opposite*
+    # polarity about the same object are conflicts.  Comparing predicates
+    # directly would treat any two different verbs as a conflict, which is
+    # both over- and under-inclusive.
+    cand_polarity = infer_polarity(candidate.predicate)
+    opposing = opposite_polarity(cand_polarity)
+    cand_lifecycle = infer_lifecycle(
+        candidate.predicate, getattr(candidate, "claim_text", "") or ""
+    )
     polarity_conflicts = [
         b["id"] for b in existing_beliefs
         if b.get("status") == "active"
         and (b.get("object") or "").strip().lower() == cand_obj
-        and (b.get("predicate") or "").strip().lower() != candidate.predicate.strip().lower()
+        and (
+            # Opposite polarity about the same object: "likes X" vs "avoids X".
+            (opposing and infer_polarity(b.get("predicate") or "") == opposing)
+            # Goal lifecycle transition: the same goal moving between
+            # active / paused / cancelled / resumed is a state change, and
+            # the previous stage must stop being current.
+            or (
+                cand_lifecycle
+                and b.get("lifecycle_state")
+                and b.get("lifecycle_state") != cand_lifecycle
+                and (b.get("predicate") or "").strip().lower()
+                == candidate.predicate.strip().lower()
+            )
+        )
     ]
 
     candidate_window = _candidate_window(candidate)

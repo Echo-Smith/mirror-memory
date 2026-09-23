@@ -287,8 +287,17 @@ class TestPublisherCommits:
             payload={"new_claim_text": "sleeps fine actually"},
         ))
         assert decision.committed
-        assert belief.claim_text == "sleeps fine actually"
-        assert belief.source == "user_corrected"
+        # Close-and-replace: the old row is history, the new one is current.
+        assert belief.status == "superseded"
+        assert decision.proposal.payload["new_claim_text"] == "sleeps fine actually"
+        from mirror_memory.core.models import Belief as _Belief
+
+        current = [
+            b for b in db_session.query(_Belief).filter_by(user_id="u1", status="active")
+        ]
+        assert len(current) == 1
+        assert current[0].claim_text == "sleeps fine actually"
+        assert current[0].source == "user_corrected"
 
     def test_forget_deletes(self, db_session):
         set_memory_enabled(db_session, "u1", True)

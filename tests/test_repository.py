@@ -393,6 +393,9 @@ class TestCorrect:
         )
 
         from mirror_memory.core.repository import correct_belief
+        # Close-and-replace: the returned belief is the NEW corrected row;
+        # the old one is superseded and keeps its original text so history
+        # stays queryable from the belief store, not just the event log.
         result = correct_belief(
             db_session, "u_corr", b.id,
             new_claim_text="User is actually 30 years old",
@@ -402,10 +405,14 @@ class TestCorrect:
         db_session.commit()
 
         assert result is not None
-        assert result.id == b.id  # same belief, updated in-place
+        assert result.id != b.id  # a new row; the old one is closed
         assert result.claim_text == "User is actually 30 years old"
         assert result.source == "user_corrected"
         assert result.object == "30"
+        # The superseded row keeps its original text for history queries.
+        assert b.status == "superseded"
+        assert b.claim_text == "User is 28 years old"
+        assert b.superseded_by == result.id
 
         # Check correction event was logged
         from mirror_memory.core.repository import get_belief_events
@@ -507,14 +514,18 @@ class TestCorrectTripleConsistency:
             predicate="age", object="28", cardinality="single",
         )
         from mirror_memory.core.repository import correct_belief
-        correct_belief(
+        corrected = correct_belief(
             db_session, "u_trip", b.id,
             new_claim_text="User is 30",
             new_object="30",
         )
         db_session.refresh(b)
-        assert b.claim_text == "User is 30"
-        assert b.object == "30"
+        assert corrected.claim_text == "User is 30"
+        assert corrected.object == "30"
+        # The old row is history, not overwritten.
+        assert b.status == "superseded"
+        assert b.claim_text == "User is 28"
+        assert b.object == "28"
 
     def test_correct_preserves_before_state_in_event(self, db_session):
         """Correction event must record the previous state."""

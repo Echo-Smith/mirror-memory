@@ -125,6 +125,17 @@ class Belief(Base):
     valid_from: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     temporal_scope: Mapped[str] = mapped_column(String(16), default="current_state")
+    # Structured polarity: positive / negative / neutral.  A claim and its
+    # withdrawal about the same object are two rows with opposite polarity,
+    # and only one of them may be current -- that is what makes "I liked X"
+    # then "I avoid X" answerable as a state change rather than a word-list
+    # guess at read time.
+    polarity: Mapped[str] = mapped_column(String(16), default="neutral")
+    # Goal lifecycle: active / paused / cancelled / resumed.  Empty for
+    # non-goal predicates.  A cancelled goal is closed, not deleted, so
+    # "I gave up" followed by "I started again" is a resumption of the same
+    # goal rather than a new one.
+    lifecycle_state: Mapped[str] = mapped_column(String(16), default="")
     # Existing provenance fields
     origin_stats_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     origin_slice_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
