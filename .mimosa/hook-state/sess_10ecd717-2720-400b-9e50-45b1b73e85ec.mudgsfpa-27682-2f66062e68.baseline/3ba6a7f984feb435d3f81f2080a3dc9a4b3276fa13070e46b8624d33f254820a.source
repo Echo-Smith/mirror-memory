@@ -91,7 +91,7 @@ class LifecyclePolicy:
         if cardinality == "event":
             return self._decide_event(judgement)
         if not self.uses_temporal_lifecycle(predicate):
-            return self._decide_multi(judgement)
+            return self._decide_multi(judgement, self.scope_for(predicate))
 
         scope = self.scope_for(predicate) or SCOPE_CURRENT_STATE
         return lifecycle_transition(
@@ -103,10 +103,18 @@ class LifecyclePolicy:
             claims_contradiction=judgement.claims_contradiction,
         )
 
-    def _decide_multi(self, judgement: RelationJudgement) -> LifecycleAction:
+    def _decide_multi(
+        self, judgement: RelationJudgement, scope: str = ""
+    ) -> LifecycleAction:
         if judgement.same_object:
             if judgement.claims_contradiction:
                 return LifecycleAction.CONTRADICT
+            # Same object, different occurrence time: a separate occurrence,
+            # not a repeat.  "saw Dr. Patel on June 2" and "saw Dr. Patel on
+            # June 16" are two facts.  Persistent scopes (likes, owns) are
+            # exempt -- re-stating "likes coffee today" is still one fact.
+            if not judgement.same_temporal_qualifier and scope != SCOPE_PERSISTENT:
+                return LifecycleAction.CREATE
             return LifecycleAction.SUPPORT
         return LifecycleAction.CREATE
 

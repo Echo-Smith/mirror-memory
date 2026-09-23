@@ -891,7 +891,12 @@ def record_claim(
 
     # Life events: derive a hash-suffixed key so distinct events don't collide,
     # and stamp expires_at so the renderer can filter stale events.
-    if dimension == "event":
+    # An occurrence time makes an event a distinct fact even when the key and
+    # object are shared: "saw Dr. Patel on June 2" and "on June 16" must be
+    # two rows, not one claim_text replaced by the other.  Hashing the claim
+    # text into the key is what keeps them apart.
+    has_occurrence_time = bool((value or {}).get("temporal"))
+    if dimension == "event" or has_occurrence_time:
         key = _event_key(key, claim_text)
         if value is None:
             value = {}
@@ -1111,15 +1116,23 @@ def support_belief_by_id(
 def _derive_updated_key(old: Belief, new_object: str) -> str:
     """Pick the key for a belief whose object changed.
 
-    ``(user_id, key)`` is unique, so a value change must move to a new key or
-    the insert collides with the row being superseded.  The base namespace is
-    kept (``lives_in`` stays ``lives_in``) and the object becomes the suffix,
-    which also makes the superseded row findable again on a round trip.
+    ``(user_id, key)`` is unique regardless of status, and superseding is a
+    status change rather than a delete -- so the new row can never reuse
+    ``old.key``.  The base namespace is kept (``lives_in`` stays ``lives_in``)
+    and the object becomes the suffix; when the object is unchanged the
+    claim's own content hash disambiguates instead.
     """
-    if not new_object or new_object == old.object:
-        return old.key
     base = old.key.split(":", 1)[0]
-    return f"{base}:{new_object.strip().lower().replace(' ', '_')}"
+    if new_object and new_object != old.object:
+        return f"{base}:{new_object.strip().lower().replace(' ', '_')}"
+    # Same or unknown object: the new row still needs its own key.
+    return f"{base}:~{_short_hash(str(new_object) + str(old.id))}"
+
+
+def _short_hash(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()[:6]
 
 
 def _target_key_for_update(old: Belief, new_key: str, new_object: str) -> str:
@@ -1133,18 +1146,21 @@ def _target_key_for_update(old: Belief, new_key: str, new_object: str) -> str:
     to it.
     """
     target = new_key or old.key
-    if target == old.key and new_object and new_object != old.object:
+    if target == old.key:
+        # The UNIQUE constraint is on (user_id, key) with no status filter,
+        # and superseding keeps the old row -- so the replacement must never
+        # take the key the old row still holds.
         return _derive_updated_key(old, new_object)
     return target
 
 
-def _disambiguate_key(session: Session, user_id: str, key: str, *, exclude_id: int) -> str:
+def _disambiguate_key(session: Session, user_id: str, key: str) -> str:
     """Return a key that is free for *user_id*, suffixing if necessary.
 
-    The UNIQUE constraint ignores ``status``, so a key taken by any other row
-    -- active, superseded, or rejected -- cannot be reused.  ``exclude_id`` is
-    the row being replaced, which is about to be superseded and so does not
-    count as a collision.
+    The UNIQUE constraint ignores ``status``, so a key taken by any row at all
+    -- active, superseded, or rejected -- cannot be reused.  A superseding
+    replacement therefore always gets a fresh key; the row it replaces keeps
+    its own for historical lookup.
     """
     candidate = key
     suffix = 2
@@ -1153,7 +1169,6 @@ def _disambiguate_key(session: Session, user_id: str, key: str, *, exclude_id: i
             select(Belief.id).where(
                 Belief.user_id == user_id,
                 Belief.key == candidate,
-                Belief.id != exclude_id,
             )
         )
         if taken is None:
@@ -1261,7 +1276,12 @@ def update_belief_by_id(
     # Normal path: create new belief.  The key must be free for this user
     # regardless of status -- the UNIQUE constraint does not care that the
     # row currently holding it is about to be superseded.
-    target_key = _disambiguate_key(session, old.user_id, target_key, exclude_id=old.id)
+    # `old` still holds its key in the database at insert time -- superseding
+    # is a status change, not a delete -- so the UNIQUE constraint will fire
+    # on any new row that reuses it.  exclude_id must therefore NOT skip
+    # `old`; the key has to be free of every row, including the one being
+    # replaced.
+    target_key = _disambiguate_key(session, old.user_id, target_key)
     new_belief = Belief(
         user_id=old.user_id,
         dimension=new_dimension or old.dimension,
