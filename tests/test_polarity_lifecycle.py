@@ -498,3 +498,94 @@ class TestRawPredicateAudit:
         audit = audit_predicate_coverage(session, "nobody")
         assert audit["beliefs_with_raw_predicate"] == 0
         assert audit["coverage"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# P2-10: release gate
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseGate:
+    @staticmethod
+    def _report(score, categories, tracks=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(score=score, by_category=categories, tracks=tracks or {})
+
+    def test_all_clear(self):
+        from mirror_memory.bench.gate import check_release_gate
+
+        result = check_release_gate(
+            self._report(0.93, {"replacement": {"score": 0.9},
+                                "round_trip": {"score": 0.95}},
+                         {"recall": 0.95, "answer": 0.9}),
+        )
+        assert result.passed
+        assert result.failures == []
+
+    def test_overall_below_gate_fails(self):
+        from mirror_memory.bench.gate import check_release_gate
+
+        result = check_release_gate(self._report(0.71, {"replacement": {"score": 0.9}}))
+        assert not result.passed
+        assert any("state overall" in f for f in result.failures)
+
+    def test_single_category_below_gate_fails(self):
+        from mirror_memory.bench.gate import check_release_gate
+
+        result = check_release_gate(
+            self._report(0.95, {"replacement": {"score": 0.9},
+                                "round_trip": {"score": 0.5}})
+        )
+        assert not result.passed
+        assert any("round_trip" in f for f in result.failures)
+
+    def test_recall_and_answer_gates(self):
+        from mirror_memory.bench.gate import check_release_gate
+
+        result = check_release_gate(
+            self._report(0.95, {"replacement": {"score": 0.9}},
+                         {"recall": 0.78, "answer": 0.6})
+        )
+        assert not result.passed
+        assert any("recall" in f for f in result.failures)
+        assert any("answer" in f for f in result.failures)
+
+    def test_missing_manifest_fails(self, tmp_path):
+        from mirror_memory.bench.gate import check_release_gate
+
+        result = check_release_gate(
+            self._report(0.95, {"replacement": {"score": 0.9}}),
+            manifest_path=tmp_path / "absent.json",
+        )
+        assert not result.passed
+        assert any("missing manifest" in f for f in result.failures)
+
+    def test_present_manifest_passes(self, tmp_path):
+        from mirror_memory.bench.gate import check_release_gate
+
+        path = tmp_path / "present.manifest.json"
+        path.write_text("{}")
+        result = check_release_gate(
+            self._report(0.95, {"replacement": {"score": 0.9}}),
+            manifest_path=path,
+        )
+        assert result.passed
+
+    def test_forced_production_gap(self):
+        from mirror_memory.bench.gate import GATE_PRODUCTION_GAP, compare_forced_production
+
+        forced = self._report(0.93, {"replacement": {"score": 0.95}})
+        production = self._report(0.91, {"replacement": {"score": 0.93}})
+        gap = compare_forced_production(forced, production)
+        assert gap["gap"] <= GATE_PRODUCTION_GAP
+        assert gap["gate"] is True
+        assert gap["per_category_gap"]["replacement"] == 0.02
+
+    def test_large_gap_fails(self):
+        from mirror_memory.bench.gate import compare_forced_production
+
+        forced = self._report(0.95, {"replacement": {"score": 0.95}})
+        production = self._report(0.70, {"replacement": {"score": 0.7}})
+        gap = compare_forced_production(forced, production)
+        assert gap["gate"] is False
