@@ -9,7 +9,7 @@ Return a JSON object:
 Each claim object:
 - dimension: one of "topic", "preference", "fact", "event", "goal", "pattern"
 - key: UNIQUE descriptive snake_case (see rules)
-- predicate: the relationship verb (likes, has, went_to, wants_to, experiences, prefers, rejects, works_at, lives_in, etc.)
+- predicate: the relationship verb (see Predicate Vocabulary)
 - object: what the predicate applies to (coffee, art_show, insomnia, japanese, etc.)
 - temporal: WHEN it happened/occurs (e.g. "last_monday", "every_day", "childhood", "current"). REQUIRED for event-dimension claims. Empty string for non-event claims.
 - valid_from / valid_to: ISO-8601 dates (YYYY-MM-DD) delimiting when the fact was TRUE. Use valid_to=null for "still true". These are what let the engine answer "where do they live now" vs "where did they live before", so fill them whenever the message implies a time. Example: "I moved to Berlin last month" -> valid_from=<first of last month>, valid_to=null. "I lived in Shanghai until 2024" -> valid_from=null, valid_to=2024-12-31. Omit both only when the message gives no time at all.
@@ -40,29 +40,87 @@ If the message is about someone ELSE (friend, family, colleague), set "subject" 
 3. Each claim = one atomic piece of information.
 4. Preserve specific facts: dates, names, numbers, places, titles.
 5. Max 5 claims per turn. Prioritize the most specific and novel.
+6. A compound sentence with "and"/"but"/";" joining two facts MUST produce two claims. Never merge "I live in Berlin and work at Globex" into one.
+7. Negation applies only to the clause it governs. "I don't like coffee but I love tea" is TWO claims: dislikes coffee, likes tea. Never read "coffee and tea" as one liked object.
+8. An occurrence time makes an event distinct. "I saw Dr. Patel on June 2" and "I saw Dr. Patel again on June 16" are two claims, each with its own temporal/valid_from.
+
+## Predicate Vocabulary (CRITICAL — pick from this set)
+
+**Single-valued attributes** (only one value is current at a time):
+- `lives_in` — where someone resides. NOT for changing employer.
+- `works_at` — employer / workplace.
+- `works_as` — profession / job title.
+- `studies_at` — school or university currently attended.
+- `profession` — occupation.
+- `age` — age in years.
+
+**Multi-valued preferences** (several values coexist):
+- `likes` / `dislikes` / `loves` / `hates` / `enjoys` / `avoids` / `prefers` — attitude toward an object.
+- `has` / `owns` / `skills` — possession or capability.
+
+**Events** (each occurrence is separate):
+- `went_to` / `attended` / `bought` / `experienced` / `saw` — something that happened.
+
+**Goals**:
+- `wants_to` / `plans_to` / `hopes_to` — an intention.
+
+### Predicate selection rules
+a. NEVER use a bare preposition as a predicate (`at`, `in`, `on`, `for`, `to`). "I am at Cedar Bank" is `works_at cedar_bank`, not `at cedar_bank`.
+b. Use the PRESENT tense form: `works_at`, not `worked_at` / `was_hired_by` / `started_at` / `joined` — those all mean `works_at`.
+c. **Domain disambiguation.** The same verb means different attributes depending on what it acts on:
+   - `moved_to` / `relocated_to` / `returned_to` / `based` + a CITY or COUNTRY → `lives_in`.
+   - `moved_to` / `moved` / `joined` / `returned_to` / `went_to` + a COMPANY or ORGANISATION → `works_at`.
+   - "I worked for Northstar. I moved to Redwood." — the second sentence is `works_at redwood`, because the conversation is about employers.
+d. `attend` / `go to` + a SCHOOL or UNIVERSITY name → `studies_at` (a current state). `attended` / `went_to` + an ACTIVITY → `event`.
+e. A behaviour is not an attitude. "I went hiking" is `went_to hiking` (event). Only output `likes`/`dislikes` when the message states the attitude explicitly ("I like hiking"), never by inferring it from a behaviour.
 
 ## Examples
 
 User: "I'm 28 and I work as a software engineer in Shanghai."
 {"claims": [
-  {"dimension": "fact", "key": "age_28", "predicate": "is", "object": "28_years_old", "claim_text": "User is 28 years old", "confidence": 0.95, "relation": "new"},
-  {"dimension": "fact", "key": "works_as_engineer", "predicate": "works_at", "object": "software_engineer_shanghai", "claim_text": "User works as a software engineer in Shanghai", "confidence": 0.95, "relation": "new"}
+  {"dimension": "fact", "key": "age_28", "predicate": "age", "object": "28", "claim_text": "User is 28 years old", "confidence": 0.95, "relation": "new"},
+  {"dimension": "fact", "key": "works_as_engineer", "predicate": "works_as", "object": "software_engineer", "claim_text": "User works as a software engineer in Shanghai", "confidence": 0.95, "relation": "new"},
+  {"dimension": "fact", "key": "lives_in_shanghai", "predicate": "lives_in", "object": "shanghai", "claim_text": "User lives in Shanghai", "confidence": 0.95, "relation": "new"}
 ], "subject": "user", "context_tags": ["work"]}
 
 User: "I went to an LGBTQ support group yesterday and it was so powerful."
 {"claims": [
-  {"dimension": "event", "key": "went_to_lgbtq_group", "predicate": "went_to", "object": "lgbtq_support_group", "claim_text": "User went to LGBTQ support group yesterday", "confidence": 0.95, "relation": "new"},
+  {"dimension": "event", "key": "went_to_lgbtq_group", "predicate": "went_to", "object": "lgbtq_support_group", "claim_text": "User went to LGBTQ support group yesterday", "confidence": 0.95, "relation": "new", "temporal": "yesterday", "valid_from": null, "valid_to": null},
   {"dimension": "preference", "key": "found_lgbtq_group_powerful", "predicate": "experiences", "object": "powerful_at_support_group", "claim_text": "User found the LGBTQ support group powerful", "confidence": 0.9, "relation": "new"}
 ], "subject": "user", "context_tags": ["social"]}
 
 User: "I like painting and I went to an art show last Saturday."
 {"claims": [
   {"dimension": "preference", "key": "likes_painting", "predicate": "likes", "object": "painting", "claim_text": "User likes painting", "confidence": 0.9, "relation": "new"},
-  {"dimension": "event", "key": "went_to_art_show", "predicate": "went_to", "object": "art_show", "claim_text": "User went to an art show last Saturday", "confidence": 0.95, "relation": "new"}
+  {"dimension": "event", "key": "went_to_art_show", "predicate": "went_to", "object": "art_show", "claim_text": "User went to an art show last Saturday", "confidence": 0.95, "relation": "new", "temporal": "last_saturday", "valid_from": null, "valid_to": null}
 ], "subject": "user", "context_tags": ["hobby"]}
 
 User: "My GPS stopped working after I bought the car in February."
 {"claims": [
   {"dimension": "event", "key": "car_gps_broke", "predicate": "experiences", "object": "gps_not_working", "claim_text": "User's GPS stopped working after buying the car in February", "confidence": 0.95, "relation": "new"},
-  {"dimension": "fact", "key": "bought_car_february", "predicate": "bought", "object": "car", "claim_text": "User bought a car in February", "confidence": 0.95, "relation": "new"}
+  {"dimension": "fact", "key": "bought_car_february", "predicate": "bought", "object": "car", "claim_text": "User bought a car in February", "confidence": 0.95, "relation": "new", "temporal": "february", "valid_from": null, "valid_to": null}
 ], "subject": "user", "context_tags": []}
+
+User: "I work for Blue Harbor. I was hired by Atlas Robotics this month."
+{"claims": [
+  {"dimension": "fact", "key": "works_at_blue_harbor", "predicate": "works_at", "object": "blue_harbor", "claim_text": "User works for Blue Harbor", "confidence": 0.95, "relation": "new"},
+  {"dimension": "fact", "key": "works_at_atlas_robotics", "predicate": "works_at", "object": "atlas_robotics", "claim_text": "User was hired by Atlas Robotics this month", "confidence": 0.95, "relation": "new", "valid_from": null, "valid_to": null}
+], "subject": "user", "context_tags": ["work"]}
+
+User: "I study at Easton. I transferred to Lakeview High."
+{"claims": [
+  {"dimension": "fact", "key": "studies_at_easton", "predicate": "studies_at", "object": "easton", "claim_text": "User studies at Easton", "confidence": 0.95, "relation": "new"},
+  {"dimension": "fact", "key": "studies_at_lakeview", "predicate": "studies_at", "object": "lakeview_high", "claim_text": "User transferred to Lakeview High", "confidence": 0.95, "relation": "new"}
+], "subject": "user", "context_tags": ["education"]}
+
+User: "I don't like coffee but I love tea."
+{"claims": [
+  {"dimension": "preference", "key": "dislikes_coffee", "predicate": "dislikes", "object": "coffee", "claim_text": "User does not like coffee", "confidence": 0.95, "relation": "new"},
+  {"dimension": "preference", "key": "likes_tea", "predicate": "likes", "object": "tea", "claim_text": "User loves tea", "confidence": 0.95, "relation": "new"}
+], "subject": "user", "context_tags": []}
+
+User: "I live in Berlin and work at Globex."
+{"claims": [
+  {"dimension": "fact", "key": "lives_in_berlin", "predicate": "lives_in", "object": "berlin", "claim_text": "User lives in Berlin", "confidence": 0.95, "relation": "new"},
+  {"dimension": "fact", "key": "works_at_globex", "predicate": "works_at", "object": "globex", "claim_text": "User works at Globex", "confidence": 0.95, "relation": "new"}
+], "subject": "user", "context_tags": ["work"]}
