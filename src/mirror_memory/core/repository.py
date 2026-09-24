@@ -2025,8 +2025,17 @@ def audit_predicate_coverage(session: Session, user_id: str) -> dict:
         )
     ).all()
 
+    # A raw form is covered when canonicalisation actually folds it -- via the
+    # synonym map OR the auxiliary/tense stripping.  Checking only the map
+    # would report `was_hired_by` as uncovered even though it resolves to
+    # works_at, which is the opposite of what the audit is for.
+    from mirror_memory.memory.canonicalize import canonicalize_predicate
+
     distinct = sorted({r for r in rows if r})
-    unmapped = [r for r in distinct if r not in synonyms]
+    unmapped = [
+        r for r in distinct
+        if canonicalize_predicate(r, synonyms) == r and r not in synonyms
+    ]
 
     return {
         "user_id": user_id,
