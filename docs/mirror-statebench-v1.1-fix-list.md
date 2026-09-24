@@ -171,3 +171,44 @@ temporal-event recall 达到 0.85。
 达标前不再使用“架构优势已证明”作为外部结论。公开的 `public_evaluation` 只用于
 可复现报告；正式发布结论需要额外的私有未见集。
 
+
+---
+
+# 执行记录（2026-09-23）
+
+## P0 — 全部完成
+
+| # | 项 | 状态 | 关键改动 |
+|---|---|---|---|
+| 1 | 节流不按维度覆盖跳过 | ✅ | 内容新颖性逃逸（value gate + 抑制分支）+ 冷启动逃逸 |
+| 2 | 修正/终止/冲突拆分 | ✅ 5/5 | `Belief.polarity`；`correct_belief` 改为关闭+新建；撤回标记过滤；`conflict_kind` 分流 self_correction / source_conflict |
+| 3 | 每对象一个当前极性 | ✅ 5/5 | `memory/polarity.py` 结构化推断；resolver 按极性判冲突；goal 生命周期 active/paused/cancelled/resumed；行为谓词恒为中性 |
+| 4 | current-state 区间与 round trip | ✅ | 时态归一化（was_hired_by→works_at）；revival 路径；`update_belief_by_id` 允许重开 superseded 行 |
+| 5 | 事件 occurrence 身份 | ✅ | 同对象+不同时间=独立 occurrence；key 含时间判别 |
+
+## P1 — 全部完成
+
+| # | 项 | 状态 | 关键改动 |
+|---|---|---|---|
+| 6 | 规范化谓词覆盖 | ✅ | 同义词表 + 时态/前缀归一 + K2 提示词闭集；`Belief.raw_predicate` 审计；`audit_predicate_coverage()` 监测未映射谓词 |
+| 7 | 时间模式参与候选选择 | ✅ | `all_occurrences` 模式（列举型查询自动进入）；StateBench recall/answer 双 track 分离报告 |
+| 8 | 渲染容量自适应 | ✅ | 列举型查询提升 per-dimension 上限（默认 12），字符预算仍为硬约束 |
+
+## P2 — 全部完成
+
+| # | 项 | 状态 | 关键改动 |
+|---|---|---|---|
+| 9 | 每 case 完整漏斗 | ✅ | `bench/funnel.py`：逐回合抽取数、候选 atom、identity 决策、持久化动作、belief rows、召回候选、门控原因、渲染块、答案 |
+| 10 | 固定发布门槛 | ✅ | `bench/gate.py`：state ≥0.90、每类 ≥0.85、recall/answer ≥0.85、manifest 必备、forced/production gap ≤0.05 |
+
+## 验证记录
+
+| 轮次 | 范围 | 结果 |
+|---|---|---|
+| StateBench v1.0 全量 | 200 例（mimo-v2.5） | 0.730，baseline 0.450 |
+| 针对性（极性改动） | 60 例（MiMo-V2.6-Flash） | contradiction 0.800→0.867；preference_evolution 噪声内 |
+| 针对性（K2 提示词 A 档） | 50 例（MiMo-V2.6-Flash，零失败） | replacement 0.500→**0.867**，stale_state 0.600→0.650 |
+
+**未达标项**：P2-10 的门槛（state ≥0.90）尚未达到——当前全量 0.730。按计划要求，在达标前不将"架构优势已证明"作为外部结论。
+
+**测试**：769 通过，0 失败。
