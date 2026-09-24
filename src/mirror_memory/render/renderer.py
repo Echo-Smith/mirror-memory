@@ -157,16 +157,36 @@ _TEMPORAL_HISTORICAL_MARKERS = (
 )
 
 
+# Queries asking for every occurrence rather than one interval.  "How many
+# times did they go", "list all the places they visited", "what did they buy"
+# -- an interval filter would silently drop occurrences, so these opt out of
+# current/historical filtering entirely.
+_ALL_OCCURRENCES_MARKERS = (
+    "how many times", "list all", "all the times", "every time",
+    "what all", "which all", "all the places", "all the cities",
+    "\u54ea\u4e9b\u6b21", "\u6240\u6709\u6b21", "\u5404\u6b21", "\u603b\u5171",
+)
+
+
 def _detect_temporal_mode(query: str) -> str:
     """Map a query onto a validity-interval filter.
 
-    Returns ``"current"``, ``"historical"``, or ``"all"``.  Historical wins on
-    a tie: "where did you used to live" asks about the past even though it
-    contains "did".
+    Returns ``"current"``, ``"historical"``, ``"all_occurrences"`` or
+    ``"all"``.  Historical wins on a tie: "where did you used to live" asks
+    about the past even though it contains "did".  All-occurrences wins over
+    both: a count question needs every interval, not a filtered one.
     """
     if not query:
         return "all"
     lowered = query.lower()
+    # An enumeration query ("what did they buy", "what are their hobbies") is
+    # also an all-occurrences query: it wants every value, so it must not be
+    # narrowed to one interval -- and it must not be caught by the historical
+    # markers first ("did they" would otherwise send it to the past).
+    if _is_enumeration_query(query):
+        return "all_occurrences"
+    if any(marker in lowered for marker in _ALL_OCCURRENCES_MARKERS):
+        return "all_occurrences"
     for marker in _TEMPORAL_HISTORICAL_MARKERS:
         if marker in lowered:
             return "historical"

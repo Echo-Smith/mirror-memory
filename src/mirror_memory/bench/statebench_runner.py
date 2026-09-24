@@ -38,6 +38,14 @@ class StateCaseResult:
     missing_history: list[str] = field(default_factory=list)
     missing_any: list[list[str]] = field(default_factory=list)
     leaked_forbidden: list[str] = field(default_factory=list)
+    # Two tracks, reported separately. ``recall_hit`` asks whether the
+    # expected values were retrieved at all (in the scored candidate set);
+    # ``answer_hit`` asks whether they survived into the rendered block.  A
+    # historical query may legitimately surface the current value as
+    # background, so conflating the two hides whether the loss is in
+    # retrieval or in rendering.
+    recall_hit: bool = False
+    answer_hit: bool = False
     note: str = ""
 
     def to_dict(self) -> dict:
@@ -50,6 +58,9 @@ class StateBenchReport:
     cases: list[StateCaseResult]
     by_category: dict[str, dict]
     by_split: dict[str, dict]
+    # Recall vs answer track (see _track_stats): empty for reports built
+    # without a candidate surface.
+    tracks: dict = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -126,7 +137,7 @@ def _matches(block: str, expected: str) -> bool:
     return _normalise_surface(expected) in _normalise_surface(block)
 
 
-def _score(case: StateCase, block: str) -> StateCaseResult:
+def _score(case: StateCase, block: str, candidates: str = "") -> StateCaseResult:
     missing_current = sorted(
         value for value in case.expect_current if not _matches(block, value)
     )
@@ -147,7 +158,14 @@ def _score(case: StateCase, block: str) -> StateCaseResult:
         or missing_any
         or leaked_forbidden
     )
+    expected = (
+        list(case.expect_current)
+        + list(case.expect_history)
+        + [v for group in case.expect_any for v in group]
+    )
     return StateCaseResult(
+        recall_hit=all(_matches(candidates, v) for v in expected) if expected else False,
+        answer_hit=all(_matches(block, v) for v in expected) if expected else False,
         case_id=case.case_id,
         category=case.category,
         split=case.split,
@@ -166,6 +184,27 @@ def _score(case: StateCase, block: str) -> StateCaseResult:
         leaked_forbidden=leaked_forbidden,
         note=case.note,
     )
+
+
+def _track_stats(results: list[StateCaseResult]) -> dict:
+    """Recall vs answer track, so a loss can be located to one of them.
+
+    A historical query may legitimately surface the current value as
+    background, so "the expected value was retrieved" and "the expected value
+    was rendered" are different questions.  The gap between them is the
+    rendering loss; below recall is the retrieval loss.
+    """
+    total = len(results)
+    if not total:
+        return {"recall": 0.0, "answer": 0.0, "rendering_loss": 0, "retrieval_loss": 0}
+    recall = sum(1 for r in results if r.recall_hit)
+    answer = sum(1 for r in results if r.answer_hit)
+    return {
+        "recall": round(recall / total, 4),
+        "answer": round(answer / total, 4),
+        "rendering_loss": sum(1 for r in results if r.recall_hit and not r.answer_hit),
+        "retrieval_loss": sum(1 for r in results if not r.recall_hit),
+    }
 
 
 def _group_stats(results: list[StateCaseResult], attribute: str) -> dict[str, dict]:
@@ -188,6 +227,7 @@ def _build_report(engine: str, results: list[StateCaseResult]) -> StateBenchRepo
         cases=results,
         by_category=_group_stats(results, "category"),
         by_split=_group_stats(results, "split"),
+        tracks=_track_stats(results),
     )
 
 

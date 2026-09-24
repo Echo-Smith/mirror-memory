@@ -475,6 +475,8 @@ def _filter_by_temporal_mode(beliefs: list[Belief], temporal_mode: str) -> list[
             b for b in beliefs
             if _is_undated(b) or not _interval_is_current(b, now)
         ]
+    # "all_occurrences" falls through: a count or list question needs every
+    # interval, so no currency filter applies.
     return beliefs
 
 
