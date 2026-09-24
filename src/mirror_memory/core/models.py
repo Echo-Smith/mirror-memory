@@ -125,6 +125,13 @@ class Belief(Base):
     valid_from: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     temporal_scope: Mapped[str] = mapped_column(String(16), default="current_state")
+    # The predicate exactly as the extractor emitted it, kept alongside the
+    # canonical ``predicate``.  Canonicalisation folds many surface forms onto
+    # one slot ("was_hired_by", "joined", "started_at" -> works_at); without
+    # the raw form there is no way to audit which spelling produced a belief,
+    # or to notice an extractor inventing verbs the synonym map has never
+    # seen.
+    raw_predicate: Mapped[str] = mapped_column(String(64), default="")
     # Structured polarity: positive / negative / neutral.  A claim and its
     # withdrawal about the same object are two rows with opposite polarity,
     # and only one of them may be current -- that is what makes "I liked X"

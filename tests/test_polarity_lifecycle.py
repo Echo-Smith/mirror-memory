@@ -438,3 +438,63 @@ class TestConflictKinds:
         )
         assert event == "contradicted"
         assert old.status == "active"
+
+
+# ---------------------------------------------------------------------------
+# P1-6: raw predicate kept for audit
+# ---------------------------------------------------------------------------
+
+
+class TestRawPredicateAudit:
+    def test_raw_predicate_stored_alongside_canonical(self, session):
+        from mirror_memory.core.repository import record_claim
+
+        set_memory_enabled(session, "u1", True)
+        belief, _ = record_claim(
+            session, "u1", dimension="fact", key="works_at_globex",
+            claim_text="User was hired by Globex", confidence=0.9,
+            predicate="works_at", object="globex",
+            raw_predicate="was_hired_by",
+        )
+        assert belief.predicate == "works_at"          # canonical
+        assert belief.raw_predicate == "was_hired_by"  # as extracted
+
+    def test_audit_reports_unmapped_predicates(self, session):
+        from mirror_memory.core.repository import audit_predicate_coverage, record_claim
+
+        set_memory_enabled(session, "u1", True)
+        # One canonicalised (was_hired_by -> works_at), one the map has never
+        # seen -- exactly the silent-split failure mode.
+        record_claim(session, "u1", dimension="fact", key="k1",
+                     claim_text="a", confidence=0.9,
+                     predicate="works_at", object="globex",
+                     raw_predicate="was_hired_by")
+        record_claim(session, "u1", dimension="fact", key="k2",
+                     claim_text="b", confidence=0.9,
+                     predicate="transitioned_to", object="acme",
+                     raw_predicate="transitioned_to")
+
+        audit = audit_predicate_coverage(session, "u1")
+        assert audit["beliefs_with_raw_predicate"] == 2
+        assert "transitioned_to" in audit["unmapped_raw_predicates"]
+        assert "was_hired_by" not in audit["unmapped_raw_predicates"]
+        assert 0.0 < audit["coverage"] < 1.0
+
+    def test_audit_full_coverage_when_all_mapped(self, session):
+        from mirror_memory.core.repository import audit_predicate_coverage, record_claim
+
+        set_memory_enabled(session, "u1", True)
+        record_claim(session, "u1", dimension="fact", key="k",
+                     claim_text="a", confidence=0.9,
+                     predicate="works_at", object="globex",
+                     raw_predicate="hired_by")
+        audit = audit_predicate_coverage(session, "u1")
+        assert audit["unmapped_raw_predicates"] == []
+        assert audit["coverage"] == 1.0
+
+    def test_audit_empty_user(self, session):
+        from mirror_memory.core.repository import audit_predicate_coverage
+
+        audit = audit_predicate_coverage(session, "nobody")
+        assert audit["beliefs_with_raw_predicate"] == 0
+        assert audit["coverage"] == 1.0

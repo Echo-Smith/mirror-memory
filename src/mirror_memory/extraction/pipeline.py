@@ -544,6 +544,7 @@ class ExtractionPipeline:
                             temporal_scope=temporal_policy.get(canon_pred, ""),
                             polarity=claim_polarity,
                             lifecycle_state=claim_lifecycle,
+                            raw_predicate=pred,
                         )
                         if new:
                             logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)
@@ -626,6 +627,11 @@ class ExtractionPipeline:
                     cardinality=policy.get(canon_pred, "multi"),
                     polarity=claim_polarity,
                     lifecycle_state=claim_lifecycle,
+                    # The extractor's own spelling, kept for audit: the
+                    # canonical predicate folds many surface forms onto one
+                    # slot and the raw form is the only record of which was
+                    # actually produced.
+                    raw_predicate=pred,
                     # Every contradiction the extractor reports is the user
                     # retracting their own earlier statement -- the two claims
                     # come from the same subject in the same conversation.  A

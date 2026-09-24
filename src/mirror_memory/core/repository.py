@@ -854,6 +854,7 @@ def record_claim(
     polarity: str = "",
     lifecycle_state: str = "",
     conflict_kind: str = CONFLICT_SOURCE_CONFLICT,
+    raw_predicate: str = "",
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -960,6 +961,7 @@ def record_claim(
             superseded_by=superseded_by,
             polarity=polarity or "neutral",
             lifecycle_state=lifecycle_state,
+            raw_predicate=raw_predicate,
             # Provenance.
             origin_stats_id=stats_id,
             origin_slice_id=origin_slice_id,
@@ -1249,6 +1251,7 @@ def update_belief_by_id(
     temporal_scope: str = "",
     polarity: str = "",
     lifecycle_state: str = "",
+    raw_predicate: str = "",
 ) -> tuple[Belief | None, Belief | None]:
     """SINGLE cardinality update: supersede old belief, create new one.
 
@@ -1362,6 +1365,7 @@ def update_belief_by_id(
         temporal_scope=temporal_scope or old.temporal_scope,
         polarity=polarity or old.polarity,
         lifecycle_state=lifecycle_state or old.lifecycle_state,
+        raw_predicate=raw_predicate or old.raw_predicate,
     )
     session.add(new_belief)
     session.flush()
@@ -1992,3 +1996,42 @@ def store_session_summary(
             turn_count=turn_count,
         ))
     session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Predicate audit — which surface forms is the extractor inventing?
+# ---------------------------------------------------------------------------
+
+
+def audit_predicate_coverage(session: Session, user_id: str) -> dict:
+    """Report which raw predicates are not covered by the synonym map.
+
+    Canonicalisation folds many surface forms onto one slot, and every fold
+    that is missing silently splits one attribute into two beliefs -- the
+    failure mode that lost 19 LongMemEval users.  This is the monitoring hook
+    for it: it names the unmapped spellings so the synonym map can be extended
+    deliberately instead of by incident.
+    """
+    from mirror_memory.config.loader import load_config
+
+    try:
+        synonyms = load_config("config/").predicate_synonyms
+    except Exception:
+        synonyms = {}
+
+    rows = session.scalars(
+        select(Belief.raw_predicate).where(
+            Belief.user_id == user_id, Belief.raw_predicate != ""
+        )
+    ).all()
+
+    distinct = sorted({r for r in rows if r})
+    unmapped = [r for r in distinct if r not in synonyms]
+
+    return {
+        "user_id": user_id,
+        "beliefs_with_raw_predicate": len(rows),
+        "distinct_raw_predicates": distinct,
+        "unmapped_raw_predicates": unmapped,
+        "coverage": round(1 - len(unmapped) / len(distinct), 4) if distinct else 1.0,
+    }
