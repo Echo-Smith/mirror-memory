@@ -351,3 +351,72 @@ class TestRendererUsesQueryAwareAdmission:
         )
         assert block is not None
         assert "charity" in block.lower()
+
+
+# ---------------------------------------------------------------------------
+# P1-8: query-adaptive render capacity
+# ---------------------------------------------------------------------------
+
+
+class TestEnumerationCapacity:
+    def test_single_value_query_is_not_enumeration(self):
+        from mirror_memory.render.renderer import _is_enumeration_query
+
+        for query in ("Where do they live now?", "What is their profession?",
+                      "How old are they?", "Who is their employer?"):
+            assert not _is_enumeration_query(query), query
+
+    @pytest.mark.parametrize("query", [
+        "What languages do they speak?",
+        "What sports do they play?",
+        "What pets do they have?",
+        "List all the cities they visited.",
+        "What did they buy?",
+        "What are their hobbies?",
+        "What did they attend?",
+    ])
+    def test_enumeration_queries_detected(self, query):
+        from mirror_memory.render.renderer import _is_enumeration_query
+
+        assert _is_enumeration_query(query), query
+
+    def test_chinese_enumeration_detected(self):
+        from mirror_memory.render.renderer import _is_enumeration_query
+
+        assert _is_enumeration_query("他们会说哪些语言？")
+        assert _is_enumeration_query("列出所有城市")
+        assert not _is_enumeration_query("他们现在住哪里？")
+
+    def test_empty_query(self):
+        from mirror_memory.render.renderer import _is_enumeration_query
+
+        assert not _is_enumeration_query("")
+
+    def test_enumeration_lifts_the_per_dimension_cap(self, session, config):
+        """An enumeration query may emit more items per dimension than a
+        single-value query -- that is the whole point of the adaptive cap."""
+        from mirror_memory.core.repository import record_claim, set_memory_enabled
+        from mirror_memory.render.renderer import render_memory_block
+
+        set_memory_enabled(session, "u1", True)
+        for obj in ("japanese", "korean", "spanish", "french", "german", "italian"):
+            record_claim(
+                session, "u1", dimension="preference", key=f"skills_{obj}",
+                claim_text=f"User speaks {obj}", confidence=0.9,
+                predicate="skills", object=obj, session_id="s1",
+            )
+
+        enumeration = render_memory_block(
+            session, "u1", config=config,
+            user_message="What languages do they speak?", language="en",
+        )
+        single = render_memory_block(
+            session, "u1", config=config,
+            user_message="What is their profession?", language="en",
+        )
+        assert enumeration is not None
+        assert single is not None
+        enum_items = [x for x in enumeration.split("; ") if x]
+        single_items = [x for x in single.split("; ") if x]
+        assert len(enum_items) > len(single_items)
+        assert len(enum_items) > config.render.max_per_dimension

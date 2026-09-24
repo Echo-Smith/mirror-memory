@@ -176,6 +176,31 @@ def _detect_temporal_mode(query: str) -> str:
     return "all"
 
 
+# Queries that ask for everything of a kind rather than the single current
+# value.  "What languages do they speak", "list all the places they visited",
+# "what did they buy" -- these need every matching occurrence, so a per-
+# dimension cap tuned for "where do they live now" starves them.
+_ENUMERATION_MARKERS = (
+    "what all", "list all", "all the", "every ", "which all", "what languages",
+    "what sports", "what pets", "what instruments", "what food", "what books",
+    "what cities", "what places", "what countries", "what schools",
+    "what companies", "what jobs", "what races", "what classes",
+    "what workshops", "what courses", "what appointments", "what gifts",
+    "what did they buy", "what did they visit", "what did they attend",
+    "what did they read", "what did they watch", "what did they eat",
+    "what hobbies", "what skills", "what are their", "what are the",
+    "\u54ea\u4e9b", "\u6240\u6709", "\u5404\u79cd", "\u5217\u51fa",
+)
+
+
+def _is_enumeration_query(query: str) -> bool:
+    """Does this query ask for every matching item rather than one value?"""
+    if not query:
+        return False
+    lowered = query.lower()
+    return any(marker in lowered for marker in _ENUMERATION_MARKERS)
+
+
 def render_memory_block(
     session: object,
     user_id: str,
@@ -322,8 +347,13 @@ def render_memory_block(
         gated_out=gated_out,
     )
 
-    # Diversity: max N items per dimension
+    # Diversity: max N items per dimension.  An enumeration query ("what
+    # languages do they speak") needs every matching value, so the per-
+    # dimension cap lifts for it; the character budget below remains the hard
+    # limit either way, so a wider cap costs prompt space, not correctness.
     max_per = render_cfg.max_per_dimension
+    if _is_enumeration_query(user_message):
+        max_per = max(max_per, render_cfg.enumeration_max_per_dimension)
     dim_counts: dict[str, int] = {}
     for _score, belief in scored:
         dim = belief.dimension

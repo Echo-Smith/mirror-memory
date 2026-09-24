@@ -186,6 +186,13 @@ class RenderConfig(BaseModel):
     floor: int = Field(default=400, description="Minimum character budget")
     cap: int = Field(default=2000, description="Maximum character budget")
     max_per_dimension: int = Field(default=3, ge=1, description="Max items per dimension in rendered block")
+    # Higher per-dimension cap used when the query asks for everything of a
+    # kind ("what languages do they speak"). The character budget still bounds
+    # the total, so this trades breadth for length rather than dropping facts.
+    enumeration_max_per_dimension: int = Field(
+        default=12, ge=1,
+        description="Per-dimension cap for enumeration queries",
+    )
     l4_render_threshold: float = Field(default=0.55, description="Min confidence for L4 beliefs to render")
     activity_half_life_days: float = Field(default=60.0, description="Half-life for belief activity time-decay")
 
