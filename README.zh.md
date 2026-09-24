@@ -100,7 +100,7 @@ pip install "mirror-memory[server,llm,dev]"  # 开发
 
 ```bash
 pytest tests/ -q
-# 631 passed in 54s
+# 769 passed in 9s
 ```
 
 ## 许可证
