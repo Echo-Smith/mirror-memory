@@ -49,10 +49,30 @@ class TestMultiNoCollision:
 
     def test_multi_coexist(self, engine):
         eng, llm = engine
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User likes coffee", "confidence": 0.9, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User likes coffee",
+                "confidence": 0.9,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u1", session_id="s1", text="I like coffee", turn_count=1)
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_painting", "predicate": "likes", "object": "painting", "claim_text": "User likes painting", "confidence": 0.9, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_painting",
+                "predicate": "likes",
+                "object": "painting",
+                "claim_text": "User likes painting",
+                "confidence": 0.9,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u1", session_id="s1", text="I like painting", turn_count=2)
 
         beliefs = eng.get_beliefs(user_id="u1")
@@ -71,11 +91,31 @@ class TestSingleUpdate:
         eng, llm = engine
 
         # First: lives_in Shanghai
-        llm._responses["k2"] = '{"claims": [{"dimension": "fact", "key": "lives_in_shanghai", "predicate": "lives_in", "object": "shanghai", "claim_text": "User lives in Shanghai", "confidence": 0.9, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "fact",
+                "key": "lives_in_shanghai",
+                "predicate": "lives_in",
+                "object": "shanghai",
+                "claim_text": "User lives in Shanghai",
+                "confidence": 0.9,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u2", session_id="s1", text="I live in Shanghai", turn_count=1)
 
         # Second: moved to Beijing (canonicalized to lives_in → UPDATE)
-        llm._responses["k2"] = '{"claims": [{"dimension": "fact", "key": "lives_in_beijing", "predicate": "moved_to", "object": "beijing", "claim_text": "User moved to Beijing", "confidence": 0.9, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "fact",
+                "key": "lives_in_beijing",
+                "predicate": "moved_to",
+                "object": "beijing",
+                "claim_text": "User moved to Beijing",
+                "confidence": 0.9,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u2", session_id="s2", text="I moved to Beijing", turn_count=1)
 
         beliefs = eng.get_beliefs(user_id="u2")
@@ -92,14 +132,34 @@ class TestSameObjectSupport:
     def test_support_boosts_confidence(self, engine):
         eng, llm = engine
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User likes coffee", "confidence": 0.7, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User likes coffee",
+                "confidence": 0.7,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u3", session_id="s1", text="I like coffee", turn_count=1)
 
         beliefs1 = eng.get_beliefs(user_id="u3")
         likes1 = [b for b in beliefs1 if b.predicate == "likes"]
         conf1 = likes1[0].confidence if likes1 else 0
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User really loves coffee", "confidence": 0.9, "relation": "supports"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User really loves coffee",
+                "confidence": 0.9,
+                "relation": "supports",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u3", session_id="s1", text="I really love coffee", turn_count=2)
 
         beliefs2 = eng.get_beliefs(user_id="u3")
@@ -118,7 +178,17 @@ class TestPredicateRetrieval:
         eng, llm = engine
 
         # Create a likes belief
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User likes coffee", "confidence": 0.8, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User likes coffee",
+                "confidence": 0.8,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u4", session_id="s1", text="I like coffee", turn_count=1)
 
         # Query about preferences
@@ -133,10 +203,30 @@ class TestCityRoundTrip:
     def test_round_trip(self, engine):
         eng, llm = engine
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "fact", "key": "lives_in_shanghai", "predicate": "lives_in", "object": "shanghai", "claim_text": "User lives in Shanghai", "confidence": 0.9, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "fact",
+                "key": "lives_in_shanghai",
+                "predicate": "lives_in",
+                "object": "shanghai",
+                "claim_text": "User lives in Shanghai",
+                "confidence": 0.9,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u6", session_id="s1", text="I live in Shanghai", turn_count=1)
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "fact", "key": "lives_in_beijing", "predicate": "moved_to", "object": "beijing", "claim_text": "User moved to Beijing", "confidence": 0.9, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "fact",
+                "key": "lives_in_beijing",
+                "predicate": "moved_to",
+                "object": "beijing",
+                "claim_text": "User moved to Beijing",
+                "confidence": 0.9,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u6", session_id="s2", text="I moved to Beijing", turn_count=1)
 
         lis3 = [
@@ -154,13 +244,143 @@ class TestCityRoundTrip:
         assert lives_in[0].object == "shanghai"
 
 
+class TestK1K2SameSlot:
+    """A K1 pattern claim and a K2 semantic claim are one slot, not two.
+
+    Before patterns carried a predicate, a K1 location row and a K2 location
+    row had nothing in common: superseding one left the other active, and the
+    value the user moved away from kept answering current-state questions.
+    """
+
+    def test_k2_replacement_closes_the_k1_row(self, engine):
+        eng, llm = engine
+        llm._responses["k2"] = '{"claims": [], "subject": "user", "context_tags": []}'
+        eng.observe(user_id="u7", session_id="s1", text="I live in Shanghai", turn_count=1)
+
+        k2 = json.dumps({"claims": [{
+            "dimension": "fact", "key": "lives_in_berlin",
+            "predicate": "lives_in", "object": "berlin",
+            "claim_text": "User moved to Berlin", "confidence": 0.9,
+            "relation": "new",
+        }], "subject": "user", "context_tags": []})
+        llm._responses["k2"] = k2
+        eng.observe(user_id="u7", session_id="s2", text="I moved to Berlin", turn_count=1)
+
+        active = [b for b in eng.get_beliefs(user_id="u7") if b.predicate == "lives_in"]
+        assert [b.object for b in active] == ["berlin"]
+
+        from sqlalchemy.orm import Session
+
+        from mirror_memory.core.models import Belief
+
+        eng._ensure_db()
+        with Session(eng._engine) as session:
+            rows = session.query(Belief).filter_by(user_id="u7").all()
+        assert {r.object for r in rows} == {"shanghai", "berlin"}
+        shanghai = [r for r in rows if r.object == "shanghai"][0]
+        assert shanghai.status == "superseded"
+
+    def test_k1_pattern_supports_the_k2_row_on_the_same_slot(self, engine):
+        """Same value restated by the other extractor is a SUPPORT, not a row."""
+        eng, llm = engine
+        k2 = json.dumps({"claims": [{
+            "dimension": "fact", "key": "lives_in_shanghai",
+            "predicate": "lives_in", "object": "shanghai",
+            "claim_text": "User lives in Shanghai", "confidence": 0.9,
+            "relation": "new",
+        }], "subject": "user", "context_tags": []})
+        llm._responses["k2"] = k2
+        eng.observe(user_id="u8", session_id="s1", text="I live in Shanghai", turn_count=1)
+
+        llm._responses["k2"] = '{"claims": [], "subject": "user", "context_tags": []}'
+        eng.observe(user_id="u8", session_id="s2", text="I live in Shanghai", turn_count=2)
+
+        lives_in = [b for b in eng.get_beliefs(user_id="u8") if b.predicate == "lives_in"]
+        assert len(lives_in) == 1
+        assert lives_in[0].object == "shanghai"
+
+    def test_k1_only_turn_with_no_triple_stores_no_belief(self, engine):
+        """A keyword-only turn is provenance, not current state."""
+        eng, llm = engine
+        llm._responses["k2"] = '{"claims": [], "subject": "user", "context_tags": []}'
+        eng.observe(user_id="u9", session_id="s1", text="I have trouble sleeping lately", turn_count=1)
+        assert eng.get_beliefs(user_id="u9") == []
+
+
+class TestRetractionClosesCurrent:
+    """A correction or cancellation ends the belief it refers to.
+
+    Forced-mode measurement: 49 of 52 state failures were "value extracted
+    but the old current row never closed".  These are the transition shapes
+    that were failing.
+    """
+
+    def test_correction_closes_the_original_claim(self, engine):
+        eng, llm = engine
+        k2 = json.dumps({"claims": [{
+            "dimension": "fact", "key": "skills_rust_coding",
+            "predicate": "skills", "object": "rust_coding",
+            "claim_text": "User can code in Rust", "confidence": 0.9,
+            "relation": "new",
+        }], "subject": "user", "context_tags": []})
+        llm._responses["k2"] = k2
+        eng.observe(user_id="u10", session_id="s1", text="I can code in Rust.", turn_count=1)
+
+        k2 = json.dumps({"claims": [{
+            "dimension": "fact", "key": "never_learned_rust",
+            "predicate": "skills", "object": "rust",
+            "claim_text": "Correction: user has never learned Rust",
+            "confidence": 0.9, "relation": "new",
+        }], "subject": "user", "context_tags": []})
+        llm._responses["k2"] = k2
+        eng.observe(user_id="u10", session_id="s2", text="Correction: I have never learned Rust.", turn_count=1)
+
+        active = [b for b in eng.get_beliefs(user_id="u10") if b.predicate == "skills"]
+        assert [b.object for b in active] == ["rust"]
+
+    def test_cancelled_goal_stops_being_current(self, engine):
+        eng, llm = engine
+        k2 = json.dumps({"claims": [{
+            "dimension": "goal", "key": "wants_to_run_marathon",
+            "predicate": "wants_to", "object": "run_a_marathon",
+            "claim_text": "User wants to run a marathon", "confidence": 0.9,
+            "relation": "new",
+        }], "subject": "user", "context_tags": []})
+        llm._responses["k2"] = k2
+        eng.observe(user_id="u11", session_id="s1", text="I want to run a marathon.", turn_count=1)
+
+        k2 = json.dumps({"claims": [{
+            "dimension": "goal", "key": "gave_up_marathon",
+            "predicate": "gave_up", "object": "marathon_goal",
+            "claim_text": "User gave up the marathon goal", "confidence": 0.9,
+            "relation": "new",
+        }], "subject": "user", "context_tags": []})
+        llm._responses["k2"] = k2
+        eng.observe(user_id="u11", session_id="s2", text="I gave up the marathon goal.", turn_count=1)
+
+        active = [b for b in eng.get_beliefs(user_id="u11")]
+        assert all(b.predicate != "wants_to" for b in active), (
+            "the cancelled goal must not stay current"
+        )
+
+
 class TestContradictionE2E:
     """Contradicting an existing belief does NOT strengthen it."""
 
     def test_contradiction_attenuates(self, engine):
         eng, llm = engine
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User likes coffee", "confidence": 0.8, "relation": "new"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User likes coffee",
+                "confidence": 0.8,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u7", session_id="s1", text="I like coffee", turn_count=1)
 
         # Get the K2-created belief's confidence
@@ -168,7 +388,17 @@ class TestContradictionE2E:
         conf_before = likes_before[0].confidence if likes_before else 0
 
         # Now say "I don't like coffee anymore" with relation=contradicts
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "dislike_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User no longer likes coffee", "confidence": 0.6, "relation": "contradicts"}], "subject": "user", "context_tags": []}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "dislike_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User no longer likes coffee",
+                "confidence": 0.6,
+                "relation": "contradicts",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u7", session_id="s1", text="I don't like coffee anymore", turn_count=2)
 
         likes_after = [b for b in eng.get_beliefs(user_id="u7") if b.key == "like_coffee"]
@@ -216,7 +446,17 @@ class TestMemoryAtomFields:
     def test_triple_fields_stored(self, engine):
         eng, llm = engine
 
-        llm._responses["k2"] = '{"claims": [{"dimension": "preference", "key": "like_coffee", "predicate": "likes", "object": "coffee", "claim_text": "User likes coffee", "confidence": 0.8, "relation": "new"}], "subject": "user", "context_tags": ["food"]}'
+        llm._responses["k2"] = json.dumps({"claims": [
+            {
+                "dimension": "preference",
+                "key": "like_coffee",
+                "predicate": "likes",
+                "object": "coffee",
+                "claim_text": "User likes coffee",
+                "confidence": 0.8,
+                "relation": "new",
+            },
+        ], "subject": "user", "context_tags": []})
         eng.observe(user_id="u5", session_id="s1", text="I like coffee", turn_count=1)
 
         beliefs = eng.get_beliefs(user_id="u5")

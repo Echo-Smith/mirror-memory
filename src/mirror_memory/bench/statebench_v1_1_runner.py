@@ -62,6 +62,11 @@ class StateBenchV11CaseResult:
     answer_text: str | None
     extracted_claims_by_turn: list[int]
     note: str = ""
+    k2_attempts: int = 0
+    k2_failures: int = 0
+    k2_empty_responses: int = 0
+    k2_parse_failures: int = 0
+    k2_schema_rejections: int = 0
 
     @property
     def passed(self) -> bool:
@@ -87,6 +92,7 @@ class StateBenchV11Report:
     answerer_model: str
     cases: list[StateBenchV11CaseResult]
     tracks: dict[str, dict]
+    extraction_health: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -97,6 +103,7 @@ class StateBenchV11Report:
             "extraction_mode": self.extraction_mode,
             "extractor_model": self.extractor_model,
             "answerer_model": self.answerer_model,
+            "extraction_health": self.extraction_health,
             "tracks": self.tracks,
             "cases": [case.to_dict() for case in self.cases],
         }
@@ -315,6 +322,8 @@ def _run_case(
         )
         for index, turn in enumerate(case.turns)
     ]
+    pipeline = engine._get_pipeline()
+    health = pipeline.k2_health
     beliefs = _snapshot_beliefs(engine, case.case_id)
     block = engine.recall(
         user_id=case.case_id,
@@ -343,6 +352,11 @@ def _run_case(
         answer_text=answer_text,
         extracted_claims_by_turn=extracted,
         note=case.note,
+        k2_attempts=health["k2_attempts"],
+        k2_failures=health["k2_failures"],
+        k2_empty_responses=health["k2_empty_responses"],
+        k2_parse_failures=health["k2_parse_failures"],
+        k2_schema_rejections=health["k2_schema_rejections"],
     )
 
 
@@ -381,6 +395,7 @@ def run_statebench_v1_1(
     *,
     categories: set[str] | None = None,
     splits: set[str] | None = None,
+    case_ids: set[str] | None = None,
     config: Any | None = None,
     config_path: str | Path = "config/",
     dataset_path: str | Path | None = None,
@@ -399,6 +414,11 @@ def run_statebench_v1_1(
     cases = load_statebench_v1_1(
         categories, splits=splits, path=dataset_path
     )
+    if case_ids is not None:
+        unknown = case_ids - {case.case_id for case in cases}
+        if unknown:
+            raise ValueError(f"unknown or filtered StateBench case ids: {sorted(unknown)}")
+        cases = [case for case in cases if case.case_id in case_ids]
     if max_cases is not None:
         if max_cases < 0:
             raise ValueError("max_cases must be non-negative")
@@ -415,6 +435,33 @@ def run_statebench_v1_1(
     ]
     source = Path(dataset_path) if dataset_path else statebench_v1_1_path()
     dataset_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    health = {
+        "k2_attempts": sum(c.k2_attempts for c in results),
+        "k2_failures": sum(c.k2_failures for c in results),
+        "k2_empty_responses": sum(c.k2_empty_responses for c in results),
+        "k2_parse_failures": sum(c.k2_parse_failures for c in results),
+        "k2_schema_rejections": sum(c.k2_schema_rejections for c in results),
+        "dataset_turns": sum(len(c.turns) for c in cases),
+    }
+    if extraction_mode != "deterministic":
+        if health["k2_attempts"] == 0:
+            raise RuntimeError(
+                f"extraction mode {extraction_mode!r} made no K2 calls -- the "
+                "report would be K1-only numbers mislabelled as a model run"
+            )
+        if health["k2_attempts"] != health["dataset_turns"]:
+            raise RuntimeError(
+                f"extraction mode {extraction_mode!r} attempted "
+                f"{health['k2_attempts']} K2 calls for "
+                f"{health['dataset_turns']} dataset turns -- the throttle did "
+                "not run every turn, so this is not a full extraction run"
+            )
+        if health["k2_failures"]:
+            raise RuntimeError(
+                f"{health['k2_failures']}/{health['k2_attempts']} K2 calls "
+                "failed -- the report would mix K1 fallback numbers into a "
+                "model run; retry when the endpoint is healthy"
+            )
     return StateBenchV11Report(
         engine=engine_name,
         dataset_version=STATEBENCH_V11_VERSION,
@@ -424,6 +471,7 @@ def run_statebench_v1_1(
         extractor_model=_model_name(effective_client),
         answerer_model=answerer_model,
         cases=results,
+        extraction_health=health,
         tracks={
             track: _track_summary(results, track)
             for track in ("state", "recall", "answer")
@@ -469,6 +517,12 @@ def render_statebench_v1_1_report(report: StateBenchV11Report) -> str:
         f"StateBench {report.dataset_version} -- engine: {report.engine}",
         f"  extraction mode: {report.extraction_mode}",
     ]
+    health = report.extraction_health or {}
+    if health:
+        lines.append(
+            f"  k2 calls: {health.get('k2_attempts', 0)} "
+            f"(failed {health.get('k2_failures', 0)})"
+        )
     for track in ("state", "recall", "answer"):
         stats = report.tracks[track]
         score = "not run" if stats["score"] is None else f"{stats['score']:.3f}"

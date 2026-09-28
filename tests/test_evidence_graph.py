@@ -228,7 +228,7 @@ class TestPipelineCreatesEvidence:
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
 
         evidence = db_session.query(Evidence).all()
         assert evidence, "observe produced no Evidence rows"
@@ -242,14 +242,36 @@ class TestPipelineCreatesEvidence:
         assert links
         assert all(link.relation == "support" for link in links)
 
-    def test_each_turn_is_its_own_evidence(self, db_session):
+    def test_turn_without_a_triple_leaves_an_observation_not_a_belief(self, db_session):
+        """A keyword-only turn is provenance, not current state.
+
+        Persisting it as a belief put an undated, never-superseded row holding
+        the raw snippet into the current-state surface, so the value the user
+        moved away from kept answering current-state questions.  The turn is
+        still recorded as Evidence -- what was seen survives what was
+        concluded.
+        """
         from mirror_memory.config.loader import load_config
         from mirror_memory.extraction.pipeline import ExtractionPipeline
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
         pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping again", 2)
+
+        assert db_session.query(Belief).count() == 0
+        evidence = db_session.query(Evidence).all()
+        assert [e.ref for e in evidence] == ["s1:1"]
+        assert evidence[0].content == "I have trouble sleeping lately"
+        assert db_session.query(BeliefEvidenceLink).count() == 0
+
+    def test_each_turn_is_its_own_evidence(self, db_session):
+        from mirror_memory.config.loader import load_config
+        from mirror_memory.extraction.pipeline import ExtractionPipeline
+
+        set_memory_enabled(db_session, "u1", True)
+        pipeline = ExtractionPipeline(config=load_config("config/"))
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin too", 2)
 
         refs = {e.ref for e in db_session.query(Evidence).all()}
         assert refs == {"s1:1", "s1:2"}
@@ -260,8 +282,8 @@ class TestPipelineCreatesEvidence:
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping again", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin too", 1)
 
         assert db_session.query(Evidence).count() == 1
 
@@ -271,8 +293,8 @@ class TestPipelineCreatesEvidence:
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping again", 2)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin too", 2)
 
         belief = db_session.query(Belief).first()
         counts = evidence_summary(db_session, "u1", belief.id)["counts"]
@@ -285,7 +307,7 @@ class TestPipelineCreatesEvidence:
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
 
         belief = db_session.query(Belief).first()
         # Legacy field is untouched by K1 (no message ids were supplied)...
@@ -327,19 +349,20 @@ class TestRetrievalUsesEvidenceGraph:
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
 
         belief = db_session.query(Belief).first()
         assert evidence_counts_for_beliefs(db_session, [belief.id])[belief.id] >= 1
 
-        # A single K1 keyword claim is L4 at 0.4 confidence, below the 0.55
-        # render watermark, so nothing renders.  What matters here is that the
-        # link-count lookup runs inside the render path without error.
+        # A K1 pattern claim that declares a predicate is L4 at 0.6
+        # confidence, above the 0.55 render watermark, so the belief renders.
+        # What matters here is that the link-count lookup runs inside the
+        # render path without error.
         block = render_memory_block(
             db_session, "u1", config=load_config("config/"),
-            user_message="sleep", language="en",
+            user_message="berlin", language="en",
         )
-        assert block is None or "sleep" in block.lower()
+        assert block is None or "berlin" in block.lower()
 
     def test_renderer_renders_once_watermark_is_met(self, db_session):
         """With enough support the belief clears the watermark and renders."""
@@ -350,7 +373,7 @@ class TestRetrievalUsesEvidenceGraph:
 
         set_memory_enabled(db_session, "u1", True)
         pipeline = ExtractionPipeline(config=load_config("config/"))
-        pipeline.observe(db_session, "u1", "s1", "I have trouble sleeping lately", 1)
+        pipeline.observe(db_session, "u1", "s1", "I live in Berlin", 1)
 
         belief = db_session.query(Belief).first()
         for _ in range(3):
@@ -359,10 +382,10 @@ class TestRetrievalUsesEvidenceGraph:
 
         block = render_memory_block(
             db_session, "u1", config=load_config("config/"),
-            user_message="sleep", language="en",
+            user_message="berlin", language="en",
         )
         assert block is not None
-        assert "sleep" in block.lower()
+        assert "berlin" in block.lower()
 
 
 # ---------------------------------------------------------------------------

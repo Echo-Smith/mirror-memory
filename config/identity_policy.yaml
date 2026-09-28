@@ -34,6 +34,9 @@ predicates:
   age:
     cardinality: single
     temporal: current_state
+  name:
+    cardinality: single
+    temporal: current_state
   profession:
     cardinality: single
     temporal: current_state

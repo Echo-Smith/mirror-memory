@@ -57,6 +57,32 @@ class ExtractionPipeline:
         # Optional observability hook: called as ``trace_hook(stage, **fields)``
         # at each funnel stage.  Never affects behaviour -- purely additive.
         self._trace_hook = trace_hook
+        # K2 health, read off the extractor that actually makes the calls: a
+        # failed K2 call is swallowed so the turn still yields K1 claims, which
+        # means a run whose every K2 call fails looks exactly like a
+        # deterministic run -- the caller must be able to tell the difference,
+        # or a rate-limited "forced" run silently reports K1 numbers.
+        self._k2_stage_failures = 0
+
+    @property
+    def k2_attempts(self) -> int:
+        return getattr(self._semantic, "llm_calls", 0)
+
+    @property
+    def k2_failures(self) -> int:
+        return getattr(self._semantic, "llm_failures", 0) + self._k2_stage_failures
+
+    @property
+    def k2_health(self) -> dict[str, int]:
+        """Full K2 health: attempts, failures, and why claims came back empty."""
+        semantic = self._semantic
+        return {
+            "k2_attempts": self.k2_attempts,
+            "k2_failures": self.k2_failures,
+            "k2_empty_responses": getattr(semantic, "empty_responses", 0),
+            "k2_parse_failures": getattr(semantic, "parse_failures", 0),
+            "k2_schema_rejections": getattr(semantic, "schema_rejections", 0),
+        }
 
     def _trace(self, stage: str, **fields: object) -> None:
         """Emit one funnel-stage event to the observability hook, if any."""
@@ -179,15 +205,20 @@ class ExtractionPipeline:
                     all_claims.extend(k2_result)
                     logger.info("pipeline: K2 extracted %d claims", len(k2_result))
         except Exception:
+            self._k2_stage_failures += 1
             logger.warning("pipeline: K2 extraction failed; continuing", exc_info=True)
 
         # -- Persist claims --------------------------------------------------
         try:
             # Assemble: scarce dimensions first, cap fill.
-            from mirror_memory.extraction.assembler import assemble_claims
+            from mirror_memory.extraction.assembler import arbitrate_claims, assemble_claims
 
             dim_counts = self._get_dimension_counts(session, user_id)
             all_claims = assemble_claims(all_claims, self._config, active_dimension_counts=dim_counts)
+            # Arbitrate same-turn K1/K2 disagreements before anything is
+            # written: once both readings are beliefs, the cross-predicate
+            # revival path can close the correct one.
+            all_claims = arbitrate_claims(all_claims, self._config.identity_policy)
             self._persist_claims(
                 session, user_id, session_id, all_claims,
                 context_tags=k2_context_tags or None,
@@ -228,10 +259,10 @@ class ExtractionPipeline:
         from, which is what keeps K1-only extraction attributable.
 
         Links are typed by *relation*, which is what lets one message support
-        one belief and contradict another.
+        one belief and contradict another.  A claim that produced no belief
+        (no cognitive triple) still leaves its observation behind: provenance
+        is a record of what was seen, independent of what was concluded.
         """
-        if belief_id is None:
-            return
         from mirror_memory.core.repository import link_evidence, record_evidence
 
         refs = [str(mid) for mid in (claim.get("evidence_message_ids") or [])]
@@ -253,7 +284,8 @@ class ExtractionPipeline:
                     extraction_method=method,
                     authority="user",
                 )
-                link_evidence(session, belief_id, evidence.id, relation=relation)
+                if belief_id is not None:
+                    link_evidence(session, belief_id, evidence.id, relation=relation)
             except Exception:
                 logger.debug(
                     "pipeline: evidence attach failed for belief=%s ref=%s",
@@ -412,11 +444,15 @@ class ExtractionPipeline:
                 claim_polarity = ""
                 claim_lifecycle = ""
 
-                # Claims with no cognitive triple (e.g. K1 keyword hits) bypass
-                # identity resolution entirely.  Recording the skip is what makes
-                # it visible in the funnel: a claim with no predicate/object
-                # cannot be matched by query-aware retrieval either.
-                if not (pred and obj and policy):
+                # Claims with no cognitive triple (e.g. K1 keyword hits) are
+                # turn-classification signals, not slot assertions.  Persisting
+                # them as beliefs puts an undated, never-superseded row holding
+                # the raw snippet into the current-state surface, so the value
+                # the user moved away from keeps answering "where do they live
+                # now" after the replacement arrives.  The snippet itself
+                # survives as session-summary source context, so recall of the
+                # text is not lost -- only its false claim to be current state.
+                if not (pred and obj):
                     self._trace(
                         "identity",
                         action="SKIPPED_NO_TRIPLE",
@@ -424,9 +460,17 @@ class ExtractionPipeline:
                         object=obj,
                         reason="claim carries no cognitive triple",
                     )
+                    # The observation still enters the ledger even though no
+                    # belief was concluded from it.
+                    self._attach_evidence_rows(
+                        session, user_id, session_id, claim, None,
+                        relation="support", source_text=source_text,
+                        turn_ref=turn_ref,
+                    )
+                    continue
 
                 # If claim has cognitive triple fields, run identity resolution.
-                if pred and obj and policy:
+                if policy:
                     # Canonicalize
                     _, canon_pred, canon_obj = canonicalize_atom(
                         claim.get("subject", "user"), pred, obj, synonyms
@@ -458,10 +502,48 @@ class ExtractionPipeline:
                     # "the 200 most recent" silently hid older predicates past
                     # that bound, and the resolver then turned what should have
                     # been a SUPPORT or UPDATE into a CREATE.
-                    existing = beliefs_with_predicates(
-                        session, user_id, {canon_pred},
-                        candidate_objects={canon_obj} if canon_obj else set(),
+                    from mirror_memory.memory.polarity import (
+                        is_resumption,
+                        is_self_correction,
+                        is_termination,
+                        object_tokens,
                     )
+
+                    retracting = is_self_correction(
+                        claim.get("claim_text", "")
+                    ) or is_termination(claim.get("claim_text", ""))
+                    resuming = is_resumption(claim.get("claim_text", ""))
+                    if retracting:
+                        # A retraction refers to its target by meaning, so the
+                        # candidate set is widened to every active belief that
+                        # mentions one of the candidate's object tokens; the
+                        # predicate/exact-object lookup would miss the very row
+                        # the retraction has to close.
+                        from mirror_memory.core.repository import (
+                            active_goal_beliefs,
+                            beliefs_referenced_by_tokens,
+                        )
+
+                        existing = beliefs_referenced_by_tokens(
+                            session, user_id, object_tokens(canon_obj),
+                        )
+                        if not existing:
+                            # "I gave up on the goal" shares no token with the
+                            # goal it ends, so the only candidate set left is
+                            # the user's live goals.
+                            existing = active_goal_beliefs(session, user_id)
+                    elif resuming:
+                        # A resumption retires the ended stage of a goal, which
+                        # is tagged rather than named by the new claim, so the
+                        # candidate set is the recent active surface.
+                        from mirror_memory.core.repository import list_active_beliefs
+
+                        existing = list_active_beliefs(session, user_id, limit=25)
+                    else:
+                        existing = beliefs_with_predicates(
+                            session, user_id, {canon_pred},
+                            candidate_objects={canon_obj} if canon_obj else set(),
+                        )
                     existing_dicts = [
                         {
                             "id": b.id,
@@ -470,6 +552,8 @@ class ExtractionPipeline:
                             "status": b.status,
                             "confidence": b.confidence,
                             "temporal": safe_json(getattr(b, "value_json", "{}")).get("temporal", ""),
+                            "transition": safe_json(getattr(b, "value_json", "{}")).get("transition", ""),
+                            "ended_object": safe_json(getattr(b, "value_json", "{}")).get("ended_object", ""),
                             "valid_from": getattr(b, "valid_from", None),
                             "valid_to": getattr(b, "valid_to", None),
                         }
@@ -523,6 +607,22 @@ class ExtractionPipeline:
                         value["predicate"] = canon_pred
                         value["object"] = canon_obj
                         claim["value"] = value
+                        # A row created by ending a current value is itself an
+                        # ended stage: a later resumption has to be able to
+                        # find and retire it, and the row's own text ("I gave
+                        # up the goal") says nothing about which goal it ended.
+                        # The ended belief's identity travels with the row so
+                        # the resumption matches by it, not by the row's own
+                        # (generic) object.
+                        if resolution.lifecycle == "END_CURRENT":
+                            value["transition"] = "END_CURRENT"
+                            value["ended_object"] = (
+                                resolution.detail.get("ended_object") or ""
+                            )
+                            value["ended_belief_id"] = (
+                                resolution.detail.get("ended_belief_id")
+                            )
+                            claim["value"] = value
 
                         old, new = update_belief_by_id(
                             session,

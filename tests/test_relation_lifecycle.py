@@ -258,8 +258,188 @@ class TestResolverOrchestration:
         assert result.action == ACTION_UPDATE
         assert result.lifecycle == LifecycleAction.TEMPORAL_UPDATE.value
         assert result.temporal_relation == TemporalRelation.FOLLOWS.value
+
+    def test_opposite_polarity_replaces_the_current_value(self):
+        """One current polarity per object: the withdrawal closes the stance.
+
+        "I do not like coffee" against an active "likes coffee" is a
+        replacement of the current value, not a second coexisting belief.
+        """
+        result = resolve_identity(
+            CandidateAtom(predicate="dislikes", object="coffee"),
+            [{"id": 7, "predicate": "likes", "object": "coffee", "status": "active",
+              "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_UPDATE
         assert result.target_belief_id == 7
-        assert "beijing" in result.reason
+        assert result.lifecycle == LifecycleAction.TEMPORAL_UPDATE.value
+
+    def test_same_polarity_about_other_objects_coexists(self):
+        result = resolve_identity(
+            CandidateAtom(predicate="likes", object="painting"),
+            [{"id": 7, "predicate": "likes", "object": "coffee", "status": "active",
+              "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_CREATE
+
+    def test_neutral_predicate_is_untouched_by_polarity_replacement(self):
+        """lives_in is neutral; no opposing polarity exists to replace."""
+        result = resolve_identity(
+            CandidateAtom(predicate="lives_in", object="berlin"),
+            [{"id": 7, "predicate": "lives_in", "object": "shanghai", "status": "active",
+              "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_UPDATE
+        assert "TEMPORAL_UPDATE" in (result.lifecycle or "")
+        assert result.target_belief_id == 7
+
+    def test_self_correction_closes_the_corrected_belief(self):
+        """An explicit retraction ends the belief it retracts.
+
+        The extractor spells the object differently each turn and often under
+        a different predicate, so the referent is found by object tokens.
+        """
+        result = resolve_identity(
+            CandidateAtom(
+                predicate="skills", object="rust",
+                claim_text="Correction: I have never learned Rust.",
+            ),
+            [{"id": 7, "predicate": "skills", "object": "rust_coding",
+              "status": "active", "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_UPDATE
+        assert result.target_belief_id == 7
+        assert result.lifecycle == "SELF_CORRECTION"
+
+    def test_termination_closes_the_current_goal(self):
+        """Cancelling a goal ends its current stage, it does not add a row."""
+        result = resolve_identity(
+            CandidateAtom(
+                predicate="gave_up", object="marathon_goal",
+                claim_text="I gave up the marathon goal.",
+            ),
+            [{"id": 7, "predicate": "wants_to", "object": "run_marathon",
+              "status": "active", "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_UPDATE
+        assert result.target_belief_id == 7
+        assert result.lifecycle == "END_CURRENT"
+
+    def test_retraction_without_a_referent_falls_through(self):
+        """A marker with no overlapping active belief is an ordinary claim."""
+        result = resolve_identity(
+            CandidateAtom(
+                predicate="gave_up", object="marathon_goal",
+                claim_text="I gave up the marathon goal.",
+            ),
+            [{"id": 7, "predicate": "likes", "object": "coffee",
+              "status": "active", "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_CREATE
+
+    def test_ordinary_restatement_is_not_a_retraction(self):
+        result = resolve_identity(
+            CandidateAtom(predicate="likes", object="coffee", claim_text="I like coffee"),
+            [{"id": 7, "predicate": "likes", "object": "coffee", "status": "active",
+              "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_SUPPORT
+
+    def test_generic_goal_referent_closes_the_active_goal(self):
+        """"I gave up on the goal" names no object that overlaps the goal."""
+        result = resolve_identity(
+            CandidateAtom(
+                predicate="experiences", object="unnamed_goal",
+                claim_text="I gave up on the goal.",
+            ),
+            [{"id": 7, "predicate": "wants_to", "object": "run_marathon",
+              "status": "active", "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_UPDATE
+        assert result.target_belief_id == 7
+        assert result.lifecycle == "END_CURRENT"
+
+    def test_resumption_retires_the_ended_stage(self):
+        """The cancellation row must not stay current once the goal is back.
+
+        The match is by the ended belief's identity, which the pipeline stamps
+        on the ended row -- the row's own object ("unnamed_goal") says nothing
+        about which goal it ended.
+        """
+        result = resolve_identity(
+            CandidateAtom(
+                predicate="went_to", object="marathon_training",
+                claim_text="I have started marathon training again.",
+            ),
+            [
+                {"id": 7, "predicate": "wants_to", "object": "run_marathon",
+                 "status": "superseded", "confidence": 0.9},
+                {"id": 8, "predicate": "experiences", "object": "unnamed_goal",
+                 "status": "active", "confidence": 0.9,
+                 "transition": "END_CURRENT", "ended_object": "run_marathon"},
+            ],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_UPDATE
+        assert result.target_belief_id == 8
+        assert result.lifecycle == "RESUME"
+
+    def test_resumption_ignores_an_unrelated_ended_stage(self):
+        """"I like coffee again" must not retire the sold-bicycle row."""
+        result = resolve_identity(
+            CandidateAtom(predicate="likes", object="coffee", claim_text="I like coffee again."),
+            [
+                {"id": 7, "predicate": "sold", "object": "red_bicycle",
+                 "status": "active", "confidence": 0.9,
+                 "transition": "END_CURRENT", "ended_object": "red_bicycle"},
+            ],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_CREATE
+
+    def test_generic_goal_cancellation_with_several_goals_closes_nothing(self):
+        """"the goal" is ambiguous when more than one goal is live."""
+        result = resolve_identity(
+            CandidateAtom(
+                predicate="experiences", object="unnamed_goal",
+                claim_text="I gave up on the goal.",
+            ),
+            [
+                {"id": 7, "predicate": "wants_to", "object": "learn_japanese",
+                 "status": "active", "confidence": 0.9},
+                {"id": 8, "predicate": "wants_to", "object": "run_marathon",
+                 "status": "active", "confidence": 0.9},
+            ],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_CREATE
+
+    def test_resumption_without_an_ended_stage_is_an_ordinary_claim(self):
+        result = resolve_identity(
+            CandidateAtom(predicate="likes", object="coffee", claim_text="I like coffee again."),
+            [{"id": 7, "predicate": "likes", "object": "coffee", "status": "active",
+              "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_SUPPORT
+
+    def test_unrelated_termination_leaves_the_goal_alone(self):
+        """"I no longer work at Acme" must not cancel an unrelated goal."""
+        result = resolve_identity(
+            CandidateAtom(predicate="works_at", object="acme", claim_text="I no longer work at Acme."),
+            [{"id": 7, "predicate": "wants_to", "object": "learn_japanese",
+              "status": "active", "confidence": 0.9}],
+            CARDINALITY, SCOPES,
+        )
+        assert result.action == ACTION_CREATE
 
     def test_picks_currently_true_belief_as_target(self):
         result = resolve_identity(

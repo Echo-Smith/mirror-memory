@@ -32,6 +32,26 @@ STATEBENCH_V11_CATEGORIES = frozenset({
 STATEBENCH_V11_SPLITS = frozenset({"development", "public_evaluation"})
 STATEBENCH_V11_TRACKS = frozenset({"state", "recall", "answer"})
 
+# Diagnostic bridge from benchmark scenarios to proposed runtime operations.
+# REVIVE means a *new* validity interval for a previously seen value; it must
+# never reopen and overwrite the earlier interval.  READ_AT_TIME is a recall
+# operation, not a write transition, even though the dataset groups it under
+# ``transition_type`` for reporting.
+TRANSITION_RUNTIME_CONTRACT = {
+    "coexisting_values": "ASSERT",
+    "current_value_replacement": "REPLACE_CURRENT",
+    "current_value_revival": "REVIVE",
+    "distinct_occurrences": "ASSERT",
+    "explicit_correction": "CORRECT",
+    "goal_cancellation": "END_CURRENT",
+    "goal_reactivation": "REVIVE",
+    "preference_reversal": "REPLACE_CURRENT",
+    "preference_revival": "REVIVE",
+    "query_time_selection": "READ_AT_TIME",
+    "relationship_termination": "END_CURRENT",
+    "state_termination": "END_CURRENT",
+}
+
 
 @dataclass(frozen=True)
 class AtomAssertion:
@@ -209,6 +229,7 @@ __all__ = [
     "STATEBENCH_V11_SPLITS",
     "STATEBENCH_V11_TRACKS",
     "STATEBENCH_V11_VERSION",
+    "TRANSITION_RUNTIME_CONTRACT",
     "StateCaseV11",
     "StateContract",
     "TextContract",

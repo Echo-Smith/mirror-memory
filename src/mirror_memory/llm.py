@@ -93,6 +93,11 @@ class OpenAILLM:
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._extra_body = extra_body
+        # Call health.  A failed call returns the caller's fallback instead of
+        # raising, so the failure is counted here -- where it happens -- or a
+        # rate-limited run looks like a model that simply found nothing.
+        self.calls = 0
+        self.call_failures = 0
 
     def generate(
         self,
@@ -125,6 +130,7 @@ class OpenAILLM:
         """
         try:
             started = time.monotonic()
+            self.calls += 1
             request: dict[str, Any] = {
                 "model": self._model,
                 "messages": [
@@ -154,6 +160,7 @@ class OpenAILLM:
             return content
 
         except Exception:
+            self.call_failures += 1
             logger.warning("LLM call failed (model=%s)", self._model, exc_info=True)
             if fallback is not None:
                 return fallback()

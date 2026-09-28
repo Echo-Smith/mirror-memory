@@ -7,7 +7,6 @@ client is injected via ``config.llm_client``.  Zero domain coupling.
 from __future__ import annotations
 
 import logging
-import time
 from datetime import UTC, datetime
 
 from mirror_memory.config.schema import MemoryConfig
@@ -52,18 +51,33 @@ def _anchor_prompt_lines(config: MemoryConfig) -> list[str]:
     return lines
 
 
+def _empty_result() -> dict:
+    """The no-claims result, in the same shape the success path returns."""
+    return {"claims": [], "subject": "user", "context_tags": []}
+
+
 def _parse_extraction_full(
     raw: str, allowed_keys: dict[str, frozenset[str]]
 ) -> dict:
     """Parse LLM output into a structured result with claims, subject, and context_tags.
 
     Returns ``{"claims": [...], "subject": "user"|"third_party", "context_tags": [...]}``.
+
+    ``parse_error`` classifies why no claims came back: ``None`` when claims
+    were produced (or the model legitimately found none), ``"invalid_json"``
+    when the text was not parseable, ``"wrong_shape"`` when it parsed to
+    something other than the claim container, and ``"no_valid_claims"`` when
+    the container held only rejected items.  A zero-claim response that is
+    not an error and a zero-claim response that is one must not be counted
+    the same way, or the run health cannot tell a quiet model from a broken
+    one.
     """
     from mirror_memory.core.utils import parse_llm_json
 
     data = parse_llm_json(raw, expect_array=True)
     if data is None:
-        return {"claims": [], "subject": "user", "context_tags": []}
+        return {"claims": [], "subject": "user", "context_tags": [],
+                "parse_error": "invalid_json"}
 
     # Accept bare [...] (legacy), {"claims": [...]}, and full structured formats.
     if isinstance(data, list):
@@ -76,10 +90,12 @@ def _parse_extraction_full(
         raw_tags = data.get("context_tags") or []
         context_tags = [str(t) for t in raw_tags if isinstance(t, str)][:3] if isinstance(raw_tags, list) else []
     else:
-        return {"claims": [], "subject": "user", "context_tags": []}
+        return {"claims": [], "subject": "user", "context_tags": [],
+                "parse_error": "wrong_shape"}
 
     if not isinstance(raw_claims, list):
-        raw_claims = []
+        return {"claims": [], "subject": subject, "context_tags": context_tags,
+                "parse_error": "wrong_shape"}
 
     validated: list[dict] = []
     for item in raw_claims:
@@ -129,10 +145,19 @@ def _parse_extraction_full(
             "confidence": confidence,
             "relation": relation,
             "source": "extracted",
+            "extractor_stage": "k2",
             "value": value,
         })
 
-    return {"claims": validated, "subject": subject, "context_tags": context_tags}
+    return {
+        "claims": validated,
+        "subject": subject,
+        "context_tags": context_tags,
+        # Every item was rejected by the schema gate: the model answered, but
+        # nothing it said was usable.  That is a different failure from a
+        # quiet model and has to be counted separately.
+        "parse_error": "no_valid_claims" if not validated and raw_claims else None,
+    }
 
 
 def _parse_extraction_json(raw: str, allowed_keys: dict[str, frozenset[str]]) -> list[dict]:
@@ -153,6 +178,17 @@ class SemanticExtractor:
     def __init__(self, config: MemoryConfig) -> None:
         self._config = config
         self._allowed_keys = _build_allowed_keys(config)
+        # LLM health counters.  A failed call returns empty claims rather than
+        # raising -- that is what keeps a turn usable -- so the failure has to
+        # be counted here or a run whose every call failed (a rate-limited
+        # "forced" run, say) is indistinguishable from a deterministic one.
+        # The three quality counters separate "the model said nothing usable"
+        # from "the model was never heard", which the release gate needs.
+        self.llm_calls = 0
+        self.llm_failures = 0
+        self.empty_responses = 0
+        self.parse_failures = 0
+        self.schema_rejections = 0
 
     def extract(
         self,
@@ -204,7 +240,8 @@ class SemanticExtractor:
             + (text or "").strip()
         )
 
-        started = time.monotonic()
+        self.llm_calls += 1
+        failures_before = getattr(llm, "call_failures", 0)
         try:
             raw = llm.generate(
                 system_prompt=system_prompt,
@@ -212,15 +249,35 @@ class SemanticExtractor:
                 fallback=lambda: '{"claims": []}',
             )
         except Exception:
+            self.llm_failures += 1
             logger.warning("semantic: LLM call failed, returning empty claims")
-            return []
+            return _empty_result()
+        # A client may swallow its own error and answer with the fallback
+        # string instead of raising.  Its failure counter is the only signal
+        # that the empty claims are a failed call, not a model that found
+        # nothing -- without this a rate-limited run measures the fallback.
+        failures_after = getattr(llm, "call_failures", 0)
+        if failures_after > failures_before:
+            self.llm_failures += failures_after - failures_before
+            logger.warning(
+                "semantic: LLM client reported a failed call, returning empty claims"
+            )
+            return _empty_result()
 
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        logger.info("semantic: LLM call completed in %dms", elapsed_ms)
+        if not (raw or "").strip():
+            self.empty_responses += 1
+            logger.warning("semantic: LLM returned an empty response")
+            return _empty_result()
 
         result = _parse_extraction_full(raw, self._allowed_keys)
+        parse_error = result.get("parse_error")
+        if parse_error == "invalid_json":
+            self.parse_failures += 1
+        elif parse_error in ("wrong_shape", "no_valid_claims"):
+            self.schema_rejections += 1
         logger.info(
-            "semantic: extracted %d claims (subject=%s, tags=%s)",
+            "semantic: extracted %d claims (subject=%s, tags=%s, parse_error=%s)",
             len(result["claims"]), result["subject"], result["context_tags"],
+            parse_error,
         )
         return result

@@ -17,6 +17,8 @@ close the superseded state at the moment it happens instead of guessing later.
 
 from __future__ import annotations
 
+import re
+
 # Predicates whose two halves are opposite polarities of one attribute.
 _POSITIVE_PREDICATES = frozenset({
     "likes", "loves", "enjoys", "prefers", "wants", "wants_to", "likes_to",
@@ -78,6 +80,11 @@ def is_goal_predicate(predicate: str) -> bool:
     return p in _GOAL_PREDICATES
 
 
+def goal_predicates() -> frozenset[str]:
+    """The predicate set that denotes a goal or intention."""
+    return frozenset(_GOAL_PREDICATES)
+
+
 def infer_lifecycle(predicate: str, claim_text: str, *, prior_state: str = "") -> str:
     """Infer a goal's lifecycle state from the claim and any prior state.
 
@@ -106,3 +113,101 @@ def opposite_polarity(polarity: str) -> str:
     if polarity == POLARITY_NEGATIVE:
         return POLARITY_POSITIVE
     return ""
+
+
+# Phrases that retract an earlier statement.  These are meta-linguistic --
+# they talk about the conversation, not about the fact -- so matching them is
+# not the "negation word carries fact-model responsibility" anti-pattern the
+# polarity model replaced.  A correction is the user withdrawing their own
+# earlier claim, which is a different transition from a source conflict.
+_CORRECTION_MARKERS = (
+    "correction",
+    "i was wrong",
+    "i mistook",
+    "i misspoke",
+    "that was mistaken",
+    "that was incorrect",
+    "i need to correct",
+    "let me correct",
+    "i take that back",
+    "i take it back",
+    "scratch that",
+    "on second thought",
+    "to correct myself",
+    "i correct myself",
+)
+
+# Generic object tokens that carry no identity: two beliefs sharing only one
+# of these are not about the same thing.
+_GENERIC_OBJECT_TOKENS = frozenset({
+    "not", "never", "few", "some", "any", "all", "the", "and", "with",
+    "for", "from", "into", "about", "very", "really", "just", "also",
+    "than", "then", "when", "what", "have", "has", "had", "was", "were",
+    "are", "did", "does", "done", "can", "could", "would", "should",
+})
+
+
+def is_self_correction(claim_text: str) -> bool:
+    """True when the claim explicitly retracts an earlier statement."""
+    text = (claim_text or "").casefold()
+    return any(marker in text for marker in _CORRECTION_MARKERS)
+
+
+# Phrases that end a current state rather than assert a new one.  Like the
+# correction markers these are meta-linguistic, but they terminate a goal, a
+# possession or an attribute instead of retracting a statement: "I gave up
+# the marathon goal", "I sold the red bicycle", "I no longer live in Shanghai".
+_TERMINATION_MARKERS = (
+    "cancelled", "canceled", "called off", "backed out",
+    "gave up", "give up", "given up", "dropped the", "abandoned",
+    "scrapped", "quit", "sold my", "sold the", "got rid of",
+    "no longer", "not anymore", "decided not to", "decided against",
+    "ended the", "broke up with", "parted ways",
+)
+
+
+def is_termination(claim_text: str) -> bool:
+    """True when the claim ends a current state instead of asserting one."""
+    text = (claim_text or "").casefold()
+    return any(marker in text for marker in _TERMINATION_MARKERS)
+
+
+# Phrases that bring a previously ended goal back.  A resumption closes the
+# ended stage: "I gave up the marathon goal" then "I have started marathon
+# training again" leaves the cancellation current unless the resumption
+# retires it.
+_RESUMPTION_MARKERS = (
+    "again", "restarted", "resumed", "back to", "renewed", "revisiting",
+    "trying again", "signed up", "booked", "enrolled", "after all",
+    "picked it up", "started training", "applying for",
+)
+
+# Words that refer to a goal without naming it.  "I gave up on the goal"
+# carries no object tokens that overlap the goal belief it ends, so the
+# referent has to be recognised as the generic one.
+_GENERIC_GOAL_WORDS = frozenset({
+    "goal", "plan", "project", "idea", "intention", "resolution", "ambition",
+})
+
+
+def is_resumption(claim_text: str) -> bool:
+    """True when the claim brings a previously ended goal back."""
+    text = (claim_text or "").casefold()
+    return any(marker in text for marker in _RESUMPTION_MARKERS)
+
+
+def refers_to_a_goal_generically(text_or_object: str) -> bool:
+    """True when the text points at "the goal" without naming it."""
+    tokens = re.split(r"[^a-z0-9]+", (text_or_object or "").casefold())
+    return bool({t for t in tokens if t} & _GENERIC_GOAL_WORDS)
+
+
+def object_tokens(obj: str) -> set[str]:
+    """The identity-bearing tokens of a canonical object.
+
+    ``fluent_korean`` and ``few_korean_phrases`` are two surfaces of one
+    thing; the shared token is what lets a correction find the belief it
+    retracts when the extractor spells the object differently each time.
+    """
+    tokens = re.split(r"[^a-z0-9]+", (obj or "").casefold())
+    return {t for t in tokens if len(t) >= 3 and t not in _GENERIC_OBJECT_TOKENS}

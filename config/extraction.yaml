@@ -138,33 +138,86 @@ keywords:
     - that's off limits
 
 # Regex patterns for structured extraction
+#
+# `predicate` + `object_group` turn a pattern into a cognitive triple: the
+# pattern asserts a slot (predicate) and the named capture group holds the
+# value.  Such claims flow through identity resolution exactly like K2 claims,
+# so a new value supersedes the old one instead of sitting beside it in the
+# current-state surface.  A pattern without `predicate` stays triple-less and
+# is no longer persisted as a belief.
 patterns:
   # Age pattern
   - regex: "(?:I'm|I am)\\s+(\\d{1,3})\\s+(?:years?\\s+old|yo)"
     dimension: fact
     key: age
+    predicate: age
+    object_group: 1
 
   # Name pattern
   - regex: "(?:my name is|call me|I'm called)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?)"
     dimension: fact
     key: my_name
+    predicate: name
+    object_group: 1
 
   # Location pattern
   - regex: "(?:I live in|I'm from|I'm living in)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)"
     dimension: fact
     key: i_live
+    predicate: lives_in
+    object_group: 1
+
+  # Relocation: the same residence slot stated as a change.  Without this the
+  # move itself produced no location claim at all, so the old value stayed the
+  # only current one.
+  - regex: "(?:I've moved to|I have moved to|I moved to|I relocated to|I just moved to)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)"
+    dimension: fact
+    key: moved_to
+    predicate: lives_in
+    object_group: 1
+
+  # Return: the round-trip's third turn.  `returned_to` is deliberately absent
+  # from the synonym map (it is domain-ambiguous), but a pattern is not: the
+  # regex itself constrains the context to residence, so declaring lives_in
+  # here does not pollute the employment slot.
+  - regex: "(?:I've returned to|I returned to|I moved back to|I'm back in|I am back in)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)"
+    dimension: fact
+    key: returned_to
+    predicate: lives_in
+    object_group: 1
 
   # Goal pattern
   - regex: "(?:I want to|I'd like to|I hope to|I plan to)\\s+(.+?)(?:\\.|,|$)"
     dimension: goal
     key: i_want
+    predicate: wants_to
+    object_group: 1
 
-  # Preference pattern
-  - regex: "(?:I (?:really )?(?:prefer|like|love|enjoy|hate|dislike))\\s+(.+?)(?:\\.|,|$)"
+  # Preference patterns — positive and negative verbs are opposite polarities
+  # of one slot, so they are separate patterns.  Adverbs between the pronoun
+  # and the verb are common ("I also like painting") and must not break the
+  # match.  A negated positive verb ("I do not like coffee") is the negative
+  # polarity, not a second positive claim.
+  - regex: "(?:I\\s+(?:(?:also|just|still|really)\\s+)?(?:prefer|like|love|enjoy))\\s+(.+?)(?:\\.|,|$)"
     dimension: preference
     key: like
+    predicate: likes
+    object_group: 1
 
-  # Frequency pattern
+  - regex: "(?:I\\s+(?:(?:also|just|still|really)\\s+)?(?:do not|don't|no longer)\\s+(?:like|love|enjoy|prefer))\\s+(.+?)(?:\\.|,|$)"
+    dimension: preference
+    key: dislike
+    predicate: dislikes
+    object_group: 1
+
+  - regex: "(?:I\\s+(?:(?:also|just|still|really)\\s+)?(?:hate|dislike|avoid))\\s+(.+?)(?:\\.|,|$)"
+    dimension: preference
+    key: dislike_verb
+    predicate: dislikes
+    object_group: 1
+
+  # Frequency pattern — a habit statement with no object slot; triple-less,
+  # so it is a turn signal rather than a persisted belief.
   - regex: "(?:I (?:always|usually|often|sometimes|rarely|never))\\s+(.+?)(?:\\.|,|$)"
     dimension: pattern
     key: always

@@ -10,18 +10,108 @@ Observation -> Claim -> Relation -> Proposal -> Atomic Publish
             -> Versioned Belief State -> Governed Projections
 ```
 
-本计划优先完成 P0 Runtime Closure。Hybrid Retrieval、Maintenance 和 Retention Lifecycle 在
-P0 的读写契约之上继续。已完成的 bugfix 先冻结为独立基线，再开始架构改造。
+本计划记录 Runtime Closure 的实施单元。发布门先聚焦状态区间/极性与 Publisher 安全；
+Observation/Assertion 拆分、完整 RecallQuery、Hybrid Retrieval 和 Maintenance 保留为演进方向。
+bugfix 已合入 `main`；当前代码复核见
+`docs/epistemic-runtime-analysis-2026-09-24.md`。
 
 ## 当前基线
 
-- 完整测试：702 passed，1 个第三方 deprecation warning；
-- Runtime/Temporal/Evidence/StateBench 等八个相关测试文件：233 passed；
-- Ruff：63 errors；
+- 代码基线：`main`，`5393053`；分析前工作区干净；
+- 完整测试：769 passed，1 skipped，1 个第三方 deprecation warning；
+- 本轮 gate/CLI/测试修改后：776 passed，1 skipped，1 个第三方 deprecation warning；
+- K1/K2 同槽切片后（2026-09-25）：**788 passed，1 skipped**，零回归；触及文件
+  Ruff 无新增；
+- 撤回 + 目标生命周期切片后（2026-09-25）：**800 passed，1 skipped**；
+- **测量完整性守门（2026-09-25）**：forced/production 在 K2 调用数为 0 或全部失败时
+  直接 `RuntimeError`；报告带 `extraction_health`（k2 尝试/失败数）。此前
+  `OpenAILLM.generate` 与 `SemanticExtractor` 两处吞错会让 429 期间的 forced 运行
+  静默退化为 K1 数字。每次复测必须先看 `k2 calls` 行。
+- Ruff：63 errors（全仓，均为既有项）；
 - StateBench v1.1 deterministic：state 25/200，recall 2/200；
-- bugfix 阶段已经结束，完整测试基线为 702 passed；当前修复仍在工作区中、尚未形成独立 Git 基线。
-- 开始实施单元 1 前，先排除 `.mimosa/` 等本地产物，将本轮代码、测试与文档整理为独立提交或标签。
+- 同槽切片后 deterministic：state **38/200 = 0.190**，recall **46/200 = 0.230**；
+  两个 pilot case（replacement、round-trip）state 与 recall 均转通过；
+  8 例 state 回退均为此前靠 K1 keyword 行文本蒙混通过的 case，明细见分析文档第 9 节；
+- StateBench v1.0 模型运行的 0.730 是历史测量；完整 v1.1 forced/production 结果尚未建立。
+- **v1.1 全量成对已完成（2026-09-25，MiMo-V2.6-Flash，200 例，同 commit/数据集/配置）**：
+  forced state 148/200 = 0.740、recall 168/200 = 0.840；production state 149/200 = 0.745、
+  recall 168/200 = 0.840；gap -0.005（通过）。发布门 FAIL：state overall 与 4 个分类
+  （contradiction 0.40、preference_evolution 0.50、round_trip 0.767、stale_state 0.75）
+  低于阈值，recall 差 2 例。52 个 state 失败中 49 例为状态模型失败（旧当前值未关闭），
+  详见分析文档第 10 节。
+- v1.1 报告与原有 release gate 的类型契约不兼容；本轮工作区已修复，并要求完整 200 例覆盖。
+- 使用 `nex-agi/nex-n2.5-pro:free` 完成 2 个 forced/production 配对 case：state 双方均 0/2，recall 双方均 2/2；模型端随后 HTTP 520、超时，未获得完整 v1.1 结果。
 - 后续实施单元保持小而独立，避免格式化或夹带无关文件，确保每一层都能单独回滚和对比基准结果。
+
+## 已完成切片：K1/K2 同槽归并与当前值资格（2026-09-25）
+
+对应执行顺序第 3 项中的同槽部分。改动与验收：
+
+- `PatternRule` 增加 `predicate` / `object_group`；`extraction.yaml` 为 age、name、
+  i_live、moved_to（新）、i_want、like、dislike（两条）声明谓词；
+  `deterministic.py` 对声明谓词的 pattern 产出三元组，key 为 `predicate:object`。
+- 无三元组 claim 不再落为 Belief 行，观测仍写入 Evidence。
+- `PATTERN_CONFIDENCE` 0.5 → 0.6（高于 L4 渲染水印 0.55）。
+- `resolve_identity`：相反极性关于同一 object 的断言替换当前值。
+- 验收：K1 pattern 行与 K2 claim 同槽归并（`tests/test_integration.py::TestK1K2SameSlot`）；
+  副词与否定句式抽取（`test_extraction.py`）；极性替换与共存（`test_relation_lifecycle.py`）；
+  无三元组轮次只留观测（`test_evidence_graph.py`）。
+
+## 执行顺序（2026-09-24 修订）
+
+下面的“实施单元 1–7”保留为设计与验收清单，编号不代表实际排期。
+
+1. **测量准备**：修复 v1.1 gate 和 forced/production 比较；把所有 benchmark
+   `transition_type` 映射到拟议 runtime 操作。代码中的
+   `TRANSITION_RUNTIME_CONTRACT` 是诊断映射，不表示这些 intent 已实现。
+2. **先测 forced + production**：在稳定且额度足够的端点上，同一 commit、case、数据集、模型、配置与回答器下运行；
+   保存两份 manifest、按 transition 的 state/recall/answer 与失败漏斗。forced 总分给出当前
+   端到端上限；抽取与状态的责任要靠逐回合 candidate、identity 和 persistence 记录拆分。
+   v1.1 全量是每个 case 多轮抽取，不是单次模型请求。
+3. **状态正确性优先**：先完成 CREATE 独立时间列、current interval、REVIVE 新 interval、
+   polarity/END_CURRENT、`at_time` 读取和 K1/K2 同槽处理；把最小 schema migration 与版本表一起上线。
+   版本容量策略是这个单元的前置设计条件，见实施单元 5。K1/K2 同槽归并、当前值资格与
+   偏好极性替换已于 2026-09-25 落地（见上文“已完成切片”）；剩余 CREATE 时间列、
+   END_CURRENT、版本化 interval 与 `at_time` 读取未完成，K1 仍缺 termination、
+   correction、relationship、goal resume 与 event occurrence 句式。
+4. **写入安全**：完成实施单元 1 的 CAS、幂等、savepoint/rollback 与证据校验；用并发和
+   故障注入测试验收，单线程 StateBench 不衡量此项收益。
+5. **迁移写入口**：按 pipeline → API → verification 顺序迁移至 Publisher，再清理旁路。
+6. **复测与决策**：对同一 v1.1 forced/production 集复测；剩余错误按 transition 与漏斗
+   归因，再决定继续修抽取、状态或召回。实施单元 6–7 的完整治理和检索重构随后推进。
+
+## 下一切片（由 2026-09-25 成对实测决定）
+
+forced 上限 0.740 的瓶颈已定位为 END_CURRENT/CORRECT 转移语义：52 个 state 失败中
+49 例是“值已抽出但旧当前值未关闭”。按失败数排序的下一批工作：
+
+1. **显式纠正与中性谓词替换**（explicit_correction 0/4、relationship_termination 0/3）：
+   correction 轮产生新谓词 belief 而原 positive 行保持 active；需要 CORRECT 意图与
+   “同一 object 的后续否定断言关闭旧行”的规则（现有极性机制只覆盖 likes/dislikes）。
+   **已实现（2026-09-25）**：撤回分支（`SELF_CORRECTION`/`END_CURRENT`）+ token 指代
+   查询，见分析文档第 11 节；forced 复测待完成。
+2. **目标生命周期**（goal_cancellation 1/8、goal_reactivation 2/10）：multi 基数下
+   lifecycle 状态变化目前只走 SUPPORT，旧阶段不关闭；forced 模式暴露出 deterministic
+   隐藏的该缺口。**已实现（2026-09-25）**：通用目标指代回落（"I gave up on the goal"
+   按目标族关闭当前目标）+ 重启分支（`is_resumption` 关闭被标记
+   `transition=END_CURRENT` 的行）+ END_CURRENT 行打标。单测覆盖；**尚未复测**
+   （端点 429 窗口内两次降级运行无效，额度恢复后重跑 forced）。
+3. **往返复活关闭中间值**（current_value_revival 23/30）：复活路径已关闭旧行，但
+   K2 产生的中间值行有部分未被关闭，需按 revival 语义统一。
+4. **event occurrence 身份**（distinct_occurrences 2 例失败）：`_event_key` 的哈希
+   后缀在部分路径上不一致地附加，破坏 occurrence 计数。
+5. CREATE 独立时间列与版本化 interval（含容量界设计）按原计划跟进。
+
+Publisher 原子化（CAS/幂等/回滚）与写入口迁移顺序不变，仍在状态切片之后；
+Hybrid Retrieval 继续推迟——recall 0.840 的失败主要是状态失败的下游。
+
+当前 deterministic 轨有 175 个 state 失败，五个零分 transition 合计 108 例：
+`current_value_replacement` 30、`current_value_revival` 30、`preference_reversal` 20、
+`query_time_selection` 20、`goal_cancellation` 8。`goal_reactivation` 10/10 和
+`explicit_correction` 3/4 构成对照，但不能代替 forced 测量。
+小样本实测发现：K2 已正确 supersede 旧 residence 值时，K1 pattern/keyword 仍可留下
+同义的 active 行，使 replacement/revival state contract 失败。版本化必须连同这些行的
+current 资格一起设计，不能只改 K2 的 interval。
 
 ## 已确定的架构决策
 
@@ -264,6 +354,17 @@ Slot identity 由 policy 生成：
 - event：subject + predicate + object + occurrence fingerprint；
 - persistent relation：subject + predicate + object。
 
+### 容量边界与历史精度
+
+版本化上线前必须明确每个 slot 的精确 interval 上限 `N`、年龄窗口、每用户总预算和
+超界处理方式。候选策略是最近 `N` 个 interval 精确保留，较旧区间压缩为有大小上限的
+归档摘要；压缩结果标记精度，`at_time` 查询不得把摘要误当作精确版本。
+
+`N` 和历史查询精度需要作为产品契约确定。若要求任意远期时间点都能精确回答，则
+仅靠丢弃或合并旧 interval 无法给出有界存储；必须另设有成本预算的冷存储或缩短精确
+历史承诺。压缩还必须保留 targeted forget 的 lineage，且不可改变当前版本。测试覆盖
+超过上限、多次 A → B → A、压缩后的查询和定向遗忘。
+
 ### 迁移策略
 
 1. 新表上线，现有 `Belief` 继续提供 read compatibility；
@@ -371,9 +472,10 @@ RecallResult
 - summary source context 明确标注，不能冒充 accepted belief；
 - 现有字符串 recall API 保持兼容。
 
-## P0 总体验收
+## Runtime Closure 总体验收
 
-完成实施单元 1–7 后执行：
+本轮发布门先验收上述执行顺序 1–6；完整 Runtime Closure 继续以实施单元 1–7 为准。
+每个阶段执行对应检查，最终执行：
 
 1. 完整 pytest；
 2. Ruff，并把本次触及文件清零；
@@ -411,6 +513,7 @@ RecallResult
 
 ## 建议立即开始的切片
 
-先执行“实施单元 1：冻结写入协议”。它的边界清晰，不需要先决定完整 BeliefVersion schema，
-却能为后面每一步提供可靠事务、并发和审计基础。该切片完成后再迁移 Pipeline；不要在同一
-变更中同时引入 Hybrid Retrieval 或 round-trip 数据模型。
+先在可稳定完成 200 例的端点上补齐 forced/production 成对基线；本轮免费端点仅留下
+2 个有效配对，无法据此判断全量瓶颈。并行设计 interval 容量界、迁移与 K1/K2 同槽规则，
+再实现上述“状态正确性优先”切片。迁移 Pipeline 流量前必须完成“实施单元 1：冻结写入
+协议”的 CAS、幂等和回滚验收。Hybrid Retrieval 保持独立演进。

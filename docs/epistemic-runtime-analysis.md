@@ -213,7 +213,13 @@ Belief SoT。
 Temporal/Evidence/Publisher 进入公开版本前，需要正式 schema version 与 migration；否则
 底层模型越丰富，升级风险越高。
 
-## 4. 应该固化的五个内核能力
+## 4. 长期演进蓝图（不是本轮发布门的实施清单）
+
+下面五类能力描述 Mirror 可以演进到的内核形态。当前 StateBench 发布门直接依赖的是
+CREATE 时间语义、current interval、polarity/termination 和查询时间选择；完整
+Observation/Assertion 拆分、Hybrid Retrieval 编译器和 Maintenance Planner 不应阻塞这一轮
+状态正确性修复。Publisher 的原子性是独立的安全属性，须在迁移写入口前完成，但单线程
+StateBench 不会测出其收益。
 
 ### 4.1 Epistemic Ledger
 
@@ -259,7 +265,7 @@ Publisher 需要根据 intent 使用不同权限，而不是把所有变化压�
 CONTRADICT。建议至少有：
 
 ```text
-ASSERT, REINFORCE, REPLACE_CURRENT, END_CURRENT,
+ASSERT, REINFORCE, REPLACE_CURRENT, REVIVE, END_CURRENT,
 CORRECT, DISPUTE, VERIFY, REJECT,
 FORGET, SYNTHESIZE, ARCHIVE
 ```
@@ -322,14 +328,18 @@ confidence 是证据聚合结果，不应代替状态；`disputed` 也不应通�
 
 建议调整为：
 
-### P0 — Runtime Closure
+### 本轮发布门：先测量，再修状态与写入安全
 
-1. 所有 mutation 统一走 Proposal/Publisher；
-2. Publisher 使用 atomic revision claim + savepoint + idempotency；
-3. CREATE 持久化 temporal、polarity、subject identity 和 evidence edges；
-4. 使用 BeliefVersion/interval，而不是复活旧 row；
-5. 建立 schema migration；
-6. summary、snapshot、index 的 forget/invalidation 与主状态一致。
+1. 修复 v1.1 gate 对三轨报告的读取和 forced/production gap 比较；
+2. 在同一模型、数据集和配置下跑 v1.1 forced + production，记录按 transition 的失败漏斗；
+3. CREATE 写入时间列，补齐 polarity/END_CURRENT，并引入新的 interval version；
+4. 版本表与容量边界同时设计：精确历史保留数、归档/压缩规则、按时间查询的精度承诺，以及
+   定向遗忘如何穿透压缩行；增加 schema migration 后再上线新表；
+5. Publisher 增加 CAS、savepoint/rollback 和幂等；再依次迁移 pipeline、API、verification；
+6. forced 复测，依据按 transition 的剩余失败确定抽取或状态模型的下一步。
+
+第 3 项决定状态分数，第 5 项保证并发和重试下的安全。单线程 StateBench 对第 5 项盲区，
+应使用独立的并发、失败注入和幂等测试验收。完整 Epistemic Ledger 等属于下方演进层。
 
 ### P1 — Recall Contract + Hybrid Retrieval
 
@@ -343,10 +353,11 @@ confidence 是证据聚合结果，不应代替状态；`disputed` 也不应通�
 
 扫描只产生 proposal；verification、stale、duplicate、drift、interval repair 都通过相同门禁。
 
-### P3 — Retention Lifecycle
+### P3 — 更广义的 Retention Lifecycle
 
-在正确性和 recall 稳定后，再引入 active -> cooling -> dormant -> archived。自动策略只改变
-可见性/成本层级；物理删除只来自明确 Hard Forget 或治理策略。
+在正确性和 recall 稳定后，再引入 active -> cooling -> dormant -> archived。这里指跨状态的
+可见性和成本策略；**版本表容量边界已纳入本轮第 4 项**。自动策略只改变可见性/成本层级；
+物理删除只来自明确 Hard Forget 或治理策略。
 
 ## 7. 可以直接作为发布门槛的不变量
 

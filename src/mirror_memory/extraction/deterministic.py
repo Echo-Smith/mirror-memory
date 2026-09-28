@@ -16,6 +16,10 @@ from mirror_memory.core.constants import (
     KEYWORD_CONFIDENCE,
     PATTERN_CONFIDENCE,
 )
+from mirror_memory.memory.canonicalize import (
+    canonicalize_object,
+    canonicalize_predicate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +66,7 @@ def extract_claims(text: str, config: MemoryConfig) -> list[dict]:
                     "confidence": KEYWORD_CONFIDENCE,
                     "relation": "supports",
                     "source": "extracted",
+                    "extractor_stage": "k1",
                     "value": {"via": "keyword", "keyword": kw},
                 })
                 break  # one claim per category per turn
@@ -74,6 +79,35 @@ def extract_claims(text: str, config: MemoryConfig) -> list[dict]:
                 import hashlib
 
                 match_text = m.group(0)[:CLAIM_TEXT_MAX_LENGTH // 2] if m.group(0) else snippet
+                # A pattern that declares a predicate asserts a slot, so the
+                # claim carries a cognitive triple and flows through identity
+                # resolution like a K2 claim: the same slot from either
+                # extractor is one belief, and a new value supersedes the old
+                # one instead of sitting beside it.  The key is slot+value so
+                # distinct values stay distinct rows.
+                if pattern_rule.predicate:
+                    obj_text = _group_text(m, pattern_rule.object_group)
+                    canon_pred = canonicalize_predicate(
+                        pattern_rule.predicate, config.predicate_synonyms
+                    )
+                    canon_obj = canonicalize_object(obj_text)
+                    if canon_obj:
+                        claims.append({
+                            "dimension": pattern_rule.dimension,
+                            "key": f"{canon_pred}:{canon_obj}",
+                            "claim_text": match_text,
+                            "confidence": PATTERN_CONFIDENCE,
+                            "relation": "supports",
+                            "source": "extracted",
+                            "extractor_stage": "k1",
+                            "value": {
+                                "via": "pattern",
+                                "match": match_text,
+                                "predicate": canon_pred,
+                                "object": canon_obj,
+                            },
+                        })
+                        continue
                 # Content-specific key: "pattern_key:content_hash".
                 content_hash = hashlib.sha256(match_text.encode()).hexdigest()[:6]
                 key = f"{pattern_rule.key}:{content_hash}"
@@ -84,9 +118,18 @@ def extract_claims(text: str, config: MemoryConfig) -> list[dict]:
                     "confidence": PATTERN_CONFIDENCE,
                     "relation": "supports",
                     "source": "extracted",
+                    "extractor_stage": "k1",
                     "value": {"via": "pattern", "match": match_text},
                 })
         except re.error:
             logger.warning("Invalid regex in config: %s", pattern_rule.regex)
 
     return claims
+
+
+def _group_text(match: re.Match, group: int) -> str:
+    """The stripped text of capture group *group*, or "" when it did not match."""
+    try:
+        return (match.group(group) or "").strip()
+    except (IndexError, re.error):
+        return ""

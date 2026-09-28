@@ -113,7 +113,11 @@ QUESTION_TIER_WEIGHT_MAX = 1.4
 
 # K1 keyword confidence (deterministic extraction).
 KEYWORD_CONFIDENCE = 0.4
-PATTERN_CONFIDENCE = 0.5
+# A regex pattern that declares a predicate is a structured assertion about a
+# slot, not a keyword hint, so it sits above the L4 render watermark (0.55):
+# at 0.5 every pattern claim was invisible to recall while still occupying the
+# current-state surface.
+PATTERN_CONFIDENCE = 0.6
 
 # Maximum claim_text length stored per belief.
 CLAIM_TEXT_MAX_LENGTH = 200

@@ -5,7 +5,6 @@ import json
 import pytest
 
 from mirror_memory.config.loader import load_config
-from mirror_memory.core.models import Base
 from mirror_memory.core.repository import record_claim
 from mirror_memory.extraction.deterministic import extract_claims
 from mirror_memory.extraction.throttle import compute_extraction_value, should_extract
@@ -45,9 +44,43 @@ class TestExtractClaims:
     def test_pattern_match(self, config):
         claims = extract_claims("I am 28 years old", config)
         # The age pattern should match
-        age_claims = [c for c in claims if c.get("key") == "age"]
+        age_claims = [c for c in claims if c.get("key", "").startswith("age")]
         if age_claims:
             assert age_claims[0]["confidence"] > 0
+
+    def test_pattern_with_predicate_yields_a_triple(self, config):
+        """A predicate-declaring pattern is a slot assertion, not a snippet."""
+        claims = extract_claims("I live in Shanghai", config)
+        triples = [c for c in claims if (c.get("value") or {}).get("predicate")]
+        assert triples, "a predicate-declaring pattern must yield a triple"
+        loc = [c for c in triples if c["value"]["predicate"] == "lives_in"]
+        assert loc, "the location pattern must declare lives_in"
+        assert loc[0]["value"]["object"] == "shanghai"
+        assert loc[0]["key"] == "lives_in:shanghai"
+
+    def test_relocation_pattern_covers_the_move_itself(self, config):
+        claims = extract_claims("I moved to Berlin in May 2026.", config)
+        loc = [c for c in claims if (c.get("value") or {}).get("predicate") == "lives_in"]
+        assert loc, "the move must assert the same residence slot"
+        assert loc[0]["value"]["object"] == "berlin"
+
+    def test_negated_preference_is_the_negative_polarity(self, config):
+        claims = extract_claims("Actually, I do not like coffee.", config)
+        neg = [c for c in claims if (c.get("value") or {}).get("predicate") == "dislikes"]
+        assert neg, "a negated preference must be the negative polarity"
+        assert neg[0]["value"]["object"] == "coffee"
+
+    def test_adverb_between_pronoun_and_verb_still_matches(self, config):
+        claims = extract_claims("I also like painting.", config)
+        pos = [c for c in claims if (c.get("value") or {}).get("predicate") == "likes"]
+        assert pos, "an adverb must not break the preference match"
+        assert pos[0]["value"]["object"] == "painting"
+
+    def test_goal_pattern_yields_a_goal_predicate(self, config):
+        claims = extract_claims("I want to run a marathon.", config)
+        goals = [c for c in claims if (c.get("value") or {}).get("predicate") == "wants_to"]
+        assert goals
+        assert goals[0]["value"]["object"] == "run_a_marathon"
 
     def test_confidence_values(self, config):
         claims = extract_claims("I like painting", config)

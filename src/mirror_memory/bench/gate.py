@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 GATE_STATE_OVERALL = 0.90
 GATE_STATE_PER_CATEGORY = 0.85
@@ -67,10 +67,44 @@ def _check(name: str, value: float, threshold: float, *, at_least: bool = True) 
     }
 
 
+def _field(report: Any, name: str, default: Any = None) -> Any:
+    return report.get(name, default) if isinstance(report, Mapping) else getattr(report, name, default)
+
+
+def _track(report: Any, name: str) -> Mapping[str, Any] | None:
+    value = (_field(report, "tracks") or {}).get(name)
+    if isinstance(value, Mapping):
+        return value
+    if value is None:
+        return None
+    return {"score": value}
+
+
+def _v11_report(report: Any) -> bool:
+    return isinstance((_field(report, "tracks") or {}).get("state"), Mapping)
+
+
+def _score(stats: Mapping[str, Any] | None) -> float | None:
+    value = stats.get("score") if stats is not None else None
+    return float(value) if value is not None else None
+
+
+def _unevaluated(name: str, threshold: float, *, at_least: bool = True) -> dict:
+    return {
+        "check": name,
+        "value": None,
+        "threshold": threshold,
+        "comparison": ">=" if at_least else "<=",
+        "passed": False,
+        "evaluated": False,
+    }
+
+
 def check_release_gate(
     report: Any,
     *,
     manifest_path: str | Path | None = None,
+    production_report: Any | None = None,
     forced: bool = True,
 ) -> GateResult:
     """Check a StateBench report against the release thresholds.
@@ -78,44 +112,155 @@ def check_release_gate(
     Parameters
     ----------
     report:
-        A ``StateBenchReport`` (needs ``score``, ``by_category`` and
-        optionally ``tracks``).
+        A StateBench v1.1 report, JSON payload, or legacy v1 report.
     manifest_path:
         When given, the report must have a manifest next to it.
+    production_report:
+        The matching production run for a forced v1.1 report.  Both runs
+        must use the same cases and extractor model.
     forced:
-        Whether this run was a forced run (every turn attempted).  The
-        production-gap check only applies to forced runs, since a production
-        run has nothing to compare against.
+        Require a forced v1.1 run and its production comparison.  Legacy v1
+        reports retain their original standalone gate behavior.
     """
     checks: list[dict] = []
     failures: list[str] = []
 
-    overall = float(getattr(report, "score", 0.0))
-    checks.append(_check("state_overall", overall, GATE_STATE_OVERALL))
-    if overall < GATE_STATE_OVERALL:
-        failures.append(f"state overall {overall:.3f} < {GATE_STATE_OVERALL}")
+    v11 = _v11_report(report)
+    state = _track(report, "state") if v11 else {
+        "score": _field(report, "score"),
+        "by_category": _field(report, "by_category") or {},
+    }
 
-    for category, stats in (getattr(report, "by_category", None) or {}).items():
-        value = float(stats.get("score", 0.0))
-        checks.append(_check(f"state_category[{category}]", value, GATE_STATE_PER_CATEGORY))
-        if value < GATE_STATE_PER_CATEGORY:
+    def require(name: str, value: float | None, threshold: float, label: str) -> None:
+        if value is None:
+            checks.append(_unevaluated(name, threshold))
+            failures.append(f"{label} not evaluated")
+            return
+        checks.append(_check(name, value, threshold))
+        if value < threshold:
+            failures.append(f"{label} {value:.3f} < {threshold}")
+
+    require("state_overall", _score(state), GATE_STATE_OVERALL, "state overall")
+    for category, stats in (state.get("by_category") or {}).items():
+        require(
+            f"state_category[{category}]", _score(stats),
+            GATE_STATE_PER_CATEGORY, f"category {category}",
+        )
+
+    for name, threshold in (("recall", GATE_RECALL), ("answer", GATE_ANSWER)):
+        track = _track(report, name)
+        if v11 or track is not None:
+            require(f"{name}_overall", _score(track), threshold, name)
+
+    if v11 and forced:
+        from mirror_memory.bench.statebench_v1_1 import load_statebench_v1_1
+
+        expected_cases = load_statebench_v1_1()
+        expected_ids = [case.case_id for case in expected_cases]
+        actual_ids = [
+            item["case_id"] if isinstance(item, Mapping) else item.case_id
+            for item in (_field(report, "cases") or [])
+        ]
+        coverage_ok = actual_ids == expected_ids
+        checks.append({
+            "check": "full_case_coverage",
+            "value": len(actual_ids),
+            "threshold": len(expected_ids),
+            "comparison": "exact case IDs and order",
+            "passed": coverage_ok,
+        })
+        if not coverage_ok:
             failures.append(
-                f"category {category} {value:.3f} < {GATE_STATE_PER_CATEGORY}"
+                f"full v1.1 case coverage required ({len(actual_ids)}/{len(expected_ids)})"
             )
+        expected_categories = {case.category for case in expected_cases}
+        actual_categories = set(state.get("by_category") or {})
+        category_coverage_ok = actual_categories == expected_categories
+        checks.append({
+            "check": "full_category_coverage",
+            "value": len(actual_categories),
+            "threshold": len(expected_categories),
+            "passed": category_coverage_ok,
+        })
+        if not category_coverage_ok:
+            failures.append("all v1.1 state categories must be evaluated")
+        for track_name in ("state", "recall", "answer"):
+            track = _track(report, track_name)
+            evaluated = track.get("total") if track is not None else None
+            track_coverage_ok = evaluated == len(expected_ids)
+            checks.append({
+                "check": f"{track_name}_case_coverage",
+                "value": evaluated,
+                "threshold": len(expected_ids),
+                "passed": track_coverage_ok,
+            })
+            if not track_coverage_ok:
+                failures.append(f"{track_name} evaluated {evaluated or 0}/{len(expected_ids)} cases")
+        mode = _field(report, "extraction_mode")
+        mode_ok = mode == "forced"
+        checks.append({"check": "forced_mode", "value": mode, "passed": mode_ok})
+        if not mode_ok:
+            failures.append(f"forced run required (got {mode or 'unknown'})")
+        # Extraction health: a forced run with failed, empty, unparsed or
+        # schema-rejected K2 calls is measuring the fallback, not the model.
+        # The runner refuses a fully-failed run; the gate refuses any run
+        # whose extraction was not clean, because a partially degraded run
+        # still reports model-labelled numbers.
+        health = _field(report, "extraction_health") or {}
+        attempts = health.get("k2_attempts")
+        expected_turns = health.get("dataset_turns")
+        turns_ok = attempts is not None and attempts == expected_turns
+        checks.append({
+            "check": "k2_attempted_every_turn",
+            "value": attempts,
+            "threshold": expected_turns,
+            "comparison": "==",
+            "passed": turns_ok,
+        })
+        if not turns_ok:
+            failures.append(
+                f"K2 attempted {attempts if attempts is not None else 'unknown'} "
+                f"of {expected_turns if expected_turns is not None else 'unknown'} turns"
+            )
+        for key, label in (
+            ("k2_failures", "failed K2 calls"),
+            ("k2_empty_responses", "empty K2 responses"),
+            ("k2_parse_failures", "unparsed K2 responses"),
+            ("k2_schema_rejections", "schema-rejected K2 responses"),
+        ):
+            count = health.get(key) or 0
+            clean = count == 0
+            checks.append({
+                "check": key,
+                "value": count,
+                "threshold": 0,
+                "comparison": "==",
+                "passed": clean,
+            })
+            if not clean:
+                failures.append(f"{count} {label}")
+        if production_report is None:
+            checks.append(_unevaluated("production_gap", GATE_PRODUCTION_GAP, at_least=False))
+            failures.append("production gap not evaluated")
+        else:
+            try:
+                gap = compare_forced_production(report, production_report)
+            except ValueError as exc:
+                failures.append(f"production comparison invalid: {exc}")
+                checks.append(_unevaluated("production_gap", GATE_PRODUCTION_GAP, at_least=False))
+            else:
+                checks.append(_check(
+                    "production_gap", gap["gap"], GATE_PRODUCTION_GAP, at_least=False,
+                ))
+                if not gap["gate"]:
+                    failures.append(
+                        f"production gap {gap['gap']:.3f} > {GATE_PRODUCTION_GAP}"
+                    )
 
-    tracks = getattr(report, "tracks", None) or {}
-    if tracks:
-        recall = float(tracks.get("recall", 0.0))
-        checks.append(_check("recall_overall", recall, GATE_RECALL))
-        if recall < GATE_RECALL:
-            failures.append(f"recall {recall:.3f} < {GATE_RECALL}")
-
-        answer = float(tracks.get("answer", 0.0))
-        checks.append(_check("answer_overall", answer, GATE_ANSWER))
-        if answer < GATE_ANSWER:
-            failures.append(f"answer {answer:.3f} < {GATE_ANSWER}")
-
-    if manifest_path is not None:
+    if v11 and manifest_path is None:
+        checks.append(_unevaluated("manifest_present", 1.0))
+        failures.append("manifest not evaluated")
+    elif manifest_path is not None:
         path = Path(manifest_path)
         present = path.exists()
         checks.append({
@@ -138,16 +283,46 @@ def compare_forced_production(forced: Any, production: Any) -> dict:
     the escapes are doing their job.  Returns the per-category and overall
     deltas plus the gate verdict on the gap itself.
     """
-    forced_score = float(getattr(forced, "score", 0.0))
-    production_score = float(getattr(production, "score", 0.0))
+    forced_v11 = _v11_report(forced)
+    production_v11 = _v11_report(production)
+    if forced_v11 != production_v11:
+        raise ValueError("report versions differ")
+    if forced_v11:
+        if _field(forced, "extraction_mode") != "forced":
+            raise ValueError("first report must use forced extraction")
+        if _field(production, "extraction_mode") != "production":
+            raise ValueError("second report must use production extraction")
+        if _field(forced, "dataset_sha256") != _field(production, "dataset_sha256"):
+            raise ValueError("dataset hashes differ")
+        forced_ids = [item.case_id if not isinstance(item, Mapping) else item["case_id"]
+                      for item in _field(forced, "cases")]
+        production_ids = [item.case_id if not isinstance(item, Mapping) else item["case_id"]
+                          for item in _field(production, "cases")]
+        if forced_ids != production_ids:
+            raise ValueError("case sets or order differ")
+        if _field(forced, "extractor_model") != _field(production, "extractor_model"):
+            raise ValueError("extractor models differ")
+        forced_state = _track(forced, "state")
+        production_state = _track(production, "state")
+        forced_score = _score(forced_state)
+        production_score = _score(production_state)
+        if forced_score is None or production_score is None:
+            raise ValueError("state track was not evaluated")
+        forced_cats = forced_state.get("by_category") or {}
+        production_cats = production_state.get("by_category") or {}
+    else:
+        forced_score = float(_field(forced, "score", 0.0))
+        production_score = float(_field(production, "score", 0.0))
+        forced_cats = _field(forced, "by_category") or {}
+        production_cats = _field(production, "by_category") or {}
     gap = forced_score - production_score
 
     per_category = {}
-    forced_cats = getattr(forced, "by_category", None) or {}
-    production_cats = getattr(production, "by_category", None) or {}
     for category in sorted(set(forced_cats) | set(production_cats)):
-        f = float((forced_cats.get(category) or {}).get("score", 0.0))
-        p = float((production_cats.get(category) or {}).get("score", 0.0))
+        f = _score(forced_cats.get(category))
+        p = _score(production_cats.get(category))
+        if f is None or p is None:
+            raise ValueError(f"category {category} is missing from one report")
         per_category[category] = round(f - p, 4)
 
     return {
