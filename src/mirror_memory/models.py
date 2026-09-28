@@ -27,6 +27,9 @@ class BeliefInfo:
     predicate: str = ""
     object: str = ""
     cardinality: str = "multi"
+    # Memory metabolism fields (storage state, orthogonal to the truth state)
+    memory_tier: str = "hot"
+    retention_class: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,8 @@ class DeleteResult:
     session_summaries: int = 0
     evidence: int = 0
     belief_evidence_links: int = 0
+    evidence_digests: int = 0
+    memory_transitions: int = 0
 
     def as_dict(self) -> dict[str, int]:
         """Return as a plain dict for backward compatibility."""
@@ -57,6 +62,8 @@ class DeleteResult:
             "session_summaries": self.session_summaries,
             "evidence": self.evidence,
             "belief_evidence_links": self.belief_evidence_links,
+            "evidence_digests": self.evidence_digests,
+            "memory_transitions": self.memory_transitions,
         }
 
 

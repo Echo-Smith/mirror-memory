@@ -31,12 +31,6 @@ from sqlalchemy import desc, false, func, or_, select
 from sqlalchemy.orm import Session
 
 from mirror_memory.core.confidence import compute_confidence_weight
-from mirror_memory.core.utils import (
-    belief_evidence_ids,
-    content_tokens,
-    coerce_datetime,
-    safe_json,
-)
 from mirror_memory.core.constants import (
     CONFIDENCE_CEILING,
     DEFAULT_QUESTION_TIER,
@@ -49,18 +43,31 @@ from mirror_memory.core.constants import (
 )
 from mirror_memory.core.models import (
     Belief,
-    BeliefEvidenceLink,
     BeliefEvent,
+    BeliefEvidenceLink,
     ConsentGrant,
-    EvolutionJob,
+    DeletionTombstone,
     Evidence,
+    EvidenceDigest,
+    EvolutionJob,
     ExtractionStats,
     InterventionEvent,
     MemoryPreference,
+    MemoryTransition,
     SessionSummary,
     Snapshot,
     utcnow,
 )
+from mirror_memory.core.utils import (
+    belief_evidence_ids,
+    coerce_datetime,
+    content_tokens,
+    safe_json,
+)
+from mirror_memory.metabolism.compact import EvidenceGraphRow
+from mirror_memory.metabolism.eligibility import tiers_for_mode
+from mirror_memory.metabolism.policy import classify_retention
+from mirror_memory.metabolism.protection import REASON_USER_CORRECTION
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +240,12 @@ def record_evidence(
             existing.authority = authority
         if observed_at is not None:
             existing.observed_at = observed_at
+        # Re-observing a message whose evidence was folded is the
+        # evidence-level reheat signal: the row goes live again (its group
+        # link stays on the digest for audit).
+        if existing.retention_state == "compacted":
+            existing.retention_state = "hot"
+            existing.compaction_group_id = None
         session.flush()
         return existing
 
@@ -291,11 +304,15 @@ def evidence_for_belief(
     belief_id: int,
     *,
     relations: tuple[str, ...] | None = None,
+    include_compacted: bool = False,
 ) -> list[tuple[Evidence, str]]:
     """Return ``(evidence, relation)`` pairs attached to *belief_id*.
 
-    Ordered newest-observed first.  *relations* narrows the result to a subset
-    of link types (e.g. only ``("support",)`` to see what backs a belief).
+    Ordered newest-observed first.  *relations* narrows the result to a
+    subset of link types (e.g. only ``("support",)`` to see what backs a
+    belief).  Compacted rows — the bulk folded into an EvidenceDigest —
+    are excluded unless *include_compacted* is set; read the digest for
+    their aggregate.
     """
     stmt = (
         select(Evidence, BeliefEvidenceLink.relation)
@@ -305,6 +322,8 @@ def evidence_for_belief(
     )
     if relations is not None:
         stmt = stmt.where(BeliefEvidenceLink.relation.in_(relations))
+    if not include_compacted:
+        stmt = stmt.where(Evidence.retention_state != "compacted")
     return [(row[0], row[1]) for row in session.execute(stmt).all()]
 
 
@@ -313,7 +332,9 @@ def evidence_summary(session: Session, user_id: str, belief_id: int) -> dict:
 
     Returns counts per relation plus the supporting evidence's provenance, so
     a caller can answer "what backs this belief, and how was it obtained?"
-    without walking the link table itself.
+    without walking the link table itself.  When the belief has been
+    compacted, the digest carries the folded bulk's aggregate (totals stay
+    whole; only the row-by-row listing is the live sample).
     """
     pairs = evidence_for_belief(session, belief_id)
     grouped: dict[str, list[dict]] = {}
@@ -329,12 +350,27 @@ def evidence_summary(session: Session, user_id: str, belief_id: int) -> dict:
                 "session_id": evidence.session_id,
             }
         )
-    return {
+    summary = {
         "belief_id": belief_id,
         "user_id": user_id,
         "counts": {relation: len(items) for relation, items in grouped.items()},
         "by_relation": grouped,
     }
+    digest = _digest_for_belief(session, belief_id)
+    if digest is not None:
+        summary["digest"] = {
+            "support_count": digest.support_count,
+            "contradict_count": digest.contradict_count,
+            "verify_count": digest.verify_count,
+            "correct_count": digest.correct_count,
+            "first_seen_at": digest.first_seen_at.isoformat() if digest.first_seen_at else None,
+            "last_seen_at": digest.last_seen_at.isoformat() if digest.last_seen_at else None,
+            "representative_ids": safe_json(digest.representative_ids),
+            "summary": digest.summary,
+            "source_distribution": safe_json(digest.source_distribution),
+            "authority_distribution": safe_json(digest.authority_distribution),
+        }
+    return summary
 
 
 def _prune_orphan_evidence(session: Session, user_id: str) -> int:
@@ -370,6 +406,273 @@ def evidence_counts_for_beliefs(session: Session, belief_ids: list[int]) -> dict
         .group_by(BeliefEvidenceLink.belief_id)
     ).all()
     return {row[0]: int(row[1]) for row in rows}
+
+
+def evidence_relation_counts_for_beliefs(session: Session, belief_ids: list[int]) -> dict[int, dict[str, int]]:
+    """Return ``{belief_id: {relation: count}}`` for the given beliefs.
+
+    The metabolism planner and the Publisher both derive protection from
+    typed relation counts (a ``correct`` link protects; ``support`` counts
+    toward evidence strength), so the grouping lives next to the plain
+    counter it generalises.
+    """
+    if not belief_ids:
+        return {}
+    rows = session.execute(
+        select(
+            BeliefEvidenceLink.belief_id,
+            BeliefEvidenceLink.relation,
+            func.count(BeliefEvidenceLink.id),
+        )
+        .where(BeliefEvidenceLink.belief_id.in_(belief_ids))
+        .group_by(BeliefEvidenceLink.belief_id, BeliefEvidenceLink.relation)
+    ).all()
+    counts: dict[int, dict[str, int]] = {}
+    for belief_id, relation, total in rows:
+        counts.setdefault(int(belief_id), {})[str(relation)] = int(total)
+    return counts
+
+
+def evidence_graph_for_beliefs(
+    session: Session, belief_ids: list[int]
+) -> dict[int, list[EvidenceGraphRow]]:
+    """The typed evidence graph as pure rows: ``{belief_id: [EvidenceGraphRow]}``.
+
+    Compaction selection and digest stats are pure functions over these
+    rows, so the planner and the Publisher see byte-identical input by
+    construction.
+    """
+    if not belief_ids:
+        return {}
+    stmt = (
+        select(
+            BeliefEvidenceLink.belief_id,
+            Evidence.id,
+            BeliefEvidenceLink.relation,
+            Evidence.authority,
+            Evidence.source_type,
+            Evidence.observed_at,
+            Evidence.retention_state,
+        )
+        .join(Evidence, Evidence.id == BeliefEvidenceLink.evidence_id)
+        .where(BeliefEvidenceLink.belief_id.in_(belief_ids))
+        .order_by(BeliefEvidenceLink.belief_id, Evidence.id)
+    )
+    graph: dict[int, list[EvidenceGraphRow]] = {}
+    for belief_id, ev_id, relation, authority, source_type, observed, state in session.execute(stmt):
+        graph.setdefault(int(belief_id), []).append(
+            EvidenceGraphRow(
+                evidence_id=int(ev_id),
+                relation=str(relation),
+                authority=str(authority or "user"),
+                source_type=str(source_type or "message"),
+                observed_at=observed,
+                retention_state=str(state or "hot"),
+            )
+        )
+    return graph
+
+
+def _digest_for_belief(session: Session, belief_id: int) -> EvidenceDigest | None:
+    stmt = select(EvidenceDigest).where(EvidenceDigest.belief_id == belief_id)
+    return session.scalar(stmt)
+
+
+def digests_for_beliefs(session: Session, belief_ids: list[int]) -> dict[int, EvidenceDigest]:
+    """``{belief_id: EvidenceDigest}`` for beliefs that have been compacted."""
+    if not belief_ids:
+        return {}
+    stmt = select(EvidenceDigest).where(EvidenceDigest.belief_id.in_(belief_ids))
+    return {digest.belief_id: digest for digest in session.scalars(stmt)}
+
+
+def apply_evidence_compaction(
+    session: Session,
+    belief: Belief,
+    *,
+    keep_ids: list[int],
+    fold_ids: list[int],
+    digest_fields: dict,
+) -> EvidenceDigest:
+    """Commit one compaction: upsert the digest, mark the evidence rows.
+
+    Called only from the Publisher's EVIDENCE_COMPACT handler.  Like tier
+    moves, this does not bump the state revision: provenance bulk is
+    storage, not truth.  The kept sample is marked ``representative`` so
+    later runs know it was deliberately chosen, not merely un-folded.
+
+    The digest is upserted (one per belief): counts always reflect the
+    whole link graph, so repeated compactions accumulate.
+    """
+    digest = _digest_for_belief(session, belief.id)
+    if digest is None:
+        digest = EvidenceDigest(user_id=belief.user_id, belief_id=belief.id)
+        session.add(digest)
+    digest.support_count = int(digest_fields.get("support_count", 0))
+    digest.contradict_count = int(digest_fields.get("contradict_count", 0))
+    digest.verify_count = int(digest_fields.get("verify_count", 0))
+    digest.correct_count = int(digest_fields.get("correct_count", 0))
+    digest.first_seen_at = digest_fields.get("first_seen_at")
+    digest.last_seen_at = digest_fields.get("last_seen_at")
+    digest.representative_ids = json.dumps(
+        list(digest_fields.get("representative_ids", []))
+    )
+    digest.summary = str(digest_fields.get("summary", ""))
+    digest.source_distribution = json.dumps(digest_fields.get("source_distribution", {}))
+    digest.authority_distribution = json.dumps(digest_fields.get("authority_distribution", {}))
+    digest.updated_at = utcnow()
+    session.flush()
+
+    # Mark rows by primary key, one get() at a time: the keep/fold sets come
+    # from a recomputed plan, and keeping the writes key-by-key makes the
+    # mapping from plan to rows explicit.
+    mark_ids: list[int] = []
+    seen: set[int] = set()
+    for group in (keep_ids, fold_ids):
+        for raw in group:
+            mark = int(raw)
+            if mark not in seen:
+                seen.add(mark)
+                mark_ids.append(mark)
+    mark_ids.sort()
+    fold_set = {int(i) for i in fold_ids}
+    evidence_rows = []
+    for mark_id in mark_ids:
+        row = session.get(Evidence, mark_id)
+        if row is not None:
+            evidence_rows.append(row)
+    for row in evidence_rows:
+        if row.id in fold_set:
+            row.retention_state = "compacted"
+            row.compaction_group_id = str(digest.id)
+            # The bulk is the point: folded rows keep their metadata (ref,
+            # source, authority, time) but release the raw content.
+            row.content = ""
+        else:
+            row.retention_state = "representative"
+
+    belief.compacted_into = digest.id
+    _append_event(
+        session,
+        belief,
+        "evidence_compacted",
+        evidence=[],
+        detail={
+            "digest_id": digest.id,
+            "kept": len(keep_ids),
+            "folded": len(fold_ids),
+            "support_count": digest.support_count,
+        },
+    )
+    return digest
+
+
+def pending_verification_keys(session: Session, user_id: str) -> set[str]:
+    """Belief keys with a verification question still awaiting an answer.
+
+    Protection is belief-granular: one pending question protects the belief
+    it asks about, not the user's entire store.
+    """
+    injection = session.scalar(
+        select(InterventionEvent)
+        .where(
+            InterventionEvent.user_id == user_id,
+            InterventionEvent.kind == QUESTION_INJECTED_KIND,
+        )
+        .order_by(desc(InterventionEvent.id))
+        .limit(1)
+    )
+    if injection is None:
+        return set()
+    answered = session.scalar(
+        select(InterventionEvent)
+        .where(
+            InterventionEvent.user_id == user_id,
+            InterventionEvent.kind == QUESTION_ANSWERED_KIND,
+            InterventionEvent.id > injection.id,
+        )
+        .limit(1)
+    )
+    if answered is not None:
+        return set()
+    detail = safe_json(injection.detail_json)
+    key = detail.get("belief_key")
+    return {str(key)} if key else set()
+
+
+def mark_belief_accessed(session: Session, belief_ids: list[int], *, now: datetime | None = None) -> int:
+    """Record that recall actually surfaced these beliefs.
+
+    This is telemetry for the metabolism runtime (heat scoring: a recalled
+    belief is a live belief), not a state transition: it deliberately does
+    **not** bump the state revision, so a recall can never invalidate an
+    in-flight proposal.  The caller owns the transaction — if it rolls
+    back, the telemetry is simply lost, which is fine.
+
+    Returns the number of beliefs touched.
+    """
+    ids = [int(bid) for bid in belief_ids if bid is not None]
+    if not ids:
+        return 0
+    stamp = now or datetime.now(UTC)
+    beliefs = list(session.scalars(select(Belief).where(Belief.id.in_(ids))))
+    for belief in beliefs:
+        belief.access_count = int(belief.access_count or 0) + 1
+        belief.last_accessed_at = stamp
+    return len(beliefs)
+
+
+# Storage-tier metabolism_state bookkeeping: hot means fully active, the
+# cooling tiers mean the belief has left the default "now?" scan priority.
+_TIER_METABOLISM_STATE = {
+    "hot": "active",
+    "warm": "cooling",
+    "dormant": "cooling",
+    "archived": "compacted",
+}
+
+
+def set_belief_tier(
+    session: Session,
+    belief_id: int,
+    *,
+    from_tier: str,
+    to_tier: str,
+    reason: str = "",
+    score: float = 0.0,
+    proposal_desc: str = "",
+) -> MemoryTransition | None:
+    """Move a belief between storage tiers and append the audit row.
+
+    Called only from the Publisher's TIER_TRANSITION handler.  Like access
+    telemetry, this deliberately does **not** bump the state revision: the
+    tier is storage state, not truth state, and a cooling move must never
+    invalidate an in-flight truth proposal (or vice versa — the revision
+    gate on the proposal itself already refuses a stale cooling decision).
+
+    Returns the audit row, or ``None`` when the live tier no longer matches
+    *from_tier* (a concurrent move won the race; the caller's transaction
+    decides what happens, the Publisher refuses upstream anyway).
+    """
+    belief = session.get(Belief, belief_id)
+    if belief is None or (belief.memory_tier or "hot") != from_tier:
+        return None
+    belief.memory_tier = to_tier
+    belief.metabolism_state = _TIER_METABOLISM_STATE.get(to_tier, "active")
+    row = MemoryTransition(
+        user_id=belief.user_id,
+        entity_type="belief",
+        entity_id=belief.id,
+        from_tier=from_tier,
+        to_tier=to_tier,
+        reason=reason,
+        score=float(score),
+        proposal_desc=proposal_desc[:128],
+        publisher_revision=get_state_revision(session, belief.user_id),
+    )
+    session.add(row)
+    session.flush()
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +740,14 @@ def list_active_beliefs(
     """
     if not is_memory_enabled(session, user_id):
         return []
-    conditions = [Belief.user_id == user_id]
+    conditions = [
+        Belief.user_id == user_id,
+        # Storage-tier eligibility: a question about the present never pays
+        # for cold storage, and archived data leaves the default scan
+        # entirely.  Every belief starts hot, so this filter is silent
+        # until the metabolism runtime (PR2) starts moving tiers.
+        Belief.memory_tier.in_(tiers_for_mode(temporal_mode)),
+    ]
     if temporal_mode == "historical":
         # A superseded belief is exactly a closed interval; excluding it would
         # make "where did they live before?" unanswerable.
@@ -519,6 +829,9 @@ def recall_candidates(
     # A superseded row is exactly a closed interval, so a question about the
     # past must be able to reach it -- same rule list_active_beliefs follows.
     statuses = ("active", "superseded") if temporal_mode == "historical" else ("active",)
+    # Storage-tier eligibility runs before ranking, not after: the whole
+    # point of tiers is that a "now?" query never loads cold storage.
+    tier_filter = Belief.memory_tier.in_(tiers_for_mode(temporal_mode))
 
     tokens = content_tokens(query)
     relevant: list[Belief] = []
@@ -534,7 +847,7 @@ def recall_candidates(
             Belief.key.ilike(f"%{_escape_like(token)}%", escape="\\")
             for token in sorted(tokens)
         ])
-        conditions = [Belief.user_id == user_id, Belief.status.in_(statuses), pattern]
+        conditions = [Belief.user_id == user_id, Belief.status.in_(statuses), tier_filter, pattern]
         if dimensions:
             conditions.append(Belief.dimension.in_(dimensions))
         relevant = list(session.scalars(
@@ -545,7 +858,7 @@ def recall_candidates(
 
     recent: list[Belief] = []
     if recent_limit > 0:
-        conditions = [Belief.user_id == user_id, Belief.status == "active"]
+        conditions = [Belief.user_id == user_id, Belief.status == "active", tier_filter]
         if dimensions:
             conditions.append(Belief.dimension.in_(dimensions))
         recent = list(session.scalars(
@@ -722,6 +1035,78 @@ def beliefs_with_predicates(
     return [b for b in results if not _is_expired(b)]
 
 
+def beliefs_referenced_by_tokens(
+    session: Session,
+    user_id: str,
+    tokens: set[str] | tuple[str, ...],
+    *,
+    limit: int = 50,
+) -> list[Belief]:
+    """Active beliefs whose object, key or text mentions any of *tokens*.
+
+    A retraction ("Correction: I have never learned Rust" against an active
+    ``rust_coding`` belief) refers to its target by meaning, not by the exact
+    predicate or object string the extractor produced for it.  The predicate
+    and exact-object lookups both miss that target, so the retraction would
+    land as a second active belief beside the one it ends.  Token overlap is
+    what finds the referent.
+    """
+    wanted = {t for t in tokens if t}
+    if not wanted or not is_memory_enabled(session, user_id):
+        return []
+    pattern = or_(*[
+        Belief.object.ilike(f"%{_escape_like(token)}%", escape="\\")
+        for token in sorted(wanted)
+    ] + [
+        Belief.key.ilike(f"%{_escape_like(token)}%", escape="\\")
+        for token in sorted(wanted)
+    ] + [
+        Belief.claim_text.ilike(f"%{_escape_like(token)}%", escape="\\")
+        for token in sorted(wanted)
+    ])
+    stmt = (
+        select(Belief)
+        .where(
+            Belief.user_id == user_id,
+            Belief.status == "active",
+            pattern,
+        )
+        .order_by(desc(Belief.last_evidence_at))
+        .limit(limit)
+    )
+    return list(session.scalars(stmt))
+
+
+def active_goal_beliefs(
+    session: Session,
+    user_id: str,
+    *,
+    limit: int = 20,
+) -> list[Belief]:
+    """Active beliefs whose predicate denotes a goal or intention.
+
+    A generic cancellation ("I gave up on the goal") names no object that
+    overlaps the goal it ends, so the referent can only be found among the
+    user's live goals.
+    """
+    from mirror_memory.memory.polarity import goal_predicates
+
+    wanted = goal_predicates()
+    if not wanted or not is_memory_enabled(session, user_id):
+        return []
+    stmt = (
+        select(Belief)
+        .where(
+            Belief.user_id == user_id,
+            Belief.status == "active",
+            Belief.predicate.in_(sorted(wanted)),
+        )
+        .order_by(desc(Belief.last_evidence_at))
+        .limit(limit)
+    )
+    return list(session.scalars(stmt))
+
+
 def _interval_is_current(belief: Belief, now: datetime) -> bool:
     """Does the belief's validity interval cover *now*?
 
@@ -857,6 +1242,7 @@ def record_claim(
     lifecycle_state: str = "",
     conflict_kind: str = CONFLICT_SOURCE_CONFLICT,
     raw_predicate: str = "",
+    retention_class: str | None = None,
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -895,6 +1281,11 @@ def record_claim(
         statement (the old state closes); ``source_conflict`` when two
         sources disagree (confidence is attenuated and clarification is
         requested).  Only meaningful with ``relation="contradicts"``.
+    retention_class:
+        Explicit retention class override (canonical / preference /
+        behavioral / episodic / transient).  ``None`` derives the class
+        from the claim's identity fields via
+        :func:`mirror_memory.metabolism.policy.classify_retention`.
     """
     if not is_memory_enabled(session, user_id):
         return None, "profile_memory_disabled"
@@ -964,11 +1355,20 @@ def record_claim(
             polarity=polarity or "neutral",
             lifecycle_state=lifecycle_state,
             raw_predicate=raw_predicate,
+            # Memory metabolism: every belief starts hot; the class fixes how
+            # fast it may cool later.
+            retention_class=retention_class
+            or classify_retention(
+                predicate=predicate,
+                cardinality=cardinality,
+                lifecycle_state=lifecycle_state,
+            ),
             # Provenance.
             origin_stats_id=stats_id,
             origin_slice_id=origin_slice_id,
             origin_session_id=session_id,
             last_evidence_session_id=session_id,
+            last_supported_at=utcnow() if relation == "supports" else None,
         )
         session.add(belief)
         session.flush()
@@ -985,6 +1385,9 @@ def record_claim(
         existing.evidence_json = json.dumps(merged_evidence[-MAX_EVIDENCE_REFS:])
         existing.last_evidence_session_id = session_id
         existing.last_evidence_at = datetime.now(UTC)
+        # Support is the reheat signal for the storage tier: a belief that
+        # keeps earning evidence must not drift dormant.
+        existing.last_supported_at = existing.last_evidence_at
 
         # Update claim_text when the new version is a genuine elaboration of
         # what is already stored -- later mentions often carry the date, name
@@ -1307,6 +1710,7 @@ def update_belief_by_id(
         existing_row.superseded_by = None
         existing_row.confidence = min(CONFIDENCE_CEILING, max(0.0, new_confidence))
         existing_row.last_evidence_at = datetime.now(UTC)
+        existing_row.last_supported_at = existing_row.last_evidence_at
         existing_row.last_evidence_session_id = session_id
         existing_row.evidence_json = json.dumps(evidence[-MAX_EVIDENCE_REFS:])
         existing_row.valid_from = new_from or existing_row.valid_from
@@ -1361,6 +1765,7 @@ def update_belief_by_id(
         cardinality=new_cardinality,
         origin_session_id=session_id,
         last_evidence_session_id=session_id,
+        last_supported_at=utcnow(),
         observed_at=observed_at or utcnow(),
         valid_from=new_from,
         valid_to=_as_utc(valid_to),
@@ -1368,6 +1773,14 @@ def update_belief_by_id(
         polarity=polarity or old.polarity,
         lifecycle_state=lifecycle_state or old.lifecycle_state,
         raw_predicate=raw_predicate or old.raw_predicate,
+        # The replacement fills the same slot, so it inherits the slot's
+        # retention class (Beijing replacing Shanghai is still canonical).
+        retention_class=old.retention_class
+        or classify_retention(
+            predicate=new_predicate or old.predicate,
+            cardinality=new_cardinality,
+            lifecycle_state=lifecycle_state or old.lifecycle_state,
+        ),
     )
     session.add(new_belief)
     session.flush()
@@ -1672,7 +2085,11 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     """Cascade-delete all memory data for a user.
 
     Deletes beliefs, events, stats, snapshots, intervention events,
-    evolution jobs, consent grants, and session summaries.
+    evolution jobs, consent grants, session summaries, evidence (with its
+    typed links), evidence digests, and tier-audit rows.  A deletion
+    tombstone survives the cascade: it records *that* the deletion
+    happened (scope hash + per-table counts, never content) and advances
+    the user's deletion generation.
 
     Returns counts of deleted rows per table.
     """
@@ -1685,6 +2102,16 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     interventions_deleted = (
         session.query(InterventionEvent)
         .filter(InterventionEvent.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
+    digests_deleted = (
+        session.query(EvidenceDigest)
+        .filter(EvidenceDigest.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
+    transitions_deleted = (
+        session.query(MemoryTransition)
+        .filter(MemoryTransition.user_id == user_id)
         .delete(synchronize_session=False)
     )
     beliefs_deleted = (
@@ -1730,8 +2157,7 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         .filter(SessionSummary.user_id == user_id)
         .delete(synchronize_session=False)
     )
-    touch_memory_state(session, user_id)
-    return {
+    counts = {
         "beliefs": int(beliefs_deleted),
         "belief_events": int(events_deleted),
         "extraction_stats": int(stats_deleted),
@@ -1742,20 +2168,69 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "session_summaries": int(summaries_deleted),
         "evidence": int(evidence_deleted),
         "belief_evidence_links": int(links_deleted),
+        "evidence_digests": int(digests_deleted),
+        "memory_transitions": int(transitions_deleted),
     }
+    _write_deletion_tombstone(session, user_id, scope="user", scope_hash=_scope_hash("user", user_id), counts=counts)
+    touch_memory_state(session, user_id)
+    return counts
+
+
+def _scope_hash(scope: str, identity: str) -> str:
+    """Stable hash of a deletion scope — identity only, never content."""
+    return _short_hash(f"{scope}:{identity}")
+
+
+def _write_deletion_tombstone(
+    session: Session,
+    user_id: str,
+    *,
+    scope: str,
+    scope_hash: str,
+    counts: dict[str, int],
+) -> DeletionTombstone:
+    """Append the content-free record that a deletion happened.
+
+    ``generation`` is the per-user deletion counter: every forget advances
+    it, which is the generation half of the revision barrier that stops a
+    stale worker from writing deleted data back.
+    """
+    latest = session.scalar(
+        select(func.max(DeletionTombstone.generation)).where(
+            DeletionTombstone.user_id == user_id
+        )
+    )
+    tombstone = DeletionTombstone(
+        user_id=user_id,
+        generation=int(latest or 0) + 1,
+        scope=scope,
+        scope_hash=scope_hash,
+        counts_json=json.dumps(counts, ensure_ascii=False),
+    )
+    session.add(tombstone)
+    session.flush()
+    return tombstone
 
 
 def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
-    """Targeted forget: delete a single belief and its event history.
+    """Targeted forget: delete a single belief and everything derived from it.
 
-    Also invalidates derived state: snapshots, pending evolution jobs,
-    and bumps the state revision to block stale worker writes.
+    One deletion transaction: the belief's events, its edges into the
+    evidence graph, its evidence digest, and its tier-audit rows all go
+    together, orphaned evidence is pruned, derived state (snapshots,
+    pending evolution jobs) is invalidated, and a content-free tombstone
+    with the advanced deletion generation is written.  The state revision
+    is bumped so stale worker writes are refused.
 
     Returns ``True`` if the belief was found and deleted.
     """
     belief = session.get(Belief, belief_id)
     if belief is None or belief.user_id != user_id:
         return False
+
+    # Capture the scope identity before the rows disappear (the tombstone
+    # stores its hash, never the key itself).
+    scope_hash = _scope_hash("belief", f"{belief_id}:{belief.key}")
 
     # Delete events first.
     session.query(BeliefEvent).filter(BeliefEvent.belief_id == belief_id).delete(
@@ -1765,10 +2240,18 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
     session.query(BeliefEvidenceLink).filter(
         BeliefEvidenceLink.belief_id == belief_id
     ).delete(synchronize_session=False)
+    # The compaction aggregate and the tier-audit trail are belief-scoped.
+    session.query(EvidenceDigest).filter(EvidenceDigest.belief_id == belief_id).delete(
+        synchronize_session=False
+    )
+    session.query(MemoryTransition).filter(
+        MemoryTransition.entity_type == "belief",
+        MemoryTransition.entity_id == belief_id,
+    ).delete(synchronize_session=False)
     session.delete(belief)
     session.flush()
     # Evidence no belief points at is garbage, not provenance.
-    _prune_orphan_evidence(session, user_id)
+    pruned = _prune_orphan_evidence(session, user_id)
 
     # Invalidate derived state: source memory was deleted, so
     # snapshots (derived understanding) and pending evolution jobs
@@ -1780,6 +2263,13 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
     ).update(
         {"status": "cancelled", "error_code": "belief_forgotten"},
         synchronize_session=False,
+    )
+    _write_deletion_tombstone(
+        session,
+        user_id,
+        scope="belief",
+        scope_hash=scope_hash,
+        counts={"beliefs": 1, "evidence_pruned": int(pruned)},
     )
     touch_memory_state(session, user_id)
     return True
@@ -1883,6 +2373,11 @@ def correct_belief(
         temporal_scope=old.temporal_scope,
         origin_session_id=old.origin_session_id,
         last_evidence_session_id=old.last_evidence_session_id,
+        last_supported_at=utcnow(),
+        # A user correction is the strongest retention signal the system
+        # gets: the corrected belief is exempt from automatic cooling.
+        retention_class=old.retention_class,
+        protected_reason=REASON_USER_CORRECTION,
         valid_from=datetime.now(UTC),
     )
     session.add(corrected)
@@ -1940,6 +2435,11 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
         "status": belief.status,
         "source": belief.source,
         "subject": getattr(belief, "subject", "user"),
+        "memory_tier": getattr(belief, "memory_tier", "hot"),
+        "retention_class": getattr(belief, "retention_class", ""),
+        "metabolism_state": getattr(belief, "metabolism_state", ""),
+        "protected_reason": getattr(belief, "protected_reason", ""),
+        "access_count": getattr(belief, "access_count", 0),
         "evidence_ids": belief_evidence_ids(belief),
         "evidence_graph": evidence_summary(session, user_id, belief_id),
         "superseded_by": belief.superseded_by,

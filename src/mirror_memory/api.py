@@ -94,10 +94,15 @@ class MemoryEngine:
             return
         from sqlalchemy import create_engine
 
+        from mirror_memory.core.migrate import check_schema
         from mirror_memory.core.models import Base
 
         self._engine = create_engine(self._database_url)
         Base.metadata.create_all(self._engine)
+        # A database written by an older engine lacks the metabolism columns
+        # the ORM now expects; fail with instructions instead of a mid-query
+        # "no such column" error.
+        check_schema(self._engine)
         self._initialized = True
 
     def _session(self):
@@ -175,6 +180,7 @@ class MemoryEngine:
         language: str = "en",
         tail_load: int = 0,
         trace_hook: Any | None = None,
+        now: Any | None = None,
     ) -> str | None:
         """Retrieve a rendered memory block for prompt injection.
 
@@ -192,6 +198,12 @@ class MemoryEngine:
             Optional observability callable ``trace_hook(stage, **fields)``
             receiving the retrieve/context stages.  Purely additive -- it
             never changes what is rendered.
+        now:
+            Reference time for freshness scoring, time labels, and the
+            access telemetry this call records.  Defaults to the current
+            UTC time; benchmarks and tests pass a simulated clock so a
+            recall can be positioned on the same timeline as the
+            metabolism cycle that follows it.
 
         Returns
         -------
@@ -220,13 +232,67 @@ class MemoryEngine:
                 user_message=query,
                 tail_load=tail_load,
                 trace_hook=trace_hook,
+                now=now,
             )
+            # Recall records access telemetry (which beliefs reached the
+            # prompt — the reheat signal for memory metabolism).  The
+            # telemetry must never break recall, so a failed commit just
+            # discards it and returns the already-rendered block.
+            try:
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.warning("recall: access telemetry commit failed; discarded")
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "recall: user=%s chars=%d latency=%dms",
             user_id[:8], len(result or ""), elapsed_ms,
         )
         return result
+
+    def run_metabolism(self, *, user_id: str, dry_run: bool = False, now: Any | None = None) -> dict:
+        """Run one memory-metabolism cycle for a user.
+
+        Scans the user's beliefs, scores heat, applies protection, and
+        proposes storage-tier transitions (hot → warm → dormant → archived,
+        plus reheat and evidence compaction) through the Publisher — the
+        cycle itself never writes directly.  Designed to be scheduled daily
+        per user (e.g. 02:00) by the host application.
+
+        Parameters
+        ----------
+        user_id:
+            The user identifier.
+        dry_run:
+            Compute every decision but publish nothing.
+        now:
+            Reference time for the cycle.  Defaults to the current UTC
+            time; benchmarks and tests pass a simulated clock so retention
+            windows (``cool_after_days`` / ``archive_after_days``) can be
+            exercised without waiting.
+
+        Returns
+        -------
+        dict
+            The cycle report: scanned / protected / proposals / committed /
+            refused counts, tier distribution before and after, and every
+            transition (or refusal) with its reason.
+
+        Raises
+        ------
+        ValidationError
+            If user_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.metabolism.planner import run_metabolism as run_cycle
+
+        with self._session() as session:
+            report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)
+            session.commit()
+            return report.as_dict()
 
     def panel(
         self,
@@ -304,6 +370,8 @@ class MemoryEngine:
                     predicate=getattr(b, "predicate", ""),
                     object=getattr(b, "object", ""),
                     cardinality=getattr(b, "cardinality", "multi"),
+                    memory_tier=getattr(b, "memory_tier", "hot"),
+                    retention_class=getattr(b, "retention_class", ""),
                 )
                 for b in beliefs
             ]
@@ -506,7 +574,15 @@ class MemoryEngine:
             return DeleteResult(**counts)
 
     def forget_belief(self, *, user_id: str, belief_id: int) -> bool:
-        """Targeted forget: delete a single belief and its event history.
+        """Targeted forget: delete a single belief and everything derived from it.
+
+        The deletion is one transaction — belief, events, evidence links,
+        digest, and tier-audit rows go together, orphaned evidence is
+        pruned, and a content-free tombstone advances the user's deletion
+        generation (the barrier that stops a stale worker from writing the
+        data back).  Routed through the Publisher like every other state
+        change; unlike collection, deletion is allowed even while memory
+        is disabled.
 
         Returns ``True`` if the belief was found and deleted.
 
@@ -519,12 +595,74 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.core.repository import forget_belief
+        from mirror_memory.core.proposal import (
+            TRANSITION_FORGET,
+            StateTransitionProposal,
+        )
+        from mirror_memory.core.publisher import Publisher
+        from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
-            result = forget_belief(session, user_id, belief_id)
+            decision = Publisher(session).publish(
+                StateTransitionProposal(
+                    transition=TRANSITION_FORGET,
+                    user_id=user_id,
+                    target_belief_id=belief_id,
+                    claimed_revision=get_state_revision(session, user_id),
+                )
+            )
             session.commit()
-            return result
+            return decision.committed
+
+    def restore_belief(self, *, user_id: str, belief_id: int) -> bool:
+        """Restore an archived belief into the default retrieval scan.
+
+        Archiving is reversible by design: an archived belief has left the
+        default scan (its conclusion is still true, its evidence is still
+        summarised) but an explicit restore brings it back to warm through
+        the Publisher — the same proposal path as every tier move, with
+        the same invariants (legal edge, scope, revision).
+
+        Returns ``True`` if the belief was archived and has been restored.
+
+        Raises
+        ------
+        ValidationError
+            If user_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.models import Belief
+        from mirror_memory.core.proposal import (
+            TRANSITION_TIER_TRANSITION,
+            StateTransitionProposal,
+        )
+        from mirror_memory.core.publisher import Publisher
+        from mirror_memory.core.repository import get_state_revision
+
+        with self._session() as session:
+            belief = session.get(Belief, belief_id)
+            if belief is None or belief.user_id != user_id:
+                return False
+            from_tier = belief.memory_tier or "hot"
+            decision = Publisher(session).publish(
+                StateTransitionProposal(
+                    transition=TRANSITION_TIER_TRANSITION,
+                    user_id=user_id,
+                    target_belief_id=belief_id,
+                    claimed_revision=get_state_revision(session, user_id),
+                    payload={
+                        "from_tier": from_tier,
+                        "to_tier": "warm",
+                        "reason": "restore",
+                        "score": 0.0,
+                    },
+                )
+            )
+            session.commit()
+            return decision.committed
 
     def forget_session(self, *, user_id: str, session_id: str) -> bool:
         """Targeted forget: delete a session summary by session_id.

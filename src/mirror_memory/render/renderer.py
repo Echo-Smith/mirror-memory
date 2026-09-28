@@ -143,82 +143,29 @@ def _extract_query_triples(
     return predicates, objects
 
 
-# Query intent → which validity intervals to draw from.  "Where do they live
-# now?" and "where did they live before?" are different questions about the
-# same predicate, and only the interval filter tells them apart.
-_TEMPORAL_CURRENT_MARKERS = (
-    "now", "currently", "these days", "at the moment", "right now",
-    "\u73b0\u5728", "\u76ee\u524d", "\u5f53\u524d",
-)
-_TEMPORAL_HISTORICAL_MARKERS = (
-    "used to", "previously", "before", "earlier", "in the past", "formerly",
-    "no longer", "used to live", "did they", "did you",
-    "\u4ee5\u524d", "\u66fe\u7ecf", "\u4e4b\u524d", "\u8fc7\u53bb", "\u66fe\u7ecf\u4f4f",
-)
-
-
-# Queries asking for every occurrence rather than one interval.  "How many
-# times did they go", "list all the places they visited", "what did they buy"
-# -- an interval filter would silently drop occurrences, so these opt out of
-# current/historical filtering entirely.
-_ALL_OCCURRENCES_MARKERS = (
-    "how many times", "list all", "all the times", "every time",
-    "what all", "which all", "all the places", "all the cities",
-    "\u54ea\u4e9b\u6b21", "\u6240\u6709\u6b21", "\u5404\u6b21", "\u603b\u5171",
+# Query intent → which validity intervals and storage tiers to draw from.
+# "Where do they live now?" and "where did they live before?" are different
+# questions about the same predicate (interval filter), and a "now?"
+# question must not pay for scanning cold storage (tier filter).  The
+# detection itself lives in mirror_memory.metabolism.eligibility so it is
+# public, testable, and reusable; the aliases below keep the historical
+# renderer-level entry points working.
+from mirror_memory.metabolism.eligibility import (  # noqa: E402
+    detect_query_mode as _detect_query_mode_impl,
+    is_enumeration_query as _is_enumeration_query_impl,
 )
 
 
 def _detect_temporal_mode(query: str) -> str:
-    """Map a query onto a validity-interval filter.
-
-    Returns ``"current"``, ``"historical"``, ``"all_occurrences"`` or
-    ``"all"``.  Historical wins on a tie: "where did you used to live" asks
-    about the past even though it contains "did".  All-occurrences wins over
-    both: a count question needs every interval, not a filtered one.
-    """
-    if not query:
-        return "all"
-    lowered = query.lower()
-    # An enumeration query ("what did they buy", "what are their hobbies") is
-    # also an all-occurrences query: it wants every value, so it must not be
-    # narrowed to one interval -- and it must not be caught by the historical
-    # markers first ("did they" would otherwise send it to the past).
-    if _is_enumeration_query(query):
-        return "all_occurrences"
-    if any(marker in lowered for marker in _ALL_OCCURRENCES_MARKERS):
-        return "all_occurrences"
-    for marker in _TEMPORAL_HISTORICAL_MARKERS:
-        if marker in lowered:
-            return "historical"
-    for marker in _TEMPORAL_CURRENT_MARKERS:
-        if marker in lowered:
-            return "current"
-    return "all"
-
-
-# Queries that ask for everything of a kind rather than the single current
-# value.  "What languages do they speak", "list all the places they visited",
-# "what did they buy" -- these need every matching occurrence, so a per-
-# dimension cap tuned for "where do they live now" starves them.
-_ENUMERATION_MARKERS = (
-    "what all", "list all", "all the", "every ", "which all", "what languages",
-    "what sports", "what pets", "what instruments", "what food", "what books",
-    "what cities", "what places", "what countries", "what schools",
-    "what companies", "what jobs", "what races", "what classes",
-    "what workshops", "what courses", "what appointments", "what gifts",
-    "what did they buy", "what did they visit", "what did they attend",
-    "what did they read", "what did they watch", "what did they eat",
-    "what hobbies", "what skills", "what are their", "what are the",
-    "\u54ea\u4e9b", "\u6240\u6709", "\u5404\u79cd", "\u5217\u51fa",
-)
+    """Map a query onto a retrieval mode (current / historical / evidence /
+    experience / all_occurrences / all).  Historical wins on a tie;
+    all-occurrences wins over both."""
+    return _detect_query_mode_impl(query)
 
 
 def _is_enumeration_query(query: str) -> bool:
     """Does this query ask for every matching item rather than one value?"""
-    if not query:
-        return False
-    lowered = query.lower()
-    return any(marker in lowered for marker in _ENUMERATION_MARKERS)
+    return _is_enumeration_query_impl(query)
 
 
 def render_memory_block(
@@ -230,6 +177,7 @@ def render_memory_block(
     language: str = "zh",
     tail_load: int = 0,
     trace_hook: object | None = None,
+    now: datetime | None = None,
 ) -> str | None:
     """Render a memory block for prompt injection.
 
@@ -252,6 +200,12 @@ def render_memory_block(
         Optional observability callable ``trace_hook(stage, **fields)``.
         Purely additive: it observes the retrieve/context stages and never
         changes what is rendered.
+    now:
+        Reference time for freshness scoring, time labels, and the access
+        telemetry this call records.  Defaults to the current UTC time;
+        benchmarks and tests pass a simulated clock so a recall can be
+        positioned on the same timeline as the metabolism cycle that
+        follows it.
 
     Returns
     -------
@@ -286,7 +240,10 @@ def render_memory_block(
         cap=render_cfg.cap,
     )
 
-    items: list[str] = []
+    # Each rendered line carries the belief it came from (None for the
+    # rejected-line banner) so access telemetry can be recorded for exactly
+    # the beliefs that reached the prompt.
+    items: list[tuple[str, object | None]] = []
 
     # -- Rejected beliefs (D8 equivalent) -- fixed first slot ----------------
     rejected = list_rejected_beliefs(session, user_id, limit=5)
@@ -298,10 +255,10 @@ def render_memory_block(
         ]
         if rejected_labels:
             if is_en:
-                items.append(f"Avoid: {', '.join(rejected_labels)}")
+                items.append((f"Avoid: {', '.join(rejected_labels)}", None))
             else:
                 joined = "\u3001".join(rejected_labels)
-                items.append(f"\u5e94\u56de\u907f\uff08\u7528\u6237\u5df2\u660e\u786e\u6401\u7f6e\uff09\uff1a{joined}")
+                items.append((f"\u5e94\u56de\u907f\uff08\u7528\u6237\u5df2\u660e\u786e\u6401\u7f6e\uff09\uff1a{joined}", None))
 
     # -- Active beliefs: scored and sorted -----------------------------------
     # Extract topics, predicates, and objects from user_message for
@@ -328,7 +285,7 @@ def render_memory_block(
         session, user_id, query=user_message,
         temporal_mode=_detect_temporal_mode(user_message),
     )
-    now = datetime.now(UTC)
+    now = now or datetime.now(UTC)
     # Evidence is a first-class entity now, so the multi-evidence bonus counts
     # typed links rather than a blob of ids on the belief row.
     from mirror_memory.core.repository import evidence_counts_for_beliefs
@@ -380,26 +337,61 @@ def render_memory_block(
         count = dim_counts.get(dim, 0)
         if count >= max_per:
             continue
-        text = _render_belief(belief, display, language)
+        text = _render_belief(belief, display, language, now=now)
         if text:
-            items.append(text)
+            items.append((text, belief))
             dim_counts[dim] = count + 1
 
     # -- Budget packing: whole-item, never truncate --------------------------
     # The rejected (D8 boundary) line in items[0] is exempt from the budget —
     # it is the strongest user signal and must never be dropped for space.
-    rendered: list[str] = []
+    rendered: list[tuple[str, object | None]] = []
     used = 0
-    for i, text in enumerate(items):
-        is_exempt = i == 0 and _is_rejected_line(items[0])
+    for i, (text, belief) in enumerate(items):
+        is_exempt = i == 0 and _is_rejected_line(items[0][0])
         if not is_exempt:
             prefix_cost = len(joiner) if rendered else 0
             if used + prefix_cost + len(text) > budget:
                 continue
             used += prefix_cost + len(text)
-        rendered.append(text)
+        rendered.append((text, belief))
 
-    block = joiner.join(rendered)
+    # Access telemetry: a belief that reached the prompt is, by definition,
+    # a live belief — this is the reheat signal the heat score consumes.
+    # Purely additive: it never changes what is rendered, and the caller
+    # owns the transaction (MemoryEngine.recall commits it).
+    from mirror_memory.core.repository import mark_belief_accessed
+
+    accessed_ids = [
+        getattr(belief, "id") for _text, belief in rendered if belief is not None
+    ]
+    try:
+        mark_belief_accessed(session, accessed_ids, now=now)
+    except Exception:
+        logger.debug("render: access telemetry failed", exc_info=True)
+
+    block = joiner.join(text for text, _belief in rendered)
+
+    # -- Evidence intent: attach provenance density -------------------------
+    # A "why / based on what" question deserves the evidence picture, not
+    # just the conclusion: the digest summary for compacted beliefs, plain
+    # observation counts otherwise.  Only for beliefs that made it into the
+    # block, bounded by the same character budget.
+    if user_message and _detect_temporal_mode(user_message) == "evidence":
+        from mirror_memory.core.repository import digests_for_beliefs
+
+        evidence_beliefs = [b for _t, b in rendered if b is not None][:3]
+        digests = digests_for_beliefs(session, [b.id for b in evidence_beliefs])
+        for belief in evidence_beliefs:
+            digest = digests.get(belief.id)
+            if digest is not None and digest.summary:
+                hint = f"[evidence] {belief.key}: {digest.summary}"
+            else:
+                count = evidence_counts.get(belief.id) or 0
+                hint = f"[evidence] {belief.key}: {count} observation(s)"
+            prefix_cost = len(joiner) if block else 0
+            if len(block or "") + prefix_cost + len(hint) <= budget:
+                block = (block + joiner + hint) if block else hint
 
     # -- Fallback: session summary retrieval --------------------------------
     # If beliefs don't contain the key nouns from the query, search session
@@ -479,7 +471,7 @@ def _retrieve_session_snippets(
     return [text for _, text in scored[:limit]]
 
 
-def _render_belief(belief: object, display: DisplayDict, language: str) -> str | None:
+def _render_belief(belief: object, display: DisplayDict, language: str, now: datetime | None = None) -> str | None:
     """Render a single belief into a display string.
 
     Uses the display dictionary for label lookup.  If no label is
@@ -506,18 +498,18 @@ def _render_belief(belief: object, display: DisplayDict, language: str) -> str |
         return None
 
     # Add time annotation if recent
-    time_tag = _time_ago_label(belief, is_en)
+    time_tag = _time_ago_label(belief, is_en, now=now)
     if time_tag:
         return f"{display_text} ({time_tag})" if is_en else f"{display_text}\uff08{time_tag}\uff09"
     return display_text
 
 
-def _time_ago_label(belief: object, is_en: bool) -> str:
+def _time_ago_label(belief: object, is_en: bool, now: datetime | None = None) -> str:
     """Compact time annotation based on last_evidence_at."""
     ts = getattr(belief, "last_evidence_at", None)
     if ts is None:
         return ""
-    now = datetime.now(UTC)
+    now = now or datetime.now(UTC)
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
     days = max(0, (now - ts).days)

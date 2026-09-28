@@ -28,6 +28,15 @@ TRANSITION_VERIFY = "VERIFY"
 TRANSITION_CORRECT = "CORRECT"
 TRANSITION_FORGET = "FORGET"
 TRANSITION_SYNTHESIZE = "SYNTHESIZE"
+# Memory metabolism: a storage-tier move (hot -> warm -> dormant, or a
+# reheat).  Changes how the belief is stored and scanned, never what it
+# claims -- truth state is untouched, which is also why committing one does
+# not bump the state revision.
+TRANSITION_TIER_TRANSITION = "TIER_TRANSITION"
+# Memory metabolism: fold a belief's redundant support evidence into an
+# EvidenceDigest, keeping a representative sample live.  The conclusion the
+# evidence supports is untouched; only the provenance bulk is aggregated.
+TRANSITION_EVIDENCE_COMPACT = "EVIDENCE_COMPACT"
 
 STATE_TRANSITIONS = (
     TRANSITION_CREATE,
@@ -38,6 +47,8 @@ STATE_TRANSITIONS = (
     TRANSITION_CORRECT,
     TRANSITION_FORGET,
     TRANSITION_SYNTHESIZE,
+    TRANSITION_TIER_TRANSITION,
+    TRANSITION_EVIDENCE_COMPACT,
 )
 
 # Transitions that mutate belief rows.  SYNTHESIZE writes derived state
@@ -49,6 +60,8 @@ BELIEF_MUTATING_TRANSITIONS = (
     TRANSITION_CONTRADICT,
     TRANSITION_CORRECT,
     TRANSITION_FORGET,
+    TRANSITION_TIER_TRANSITION,
+    TRANSITION_EVIDENCE_COMPACT,
 )
 
 
@@ -74,6 +87,14 @@ class StateTransitionProposal:
         refuses to commit if the live revision has moved.
     lifecycle / temporal_relation:
         The policy's reasoning, carried through so the commit is auditable.
+    payload (TIER_TRANSITION):
+        ``from_tier`` / ``to_tier`` must name a legal edge of the tier state
+        machine and ``from_tier`` must still match the live row; ``reason``
+        and ``score`` carry the decision's provenance into the audit log.
+    payload (EVIDENCE_COMPACT):
+        ``keep_ids`` / ``fold_ids`` must match the selection the Publisher
+        recomputes from the live evidence graph under the payload's
+        ``policy`` (clamped to sane bounds) and ``min_support_links``.
     """
 
     transition: str

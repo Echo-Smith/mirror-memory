@@ -19,12 +19,17 @@ from mirror_memory.exceptions import ConfigError
 from .schema import (
     AnchorConfig,
     BudgetConfig,
+    CompactionConfig,
     DimensionConfig,
     DisplayLabel,
     ExtractionConfig,
+    HeatConfig,
     MemoryConfig,
+    MetabolismConfig,
+    MetabolismPlannerConfig,
     PatternRule,
     PromptTemplates,
+    RetentionClassPolicy,
     SuppressionRule,
 )
 
@@ -165,6 +170,8 @@ def _parse_extraction(data: dict[str, Any]) -> ExtractionConfig:
                         regex=raw_regex,
                         dimension=p.get("dimension", ""),
                         key=p.get("key", ""),
+                        predicate=p.get("predicate", "") or "",
+                        object_group=int(p.get("object_group", 1) or 1),
                     )
                 )
             except re.error as e:
@@ -223,6 +230,90 @@ def _parse_question_value_tiers(data: dict[str, Any]) -> dict[str, int]:
         except (TypeError, ValueError):
             logger.warning("Skipping invalid question_value_tiers entry %s=%r", dim, tier)
     return tiers
+
+
+def _parse_metabolism(data: dict[str, Any]) -> MetabolismConfig:
+    """Parse ``metabolism.yaml``; an empty file yields the defaults.
+
+    Invalid retention-class names in ``retention_predicates`` are skipped
+    with a warning rather than failing startup — a typo in a cooling hint
+    must not take the engine down.
+    """
+    if not isinstance(data, dict) or not data:
+        return MetabolismConfig()
+
+    from mirror_memory.metabolism.policy import RETENTION_CLASSES
+
+    retention_classes: dict[str, RetentionClassPolicy] = {}
+    raw_classes = data.get("retention_classes", {})
+    if isinstance(raw_classes, dict):
+        for name, cfg in raw_classes.items():
+            if name not in RETENTION_CLASSES or not isinstance(cfg, dict):
+                logger.warning("Skipping invalid retention class entry %r", name)
+                continue
+            retention_classes[str(name)] = RetentionClassPolicy(
+                cool_after_days=cfg.get("cool_after_days"),
+                archive_after_days=cfg.get("archive_after_days"),
+            )
+
+    retention_predicates: dict[str, str] = {}
+    raw_predicates = data.get("retention_predicates", {})
+    if isinstance(raw_predicates, dict):
+        for predicate, cls in raw_predicates.items():
+            if cls in RETENTION_CLASSES:
+                retention_predicates[str(predicate)] = str(cls)
+            else:
+                logger.warning(
+                    "Skipping retention_predicates entry %s=%r (unknown class)", predicate, cls
+                )
+
+    heat_raw = data.get("heat", {})
+    heat = HeatConfig()
+    if isinstance(heat_raw, dict):
+        weights_raw = heat_raw.get("weights", {})
+        thresholds_raw = heat_raw.get("thresholds", {})
+        try:
+            heat = HeatConfig(
+                half_life_days=float(heat_raw.get("half_life_days", 60.0)),
+                protected_floor=float(heat_raw.get("protected_floor", 0.70)),
+                **(
+                    {"weights": dict(weights_raw)} if isinstance(weights_raw, dict) else {}
+                ),
+                **(
+                    {"thresholds": dict(thresholds_raw)} if isinstance(thresholds_raw, dict) else {}
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning("Invalid heat config %r; using defaults (%s)", heat_raw, exc)
+
+    kwargs: dict[str, Any] = {}
+    if retention_classes:
+        kwargs["retention_classes"] = retention_classes
+    planner_raw = data.get("planner", {})
+    if isinstance(planner_raw, dict) and planner_raw:
+        try:
+            kwargs["planner"] = MetabolismPlannerConfig(
+                max_transitions_per_run=int(planner_raw.get("max_transitions_per_run", 200))
+            )
+        except (TypeError, ValueError):
+            logger.warning("Invalid planner config %r; using defaults", planner_raw)
+
+    compaction_raw = data.get("compaction", {})
+    if isinstance(compaction_raw, dict) and compaction_raw:
+        try:
+            kwargs["compaction"] = CompactionConfig(
+                min_support_links=int(compaction_raw.get("min_support_links", 12)),
+                keep=dict(compaction_raw.get("keep", {})),
+            )
+        except (TypeError, ValueError):
+            logger.warning("Invalid compaction config %r; using defaults", compaction_raw)
+
+    return MetabolismConfig(
+        retention_predicates=retention_predicates,
+        default_retention_class=str(data.get("default_retention_class", "preference")),
+        heat=heat,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +415,7 @@ def load_config(config_path: str | Path) -> MemoryConfig:
         identity_policy=identity_policy,
         temporal_policy=temporal_policy,
         predicate_synonyms=predicate_synonyms,
+        metabolism=_parse_metabolism(_read_yaml(base / "metabolism.yaml")),
     )
 
     if config.render.floor > config.render.cap:

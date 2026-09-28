@@ -153,6 +153,29 @@ class Belief(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
+    # Memory metabolism (lifecycle runtime).  These are orthogonal to the
+    # truth state above: "superseded + warm" is a perfectly good combination
+    # ("no longer the current value, but historically true and plausibly
+    # useful soon"), and mixing the two dimensions is exactly the confusion
+    # the split prevents.  The tier is changed only by maintenance proposals
+    # committed through the Publisher -- never by the read path.
+    memory_tier: Mapped[str] = mapped_column(String(16), default="hot")
+    metabolism_state: Mapped[str] = mapped_column(String(16), default="active")
+    retention_class: Mapped[str] = mapped_column(String(16), default="preference")
+    importance_score: Mapped[float] = mapped_column(Float, default=0.5)
+    # Access telemetry: how often recall has actually surfaced this belief.
+    # Recording an access is not a state transition -- it deliberately does
+    # not bump the state revision, so a recall can never invalidate an
+    # in-flight proposal.
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_supported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Why this belief is exempt from automatic cooling/compaction (see
+    # mirror_memory.metabolism.protection); empty when it is not.
+    protected_reason: Mapped[str] = mapped_column(String(64), default="")
+    # EvidenceDigest id this belief's raw evidence was folded into (PR3).
+    compacted_into: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
 
 # ---------------------------------------------------------------------------
 # Evidence (first-class provenance entity)
@@ -191,8 +214,59 @@ class Evidence(Base):
     authority: Mapped[str] = mapped_column(String(32), default="user")
     observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Memory metabolism (PR3).  ``hot`` rows are live provenance;
+    # ``representative`` rows are the sample kept after compaction;
+    # ``compacted`` rows were folded into an EvidenceDigest (their content
+    # is cleared — the digest carries the counts, the representatives carry
+    # the wording); ``archived`` is the PR4 cold store.
+    retention_state: Mapped[str] = mapped_column(String(16), default="hot")
+    # Which digest group folded this row (EvidenceDigest.id as string).
+    compaction_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (UniqueConstraint("user_id", "ref", name="uq_mm_evidence_user_ref"),)
+
+
+# ---------------------------------------------------------------------------
+# Evidence digest (compaction aggregate)
+# ---------------------------------------------------------------------------
+
+
+class EvidenceDigest(Base):
+    """The aggregate that survives evidence compaction.
+
+    Fifty "I like coffee" messages are one fact with fifty observations.
+    Compaction folds the redundant bulk into this row — counts by relation,
+    time span, source/authority distributions, and the surviving
+    representative sample — so the hot store carries ~6 rows plus one
+    digest while the conclusion ("likes coffee, 48 observations, never
+    contradicted") stays exactly as answerable.
+
+    One digest per belief (upserted across repeated compaction runs; counts
+    always reflect the full link graph, not just the latest run's fold).
+    """
+
+    __tablename__ = "mm_evidence_digests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    belief_id: Mapped[int] = mapped_column(Integer, index=True, unique=True)
+    # Total typed-link counts across the belief's whole history — including
+    # representatives and already-folded rows.
+    support_count: Mapped[int] = mapped_column(Integer, default=0)
+    contradict_count: Mapped[int] = mapped_column(Integer, default=0)
+    verify_count: Mapped[int] = mapped_column(Integer, default=0)
+    correct_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # JSON list of the evidence ids kept as the surviving sample.
+    representative_ids: Mapped[str] = mapped_column(Text, default="[]")
+    # Rule-generated one-liner (no model): "48 observations since 2025-03,
+    # sources: message, authority: user".
+    summary: Mapped[str] = mapped_column(Text, default="")
+    source_distribution: Mapped[str] = mapped_column(Text, default="{}")
+    authority_distribution: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +320,80 @@ class BeliefEvent(Base):
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
     detail_json: Mapped[str] = mapped_column(Text, default="{}")
     origin_stats_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Memory transition (metabolism audit log)
+# ---------------------------------------------------------------------------
+
+
+class MemoryTransition(Base):
+    """Audit row for one committed storage-tier transition.
+
+    Written only by the Publisher (via ``set_belief_tier``) when a
+    TIER_TRANSITION proposal commits.  This is what makes "why was this
+    memory archived?" answerable months later: the decision's reason,
+    heat score, and resulting revision are kept alongside the change.
+
+    Truth-state events (created/supported/...) live in
+    :class:`BeliefEvent`; storage-tier events live here.  Two orthogonal
+    state dimensions, two logs.
+    """
+
+    __tablename__ = "mm_memory_transitions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    entity_type: Mapped[str] = mapped_column(String(16), default="belief")
+    entity_id: Mapped[int] = mapped_column(Integer, index=True)
+    from_tier: Mapped[str] = mapped_column(String(16))
+    to_tier: Mapped[str] = mapped_column(String(16))
+    # Why the transition fired: "cooling", "reheat", "manual", ...
+    reason: Mapped[str] = mapped_column(String(64), default="")
+    # The heat score the decision was computed from.
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    # Log-safe proposal description (proposals carry no id of their own).
+    proposal_desc: Mapped[str] = mapped_column(String(128), default="")
+    # State revision at commit time.  Note this is the *observed* revision,
+    # not one the transition caused -- tier moves deliberately leave the
+    # revision alone (storage state, not truth state).
+    publisher_revision: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Deletion tombstone (forget audit + generation barrier)
+# ---------------------------------------------------------------------------
+
+
+class DeletionTombstone(Base):
+    """The record that a deletion happened — deliberately content-free.
+
+    A forget is a deletion *transaction*: the belief, its events, evidence
+    links, digest, and tier-audit rows go in one commit, and this row is
+    what survives it.  It carries no claim text, no evidence content, and
+    no key — only a hash of the deletion scope, so "was this thing
+    deleted?" is answerable while "what did it say?" is not.
+
+    ``generation`` increments per user on every deletion.  It is the
+    generation half of the revision barrier: a stale worker holding a
+    pre-deletion revision cannot write the data back, and a re-observation
+    of the same message creates *new* rows rather than resurrecting the
+    deleted ones.
+    """
+
+    __tablename__ = "mm_deletion_tombstones"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    # "belief" / "session" / "user" — what kind of scope was deleted.
+    scope: Mapped[str] = mapped_column(String(16), default="belief")
+    # Hash of the scope identity (never the content itself).
+    scope_hash: Mapped[str] = mapped_column(String(64), default="")
+    # Per-table deleted row counts — structure, not content.
+    counts_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

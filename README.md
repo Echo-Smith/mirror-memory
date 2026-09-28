@@ -63,20 +63,24 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 **Retrieval**
 - **Query-aware retrieval** — content-overlap ranking plus predicate/object matching; phrasing-independent
 - **Temporal intent routing** — current / historical / all_occurrences, chosen from the question
+- **Tier eligibility before ranking** — a "now?" question never scans dormant/archived storage (memory metabolism); recall records access telemetry, which is the reheat signal
 - **Query-adaptive rendering** — enumeration queries ("what languages do they speak") lift the per-dimension cap; the character budget stays the hard limit
 - **Dual-channel** — structured beliefs + session summary fallback
 - **Shadow lifecycle** — single-session → shadow, multi-session → auto-promote
 
 **Runtime**
 - **Single-writer publish** — every state change is a proposal; only the Publisher commits, after checking revision / consent / scope / authority / invariants
+- **Memory metabolism** — belief lifecycle beyond truth: retention classes (canonical/preference/behavioral/episodic/transient), heat scoring, protection invariants, and hot/warm/dormant/archived tier eligibility. A daily planner proposes tier transitions through the Publisher (protection re-derived at commit; tier moves never bump the state revision) with a full audit log. Rules only — no model decides what to cool or delete
+- **Evidence compaction** — fifty "I like coffee" messages become one digest: >12 support links triggers folding into an `EvidenceDigest` (counts, time span, source/authority distributions) while a representative sample stays live and `correct`/`contradict`/`verify` links are never folded; the Publisher recomputes the selection and refuses a mismatch
+- **Archive & forget** — dormant beliefs past their class's `archive_after_days` leave the default scan (restorable on demand through the Publisher); a forget is one deletion transaction (belief + events + links + digest + audit rows + orphan evidence) closed by a content-free tombstone with an advancing deletion generation that blocks stale workers
 - **Built-in LLM adapter** — one-liner startup with any OpenAI-compatible API
 - **FastAPI server** — auth, CORS, health check, Swagger UI
 
 **Tooling**
 - **Benchmark funnel** — 5 stage metrics + failure attribution, not just a score
 - **StateBench** — a dedicated stateful-memory benchmark with a release gate
-- **769 tests** — 0 failures, core paths fully covered
-
+- **MetabolismBench** — 29 scripted lifecycle cases (survival / history / correction / conflict / compaction / reactivation / deletion / stale-worker) with semantic-preservation and compaction-efficiency metrics
+- **956 tests** — 0 failures, core paths fully covered
 ## Architecture / 架构
 
 ```
@@ -256,7 +260,7 @@ See [docs/api-reference.md](docs/api-reference.md).
 ```bash
 pip install "mirror-memory[dev]"
 pytest tests/ -q
-# 769 passed in 9s
+# 956 passed in 13s
 ```
 
 Runtime invariants (stale writes leave the database byte-identical, Publisher

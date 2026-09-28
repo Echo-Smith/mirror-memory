@@ -30,7 +30,9 @@
 - `patterns`: list of regex pattern objects
   - `regex`: str (required) -- Python regex pattern
   - `dimension`: str (required)
-  - `key`: str (required)
+  - `key`: str (required) -- base key; a predicate-declaring pattern's stored key becomes `predicate:object`
+  - `predicate`: str (optional, default "") -- canonical predicate the pattern asserts. When set, the pattern yields a cognitive triple (predicate + `object_group` capture) and flows through identity resolution like a K2 claim, so a new value supersedes the old one. Empty keeps the claim triple-less, and such claims are no longer persisted as beliefs.
+  - `object_group`: int (optional, default 1, >= 1) -- capture group holding the object text; must not exceed the regex's group count
 - `context_tags`: list[str]
 - `max_claims_per_turn`: int (default 6) -- max claims per extraction turn; must exceed the K2 parser's self-cap of 3 or K1 claims are structurally excluded when K2 returns its maximum
 - `llm_every_turns`: int (default 5) -- LLM extraction fires every N turns at minimum
@@ -45,6 +47,29 @@
   - `floor`: int (default 160)
   - `cap`: int (default 720)
 - `question_value_tiers`: dict[str, int] -- dimension -> priority tier for verification question candidates (higher = more valuable to verify)
+
+## metabolism.yaml
+
+Rule-based memory lifecycle. No model decides what to cool, compact, or delete.
+
+- `retention_classes`: dict[str, dict] -- retention class -> cooling schedule
+  - `cool_after_days`: int | null -- days without use before the belief may leave the hot tier; null = never moved on age alone
+  - `archive_after_days`: int | null -- days before the belief may leave the default retrieval scan; null = never. Archiving is not deletion.
+  - known classes: `canonical` / `preference` / `behavioral` / `episodic` / `transient`
+- `retention_predicates`: dict[str, str] -- explicit predicate -> class overrides; beat every derived rule (default `{}`)
+- `default_retention_class`: str -- fallback for claims with no usable identity signal (default `preference`)
+- `heat`: dict -- heat-score parameters
+  - `weights`: dict -- `freshness` / `access` / `evidence_strength` / `authority` / `importance`, should sum to ~1.0
+  - `half_life_days`: float (default 60)
+  - `thresholds`: dict -- `hot` (0.70) / `warm` (0.40) / `dormant` (0.15), must be strictly ordered
+  - `protected_floor`: float (default 0.70) -- heat floor applied to protected beliefs
+- `planner`: dict -- cycle safety rails
+  - `max_transitions_per_run`: int (default 200, >= 1) -- upper bound on tier transitions + compactions proposed per run; excess cold beliefs are handled on the following run
+- `compaction`: dict -- evidence compaction thresholds
+  - `min_support_links`: int (default 12, >= 1) -- compaction starts strictly above this many support links on one belief
+  - `keep`: dict -- `oldest` (1) / `recent` (3) / `highest_authority` (2) -- size of the live representative sample; `correct` / `contradict` / `verify` links are never folded regardless of these values
+
+Default class derivation (when no override matches): goal lifecycle state or a `wants_to`-style predicate -> `behavioral`; event cardinality -> `episodic`; single cardinality -> `canonical`; anything else -> `default_retention_class`.
 
 ## prompts/
 

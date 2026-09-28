@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Dimension
@@ -85,11 +85,30 @@ class DisplayLabel(BaseModel):
 
 
 class PatternRule(BaseModel):
-    """A regex-based extraction pattern."""
+    """A regex-based extraction pattern.
+
+    ``predicate`` and ``object_group`` turn a pattern from a text snippet into
+    a cognitive triple.  A pattern that declares a predicate asserts a slot
+    (``lives_in``), and ``object_group`` names the capture group holding the
+    value; without them the claim has no triple, cannot be matched against
+    existing beliefs, and would sit in the current-state surface forever.
+    """
 
     regex: str = Field(..., min_length=1, description="Python regex pattern")
     dimension: str = Field(..., min_length=1)
     key: str = Field(..., min_length=1)
+    predicate: str = Field(
+        default="",
+        description=(
+            "Canonical predicate this pattern asserts (e.g. 'lives_in'). "
+            "Empty keeps the claim triple-less."
+        ),
+    )
+    object_group: int = Field(
+        default=1,
+        ge=1,
+        description="Capture group holding the object text",
+    )
 
     @field_validator("regex", mode="after")
     @classmethod
@@ -99,6 +118,17 @@ class PatternRule(BaseModel):
         except re.error as exc:
             raise ValueError(f"Invalid regex: {exc}") from exc
         return v
+
+    @model_validator(mode="after")
+    def _validate_object_group(self) -> "PatternRule":
+        if self.predicate:
+            groups = re.compile(self.regex).groups
+            if self.object_group > groups:
+                raise ValueError(
+                    f"object_group={self.object_group} exceeds the "
+                    f"{groups} capture group(s) in regex {self.regex!r}"
+                )
+        return self
 
 
 class SuppressionRule(BaseModel):
@@ -208,6 +238,127 @@ class WorkerConfig(BaseModel):
     third_party_markers: list[str] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Memory metabolism (lifecycle runtime)
+# ---------------------------------------------------------------------------
+
+
+class RetentionClassPolicy(BaseModel):
+    """Cooling schedule for one retention class.
+
+    ``None`` means "no automatic move at this stage" — the canonical class
+    (name, employer, long-lived facts) is never cooled or archived by the
+    background runtime on age alone.
+    """
+
+    cool_after_days: int | None = Field(default=None, ge=1)
+    archive_after_days: int | None = Field(default=None, ge=1)
+
+
+class HeatWeights(BaseModel):
+    """Weights of the heat-score signals; they should sum to ~1.0."""
+
+    freshness: float = Field(default=0.30, ge=0, le=1)
+    access: float = Field(default=0.20, ge=0, le=1)
+    evidence_strength: float = Field(default=0.20, ge=0, le=1)
+    authority: float = Field(default=0.15, ge=0, le=1)
+    importance: float = Field(default=0.15, ge=0, le=1)
+
+
+class HeatThresholds(BaseModel):
+    """Heat-score cut points mapping onto storage tiers."""
+
+    hot: float = Field(default=0.70, ge=0, le=1)
+    warm: float = Field(default=0.40, ge=0, le=1)
+    dormant: float = Field(default=0.15, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "HeatThresholds":
+        if not (self.hot > self.warm > self.dormant):
+            raise ValueError(
+                f"heat thresholds must satisfy hot > warm > dormant, got "
+                f"{self.hot} > {self.warm} > {self.dormant}"
+            )
+        return self
+
+
+class HeatConfig(BaseModel):
+    """Heat-score parameters (see ``mirror_memory.metabolism.heat``)."""
+
+    weights: HeatWeights = Field(default_factory=HeatWeights)
+    half_life_days: float = Field(default=60.0, gt=0)
+    thresholds: HeatThresholds = Field(default_factory=HeatThresholds)
+    protected_floor: float = Field(default=0.70, ge=0, le=1)
+
+
+class MetabolismPlannerConfig(BaseModel):
+    """Safety rails for one metabolism cycle (see ``metabolism.planner``)."""
+
+    max_transitions_per_run: int = Field(
+        default=200, ge=1,
+        description="Upper bound on tier transitions + compactions proposed per run; excess "
+        "cold beliefs are handled on the following run instead",
+    )
+
+
+class CompactionKeepPolicy(BaseModel):
+    """How many support rows survive evidence compaction, per rule."""
+
+    oldest: int = Field(default=1, ge=1, le=10)
+    recent: int = Field(default=3, ge=1, le=10)
+    highest_authority: int = Field(default=2, ge=1, le=10)
+
+
+class CompactionConfig(BaseModel):
+    """Evidence-compaction thresholds (see ``metabolism.compact``)."""
+
+    min_support_links: int = Field(
+        default=12, ge=1, le=1000,
+        description="Compaction starts strictly above this many support links on one belief",
+    )
+    keep: CompactionKeepPolicy = Field(default_factory=CompactionKeepPolicy)
+
+
+class MetabolismConfig(BaseModel):
+    """Memory-metabolism settings, loaded from ``metabolism.yaml``.
+
+    Values here drive rule-based lifecycle decisions only — no model ever
+    decides what to cool, compact, or delete.
+    """
+
+    retention_classes: dict[str, RetentionClassPolicy] = Field(
+        default_factory=lambda: {
+            "canonical": RetentionClassPolicy(cool_after_days=None, archive_after_days=None),
+            "preference": RetentionClassPolicy(cool_after_days=180, archive_after_days=720),
+            "behavioral": RetentionClassPolicy(cool_after_days=60, archive_after_days=180),
+            "episodic": RetentionClassPolicy(cool_after_days=30, archive_after_days=90),
+            "transient": RetentionClassPolicy(cool_after_days=7, archive_after_days=30),
+        },
+        description="Retention class -> cooling schedule. archive_after_days is not deletion: "
+        "archived data simply leaves the default retrieval scan.",
+    )
+    retention_predicates: dict[str, str] = Field(
+        default_factory=dict,
+        description="Explicit predicate -> retention class overrides; beat every derived rule",
+    )
+    default_retention_class: str = Field(
+        default="preference",
+        description="Fallback class for claims with no usable identity signal",
+    )
+    heat: HeatConfig = Field(default_factory=HeatConfig)
+    planner: MetabolismPlannerConfig = Field(default_factory=MetabolismPlannerConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+
+    @field_validator("default_retention_class")
+    @classmethod
+    def _known_default_class(cls, v: str) -> str:
+        from mirror_memory.metabolism.policy import RETENTION_CLASSES
+
+        if v not in RETENTION_CLASSES:
+            raise ValueError(f"default_retention_class must be one of {RETENTION_CLASSES}, got {v!r}")
+        return v
+
+
 class MemoryConfig(BaseModel):
     """Root configuration object assembled from multiple YAML files.
 
@@ -258,6 +409,11 @@ class MemoryConfig(BaseModel):
     predicate_synonyms: dict[str, str] = Field(
         default_factory=dict,
         description="Variant predicate → canonical predicate (e.g. loves → likes)",
+    )
+    # Memory metabolism — retention classes, heat scoring, tier eligibility.
+    metabolism: MetabolismConfig = Field(
+        default_factory=MetabolismConfig,
+        description="Memory-metabolism settings from metabolism.yaml",
     )
     llm_client: Any = Field(default=None, description="LLM client; must expose generate()")
     session_factory: Any = Field(default=None, description="Callable returning a new SQLAlchemy Session")

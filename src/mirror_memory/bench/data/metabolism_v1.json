@@ -1,0 +1,576 @@
+{
+  "bench": "metabolism_v1",
+  "description": "Memory-lifecycle cases: after simulated months of cooling, compaction, archiving and deletion, is the memory still correct where it must be, and gone where it must not be?",
+  "categories": [
+    "current_survival",
+    "historical_preservation",
+    "correction_protection",
+    "conflict_preservation",
+    "evidence_compaction",
+    "reactivation",
+    "deletion",
+    "stale_worker"
+  ],
+  "cases": [
+    {
+      "case_id": "current-survival-residence",
+      "category": "current_survival",
+      "note": "A canonical fact must never be cooled or archived by age alone.",
+      "turns": [
+        "I live in Berlin.",
+        "I moved to Berlin last month and I like it here."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 400},
+        {"op": "cycle", "days": 800},
+        {"op": "cycle", "days": 1200},
+        {"op": "tier", "key": "berlin", "expect": "hot"},
+        {"op": "recall", "query": "where do they live now?", "expect": ["Berlin"]}
+      ]
+    },
+    {
+      "case_id": "current-survival-work",
+      "category": "current_survival",
+      "note": "Same for the employment slot.",
+      "turns": [
+        "I work at Globex as a data analyst.",
+        "I have been working at Globex since last year."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 400},
+        {"op": "cycle", "days": 800},
+        {"op": "tier", "key": "globex", "expect": "hot"},
+        {"op": "recall", "query": "where do they work now?", "expect": ["Globex"]}
+      ]
+    },
+    {
+      "case_id": "current-survival-supported-preference",
+      "category": "current_survival",
+      "note": "A preference backed by repeated observations stays reachable across a long window.",
+      "turns": [
+        "I love painting landscapes.",
+        "Painting landscapes is my favourite hobby.",
+        "I painted a landscape again last weekend."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 400},
+        {"op": "recall", "query": "what are their hobbies?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "current-survival-recent-fact",
+      "category": "current_survival",
+      "note": "A recently stated fact is current after one short cycle.",
+      "turns": ["I am learning to play the guitar."],
+      "steps": [
+        {"op": "cycle", "days": 30},
+        {"op": "recall", "query": "what are they learning?", "expect": ["guitar"]}
+      ]
+    },
+    {
+      "case_id": "history-preserved-after-move",
+      "category": "historical_preservation",
+      "note": "The superseded residence stays answerable as history while it is still warm.",
+      "turns": [
+        "I lived in Shanghai for three years.",
+        "I used to live in Shanghai.",
+        "I moved to Berlin last month."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "recall", "query": "where did they live before?", "expect": ["Shanghai"]},
+        {"op": "recall", "query": "where do they live now?", "expect": ["Berlin"]}
+      ]
+    },
+    {
+      "case_id": "history-preserved-after-compaction",
+      "category": "historical_preservation",
+      "note": "The old value stays answerable across the window in which compaction would have run; storage is measured in the evidence_compaction category.",
+      "turns": [
+        "I lived in Shanghai for three years.",
+        "I lived in Shanghai near the bund.",
+        "I lived in Shanghai and I miss it.",
+        "I lived in Shanghai before the pandemic.",
+        "I lived in Shanghai for work.",
+        "I lived in Shanghai with my cat.",
+        "I lived in Shanghai in 2019.",
+        "I lived in Shanghai for three years, it was great.",
+        "I lived in Shanghai near the metro.",
+        "I lived in Shanghai and knew the city well.",
+        "I lived in Shanghai during university.",
+        "I lived in Shanghai with friends.",
+        "I lived in Shanghai for a long time.",
+        "I lived in Shanghai until last year.",
+        "I moved to Berlin last month."
+      ],
+      "steps": [
+        {"op": "probe", "query": "where did they live before?", "expect": ["Shanghai"]},
+        {"op": "cycle", "days": 100},
+        {"op": "probe_after", "query": "where did they live before?", "expect": ["Shanghai"]},
+        {"op": "recall", "query": "where do they live now?", "expect": ["Berlin"]}
+      ]
+    },
+    {
+      "case_id": "history-preserved-previous-job",
+      "category": "historical_preservation",
+      "note": "The previous employer survives as history too.",
+      "turns": [
+        "I worked at Acme for two years.",
+        "I used to work at Acme.",
+        "I started at Globex last month."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "recall", "query": "where did they work before?", "expect": ["Acme"]},
+        {"op": "recall", "query": "where do they work now?", "expect": ["Globex"]}
+      ]
+    },
+    {
+      "case_id": "history-preserved-old-city-cold",
+      "category": "historical_preservation",
+      "note": "A superseded value that cooled to dormant is still reachable by a historical query.",
+      "turns": [
+        "I lived in Munich for a while.",
+        "I lived in Munich before moving.",
+        "I moved to Berlin last month."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 200},
+        {"op": "recall", "query": "where did they live before Berlin?", "expect": ["Munich"]}
+      ]
+    },
+    {
+      "case_id": "correction-survives-aging",
+      "category": "correction_protection",
+      "note": "A user-corrected belief is never cooled or archived, however old.",
+      "turns": [
+        "I work at Acme.",
+        "I work at Acme as a designer."
+      ],
+      "steps": [
+        {"op": "correct", "key": "acme", "new_text": "User works at Globex as a data analyst", "new_object": "Globex", "new_predicate": "works_at"},
+        {"op": "cycle", "days": 400},
+        {"op": "cycle", "days": 800},
+        {"op": "cycle", "days": 1200},
+        {"op": "tier", "key": "globex", "expect": "hot"},
+        {"op": "recall", "query": "where do they work now?", "expect": ["Globex"]}
+      ]
+    },
+    {
+      "case_id": "correction-survives-correction-of-city",
+      "category": "correction_protection",
+      "note": "Correcting the city keeps the corrected value protected and current.",
+      "turns": [
+        "I live in Shanghai.",
+        "I live in Shanghai near the bund."
+      ],
+      "steps": [
+        {"op": "correct", "key": "shanghai", "new_text": "User lives in Berlin", "new_object": "Berlin", "new_predicate": "lives_in"},
+        {"op": "cycle", "days": 1000},
+        {"op": "tier", "key": "berlin", "expect": "hot"},
+        {"op": "recall", "query": "where do they live now?", "expect": ["Berlin"]}
+      ]
+    },
+    {
+      "case_id": "correction-history-still-answerable",
+      "category": "correction_protection",
+      "note": "The pre-correction value stays answerable as history; the corrected value is the current one.",
+      "turns": [
+        "I work at Acme.",
+        "I work at Acme as a designer."
+      ],
+      "steps": [
+        {"op": "correct", "key": "acme", "new_text": "User works at Globex as a data analyst", "new_object": "Globex", "new_predicate": "works_at"},
+        {"op": "cycle", "days": 300},
+        {"op": "recall", "query": "where do they work now?", "expect": ["Globex"]},
+        {"op": "recall", "query": "where did they work before?", "expect": ["Acme"]}
+      ]
+    },
+    {
+      "case_id": "correction-compacts-but-keeps-the-correction",
+      "category": "correction_protection",
+      "note": "Compaction is not blocked by a correction (the corrected rows are always kept), and the corrected conclusion survives the fold.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "correct", "key": "landscape", "new_text": "User loves painting landscapes in oils", "new_object": "landscapes"},
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "landscape", "expect_exists": true},
+        {"op": "recall", "query": "what do they love?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "conflict-stays-unresolved",
+      "category": "conflict_preservation",
+      "note": "A cross-source conflict must not be compacted away; the dispute stays live.",
+      "turns": [
+        "I am a vegetarian.",
+        "I am a vegetarian, I never eat meat.",
+        "I am a vegetarian and I cook at home.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian."
+      ],
+      "steps": [
+        {"op": "inject_conflict", "key": "vegetarian", "claim_text": "A second source reports they eat chicken regularly"},
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "vegetarian", "expect_exists": false},
+        {"op": "recall", "query": "are they a vegetarian?", "expect": ["vegetarian"]}
+      ]
+    },
+    {
+      "case_id": "conflict-protected-from-cooling",
+      "category": "conflict_preservation",
+      "note": "An unresolved conflict is not cooled by age while clarification is pending.",
+      "turns": [
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian."
+      ],
+      "steps": [
+        {"op": "inject_conflict", "key": "vegetarian", "claim_text": "A second source reports they eat chicken regularly"},
+        {"op": "cycle", "days": 400},
+        {"op": "cycle", "days": 800},
+        {"op": "tier", "key": "vegetarian", "expect": "hot"}
+      ]
+    },
+    {
+      "case_id": "conflict-not-archived-while-open",
+      "category": "conflict_preservation",
+      "note": "The dispute survives past the archive clock too — archiving would flatten it.",
+      "turns": [
+        "I am a vegetarian.",
+        "I am a vegetarian.",
+        "I am a vegetarian."
+      ],
+      "steps": [
+        {"op": "inject_conflict", "key": "vegetarian", "claim_text": "A second source reports they eat chicken regularly"},
+        {"op": "cycle", "days": 400},
+        {"op": "cycle", "days": 800},
+        {"op": "tier", "key": "vegetarian", "expect": "hot"},
+        {"op": "recall", "query": "are they a vegetarian?", "expect": ["vegetarian"]}
+      ]
+    },
+    {
+      "case_id": "compaction-folds-bulk-keeps-conclusion",
+      "category": "evidence_compaction",
+      "note": "The core metric: 14 observations fold into a digest, the conclusion is unchanged.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "probe", "query": "what do they love?", "expect": ["landscape"]},
+        {"op": "storage_mark"},
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "landscape", "expect_exists": true},
+        {"op": "storage_check", "expect_reduction": true},
+        {"op": "probe_after", "query": "what do they love?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "compaction-below-threshold-untouched",
+      "category": "evidence_compaction",
+      "note": "Five observations are not yet bulk: nothing is folded.",
+      "turns": [
+        "I enjoy hiking in the mountains.",
+        "I enjoy hiking in the mountains.",
+        "I enjoy hiking in the mountains.",
+        "I enjoy hiking in the mountains.",
+        "I enjoy hiking in the mountains."
+      ],
+      "steps": [
+        {"op": "storage_mark"},
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "hiking", "expect_exists": false},
+        {"op": "recall", "query": "what do they enjoy?", "expect": ["hiking"]}
+      ]
+    },
+    {
+      "case_id": "compaction-idempotent",
+      "category": "evidence_compaction",
+      "note": "A second cycle after compaction folds nothing new.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "landscape", "expect_exists": true},
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "landscape", "expect_exists": true},
+        {"op": "recall", "query": "what do they love?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "compaction-new-evidence-folds-again",
+      "category": "evidence_compaction",
+      "note": "New observations after compaction re-open folding and the digest accumulates.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 100},
+        {"op": "observe", "text": "I painted another landscape yesterday."},
+        {"op": "observe", "text": "I painted a landscape of the lake."},
+        {"op": "observe", "text": "Another landscape painting finished."},
+        {"op": "observe", "text": "I painted a landscape at sunset."},
+        {"op": "observe", "text": "I painted a landscape of my garden."},
+        {"op": "observe", "text": "I painted one more landscape today."},
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "landscape", "expect_exists": true},
+        {"op": "recall", "query": "what do they love?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "reactivation-dormant-to-hot",
+      "category": "reactivation",
+      "note": "A dormant belief the user asks about again reheats to hot.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 200},
+        {"op": "tier", "key": "landscape", "expect": "dormant"},
+        {"op": "recall", "query": "what do they love painting?", "expect": ["landscape"]},
+        {"op": "cycle", "days": 1},
+        {"op": "tier", "key": "landscape", "expect": "hot"},
+        {"op": "recall", "query": "what do they love painting?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "reactivation-by-new-evidence",
+      "category": "reactivation",
+      "note": "New support for a dormant belief reheats it without any recall.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 200},
+        {"op": "tier", "key": "landscape", "expect": "dormant"},
+        {"op": "observe", "text": "I painted a landscape this morning, I love it."},
+        {"op": "cycle", "days": 1},
+        {"op": "tier", "key": "landscape", "expect": "hot"}
+      ]
+    },
+    {
+      "case_id": "reactivation-stays-dormant-if-unused",
+      "category": "reactivation",
+      "note": "Without renewed interest the belief stays dormant — cooling is not a one-way ratchet upward.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 100},
+        {"op": "tier", "key": "landscape", "expect": "dormant"}
+      ]
+    },
+    {
+      "case_id": "reactivation-archived-then-restored",
+      "category": "reactivation",
+      "note": "An archived belief is invisible until an explicit restore brings it back.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 600},
+        {"op": "tier", "key": "landscape", "expect": "archived"},
+        {"op": "recall", "query": "what do they love painting?", "reject": ["landscape"]},
+        {"op": "restore", "key": "landscape"},
+        {"op": "recall", "query": "what do they love painting?", "expect": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "deletion-unrecallable",
+      "category": "deletion",
+      "note": "After forget, no recall path returns the belief.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "recall", "query": "what do they love?", "expect": ["landscape"]},
+        {"op": "forget", "key": "landscape"},
+        {"op": "gone", "key": "landscape"},
+        {"op": "recall", "query": "what do they love?", "reject": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "deletion-tombstone-content-free",
+      "category": "deletion",
+      "note": "The tombstone records that a deletion happened without recording what was deleted.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "forget", "key": "landscape"},
+        {"op": "tombstone", "key": "landscape"}
+      ]
+    },
+    {
+      "case_id": "deletion-after-archival",
+      "category": "deletion",
+      "note": "An archived belief can still be forgotten; archiving is not a deletion lock.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 200},
+        {"op": "cycle", "days": 600},
+        {"op": "tier", "key": "landscape", "expect": "archived"},
+        {"op": "forget", "key": "landscape"},
+        {"op": "gone", "key": "landscape"},
+        {"op": "recall", "query": "what do they love?", "reject": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "deletion-compacted-belief-cascade",
+      "category": "deletion",
+      "note": "Forgetting a compacted belief removes its digest and audit trail with it.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "cycle", "days": 100},
+        {"op": "digest", "key": "landscape", "expect_exists": true},
+        {"op": "forget", "key": "landscape"},
+        {"op": "gone", "key": "landscape"},
+        {"op": "digest", "key": "landscape", "expect_exists": false}
+      ]
+    },
+    {
+      "case_id": "stale-worker-cannot-resurrect",
+      "category": "stale_worker",
+      "note": "A write computed before the deletion is refused after it.",
+      "turns": [
+        "I love painting landscapes.",
+        "I love painting landscapes.",
+        "I love painting landscapes."
+      ],
+      "steps": [
+        {"op": "stale_worker", "key": "landscape"},
+        {"op": "gone", "key": "landscape"},
+        {"op": "recall", "query": "what do they love?", "reject": ["landscape"]}
+      ]
+    },
+    {
+      "case_id": "stale-worker-corrected-belief",
+      "category": "stale_worker",
+      "note": "The same barrier holds for a corrected belief.",
+      "turns": [
+        "I work at Acme.",
+        "I work at Acme as a designer."
+      ],
+      "steps": [
+        {"op": "correct", "key": "acme", "new_text": "User works at Globex as a data analyst", "new_object": "Globex", "new_predicate": "works_at"},
+        {"op": "stale_worker", "key": "globex"},
+        {"op": "gone", "key": "globex"}
+      ]
+    }
+  ]
+}

@@ -33,23 +33,40 @@ from mirror_memory.core.proposal import (
     TRANSITION_CONTRADICT,
     TRANSITION_CORRECT,
     TRANSITION_CREATE,
+    TRANSITION_EVIDENCE_COMPACT,
     TRANSITION_FORGET,
     TRANSITION_SUPPORT,
     TRANSITION_SYNTHESIZE,
+    TRANSITION_TIER_TRANSITION,
     TRANSITION_UPDATE,
     TRANSITION_VERIFY,
     PublishDecision,
     StateTransitionProposal,
 )
 from mirror_memory.core.repository import (
+    apply_evidence_compaction,
     correct_belief,
+    evidence_graph_for_beliefs,
+    evidence_relation_counts_for_beliefs,
     forget_belief,
     get_state_revision,
     is_memory_enabled,
+    pending_verification_keys,
     record_claim,
+    set_belief_tier,
     support_belief_by_id,
     update_belief_by_id,
 )
+from mirror_memory.metabolism.compact import (
+    build_digest_fields,
+    clamp_policy,
+    plan_compaction,
+)
+from mirror_memory.metabolism.protection import (
+    compaction_protection_reason,
+    protection_reason,
+)
+from mirror_memory.metabolism.tiers import is_legal_tier_transition
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +118,13 @@ class Publisher:
 
     def _check_gates(self, proposal: StateTransitionProposal) -> str | None:
         """Return a refusal reason, or ``None`` when every gate passes."""
-        # Consent.
-        if not is_memory_enabled(self._session, proposal.user_id):
-            return "memory_disabled"
+        # Consent gates *collection*: with memory off, nothing new may be
+        # written.  Deletion is the one transition that must stay available
+        # when memory is disabled — a user who turned memory off still has
+        # the right to have what was collected erased.
+        if proposal.transition != TRANSITION_FORGET:
+            if not is_memory_enabled(self._session, proposal.user_id):
+                return "memory_disabled"
 
         # Revision: the decision was computed against `claimed_revision`.
         current = get_state_revision(self._session, proposal.user_id)
@@ -137,6 +158,12 @@ class Publisher:
         if proposal.transition == TRANSITION_SYNTHESIZE:
             return None
 
+        if proposal.transition == TRANSITION_TIER_TRANSITION:
+            return self._check_tier_invariants(proposal, target)
+
+        if proposal.transition == TRANSITION_EVIDENCE_COMPACT:
+            return self._check_compact_invariants(proposal, target)
+
         # Every other transition acts on an existing belief.
         if target is None:
             return "target_belief_missing"
@@ -155,6 +182,104 @@ class Publisher:
 
         return None
 
+    def _check_tier_invariants(
+        self, proposal: StateTransitionProposal, target: Belief | None
+    ) -> str | None:
+        """Gates for a storage-tier move (cool, reheat, archive, restore).
+
+        A superseded belief *is* coolable — "superseded but historically
+        true and plausibly useful" is exactly the combination the tiers
+        exist to express — so the generic superseded refusal does not apply
+        here.  Protection, however, is re-derived from live state rather
+        than trusted from the planner's payload: the invariant must hold
+        even against a buggy or stale planner.
+        """
+        if target is None:
+            return "target_belief_missing"
+        if target.user_id != proposal.user_id:
+            return "target_belief_scope_mismatch"
+        if target.status == "rejected":
+            return "resurrection_guard"
+
+        from_tier = str(proposal.payload.get("from_tier", ""))
+        to_tier = str(proposal.payload.get("to_tier", ""))
+        live_tier = target.memory_tier or "hot"
+
+        # The decision was computed against from_tier; if the live row has
+        # moved since, the decision describes a belief that no longer exists.
+        if from_tier != live_tier:
+            return f"tier_mismatch(claimed={from_tier}, live={live_tier})"
+        if not is_legal_tier_transition(from_tier, to_tier):
+            return f"illegal_tier_transition({from_tier}->{to_tier})"
+
+        counts = evidence_relation_counts_for_beliefs(self._session, [target.id]).get(
+            target.id, {}
+        )
+        reason = protection_reason(
+            target,
+            support_count=counts.get("support", 0),
+            correct_count=counts.get("correct", 0),
+            pending_verification=target.key in pending_verification_keys(
+                self._session, proposal.user_id
+            ),
+        )
+        if reason is not None:
+            return f"protected:{reason}"
+        return None
+
+    def _check_compact_invariants(
+        self, proposal: StateTransitionProposal, target: Belief | None
+    ) -> str | None:
+        """Gates for folding a belief's evidence bulk into a digest.
+
+        Protection is re-derived from live state (same as tier moves), and
+        the selection itself is **recomputed** from the live evidence graph
+        under the payload's (bounds-clamped) policy — the planner's keep/fold
+        lists must match exactly, so a stale or forged plan cannot fold rows
+        the rules would keep.
+        """
+        if target is None:
+            return "target_belief_missing"
+        if target.user_id != proposal.user_id:
+            return "target_belief_scope_mismatch"
+        if target.status == "rejected":
+            return "resurrection_guard"
+
+        graph = evidence_graph_for_beliefs(self._session, [target.id]).get(target.id, [])
+        counts: dict[str, int] = {}
+        for row in graph:
+            counts[row.relation] = counts.get(row.relation, 0) + 1
+
+        # Compaction-specific protection: a live dispute or a pending
+        # question blocks folding; a user correction does not — the
+        # corrected rows are always kept by the keep rules.
+        reason = compaction_protection_reason(
+            target,
+            pending_verification=target.key in pending_verification_keys(
+                self._session, proposal.user_id
+            ),
+        )
+        if reason is not None:
+            return f"protected:{reason}"
+
+        policy = clamp_policy(proposal.payload.get("policy"))
+        min_support = min(
+            max(int(proposal.payload.get("min_support_links", 12) or 12), 1), 1000
+        )
+        plan = plan_compaction(
+            graph, target.id, policy=policy, min_support=min_support
+        )
+        if plan is None:
+            return f"below_compaction_threshold(support={counts.get('support', 0)})"
+        if not plan.folds_anything:
+            return "nothing_to_fold"
+
+        claimed_keep = {int(i) for i in proposal.payload.get("keep_ids", [])}
+        claimed_fold = {int(i) for i in proposal.payload.get("fold_ids", [])}
+        if claimed_keep != set(plan.keep_ids) or claimed_fold != set(plan.fold_ids):
+            return "stale_selection"
+        return None
+
     # -- commit ------------------------------------------------------------
 
     def _commit(self, proposal: StateTransitionProposal) -> int:
@@ -168,6 +293,8 @@ class Publisher:
             TRANSITION_FORGET: self._commit_forget,
             TRANSITION_VERIFY: self._commit_verify,
             TRANSITION_SYNTHESIZE: self._commit_synthesize,
+            TRANSITION_TIER_TRANSITION: self._commit_tier_transition,
+            TRANSITION_EVIDENCE_COMPACT: self._commit_evidence_compact,
         }[proposal.transition]
         return handler(proposal)
 
@@ -193,6 +320,7 @@ class Publisher:
             predicate=payload.get("predicate", ""),
             object=payload.get("object", ""),
             cardinality=payload.get("cardinality", "multi"),
+            retention_class=payload.get("retention_class"),
         )
         return get_state_revision(self._session, proposal.user_id)
 
@@ -290,5 +418,49 @@ class Publisher:
             payload.get("policy") or {},
             payload.get("watermark") or "",
             shadow=bool(payload.get("shadow", False)),
+        )
+        return get_state_revision(self._session, proposal.user_id)
+
+    def _commit_tier_transition(self, proposal: StateTransitionProposal) -> int:
+        """TIER_TRANSITION moves a belief between storage tiers.
+
+        The audit row (who moved what where, and on which heat score) is
+        written in the same transaction as the move.  The state revision is
+        deliberately left alone — see :func:`set_belief_tier`.
+        """
+        payload = proposal.payload
+        set_belief_tier(
+            self._session,
+            proposal.target_belief_id,
+            from_tier=str(payload.get("from_tier", "")),
+            to_tier=str(payload.get("to_tier", "")),
+            reason=str(payload.get("reason", "")),
+            score=float(payload.get("score", 0.0)),
+            proposal_desc=proposal.describe(),
+        )
+        return get_state_revision(self._session, proposal.user_id)
+
+    def _commit_evidence_compact(self, proposal: StateTransitionProposal) -> int:
+        """EVIDENCE_COMPACT folds redundant support evidence into a digest.
+
+        The gates already recomputed the plan, so the commit rebuilds the
+        same plan (same pure functions, same live graph) and applies it.
+        As with tier moves, the state revision is untouched: provenance
+        bulk is storage, not truth.
+        """
+        target = self._session.get(Belief, proposal.target_belief_id)
+        graph = evidence_graph_for_beliefs(self._session, [target.id]).get(target.id, [])
+        policy = clamp_policy(proposal.payload.get("policy"))
+        min_support = min(
+            max(int(proposal.payload.get("min_support_links", 12) or 12), 1), 1000
+        )
+        plan = plan_compaction(graph, target.id, policy=policy, min_support=min_support)
+        digest_fields = build_digest_fields(graph, plan.keep_ids)
+        apply_evidence_compaction(
+            self._session,
+            target,
+            keep_ids=list(plan.keep_ids),
+            fold_ids=list(plan.fold_ids),
+            digest_fields=digest_fields,
         )
         return get_state_revision(self._session, proposal.user_id)

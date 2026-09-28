@@ -1,0 +1,83 @@
+# Memory metabolism — the long-run lifecycle layer.
+#
+# Two orthogonal state dimensions per belief:
+#   truth state   status / valid_from / valid_to   (owned by identity/temporal)
+#   storage state memory_tier / metabolism_state   (owned by metabolism)
+# "superseded + warm" = history that stays reachable, not deleted.
+#
+# Everything here is rule-based.  No model decides what to cool, compact,
+# or delete; archive_after_days is not deletion (archived data only leaves
+# the default retrieval scan).  Consumed by mirror_memory.metabolism.
+
+# Cooling schedules per retention class.  null = never moved by the
+# background runtime on age alone (canonical facts: name, employer, ...).
+retention_classes:
+  canonical:
+    cool_after_days: null
+    archive_after_days: null
+  preference:
+    cool_after_days: 180
+    archive_after_days: 720
+  behavioral:
+    cool_after_days: 60
+    archive_after_days: 180
+  episodic:
+    cool_after_days: 30
+    archive_after_days: 90
+  transient:
+    cool_after_days: 7
+    archive_after_days: 30
+
+# Explicit predicate overrides; beat every derived rule.  The default
+# derivation reuses the identity axes instead:
+#   goal lifecycle / wants_to-style predicate -> behavioral
+#   event cardinality                          -> episodic
+#   single cardinality                         -> canonical
+#   anything else                              -> default_retention_class
+retention_predicates: {}
+
+# Fallback for claims with no usable identity signal.  Deliberately mild:
+# a wrong "transient" (7-day cooling) loses answers, a wrong "preference"
+# only cools slower.
+default_retention_class: preference
+
+# Heat score: how alive a belief is, in [0, 1].
+#   heat = .30*freshness + .20*access + .20*evidence_strength
+#        + .15*authority + .15*importance
+# Freshness decays exponentially from last_accessed_at (falls back to
+# last_evidence_at).  A protected belief (user correction, unresolved
+# conflict, pending verification, ...) is floored at protected_floor —
+# protection always outranks age.
+heat:
+  weights:
+    freshness: 0.30
+    access: 0.20
+    evidence_strength: 0.20
+    authority: 0.15
+    importance: 0.15
+  half_life_days: 60
+  thresholds:
+    hot: 0.70
+    warm: 0.40
+    dormant: 0.15
+  protected_floor: 0.70
+
+# Planner safety rails.  The cycle is scan -> score -> protect -> propose ->
+# publish; the planner never commits directly, the Publisher re-derives
+# protection, and tier moves do not bump the state revision.
+planner:
+  # Upper bound on tier transitions + compactions per run; excess cold
+  # beliefs are handled on the following run instead of spiking one cycle.
+  max_transitions_per_run: 200
+
+# Evidence compaction: a belief with more than min_support_links support
+# links gets the bulk folded into an EvidenceDigest.  Kept sample per the
+# keep policy below; correct / contradict / verify links are never folded.
+# Folded rows keep their metadata but release their raw content — the
+# digest carries the counts, the sample carries the wording.
+compaction:
+  min_support_links: 12
+  keep:
+    oldest: 1
+    recent: 3
+    highest_authority: 2
