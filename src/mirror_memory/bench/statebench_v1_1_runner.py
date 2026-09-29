@@ -147,8 +147,25 @@ _NEGATIVE_MARKERS = (
     " do not ", " don't ", " not ", " no longer ", " never ",
     " dislike", " hate", " avoid", " gave up", " cancelled", " canceled",
     " abandoned", " dropped", " sold", " stolen", " recycled",
-    " gave away", " lost interest", " decided against", " cannot ",
+    " lost interest", " decided against", " cannot ",
+    # A downgrade is a negative statement about the attribute: "only knows
+    # a few Korean phrases" withdraws "speaks fluent Korean".
+    " only know", " only knew", " just a few", " barely any",
+    " a few ", " not fluent", " not certified", " never learned",
 )
+
+# Disposal verbs whose object sits between the verb and the particle, so the
+# contiguous " gave away " never matches "gave the film camera away".
+_DISPOSAL_VERBS = ("gave", "given", "threw", "throw", "tossed", "handed")
+_DISPOSAL_PARTICLES = ("away", "out")
+
+
+def _is_disposal_phrasing(text: str) -> bool:
+    words = text.split()
+    return any(
+        verb in words and any(particle in words for particle in _DISPOSAL_PARTICLES)
+        for verb in _DISPOSAL_VERBS
+    )
 
 
 def _polarity(atom: dict) -> str:
@@ -157,6 +174,8 @@ def _polarity(atom: dict) -> str:
     if predicate in {"dislikes", "hates", "avoids"}:
         return "negative"
     if any(marker in text for marker in _NEGATIVE_MARKERS):
+        return "negative"
+    if _is_disposal_phrasing(text):
         return "negative"
     return "positive"
 
