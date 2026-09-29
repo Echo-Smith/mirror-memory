@@ -40,14 +40,12 @@ from mirror_memory.core.models import Belief
 from mirror_memory.core.repository import (
     QUESTION_ANSWERED_KIND,
     QUESTION_INJECTED_KIND,
-    confirm_belief,
     get_belief,
     get_pending_verification,
     has_unanswered_injection,
     is_memory_enabled,
     record_extraction_stats,
     record_intervention_event,
-    reject_belief,
 )
 from mirror_memory.core.utils import parse_llm_json, safe_json
 
@@ -342,11 +340,37 @@ def run_verification_judgment(
         stats.latency_ms = int((time.monotonic() - started) * 1000)
 
         verdict = parse_verdict(raw)
+        if verdict in ("confirm", "deny"):
+            # The user's answer is a truth decision, so it goes through the
+            # Publisher like every other one: revision-checked, logged under
+            # its proposal id, and atomic.
+            from mirror_memory.core.proposal import (
+                TRANSITION_REJECT,
+                TRANSITION_VERIFY,
+                StateTransitionProposal,
+            )
+            from mirror_memory.core.publisher import Publisher
+            from mirror_memory.core.repository import get_state_revision
+
+            transition = TRANSITION_VERIFY if verdict == "confirm" else TRANSITION_REJECT
+            decision = Publisher(session, config).publish(
+                StateTransitionProposal(
+                    transition=transition,
+                    user_id=user_id,
+                    session_id=session_id,
+                    target_belief_id=belief.id,
+                    expected_revision=get_state_revision(session, user_id),
+                    actor_type="user",
+                    actor_id=session_id,
+                )
+            )
+            if not decision.committed:
+                logger.info(
+                    "verification: %s refused (%s)", transition, decision.reason
+                )
         if verdict == "confirm":
-            confirm_belief(session, user_id, belief.id)
             _update_confirm_rate(session, belief, "confirm")
         elif verdict == "deny":
-            reject_belief(session, user_id, belief.id)
             _update_confirm_rate(session, belief, "deny")
         else:
             _update_confirm_rate(session, belief, "unclear")

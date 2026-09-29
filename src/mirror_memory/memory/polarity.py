@@ -135,6 +135,31 @@ _CORRECTION_MARKERS = (
     "on second thought",
     "to correct myself",
     "i correct myself",
+    # Substantive negations of a prior positive claim.  These are not
+    # meta-linguistic, but they retract exactly what a correction does:
+    # "I have never learned Rust" withdraws "I can code in Rust", "I am
+    # not certified to dive" withdraws "I am a certified diver".  The
+    # retraction path only fires when an active belief shares the
+    # object's tokens, so a first-ever negative claim still creates.
+    "never learned",
+    "never learnt",
+    "have never",
+    "has never",
+    "not certified",
+    "isn't certified",
+    "not qualified",
+    "do not speak",
+    "does not speak",
+    "don't speak",
+    "cannot speak",
+    "can't speak",
+    "not fluent",
+    "only know a few",
+    "only knows a few",
+    "just a few",
+    "barely any",
+    "was wrong about",
+    "was mistaken about",
 )
 
 # Generic object tokens that carry no identity: two beliefs sharing only one
@@ -163,13 +188,42 @@ _TERMINATION_MARKERS = (
     "scrapped", "quit", "sold my", "sold the", "got rid of",
     "no longer", "not anymore", "decided not to", "decided against",
     "ended the", "broke up with", "parted ways",
+    # Disposing of a possession ends it as surely as selling it does.
+    "gave away", "given away", "threw away", "threw out",
+    "recycled", "donated", "handed down", "lost my", "lost the",
+    # Ways of taking something off the table.
+    "rejected", "postponed", "put off", "removed", "took off",
+    "shelved", "paused", "dropped out of",
+    # Withdrawing from something you used to do.  Guarded by the token
+    # overlap the caller requires, so "stopped by the shop" closes nothing.
+    "stopped enjoying", "stopped liking", "stopped doing", "stopped going",
+    "stopped practicing", "stopped playing", "no longer enjoy",
 )
+
+
+# Disposal verbs whose object sits between the verb and the particle:
+# "gave the film camera away", "threw the old laptop out".  A contiguous
+# substring never matches these, so they are checked as a verb/particle
+# pair instead.
+_DISPOSAL_VERBS = ("gave", "given", "threw", "throw", "tossed", "handed")
+_DISPOSAL_PARTICLES = ("away", "out")
+
+
+def _is_disposal_phrasing(text: str) -> bool:
+    words = text.split()
+    return any(
+        verb in words and any(particle in words for particle in _DISPOSAL_PARTICLES)
+        for verb in _DISPOSAL_VERBS
+    )
 
 
 def is_termination(claim_text: str) -> bool:
     """True when the claim ends a current state instead of asserting one."""
     text = (claim_text or "").casefold()
-    return any(marker in text for marker in _TERMINATION_MARKERS)
+    return (
+        any(marker in text for marker in _TERMINATION_MARKERS)
+        or _is_disposal_phrasing(text)
+    )
 
 
 # Phrases that bring a previously ended goal back.  A resumption closes the

@@ -45,6 +45,8 @@ from mirror_memory.core.models import (
     Belief,
     BeliefEvent,
     BeliefEvidenceLink,
+    BeliefIdentity,
+    BeliefVersion,
     ConsentGrant,
     DeletionTombstone,
     Evidence,
@@ -54,6 +56,7 @@ from mirror_memory.core.models import (
     InterventionEvent,
     MemoryPreference,
     MemoryTransition,
+    ProposalLog,
     SessionSummary,
     Snapshot,
     utcnow,
@@ -144,6 +147,40 @@ def bump_state_revision(session: Session, user_id: str) -> int:
     result = session.execute(
         sa_update(MemoryPreference)
         .where(MemoryPreference.user_id == user_id)
+        .values(state_revision=MemoryPreference.state_revision + 1, updated_at=utcnow())
+        .returning(MemoryPreference.state_revision)
+    )
+    new_rev = result.scalar_one_or_none()
+    session.flush()
+    return new_rev
+
+
+def cas_bump_state_revision(session: Session, user_id: str, expected: int) -> int | None:
+    """Compare-and-swap the state revision: ``expected -> expected + 1``.
+
+    The single-database-statement form of the stale check.  A read-then-
+    compare gate can be overtaken between the two statements; this cannot:
+    the UPDATE only lands while the row still holds *expected*, so exactly
+    one concurrent publisher can win.
+
+    Returns the new revision, or ``None`` when the row no longer holds
+    *expected* (a concurrent write landed first — the proposal is stale).
+    """
+    from sqlalchemy import update as sa_update
+
+    # Ensure the row exists so a first-ever publish has a revision to CAS
+    # against (revision 1 is the documented default for a missing row).
+    existing = session.get(MemoryPreference, user_id)
+    if existing is None:
+        with session.begin_nested():
+            session.add(MemoryPreference(user_id=user_id, state_revision=1))
+        session.flush()
+    result = session.execute(
+        sa_update(MemoryPreference)
+        .where(
+            MemoryPreference.user_id == user_id,
+            MemoryPreference.state_revision == expected,
+        )
         .values(state_revision=MemoryPreference.state_revision + 1, updated_at=utcnow())
         .returning(MemoryPreference.state_revision)
     )
@@ -673,6 +710,276 @@ def set_belief_tier(
     session.add(row)
     session.flush()
     return row
+
+
+# ---------------------------------------------------------------------------
+# Versioned belief ledger (PR3)
+# ---------------------------------------------------------------------------
+
+
+def get_or_create_identity(
+    session: Session,
+    user_id: str,
+    *,
+    subject: str,
+    predicate: str,
+    slot_key: str,
+    cardinality: str = "multi",
+) -> BeliefIdentity:
+    """The stable slot a line of beliefs is about (idempotent)."""
+    identity = session.scalar(
+        select(BeliefIdentity).where(
+            BeliefIdentity.user_id == user_id,
+            BeliefIdentity.subject == (subject or "user"),
+            BeliefIdentity.predicate == (predicate or ""),
+            BeliefIdentity.slot_key == slot_key,
+        )
+    )
+    if identity is None:
+        identity = BeliefIdentity(
+            user_id=user_id,
+            subject=subject or "user",
+            predicate=predicate or "",
+            slot_key=slot_key,
+            cardinality=cardinality or "multi",
+        )
+        session.add(identity)
+        session.flush()
+    return identity
+
+
+def _slot_key_for(belief: Belief) -> str:
+    """The slot a belief belongs to.
+
+    A single-valued current-state predicate (``lives_in``, ``works_at``)
+    holds one value at a time, so every value it has ever held is a version
+    of ONE slot — the predicate.  A multi-valued predicate (``likes``)
+    keeps coexisting values, so each value is its own slot, keyed by the
+    value-specific read-model key.
+    """
+    predicate = (belief.predicate or "").strip().lower()
+    if predicate and (
+        belief.cardinality == "single" or predicate in _SINGLE_VALUED_PREDICATES
+    ):
+        return predicate
+    return belief.key
+
+
+def append_belief_version(
+    session: Session,
+    belief: Belief,
+    *,
+    proposal_id: str = "",
+    slot_key: str | None = None,
+    max_versions: int | None = None,
+    version_ttl_days: int | None = None,
+) -> BeliefVersion:
+    """Record *belief* as a version of its slot, closing the previous one.
+
+    The version inherits the belief row's truth interval and stamps its
+    belief interval from the row's evidence timestamps.  Any still-open
+    version of the same slot is closed (``epistemic_to`` now,
+    ``superseded_by_version`` pointing here) — that is what makes a new
+    value a *replacement* rather than a second live fact.
+
+    ``max_versions`` / ``version_ttl_days`` bound the table: beyond the
+    newest N, and past the TTL, old versions are pruned so a
+    frequently-changed slot cannot grow without limit.
+    """
+    resolved_slot = slot_key or _slot_key_for(belief)
+    identity = get_or_create_identity(
+        session,
+        belief.user_id,
+        subject=belief.subject,
+        predicate=belief.predicate,
+        slot_key=resolved_slot,
+        cardinality=belief.cardinality,
+    )
+    version = BeliefVersion(
+        user_id=belief.user_id,
+        identity_id=identity.id,
+        object=belief.object or "",
+        polarity=belief.polarity or "neutral",
+        lifecycle_state=belief.lifecycle_state or "",
+        confidence=belief.confidence,
+        valid_from=belief.valid_from,
+        valid_to=belief.valid_to,
+        epistemic_from=belief.observed_at or belief.first_seen_at or utcnow(),
+        epistemic_to=None,
+        created_by_proposal=proposal_id or "",
+        belief_id=belief.id,
+    )
+    session.add(version)
+    session.flush()
+    _close_open_versions(session, identity.id, except_version_id=version.id)
+    _prune_old_versions(session, identity.id, max_versions=max_versions, version_ttl_days=version_ttl_days)
+    return version
+
+
+def _prune_old_versions(
+    session: Session,
+    identity_id: int,
+    *,
+    max_versions: int | None,
+    version_ttl_days: int | None,
+) -> int:
+    """Drop versions beyond the newest *max_versions* or older than the TTL.
+
+    The version being opened is never a candidate.  Pruning is bounded by
+    both knobs on purpose: the cap alone would erase history for a slot
+    that legitimately changed often, the TTL alone would let a burst of
+    changes bloat the table.
+    """
+    rows = list(
+        session.scalars(
+            select(BeliefVersion)
+            .where(BeliefVersion.identity_id == identity_id)
+            .order_by(BeliefVersion.id)
+        )
+    )
+    if len(rows) <= 1:
+        return 0
+    newest = rows[-1]
+    candidates = rows[:-1]
+
+    doomed: set[int] = set()
+    if max_versions is not None and len(rows) > max_versions:
+        doomed.update(row.id for row in candidates[: len(rows) - max_versions])
+    if version_ttl_days is not None:
+        cutoff = utcnow().replace(tzinfo=None) - timedelta(days=version_ttl_days)
+        for row in candidates:
+            closed_at = _as_utc(row.epistemic_to) or _as_utc(row.valid_to)
+            # The engine stores naive UTC; compare against a naive cutoff.
+            if closed_at is not None and closed_at.replace(tzinfo=None) < cutoff:
+                doomed.add(row.id)
+    doomed.discard(newest.id)
+    if not doomed:
+        return 0
+    deleted = (
+        session.query(BeliefVersion)
+        .filter(BeliefVersion.id.in_(sorted(doomed)))
+        .delete(synchronize_session=False)
+    )
+    return int(deleted)
+
+
+def backfill_belief_ledger(session: Session, user_id: str) -> dict[str, int]:
+    """Give pre-ledger beliefs their identity and first version.
+
+    A database written before the versioned ledger has belief rows with no
+    :class:`BeliefIdentity` and no :class:`BeliefVersion`; the first update
+    to such a belief would otherwise open a chain that starts mid-history.
+    This walks the user's beliefs and appends the missing opening version
+    for each, oldest first, so the chain reads in the order the values were
+    held.  Idempotent: beliefs that already have a version are skipped.
+    """
+    versioned = set(
+        session.scalars(
+            select(BeliefVersion.belief_id).where(
+                BeliefVersion.user_id == user_id, BeliefVersion.belief_id.is_not(None)
+            )
+        )
+    )
+    beliefs = [
+        b
+        for b in session.scalars(
+            select(Belief).where(Belief.user_id == user_id).order_by(Belief.first_seen_at, Belief.id)
+        )
+        if b.id not in versioned
+    ]
+    for belief in beliefs:
+        append_belief_version(session, belief, proposal_id="backfill")
+    return {"identities_touched": len({b.predicate for b in beliefs}), "versions_added": len(beliefs)}
+
+
+def _close_open_versions(
+    session: Session, identity_id: int, *, except_version_id: int
+) -> None:
+    """Close every still-open version of a slot except the newest one."""
+    now = utcnow()
+    open_versions = list(
+        session.scalars(
+            select(BeliefVersion).where(
+                BeliefVersion.identity_id == identity_id,
+                BeliefVersion.epistemic_to.is_(None),
+                BeliefVersion.id != except_version_id,
+            )
+        )
+    )
+    for older in open_versions:
+        older.epistemic_to = now
+        older.superseded_by_version = except_version_id
+
+
+def close_open_versions_for_belief(session: Session, belief_id: int) -> None:
+    """Close the open version(s) projecting onto *belief_id*.
+
+    Used by REJECT: a rejected value stops being believed, so its epistemic
+    interval ends even though the row itself stays as history.
+    """
+    now = utcnow()
+    open_versions = list(
+        session.scalars(
+            select(BeliefVersion).where(
+                BeliefVersion.belief_id == belief_id,
+                BeliefVersion.epistemic_to.is_(None),
+            )
+        )
+    )
+    for version in open_versions:
+        version.epistemic_to = now
+
+
+def belief_versions_for_identity(
+    session: Session, user_id: str, *, slot_key: str
+) -> list[BeliefVersion]:
+    """Every version of a slot, oldest first (the ledger's answer to
+    "what has this ever been?")."""
+    stmt = (
+        select(BeliefVersion)
+        .join(BeliefIdentity, BeliefIdentity.id == BeliefVersion.identity_id)
+        .where(
+            BeliefIdentity.user_id == user_id,
+            BeliefIdentity.slot_key == slot_key,
+        )
+        .order_by(BeliefVersion.id)
+    )
+    return list(session.scalars(stmt))
+
+
+def belief_history(
+    session: Session, user_id: str, belief_id: int
+) -> list[dict]:
+    """The version chain behind one read-model belief, oldest first.
+
+    The read model keeps one row per slot value; the ledger keeps the whole
+    chain.  A→B→A is three versions here even though the read model shows
+    three rows too — the difference is that the ledger says they are one
+    slot's history, with the proposal that opened each interval.
+    """
+    belief = session.get(Belief, belief_id)
+    if belief is None or belief.user_id != user_id:
+        return []
+    versions = belief_versions_for_identity(
+        session, user_id, slot_key=_slot_key_for(belief)
+    )
+    return [
+        {
+            "version_id": v.id,
+            "object": v.object,
+            "polarity": v.polarity,
+            "lifecycle_state": v.lifecycle_state,
+            "confidence": v.confidence,
+            "valid_from": v.valid_from.isoformat() if v.valid_from else None,
+            "valid_to": v.valid_to.isoformat() if v.valid_to else None,
+            "epistemic_from": v.epistemic_from.isoformat() if v.epistemic_from else None,
+            "epistemic_to": v.epistemic_to.isoformat() if v.epistemic_to else None,
+            "created_by_proposal": v.created_by_proposal,
+            "superseded_by_version": v.superseded_by_version,
+            "belief_id": v.belief_id,
+        }
+        for v in versions
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1243,6 +1550,7 @@ def record_claim(
     conflict_kind: str = CONFLICT_SOURCE_CONFLICT,
     raw_predicate: str = "",
     retention_class: str | None = None,
+    bump_revision: bool = True,
 ) -> tuple[Belief | None, str]:
     """Write a claim, applying the merge strategy.
 
@@ -1373,7 +1681,8 @@ def record_claim(
         session.add(belief)
         session.flush()
         _append_event(session, belief, "created", evidence=evidence, stats_id=stats_id)
-        touch_memory_state(session, user_id)
+        if bump_revision:
+            touch_memory_state(session, user_id)
         return belief, "created"
 
     if relation == "supports":
@@ -1434,7 +1743,8 @@ def record_claim(
             detail={"confidence": existing.confidence},
             stats_id=stats_id,
         )
-        touch_memory_state(session, user_id)
+        if bump_revision:
+            touch_memory_state(session, user_id)
         return existing, "supported"
 
     # Contradictions split by kind.
@@ -1454,7 +1764,8 @@ def record_claim(
         }
         _append_event(session, existing, "contradicted", evidence=evidence,
                       detail=detail, stats_id=stats_id)
-        touch_memory_state(session, user_id)
+        if bump_revision:
+            touch_memory_state(session, user_id)
         return existing, "self_corrected"
 
     # Source conflict: neither side is authoritative, so neither is
@@ -1469,7 +1780,8 @@ def record_claim(
         "conflict_kind": CONFLICT_SOURCE_CONFLICT,
     }
     _append_event(session, existing, "contradicted", evidence=evidence, detail=detail, stats_id=stats_id)
-    touch_memory_state(session, user_id)
+    if bump_revision:
+        touch_memory_state(session, user_id)
     return existing, "contradicted"
 
 
@@ -1478,7 +1790,9 @@ def record_claim(
 # ---------------------------------------------------------------------------
 
 
-def confirm_belief(session: Session, user_id: str, belief_id: int) -> Belief | None:
+def confirm_belief(
+    session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
+) -> Belief | None:
     """User confirmation: L4 -> L2 (questioning loop upgrade primitive)."""
     belief = session.get(Belief, belief_id)
     if belief is None or belief.user_id != user_id or belief.status != "active":
@@ -1487,11 +1801,14 @@ def confirm_belief(session: Session, user_id: str, belief_id: int) -> Belief | N
     belief.source = "user_confirmed"
     belief.confidence = max(belief.confidence, 0.9)
     _append_event(session, belief, "confirmed", evidence=[], detail={"layer": "L2"})
-    touch_memory_state(session, user_id)
+    if bump_revision:
+        touch_memory_state(session, user_id)
     return belief
 
 
-def reject_belief(session: Session, user_id: str, belief_id: int) -> Belief | None:
+def reject_belief(
+    session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
+) -> Belief | None:
     """User rejection: status -> rejected (same key never resurrected)."""
     belief = session.get(Belief, belief_id)
     if belief is None or belief.user_id != user_id or belief.status != "active":
@@ -1499,7 +1816,8 @@ def reject_belief(session: Session, user_id: str, belief_id: int) -> Belief | No
     belief.status = "rejected"
     belief.confidence = 0.0
     _append_event(session, belief, "rejected", evidence=[], detail={"reason": "user_denied"})
-    touch_memory_state(session, user_id)
+    if bump_revision:
+        touch_memory_state(session, user_id)
     return belief
 
 
@@ -1516,6 +1834,7 @@ def support_belief_by_id(
     confidence_gain: float | None = None,
     session_id: str | None = None,
     evidence_message_ids: list[int] | None = None,
+    bump_revision: bool = True,
 ) -> Belief | None:
     """Strengthen an existing belief by ID (SUPPORT action).
 
@@ -1567,7 +1886,8 @@ def support_belief_by_id(
     belief.confidence = min(CONFIDENCE_CEILING, belief.confidence + confidence_gain)
     session.flush()
     _append_event(session, belief, "supported", evidence=evidence)
-    touch_memory_state(session, belief.user_id)
+    if bump_revision:
+        touch_memory_state(session, belief.user_id)
     return belief
 
 
@@ -1657,6 +1977,7 @@ def update_belief_by_id(
     polarity: str = "",
     lifecycle_state: str = "",
     raw_predicate: str = "",
+    bump_revision: bool = True,
 ) -> tuple[Belief | None, Belief | None]:
     """SINGLE cardinality update: supersede old belief, create new one.
 
@@ -1693,51 +2014,12 @@ def update_belief_by_id(
     if new_from is not None and old.valid_to is None:
         old.valid_to = new_from
 
-    # Check for an existing superseded belief with the same key (revival).
-    existing_row = (
-        session.query(Belief)
-        .filter(
-            Belief.user_id == old.user_id,
-            Belief.key == target_key,
-            Belief.status == "superseded",
-        )
-        .first()
-    )
-
-    if existing_row:
-        # Revive: reactivate the old row, supersede current.
-        existing_row.status = "active"
-        existing_row.superseded_by = None
-        existing_row.confidence = min(CONFIDENCE_CEILING, max(0.0, new_confidence))
-        existing_row.last_evidence_at = datetime.now(UTC)
-        existing_row.last_supported_at = existing_row.last_evidence_at
-        existing_row.last_evidence_session_id = session_id
-        existing_row.evidence_json = json.dumps(evidence[-MAX_EVIDENCE_REFS:])
-        existing_row.valid_from = new_from or existing_row.valid_from
-        existing_row.valid_to = _as_utc(valid_to)
-        existing_row.observed_at = observed_at or utcnow()
-        if temporal_scope:
-            existing_row.temporal_scope = temporal_scope
-        if polarity:
-            existing_row.polarity = polarity
-        if lifecycle_state:
-            existing_row.lifecycle_state = lifecycle_state
-        if new_claim_text:
-            existing_row.claim_text = new_claim_text
-        if new_value:
-            existing_row.value_json = json.dumps(new_value, ensure_ascii=False)
-        session.flush()
-
-        old.status = "superseded"
-        old.superseded_by = existing_row.id
-        session.flush()
-
-        _append_event(session, old, "superseded", evidence=evidence,
-                      detail={"superseded_by": existing_row.id})
-        _append_event(session, existing_row, "created", evidence=evidence,
-                      detail={"supersedes": old.id, "revived": True})
-        touch_memory_state(session, old.user_id)
-        return old, existing_row
+    # A value the user returns to (A -> B -> A) is a NEW version of the
+    # slot, not a revival of the old row: the ledger keeps every interval,
+    # and the first stay in Shanghai is history that must stay closed.  The
+    # read model still needs a distinct key for the returning row (its
+    # UNIQUE constraint does not care about status).
+    target_key = _target_key_for_update(old, new_key, new_object)
 
     # Normal path: create new belief.  The key must be free for this user
     # regardless of status -- the UNIQUE constraint does not care that the
@@ -1793,7 +2075,8 @@ def update_belief_by_id(
                   detail={"superseded_by": new_belief.id, "valid_to": _iso(old.valid_to)})
     _append_event(session, new_belief, "created", evidence=evidence,
                   detail={"supersedes": old.id, "valid_from": _iso(new_belief.valid_from)})
-    touch_memory_state(session, old.user_id)
+    if bump_revision:
+        touch_memory_state(session, old.user_id)
     return old, new_belief
 
 
@@ -2114,6 +2397,24 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         .filter(MemoryTransition.user_id == user_id)
         .delete(synchronize_session=False)
     )
+    # The versioned ledger holds the plaintext object of every value the
+    # user ever asserted, so a full deletion has to take the whole chain:
+    # versions first (they reference the identity), then the identities.
+    versions_deleted = (
+        session.query(BeliefVersion)
+        .filter(BeliefVersion.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
+    identities_deleted = (
+        session.query(BeliefIdentity)
+        .filter(BeliefIdentity.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
+    proposals_deleted = (
+        session.query(ProposalLog)
+        .filter(ProposalLog.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
     beliefs_deleted = (
         session.query(Belief).filter(Belief.user_id == user_id).delete(synchronize_session=False)
     )
@@ -2170,6 +2471,9 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "belief_evidence_links": int(links_deleted),
         "evidence_digests": int(digests_deleted),
         "memory_transitions": int(transitions_deleted),
+        "belief_versions": int(versions_deleted),
+        "belief_identities": int(identities_deleted),
+        "proposals": int(proposals_deleted),
     }
     _write_deletion_tombstone(session, user_id, scope="user", scope_hash=_scope_hash("user", user_id), counts=counts)
     touch_memory_state(session, user_id)
@@ -2212,7 +2516,9 @@ def _write_deletion_tombstone(
     return tombstone
 
 
-def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
+def forget_belief(
+    session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
+) -> bool:
     """Targeted forget: delete a single belief and everything derived from it.
 
     One deletion transaction: the belief's events, its edges into the
@@ -2248,6 +2554,24 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
         MemoryTransition.entity_type == "belief",
         MemoryTransition.entity_id == belief_id,
     ).delete(synchronize_session=False)
+    # The versioned ledger holds the plaintext object in every version of
+    # the slot, so forgetting the belief means forgetting its whole history
+    # chain -- otherwise the deleted content survives in BeliefVersion.
+    ledger_counts = _purge_belief_ledger(session, belief)
+    # The publish log is idempotency state; its rows name the belief that
+    # was deleted (either as the target or as the row the commit created),
+    # so they go with it (the tombstone and the revision barrier still
+    # refuse a replayed proposal afterwards).
+    proposals_deleted = (
+        session.query(ProposalLog)
+        .filter(
+            or_(
+                ProposalLog.target_belief_id == belief_id,
+                ProposalLog.created_belief_id == belief_id,
+            )
+        )
+        .delete(synchronize_session=False)
+    )
     session.delete(belief)
     session.flush()
     # Evidence no belief points at is garbage, not provenance.
@@ -2269,10 +2593,44 @@ def forget_belief(session: Session, user_id: str, belief_id: int) -> bool:
         user_id,
         scope="belief",
         scope_hash=scope_hash,
-        counts={"beliefs": 1, "evidence_pruned": int(pruned)},
+        counts={
+            "beliefs": 1,
+            "evidence_pruned": int(pruned),
+            **ledger_counts,
+            "proposals": int(proposals_deleted),
+        },
     )
-    touch_memory_state(session, user_id)
+    if bump_revision:
+        touch_memory_state(session, user_id)
     return True
+
+
+def _purge_belief_ledger(session: Session, belief: Belief) -> dict[str, int]:
+    """Delete the versioned-ledger rows for one belief's slot.
+
+    A slot is (user, subject, predicate, slot key); every value it ever
+    held is a :class:`BeliefVersion` whose ``object`` is plaintext, so a
+    forget must remove the whole chain, not just the current row.  The
+    identity goes too once its versions are gone.
+    """
+    slot_key = _slot_key_for(belief)
+    identity = session.scalar(
+        select(BeliefIdentity).where(
+            BeliefIdentity.user_id == belief.user_id,
+            BeliefIdentity.subject == (belief.subject or "user"),
+            BeliefIdentity.predicate == (belief.predicate or ""),
+            BeliefIdentity.slot_key == slot_key,
+        )
+    )
+    if identity is None:
+        return {"versions": 0, "identities": 0}
+    versions_deleted = (
+        session.query(BeliefVersion)
+        .filter(BeliefVersion.identity_id == identity.id)
+        .delete(synchronize_session=False)
+    )
+    session.delete(identity)
+    return {"versions": int(versions_deleted), "identities": 1}
 
 
 def forget_session_summary(session: Session, user_id: str, session_id: str) -> bool:
@@ -2310,6 +2668,7 @@ def correct_belief(
     new_predicate: str | None = None,
     new_object: str | None = None,
     new_value: dict | None = None,
+    bump_revision: bool = True,
 ) -> Belief | None:
     """User-initiated correction: supersede old belief with corrected version.
 
@@ -2401,7 +2760,8 @@ def correct_belief(
     _append_event(session, old, "corrected", evidence=[], detail=detail)
     _append_event(session, corrected, "created", evidence=[],
                   detail={"supersedes": old.id, "via": "user_correction"})
-    touch_memory_state(session, user_id)
+    if bump_revision:
+        touch_memory_state(session, user_id)
     return corrected
 
 

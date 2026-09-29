@@ -48,6 +48,9 @@ class DeleteResult:
     belief_evidence_links: int = 0
     evidence_digests: int = 0
     memory_transitions: int = 0
+    belief_versions: int = 0
+    belief_identities: int = 0
+    proposals: int = 0
 
     def as_dict(self) -> dict[str, int]:
         """Return as a plain dict for backward compatibility."""
@@ -64,6 +67,9 @@ class DeleteResult:
             "belief_evidence_links": self.belief_evidence_links,
             "evidence_digests": self.evidence_digests,
             "memory_transitions": self.memory_transitions,
+            "belief_versions": self.belief_versions,
+            "belief_identities": self.belief_identities,
+            "proposals": self.proposals,
         }
 
 

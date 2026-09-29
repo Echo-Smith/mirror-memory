@@ -41,9 +41,16 @@ def _build_answerer(model: str, api_key: str, base_url: str | None, extra_body=N
     )
 
     def answerer(question: str, context: str) -> str:
+        # The answer contract is scored on the memory's surface wording, so
+        # the answerer is asked to quote the relevant fact(s) verbatim and
+        # then answer.  Without that instruction a terse-but-correct "No"
+        # scores as a miss, and the track measures the answerer's style
+        # instead of what the engine managed to keep in the block.
         prompt = (
             "Answer the question using only the memory context below. "
-            "Reply with the answer alone.\n\n"
+            "First quote verbatim every memory line that is relevant to the "
+            "question, then give the answer. Do not add explanations or "
+            "headers.\n\n"
             f"[Memory]\n{context or '(none)'}\n\n[Question]\n{question}\n\nANSWER:"
         )
         raw = llm.generate(system_prompt="", payload_text=prompt)

@@ -15,6 +15,7 @@ logged, rejected, or replayed without any of it having happened.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -37,6 +38,11 @@ TRANSITION_TIER_TRANSITION = "TIER_TRANSITION"
 # EvidenceDigest, keeping a representative sample live.  The conclusion the
 # evidence supports is untouched; only the provenance bulk is aggregated.
 TRANSITION_EVIDENCE_COMPACT = "EVIDENCE_COMPACT"
+# The user denied a verification question: the belief is closed as rejected
+# (its key is never resurrected).  Spelled out rather than smuggled through
+# another transition, because a denial is a user decision with its own
+# invariant -- not an inference.
+TRANSITION_REJECT = "REJECT"
 
 STATE_TRANSITIONS = (
     TRANSITION_CREATE,
@@ -49,6 +55,7 @@ STATE_TRANSITIONS = (
     TRANSITION_SYNTHESIZE,
     TRANSITION_TIER_TRANSITION,
     TRANSITION_EVIDENCE_COMPACT,
+    TRANSITION_REJECT,
 )
 
 # Transitions that mutate belief rows.  SYNTHESIZE writes derived state
@@ -62,6 +69,32 @@ BELIEF_MUTATING_TRANSITIONS = (
     TRANSITION_FORGET,
     TRANSITION_TIER_TRANSITION,
     TRANSITION_EVIDENCE_COMPACT,
+    TRANSITION_REJECT,
+)
+
+# The transitions that assert something about the *truth* state, and
+# therefore must carry an ``expected_revision``: a decision about what is
+# true is only valid against the state it was computed from.  Storage-only
+# transitions (tier moves, compaction, synthesis) do not bump the revision
+# and may omit it.
+TRUTH_TRANSITIONS = (
+    TRANSITION_CREATE,
+    TRANSITION_SUPPORT,
+    TRANSITION_UPDATE,
+    TRANSITION_CONTRADICT,
+    TRANSITION_VERIFY,
+    TRANSITION_CORRECT,
+    TRANSITION_FORGET,
+    TRANSITION_REJECT,
+)
+
+# The subset that changes the slot's *value*, and therefore appends a new
+# version to the ledger.  SUPPORT / VERIFY deepen the same value;
+# CONTRADICT contests it; REJECT closes it.
+VALUE_TRANSITIONS = (
+    TRANSITION_CREATE,
+    TRANSITION_UPDATE,
+    TRANSITION_CORRECT,
 )
 
 
@@ -82,9 +115,23 @@ class StateTransitionProposal:
         for CONTRADICT, the correction for CORRECT.
     evidence_ids:
         :class:`~mirror_memory.core.models.Evidence` rows backing the change.
-    claimed_revision:
+    expected_revision:
         The state revision the decision was computed against.  The Publisher
-        refuses to commit if the live revision has moved.
+        refuses to commit if the live revision has moved.  **Required for
+        every truth mutation** (CREATE / SUPPORT / UPDATE / CONTRADICT /
+        VERIFY / CORRECT / FORGET): a proposal without it is refused rather
+        than silently skipping the stale check.  Storage-only transitions
+        (TIER_TRANSITION / EVIDENCE_COMPACT / SYNTHESIZE) may omit it.
+    proposal_id / idempotency_key:
+        Identity of the decision.  Replaying a ``proposal_id`` that already
+        committed is answered ``already_committed`` without re-executing;
+        ``idempotency_key`` lets a caller collapse *different* proposal
+        objects that represent the same intended change (a retry after a
+        timeout, say) onto one commit.
+    actor_type / actor_id:
+        Who is asking: ``user`` / ``worker`` / ``metabolism`` / ``system``.
+        Recorded in the proposal log so a committed change can always be
+        traced back to its requester.
     lifecycle / temporal_relation:
         The policy's reasoning, carried through so the commit is auditable.
     payload (TIER_TRANSITION):
@@ -103,7 +150,11 @@ class StateTransitionProposal:
     target_belief_id: int | None = None
     payload: dict[str, Any] = field(default_factory=dict)
     evidence_ids: list[int] = field(default_factory=list)
-    claimed_revision: int = 0
+    expected_revision: int = 0
+    proposal_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    idempotency_key: str = ""
+    actor_type: str = "system"
+    actor_id: str = ""
     lifecycle: str = ""
     temporal_relation: str = ""
     created_at: datetime | None = None
@@ -111,6 +162,13 @@ class StateTransitionProposal:
     def __post_init__(self) -> None:
         if self.transition not in STATE_TRANSITIONS:
             raise ValueError(f"unknown state transition: {self.transition!r}")
+        if not self.proposal_id:
+            self.proposal_id = uuid.uuid4().hex
+        if not self.idempotency_key:
+            # Default the key to the proposal id: one proposal object is
+            # one intended change.  Callers that build a *new* object for a
+            # retry pass a stable key of their own.
+            self.idempotency_key = self.proposal_id
 
     @property
     def mutates_beliefs(self) -> bool:

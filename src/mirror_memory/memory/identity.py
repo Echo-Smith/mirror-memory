@@ -52,6 +52,25 @@ from mirror_memory.memory.temporal import (
 logger = logging.getLogger(__name__)
 
 
+def _tokens_overlap(left: set[str], right: set[str]) -> bool:
+    """Do two token sets denote the same thing?
+
+    Exact overlap is not enough: the extractor spells one object differently
+    across turns ("traveling" then "travel", "gardening" then "gardens"), so
+    a token that is a prefix of the other (five characters or more, so
+    chance collisions like "read"/"reading" against "ready" stay apart)
+    counts as a match.
+    """
+    if left & right:
+        return True
+    for a in left:
+        for b in right:
+            shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+            if len(shorter) >= 5 and longer.startswith(shorter):
+                return True
+    return False
+
+
 def resolve_identity(
     candidate: CandidateAtom,
     existing_beliefs: list[dict],
@@ -108,7 +127,11 @@ def resolve_identity(
         sharing = [
             b for b in existing_beliefs
             if b.get("status") == "active"
-            and object_tokens(b.get("object") or "") & cand_tokens
+            # Prefix-tolerant overlap: the retraction's object and the row
+            # it ends are spelled differently ("diving_certification"
+            # against "certified_diver"), and exact token equality missed
+            # most of them.
+            and _tokens_overlap(object_tokens(b.get("object") or ""), cand_tokens)
         ]
         if not sharing and terminating:
             # "I gave up on the goal" names no object that overlaps the goal
@@ -155,14 +178,43 @@ def resolve_identity(
     # "again" ("I like coffee again" after selling a car) closes nothing.
     if is_resumption(claim_text):
         cand_tokens = object_tokens(candidate.object)
+        # The ended stage is not always a tagged END_CURRENT row: a
+        # withdrawal the extractor filed as an ordinary negative belief
+        # ("I stopped enjoying travel" -> dislikes_travel) ends the value
+        # just as surely.  Anything marked ended -- a negative polarity, a
+        # termination phrasing, a paused/cancelled goal -- is a candidate.
+        #
+        # The match is two-hop on purpose.  The withdrawal rarely names the
+        # same thing the resumption does ("I postponed buying" against "I am
+        # viewing houses again" shares no token), but it always names what
+        # the *goal* named ("postponed buying" against "plans to buy a
+        # house").  So an ended row qualifies when it overlaps the
+        # resumption's tokens, or the tokens of any row that does.
+        anchor_tokens = set(cand_tokens)
+        for b in existing_beliefs:
+            if _tokens_overlap(object_tokens(b.get("object") or ""), cand_tokens) or (
+                _tokens_overlap(object_tokens(b.get("claim_text") or ""), cand_tokens)
+            ):
+                anchor_tokens |= object_tokens(b.get("object") or "")
+                anchor_tokens |= object_tokens(b.get("claim_text") or "")
         ended = [
             b for b in existing_beliefs
             if b.get("status") == "active"
-            and (b.get("transition") or "") == "END_CURRENT"
+            and (
+                (b.get("transition") or "") == "END_CURRENT"
+                or infer_polarity(b.get("predicate") or "") == "negative"
+                or is_termination(b.get("claim_text") or "")
+                or (b.get("lifecycle_state") or "") in ("paused", "cancelled")
+            )
             and (
                 not cand_tokens
-                or object_tokens(b.get("ended_object") or b.get("object") or "")
-                & cand_tokens
+                or _tokens_overlap(
+                    object_tokens(b.get("ended_object") or b.get("object") or ""),
+                    anchor_tokens,
+                )
+                or _tokens_overlap(
+                    object_tokens(b.get("claim_text") or ""), anchor_tokens
+                )
             )
         ]
         if ended:
@@ -208,7 +260,15 @@ def resolve_identity(
     same_attribute_any = (
         attribute_matches
         if candidate.predicate not in policy
-        and len({(b.get("predicate") or "").strip().lower() for b in attribute_matches}) <= 1
+        and attribute_matches
+        # Only a single-valued slot can be "returned to": an event
+        # predicate (``went_to``) holds each occurrence separately, so
+        # "went back to the museum" must stay its own event rather than
+        # superseding the previous visit.
+        and all(
+            (policy.get((b.get("predicate") or "").strip().lower()) == "single")
+            for b in attribute_matches
+        )
         else []
     )
 
@@ -229,7 +289,16 @@ def resolve_identity(
         opposing_rows = [
             b for b in existing_beliefs
             if b.get("status") == "active"
-            and (b.get("object") or "").strip().lower() == cand_obj
+            and (
+                # Same object, or the same attribute spelled differently
+                # across turns: "dislikes museums" against "enjoys museum
+                # trips" is a reversal of one attribute, and exact string
+                # equality never sees it.
+                (b.get("object") or "").strip().lower() == cand_obj
+                or _tokens_overlap(
+                    object_tokens(cand_obj), object_tokens(b.get("object") or "")
+                )
+            )
             and opposing_early
             and infer_polarity(b.get("predicate") or "") == opposing_early
         ]
@@ -279,7 +348,7 @@ def resolve_identity(
             ),
             lifecycle="TEMPORAL_UPDATE",
             temporal_relation="follows",
-            detail={"close_belief_ids": closed},
+            detail={"close_belief_ids": closed, "revival": True},
         )
 
     # One current polarity per object, decided structurally: the candidate's
@@ -295,7 +364,18 @@ def resolve_identity(
     polarity_conflicts = [
         b["id"] for b in existing_beliefs
         if b.get("status") == "active"
-        and (b.get("object") or "").strip().lower() == cand_obj
+        and (
+            # Same object, or the same attribute spelled differently across
+            # turns ("tea" then "tea_over_coffee", "museums" then
+            # "museum_trips").  The extractor never spells one object the
+            # same way twice, so exact equality silently skipped most
+            # reversals -- the same reason the retraction and resumption
+            # paths match on tokens.
+            (b.get("object") or "").strip().lower() == cand_obj
+            or _tokens_overlap(
+                object_tokens(cand_obj), object_tokens(b.get("object") or "")
+            )
+        )
         and (
             # Opposite polarity about the same object: "likes X" vs "avoids X".
             (opposing and infer_polarity(b.get("predicate") or "") == opposing)

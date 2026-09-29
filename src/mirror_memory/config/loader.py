@@ -24,6 +24,7 @@ from .schema import (
     DisplayLabel,
     ExtractionConfig,
     HeatConfig,
+    LedgerConfig,
     MemoryConfig,
     MetabolismConfig,
     MetabolismPlannerConfig,
@@ -307,6 +308,18 @@ def _parse_metabolism(data: dict[str, Any]) -> MetabolismConfig:
             )
         except (TypeError, ValueError):
             logger.warning("Invalid compaction config %r; using defaults", compaction_raw)
+
+    ledger_raw = data.get("ledger", {})
+    if isinstance(ledger_raw, dict) and ledger_raw:
+        try:
+            kwargs["ledger"] = LedgerConfig(
+                max_versions_per_identity=int(
+                    ledger_raw.get("max_versions_per_identity", 50)
+                ),
+                version_ttl_days=int(ledger_raw.get("version_ttl_days", 730)),
+            )
+        except (TypeError, ValueError):
+            logger.warning("Invalid ledger config %r; using defaults", ledger_raw)
 
     return MetabolismConfig(
         retention_predicates=retention_predicates,

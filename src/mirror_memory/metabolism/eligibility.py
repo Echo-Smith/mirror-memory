@@ -24,7 +24,7 @@ then evidence, then experience, then current, else "all".
 
 from __future__ import annotations
 
-from mirror_memory.metabolism.tiers import TIER_ARCHIVED, TIER_DORMANT, TIER_HOT, TIER_WARM
+from mirror_memory.metabolism.tiers import TIER_DORMANT, TIER_HOT, TIER_WARM
 
 # -- Query modes ---------------------------------------------------------------
 

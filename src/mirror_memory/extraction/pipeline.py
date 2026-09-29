@@ -15,12 +15,50 @@ from mirror_memory.core.constants import (
     SNIPPET_MAX_LENGTH,
     SNIPPET_MIN_LENGTH,
 )
+from mirror_memory.core.proposal import (
+    TRANSITION_CONTRADICT,
+    TRANSITION_CREATE,
+    TRANSITION_SUPPORT,
+    TRANSITION_UPDATE,
+)
 from mirror_memory.core.utils import safe_json
 from mirror_memory.extraction.deterministic import extract_claims
 from mirror_memory.extraction.semantic import SemanticExtractor
 from mirror_memory.extraction.throttle import should_extract
 
 logger = logging.getLogger(__name__)
+
+
+_RETURN_PHRASINGS = (
+    "went back to",
+    "going back to",
+    "go back to",
+    "returned to",
+    "returning to",
+    "return to",
+    "moved back to",
+    "moving back to",
+    "switched back to",
+    "switching back to",
+    "transferred back to",
+    "back at ",
+    "am back at",
+    "started back at",
+    "enrolled again at",
+    "rejoined",
+)
+
+
+def _is_return_phrasing(claim_text: str) -> bool:
+    """Does this claim say the user is back at a value they held before?
+
+    Matched on the claim text because the extractor folds the marker into
+    the predicate (``went_to``), where it is indistinguishable from a plain
+    visit.  The identity resolver's revival path then decides whether the
+    object actually belongs to a single-valued slot.
+    """
+    lowered = (claim_text or "").lower()
+    return any(marker in lowered for marker in _RETURN_PHRASINGS)
 
 
 class ExtractionPipeline:
@@ -238,6 +276,74 @@ class ExtractionPipeline:
 
         return all_claims
 
+    def _ensure_evidence_rows(
+        self,
+        session: object,
+        user_id: str,
+        session_id: str,
+        claim: dict,
+        *,
+        source_text: str = "",
+        turn_ref: str = "",
+    ) -> list[int]:
+        """Record a claim's source messages as Evidence rows; return their ids.
+
+        Split out of :meth:`_attach_evidence_rows` so the ids exist *before*
+        a proposal is published — the Publisher's authority gate needs the
+        evidence to already belong to the user and the session the proposal
+        claims.
+        """
+        from mirror_memory.core.repository import record_evidence
+
+        refs = [str(mid) for mid in (claim.get("evidence_message_ids") or [])]
+        if not refs and turn_ref:
+            refs = [turn_ref]
+        if not refs:
+            return []
+
+        method = claim.get("source") or "extracted"
+        ids: list[int] = []
+        for ref in refs:
+            try:
+                evidence = record_evidence(
+                    session,
+                    user_id,
+                    ref=ref,
+                    content=source_text,
+                    session_id=session_id,
+                    source_type="message",
+                    extraction_method=method,
+                    authority="user",
+                )
+                ids.append(evidence.id)
+            except Exception:
+                logger.debug(
+                    "pipeline: evidence row failed for ref=%s", ref, exc_info=True,
+                )
+        return ids
+
+    @staticmethod
+    def _link_evidence_rows(
+        session: object,
+        belief_id: int | None,
+        evidence_ids: list[int],
+        *,
+        relation: str,
+    ) -> None:
+        """Link already-created Evidence rows to a belief with a typed relation."""
+        if belief_id is None or not evidence_ids:
+            return
+        from mirror_memory.core.repository import link_evidence
+
+        for evidence_id in evidence_ids:
+            try:
+                link_evidence(session, belief_id, evidence_id, relation=relation)
+            except Exception:
+                logger.debug(
+                    "pipeline: evidence link failed for belief=%s evidence=%s",
+                    belief_id, evidence_id, exc_info=True,
+                )
+
     def _attach_evidence_rows(
         self,
         session: object,
@@ -263,34 +369,65 @@ class ExtractionPipeline:
         (no cognitive triple) still leaves its observation behind: provenance
         is a record of what was seen, independent of what was concluded.
         """
-        from mirror_memory.core.repository import link_evidence, record_evidence
+        ids = self._ensure_evidence_rows(
+            session, user_id, session_id, claim,
+            source_text=source_text, turn_ref=turn_ref,
+        )
+        self._link_evidence_rows(session, belief_id, ids, relation=relation)
 
-        refs = [str(mid) for mid in (claim.get("evidence_message_ids") or [])]
-        if not refs and turn_ref:
-            refs = [turn_ref]
-        if not refs:
-            return
+    def _publish(
+        self,
+        session: object,
+        user_id: str,
+        session_id: str | None,
+        transition: str,
+        *,
+        target_belief_id: int | None = None,
+        payload: dict,
+        evidence_ids: list[int],
+        trace_action: str,
+        predicate: str = "",
+        object_: str = "",
+        claim_text: str = "",
+    ):
+        """Publish one claim decision through the Publisher.
 
-        method = claim.get("source") or "extracted"
-        for ref in refs:
-            try:
-                evidence = record_evidence(
-                    session,
-                    user_id,
-                    ref=ref,
-                    content=source_text,
-                    session_id=session_id,
-                    source_type="message",
-                    extraction_method=method,
-                    authority="user",
-                )
-                if belief_id is not None:
-                    link_evidence(session, belief_id, evidence.id, relation=relation)
-            except Exception:
-                logger.debug(
-                    "pipeline: evidence attach failed for belief=%s ref=%s",
-                    belief_id, ref, exc_info=True,
-                )
+        The revision is read fresh for every proposal: several claims in one
+        turn each advance it, and the Publisher's compare-and-swap refuses a
+        proposal computed against a revision that has since moved.
+        """
+        from mirror_memory.core.proposal import StateTransitionProposal
+        from mirror_memory.core.publisher import Publisher
+        from mirror_memory.core.repository import get_state_revision
+
+        proposal = StateTransitionProposal(
+            transition=transition,
+            user_id=user_id,
+            session_id=session_id,
+            target_belief_id=target_belief_id,
+            payload=payload,
+            evidence_ids=evidence_ids,
+            expected_revision=get_state_revision(session, user_id),
+            actor_type="extraction",
+            actor_id=session_id or "",
+        )
+        decision = Publisher(session, self._config).publish(proposal)
+        persisted = bool(decision.committed)
+        belief_id = (decision.detail or {}).get("belief_id") if persisted else None
+        self._trace(
+            "publish",
+            action=trace_action,
+            committed=persisted,
+            reason=decision.reason,
+            proposal_id=proposal.proposal_id,
+            belief_id=belief_id,
+        )
+        if not persisted:
+            logger.info(
+                "pipeline: publish refused action=%s reason=%s",
+                trace_action, decision.reason,
+            )
+        return decision, belief_id
 
     @staticmethod
     def _round_trip_close_time(candidate) -> object:
@@ -396,7 +533,6 @@ class ExtractionPipeline:
             CONFLICT_SELF_CORRECTION,
             CONFLICT_SOURCE_CONFLICT,
             beliefs_with_predicates,
-            record_claim,
         )
         from mirror_memory.memory.atom import ACTION_CONTRADICT, ACTION_SUPPORT, ACTION_UPDATE, CandidateAtom
         from mirror_memory.memory.canonicalize import canonicalize_atom
@@ -475,6 +611,20 @@ class ExtractionPipeline:
                     _, canon_pred, canon_obj = canonicalize_atom(
                         claim.get("subject", "user"), pred, obj, synonyms
                     )
+                    # A return-to-value phrasing ("I went back to Falcon
+                    # Works", "I returned to Shanghai") says the user is back
+                    # at a value they held before, so the slot is whichever
+                    # one holds that value -- not whichever verb the
+                    # extractor guessed (``went_to`` for a workplace, or
+                    # ``works_at`` for a school).  Rewriting it to the
+                    # deliberately-unmapped ``returned_to`` hands the
+                    # decision to the resolver's revival path, which matches
+                    # on the object and closes the values the user left.
+                    if (
+                        _is_return_phrasing(claim.get("claim_text", ""))
+                        and canon_pred != "returned_to"
+                    ):
+                        canon_pred = "returned_to"
                     claim_polarity = infer_polarity(canon_pred)
                     claim_lifecycle = infer_lifecycle(
                         canon_pred, claim.get("claim_text", "")
@@ -495,6 +645,9 @@ class ExtractionPipeline:
                         valid_to=value.get("valid_to"),
                         temporal_scope=temporal_policy.get(canon_pred, ""),
                         relation=claim.get("relation", "supports"),
+                        # A return phrasing matches its slot by value, so the
+                        # object comparison widens to shared identity tokens.
+                        returning=_is_return_phrasing(claim.get("claim_text", "")),
                     )
 
                     # Get the beliefs this candidate could match.  The set is
@@ -513,6 +666,20 @@ class ExtractionPipeline:
                         claim.get("claim_text", "")
                     ) or is_termination(claim.get("claim_text", ""))
                     resuming = is_resumption(claim.get("claim_text", ""))
+                    # A value revival ("I went back to Falcon Works") has to
+                    # see the *superseded* row it returns to, so it takes the
+                    # object-aware candidate set (which includes history)
+                    # rather than the active-only resumption surface.
+                    returning = _is_return_phrasing(claim.get("claim_text", ""))
+                    # A retraction or termination asserts the negation of the
+                    # value it closes ("I gave the camera away" is not owning
+                    # it).  The extractor's predicate for these ("gave_away",
+                    # "not_speak") carries no polarity, so without this the
+                    # closing row reads as a second positive fact about the
+                    # same object and a current-state question keeps
+                    # returning the withdrawn value.
+                    if retracting and claim_polarity != "negative":
+                        claim_polarity = "negative"
                     if retracting:
                         # A retraction refers to its target by meaning, so the
                         # candidate set is widened to every active belief that
@@ -532,7 +699,7 @@ class ExtractionPipeline:
                             # goal it ends, so the only candidate set left is
                             # the user's live goals.
                             existing = active_goal_beliefs(session, user_id)
-                    elif resuming:
+                    elif resuming and not returning:
                         # A resumption retires the ended stage of a goal, which
                         # is tagged rather than named by the new claim, so the
                         # candidate set is the recent active surface.
@@ -544,6 +711,27 @@ class ExtractionPipeline:
                             session, user_id, {canon_pred},
                             candidate_objects={canon_obj} if canon_obj else set(),
                         )
+                        # The predicate/object lookup misses the rows that
+                        # state the *opposite* of this claim about the same
+                        # attribute: "dislikes museums" against "enjoys
+                        # museum trips" has a different predicate and a
+                        # differently-spelled object, so none of the query's
+                        # clauses reach it -- and the withdrawal then stays
+                        # active beside its own reversal.  Token overlap
+                        # finds those rows; the resolver's polarity rule
+                        # decides whether they are the same attribute.
+                        from mirror_memory.core.repository import (
+                            beliefs_referenced_by_tokens,
+                        )
+
+                        referenced = beliefs_referenced_by_tokens(
+                            session, user_id, object_tokens(canon_obj)
+                        )
+                        if referenced:
+                            seen_ids = {b.id for b in existing}
+                            existing = existing + [
+                                b for b in referenced if b.id not in seen_ids
+                            ]
                     existing_dicts = [
                         {
                             "id": b.id,
@@ -580,29 +768,38 @@ class ExtractionPipeline:
 
                     # Dispatch based on resolver action.
                     if resolution.action == ACTION_SUPPORT and resolution.target_belief_id:
-                        from mirror_memory.core.repository import support_belief_by_id
-
-                        supported = support_belief_by_id(
-                            session,
-                            resolution.target_belief_id,
+                        evidence_ids = self._ensure_evidence_rows(
+                            session, user_id, session_id, claim,
+                            source_text=source_text, turn_ref=turn_ref,
+                        )
+                        decision, _belief_id = self._publish(
+                            session, user_id, session_id, TRANSITION_SUPPORT,
+                            target_belief_id=resolution.target_belief_id,
+                            payload={
+                                "claim_text": claim.get("claim_text", ""),
+                                "evidence_message_ids": claim.get("evidence_message_ids"),
+                            },
+                            evidence_ids=evidence_ids,
+                            trace_action="SUPPORT",
+                            predicate=canon_pred,
+                            object_=canon_obj,
                             claim_text=claim.get("claim_text", ""),
-                            session_id=session_id,
-                            evidence_message_ids=claim.get("evidence_message_ids"),
                         )
                         _record_store(
                             action="SUPPORT",
                             belief_id=resolution.target_belief_id,
-                            persisted=supported is not None,
+                            persisted=decision.committed,
                             predicate=canon_pred,
                             object=canon_obj,
                             claim_text=claim.get("claim_text", ""),
                         )
-                        _attach_evidence(claim, resolution.target_belief_id, "support")
+                        self._link_evidence_rows(
+                            session, resolution.target_belief_id, evidence_ids,
+                            relation="support",
+                        )
                         continue  # SUPPORT handled, skip record_claim
 
                     if resolution.action == ACTION_UPDATE and resolution.target_belief_id:
-                        from mirror_memory.core.repository import update_belief_by_id
-
                         # Preserve metadata through the update.
                         value["predicate"] = canon_pred
                         value["object"] = canon_obj
@@ -624,66 +821,96 @@ class ExtractionPipeline:
                             )
                             claim["value"] = value
 
-                        old, new = update_belief_by_id(
-                            session,
-                            resolution.target_belief_id,
-                            new_subject=claim.get("subject", "user"),
-                            new_predicate=canon_pred,
-                            new_object=canon_obj,
-                            new_dimension=claim.get("dimension", ""),
-                            new_key=claim.get("key", ""),
-                            new_claim_text=claim.get("claim_text", ""),
-                            new_confidence=claim.get("confidence", 0.0),
-                            new_cardinality=policy.get(canon_pred, "multi"),
-                            session_id=session_id,
-                            evidence_message_ids=claim.get("evidence_message_ids"),
-                            new_value=value,
-                            observed_at=candidate.observed_at,
-                            valid_from=candidate.valid_from,
-                            valid_to=candidate.valid_to,
-                            temporal_scope=temporal_policy.get(canon_pred, ""),
-                            polarity=claim_polarity,
-                            lifecycle_state=claim_lifecycle,
-                            raw_predicate=pred,
+                        evidence_ids = self._ensure_evidence_rows(
+                            session, user_id, session_id, claim,
+                            source_text=source_text, turn_ref=turn_ref,
                         )
-                        if new:
-                            logger.info("pipeline: UPDATE %s -> %s", old.id if old else "?", new.id)
                         # Round-trip revival: the resolver may name other
                         # same-attribute beliefs to close (the values the user
-                        # left and has now returned past).  Without this the
-                        # middle value of A -> B -> A stays active with an open
-                        # interval and current-state questions return it.
-                        from mirror_memory.core.models import Belief as _Belief
+                        # left and has now returned past).  They travel in the
+                        # payload so the Publisher closes them inside the same
+                        # transaction as the revival -- a partial round-trip
+                        # (new value live, middle value still active) is
+                        # exactly the corruption this prevents.
+                        close_ids = [
+                            int(i)
+                            for i in (resolution.detail.get("close_belief_ids") or [])
+                            if i is not None and int(i) != resolution.target_belief_id
+                        ]
+                        # A revival returns to a previous value, so the new
+                        # row belongs to the *revived* slot: it inherits the
+                        # target's predicate and key rather than the verb the
+                        # return phrasing was rewritten to.  Without this the
+                        # revived value lands under ``returned_to`` and leaves
+                        # the slot it belongs to empty.
+                        revival_predicate, revival_key = canon_pred, claim.get("key", "")
+                        if resolution.detail.get("revival"):
+                            from mirror_memory.core.models import Belief as _Belief
 
-                        cls_close = None
-                        for close_id in resolution.detail.get("close_belief_ids") or []:
-                            if close_id in (None, resolution.target_belief_id):
-                                continue
-                            middle = session.get(_Belief, close_id)
-                            if middle is not None and middle.status == "active":
-                                if middle.valid_to is None:
-                                    middle.valid_to = cls_close or self._round_trip_close_time(candidate)
-                                middle.status = "superseded"
-                                middle.superseded_by = new.id if new else None
-                                logger.info(
-                                    "pipeline: round-trip closed %s (%s)",
-                                    middle.id, middle.object,
-                                )
+                            target_row = session.get(_Belief, resolution.target_belief_id)
+                            if target_row is not None:
+                                revival_predicate = target_row.predicate or canon_pred
+                                revival_key = target_row.key or revival_key
+                        decision, new_id = self._publish(
+                            session, user_id, session_id, TRANSITION_UPDATE,
+                            target_belief_id=resolution.target_belief_id,
+                            payload={
+                                "subject": claim.get("subject", "user"),
+                                "predicate": revival_predicate,
+                                "object": canon_obj,
+                                "dimension": claim.get("dimension", ""),
+                                "key": revival_key,
+                                "claim_text": claim.get("claim_text", ""),
+                                "confidence": claim.get("confidence", 0.0),
+                                # The cardinality follows the predicate the
+                                # row will actually carry: a revival inherits
+                                # the target's (``lives_in`` is single), so
+                                # keying it off the rewritten ``returned_to``
+                                # would file the returning value as a
+                                # multi-valued preference and let it cool.
+                                "cardinality": policy.get(revival_predicate, "multi"),
+                                "evidence_message_ids": claim.get("evidence_message_ids"),
+                                "value": value,
+                                "observed_at": candidate.observed_at,
+                                "valid_from": candidate.valid_from,
+                                "valid_to": candidate.valid_to,
+                                "temporal_scope": temporal_policy.get(canon_pred, ""),
+                                "polarity": claim_polarity,
+                                "lifecycle_state": claim_lifecycle,
+                                "raw_predicate": pred,
+                                "close_belief_ids": close_ids,
+                                # A revival targets a superseded row on
+                                # purpose; the Publisher's closed-row
+                                # invariant lets this one through.
+                                "revival": bool(resolution.detail.get("revival")),
+                                "close_at": self._round_trip_close_time(candidate),
+                            },
+                            evidence_ids=evidence_ids,
+                            trace_action="UPDATE",
+                            predicate=canon_pred,
+                            object_=canon_obj,
+                            claim_text=claim.get("claim_text", ""),
+                        )
+                        if new_id is not None:
+                            logger.info("pipeline: UPDATE -> %s", new_id)
                         _record_store(
                             action="UPDATE",
-                            belief_id=new.id if new else None,
-                            persisted=new is not None,
+                            belief_id=new_id,
+                            persisted=decision.committed,
                             predicate=canon_pred,
                             object=canon_obj,
                             claim_text=claim.get("claim_text", ""),
                         )
-                        _attach_evidence(
-                            claim, new.id if new else None, "support"
+                        self._link_evidence_rows(
+                            session, new_id, evidence_ids, relation="support"
                         )
-                        if old is not None:
+                        if decision.committed and resolution.target_belief_id:
                             # The superseded value stays in the graph, marked as
                             # what it now is: replaced.
-                            _attach_evidence(claim, old.id, "correct")
+                            self._link_evidence_rows(
+                                session, resolution.target_belief_id, evidence_ids,
+                                relation="correct",
+                            )
                         continue  # UPDATE handled, skip record_claim
 
                     if resolution.action == ACTION_CONTRADICT and resolution.target_belief_id:
@@ -704,56 +931,66 @@ class ExtractionPipeline:
                     claim["value"] = value
 
                 # CREATE / CONTRADICT: persist via record_claim.
-                belief, event_type = record_claim(
-                    session,
-                    user_id,
-                    dimension=claim.get("dimension", ""),
-                    key=claim.get("key", ""),
-                    claim_text=claim.get("claim_text", ""),
-                    value=claim.get("value"),
-                    relation=claim.get("relation", "supports"),
-                    confidence=claim.get("confidence", 0.0),
-                    layer=claim.get("layer", "L4"),
-                    source=claim.get("source", "extracted"),
-                    session_id=session_id,
-                    evidence_message_ids=claim.get("evidence_message_ids"),
-                    blocked_key_prefixes=self._config.blocked_key_prefixes,
-                    allowed_dimensions=allowed,
-                    context_tags=context_tags,
-                    # Triple fields.
-                    subject=claim.get("subject", "user"),
+                evidence_ids = self._ensure_evidence_rows(
+                    session, user_id, session_id, claim,
+                    source_text=source_text, turn_ref=turn_ref,
+                )
+                relation = claim.get("relation", "supports")
+                decision, belief_id = self._publish(
+                    session, user_id, session_id,
+                    TRANSITION_CONTRADICT if relation == "contradicts" else TRANSITION_CREATE,
+                    payload={
+                        "dimension": claim.get("dimension", ""),
+                        "key": claim.get("key", ""),
+                        "claim_text": claim.get("claim_text", ""),
+                        "value": claim.get("value"),
+                        "confidence": claim.get("confidence", 0.0),
+                        "layer": claim.get("layer", "L4"),
+                        "source": claim.get("source", "extracted"),
+                        "evidence_message_ids": claim.get("evidence_message_ids"),
+                        "blocked_key_prefixes": list(self._config.blocked_key_prefixes),
+                        # None (non-strict mode) means "any dimension".
+                        "allowed_dimensions": allowed,
+                        "context_tags": context_tags,
+                        # Triple fields.
+                        "subject": claim.get("subject", "user"),
+                        "predicate": canon_pred,
+                        "object": canon_obj,
+                        "cardinality": policy.get(canon_pred, "multi"),
+                        "polarity": claim_polarity,
+                        "lifecycle_state": claim_lifecycle,
+                        # The extractor's own spelling, kept for audit: the
+                        # canonical predicate folds many surface forms onto one
+                        # slot and the raw form is the only record of which was
+                        # actually produced.
+                        "raw_predicate": pred,
+                        # Every contradiction the extractor reports is the user
+                        # retracting their own earlier statement -- the two claims
+                        # come from the same subject in the same conversation.  A
+                        # cross-source disagreement never reaches this path.
+                        "conflict_kind": (
+                            CONFLICT_SELF_CORRECTION
+                            if relation == "contradicts"
+                            else CONFLICT_SOURCE_CONFLICT
+                        ),
+                    },
+                    evidence_ids=evidence_ids,
+                    trace_action="CREATE" if relation != "contradicts" else "CONTRADICT",
                     predicate=canon_pred,
-                    object=canon_obj,
-                    cardinality=policy.get(canon_pred, "multi"),
-                    polarity=claim_polarity,
-                    lifecycle_state=claim_lifecycle,
-                    # The extractor's own spelling, kept for audit: the
-                    # canonical predicate folds many surface forms onto one
-                    # slot and the raw form is the only record of which was
-                    # actually produced.
-                    raw_predicate=pred,
-                    # Every contradiction the extractor reports is the user
-                    # retracting their own earlier statement -- the two claims
-                    # come from the same subject in the same conversation.  A
-                    # cross-source disagreement never reaches this path.
-                    conflict_kind=(
-                        CONFLICT_SELF_CORRECTION
-                        if claim.get("relation") == "contradicts"
-                        else CONFLICT_SOURCE_CONFLICT
-                    ),
+                    object_=canon_obj,
+                    claim_text=claim.get("claim_text", ""),
                 )
                 _record_store(
-                    action=event_type.upper(),
-                    belief_id=belief.id if belief is not None else None,
-                    persisted=belief is not None,
+                    action="CONTRADICT" if relation == "contradicts" else "CREATE",
+                    belief_id=belief_id,
+                    persisted=decision.committed,
                     predicate=canon_pred,
                     object=canon_obj,
                     claim_text=claim.get("claim_text", ""),
                 )
-                _attach_evidence(
-                    claim,
-                    belief.id if belief is not None else None,
-                    "contradict" if event_type == "contradicted" else "support",
+                self._link_evidence_rows(
+                    session, belief_id, evidence_ids,
+                    relation="contradict" if relation == "contradicts" else "support",
                 )
             except Exception:
                 logger.warning(

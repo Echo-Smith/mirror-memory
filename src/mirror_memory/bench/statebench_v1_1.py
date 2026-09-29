@@ -18,7 +18,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
 
-STATEBENCH_V11_VERSION = "1.1.0"
+STATEBENCH_V11_VERSION = "1.2.0"
 STATEBENCH_V11_CASE_COUNT = 200
 STATEBENCH_V11_CATEGORIES = frozenset({
     "replacement",

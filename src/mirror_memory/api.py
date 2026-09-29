@@ -603,12 +603,12 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
-            decision = Publisher(session).publish(
+            decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_FORGET,
                     user_id=user_id,
                     target_belief_id=belief_id,
-                    claimed_revision=get_state_revision(session, user_id),
+                    expected_revision=get_state_revision(session, user_id),
                 )
             )
             session.commit()
@@ -647,12 +647,12 @@ class MemoryEngine:
             if belief is None or belief.user_id != user_id:
                 return False
             from_tier = belief.memory_tier or "hot"
-            decision = Publisher(session).publish(
+            decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_TIER_TRANSITION,
                     user_id=user_id,
                     target_belief_id=belief_id,
-                    claimed_revision=get_state_revision(session, user_id),
+                    expected_revision=get_state_revision(session, user_id),
                     payload={
                         "from_tier": from_tier,
                         "to_tier": "warm",
@@ -717,26 +717,73 @@ class MemoryEngine:
             raise ValidationError("new_claim_text must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.core.repository import correct_belief
+        from mirror_memory.core.proposal import (
+            TRANSITION_CORRECT,
+            StateTransitionProposal,
+        )
+        from mirror_memory.core.publisher import Publisher
+        from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
-            result = correct_belief(
-                session, user_id, belief_id,
-                new_claim_text=new_claim_text,
-                correction_note=correction_note,
-                new_predicate=new_predicate,
-                new_object=new_object,
-                new_value=new_value,
+            decision = Publisher(session, self._config).publish(
+                StateTransitionProposal(
+                    transition=TRANSITION_CORRECT,
+                    user_id=user_id,
+                    target_belief_id=belief_id,
+                    expected_revision=get_state_revision(session, user_id),
+                    actor_type="user",
+                    payload={
+                        "new_claim_text": new_claim_text,
+                        "correction_note": correction_note,
+                        "new_predicate": new_predicate,
+                        "new_object": new_object,
+                        "new_value": new_value,
+                    },
+                )
             )
             session.commit()
-            if result is None:
+            if not decision.committed:
+                return None
+            corrected_id = (decision.detail or {}).get("belief_id")
+            if corrected_id is None:
+                return None
+            from mirror_memory.core.models import Belief
+
+            row = session.get(Belief, corrected_id)
+            if row is None:
                 return None
             return {
-                "belief_id": result.id,
-                "claim_text": result.claim_text,
-                "status": result.status,
-                "confidence": result.confidence,
+                "belief_id": row.id,
+                "claim_text": row.claim_text,
+                "status": row.status,
+                "confidence": row.confidence,
             }
+
+    def belief_history(self, *, user_id: str, belief_id: int) -> list[dict]:
+        """Return the version chain behind a belief, oldest first.
+
+        The versioned ledger is the authoritative history: one identity per
+        slot, one version per value that slot has held, with the truth
+        interval and the belief interval recorded separately and the
+        proposal that opened each interval attached.  A→B→A is three
+        versions of one identity — the first stay is history that stays
+        closed, not a row to reopen.
+
+        Returns an empty list when the belief is not found.
+
+        Raises
+        ------
+        ValidationError
+            If user_id is empty.
+        """
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+
+        self._ensure_db()
+        from mirror_memory.core.repository import belief_history
+
+        with self._session() as session:
+            return belief_history(session, user_id, belief_id)
 
     def explain(self, *, user_id: str, belief_id: int) -> dict | None:
         """Return the provenance chain for a belief.

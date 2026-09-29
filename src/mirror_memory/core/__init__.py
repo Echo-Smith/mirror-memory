@@ -7,18 +7,12 @@ by the caller.
 """
 
 # -- Models ------------------------------------------------------------------
-from mirror_memory.core.models import (
-    Base,
-    Belief,
-    BeliefEvent,
-    EvolutionJob,
-    ExtractionStats,
-    InterventionEvent,
-    MemoryPreference,
-    Snapshot,
-    User,
-    utcnow,
-)
+from mirror_memory.core.activity import belief_activity
+from mirror_memory.core.behavioral import detect_behavioral_signals
+from mirror_memory.core.budget import compute_profile_budget
+
+# -- Pure functions ----------------------------------------------------------
+from mirror_memory.core.confidence import compute_confidence_weight
 
 # -- Constants ---------------------------------------------------------------
 from mirror_memory.core.constants import (
@@ -31,8 +25,8 @@ from mirror_memory.core.constants import (
     L4_RENDER_THRESHOLD,
     LOW_CONFIDENCE_PATTERN_CEIL,
     LOW_CONFIDENCE_PATTERN_FLOOR,
-    MAX_EVIDENCE_REFS,
     MAX_CLAIMS_PER_TURN,
+    MAX_EVIDENCE_REFS,
     MESSAGE_LENGTH_DROP_RATIO,
     PROFILE_SIGNAL_THRESHOLD,
     QUESTION_TIER_WEIGHT_MAX,
@@ -48,13 +42,18 @@ from mirror_memory.core.constants import (
     VAD_HESITATION_PAUSE_COUNT,
     VAD_PAUSE_THRESHOLD_MS,
 )
-
-# -- Pure functions ----------------------------------------------------------
-from mirror_memory.core.confidence import compute_confidence_weight
-from mirror_memory.core.activity import belief_activity
-from mirror_memory.core.budget import compute_profile_budget
-from mirror_memory.core.retrieval import score_belief
-from mirror_memory.core.behavioral import detect_behavioral_signals
+from mirror_memory.core.models import (
+    Base,
+    Belief,
+    BeliefEvent,
+    EvolutionJob,
+    ExtractionStats,
+    InterventionEvent,
+    MemoryPreference,
+    Snapshot,
+    User,
+    utcnow,
+)
 
 # -- Repository --------------------------------------------------------------
 from mirror_memory.core.repository import (
@@ -76,6 +75,7 @@ from mirror_memory.core.repository import (
     set_memory_enabled,
     update_belief_value,
 )
+from mirror_memory.core.retrieval import score_belief
 
 __all__ = [
     # Models

@@ -7,8 +7,6 @@ signals subtract; floor = 0.5 (new beliefs never stagnate entirely).
 
 from __future__ import annotations
 
-import json
-
 
 def compute_confidence_weight(
     *,

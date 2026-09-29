@@ -65,6 +65,11 @@ class CandidateAtom:
     temporal_scope: str = "current_state"
     source: str = "extracted"
     relation: str = "supports"  # supports / contradicts / updates / new
+    # A return phrasing ("I went back to X") identifies its slot by value,
+    # so the object comparison widens to shared identity tokens: the
+    # extractor spells "Kingsley" where the stored row says
+    # "kingsley_college".
+    returning: bool = False
 
 
 # ── Atom state transitions ────────────────────────────────────────────────

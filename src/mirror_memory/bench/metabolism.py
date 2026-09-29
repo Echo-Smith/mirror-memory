@@ -37,7 +37,6 @@ from pathlib import Path
 from typing import Any
 
 from mirror_memory.core.utils import safe_json_list
-from mirror_memory.metabolism.tiers import TIER_ARCHIVED, TIER_DORMANT, TIER_HOT, TIER_WARM
 
 # -- Case schema ---------------------------------------------------------------
 
@@ -539,7 +538,7 @@ def run_case(
                         transition=TRANSITION_SUPPORT,
                         user_id=user_id,
                         target_belief_id=beliefs[0].id,
-                        claimed_revision=revision,
+                        expected_revision=revision,
                         payload={"claim_text": "stale worker write"},
                     )
                     engine.forget_belief(user_id=user_id, belief_id=beliefs[0].id)

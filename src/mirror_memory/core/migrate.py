@@ -54,7 +54,6 @@ _REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
         "compaction_group_id",
     ),
 }
-
 # (table, column) -> additive statement.  Static, hand-written, and never
 # executed by this module — see the module docstring.
 _MIGRATION_STATEMENTS: dict[tuple[str, str], str] = {

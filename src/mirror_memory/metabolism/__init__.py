@@ -15,8 +15,8 @@ reason and score.  Evidence compaction (PR3) and archive/forget cascade
 """
 
 from mirror_memory.metabolism.eligibility import (
-    DEFAULT_SCAN_TIERS,
     CURRENT_SCAN_TIERS,
+    DEFAULT_SCAN_TIERS,
     MODE_ALL,
     MODE_ALL_OCCURRENCES,
     MODE_CURRENT,

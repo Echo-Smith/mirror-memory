@@ -164,10 +164,15 @@ synonym_map:
   settled_in: lives_in
   moved_back_to: lives_in
 
-  # Profession.
-  retrained: profession
-  became: profession
-  career_is: profession
+  # Profession.  The extractor emits `works_as` for "I am a X"; a past
+  # profession ("I was a teacher") arrives as `profession`.  Both are the
+  # same single-valued slot, so `profession` folds onto `works_as` —
+  # otherwise the two never meet in resolution and the old value stays
+  # active next to the new one.
+  profession: works_as
+  retrained: works_as
+  became: works_as
+  career_is: works_as
 
   go_to: went_to
   visits: went_to

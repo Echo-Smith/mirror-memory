@@ -70,6 +70,18 @@ class StorageError(MirrorMemoryError):
     pass
 
 
+class StaleRevisionError(MirrorMemoryError):
+    """A compare-and-swap on the state revision lost the race.
+
+    The Publisher catches this and turns it into a refusal (the savepoint
+    has already rolled the attempt back).  It is an exception rather than a
+    return value so a failed CAS cannot be mistaken for a successful one
+    that happened to compute the same number.
+    """
+
+    pass
+
+
 class ValidationError(MirrorMemoryError):
     """Input validation failure.
 

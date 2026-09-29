@@ -48,7 +48,6 @@ from mirror_memory.core.repository import (
     pending_verification_keys,
 )
 from mirror_memory.metabolism.compact import (
-    DEFAULT_KEEP_POLICY,
     KeepPolicy,
     plan_compaction,
 )
@@ -418,7 +417,7 @@ def run_metabolism(
                                 transition=TRANSITION_EVIDENCE_COMPACT,
                                 user_id=user_id,
                                 target_belief_id=belief.id,
-                                claimed_revision=revision,
+                                expected_revision=revision,
                                 payload={
                                     "keep_ids": list(plan.keep_ids),
                                     "fold_ids": list(plan.fold_ids),
@@ -444,7 +443,7 @@ def run_metabolism(
                     transition=TRANSITION_TIER_TRANSITION,
                     user_id=user_id,
                     target_belief_id=decision.belief_id,
-                    claimed_revision=revision,
+                    expected_revision=revision,
                     payload={
                         "from_tier": decision.from_tier,
                         "to_tier": decision.to_tier,
@@ -458,7 +457,7 @@ def run_metabolism(
     report.proposals = len(proposals) + len(compaction)
     report.compaction_proposals = len(compaction)
     if not dry_run:
-        pub = publisher or Publisher(session)
+        pub = publisher or Publisher(session, config)
         for decision, proposal in proposals:
             result = pub.publish(proposal)
             if result.committed:

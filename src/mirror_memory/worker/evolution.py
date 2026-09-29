@@ -196,7 +196,7 @@ def _process_single_job(
         # enqueue time).  The revision may have been bumped by state mutations
         # between enqueue and compute, so we re-read the current value to
         # compare against the post-compute revision at Node 6.
-        claimed_revision = get_state_revision(session, job.user_id)
+        expected_revision = get_state_revision(session, job.user_id)
 
         # Node 1: load_evidence
         evidence = _load_evidence(session, job.user_id)
@@ -237,7 +237,7 @@ def _process_single_job(
             transition=TRANSITION_SYNTHESIZE,
             user_id=job.user_id,
             session_id=None,
-            claimed_revision=claimed_revision,
+            expected_revision=expected_revision,
             payload={
                 "content": content,
                 "policy": policy,
@@ -245,7 +245,7 @@ def _process_single_job(
                 "shadow": is_shadow,
             },
         )
-        decision = Publisher(session).publish(proposal)
+        decision = Publisher(session, config).publish(proposal)
         if not decision.committed:
             logger.info(
                 "evolution: publish refused (job=%s reason=%s)",

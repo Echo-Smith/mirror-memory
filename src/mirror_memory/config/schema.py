@@ -319,6 +319,24 @@ class CompactionConfig(BaseModel):
     keep: CompactionKeepPolicy = Field(default_factory=CompactionKeepPolicy)
 
 
+class LedgerConfig(BaseModel):
+    """Bounds on the versioned belief ledger.
+
+    Without them the version table grows without limit: every value a slot
+    has ever held is a row, and a heavily-changed slot (a goal abandoned
+    and resumed monthly) would accumulate one per change forever.
+    """
+
+    max_versions_per_identity: int = Field(
+        default=50, ge=2, le=1000,
+        description="Newest N versions kept per slot; older ones are pruned when a new one opens",
+    )
+    version_ttl_days: int = Field(
+        default=730, ge=30, le=3650,
+        description="Versions whose belief interval closed longer ago than this are pruned",
+    )
+
+
 class MetabolismConfig(BaseModel):
     """Memory-metabolism settings, loaded from ``metabolism.yaml``.
 
@@ -348,6 +366,7 @@ class MetabolismConfig(BaseModel):
     heat: HeatConfig = Field(default_factory=HeatConfig)
     planner: MetabolismPlannerConfig = Field(default_factory=MetabolismPlannerConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    ledger: LedgerConfig = Field(default_factory=LedgerConfig)
 
     @field_validator("default_retention_class")
     @classmethod

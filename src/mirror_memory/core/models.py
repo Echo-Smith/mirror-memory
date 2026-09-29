@@ -398,6 +398,133 @@ class DeletionTombstone(Base):
 
 
 # ---------------------------------------------------------------------------
+# Proposal log (publish protocol: idempotency + audit)
+# ---------------------------------------------------------------------------
+
+
+class ProposalLog(Base):
+    """Append-only record of every *committed* proposal.
+
+    Two jobs.  **Idempotency**: ``proposal_id`` is unique, so replaying a
+    proposal is answered with ``already_committed`` instead of writing the
+    same change twice — the Publisher checks this table before it runs any
+    handler.  **Audit**: who (actor) asked for what (transition), against
+    which revision, and what the revision became.
+
+    Refusals are deliberately not logged here: a refused proposal changed
+    nothing, so a retry with the same id must be free to re-evaluate.  The
+    row is written inside the same transaction as the change it records, so
+    a rolled-back commit cannot leave a phantom log entry.
+    """
+
+    __tablename__ = "mm_proposal_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    proposal_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), default="", index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    transition: Mapped[str] = mapped_column(String(32))
+    target_belief_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The belief this proposal *created* (CREATE / UPDATE / CORRECT), when
+    # it produced one.  Deletion needs it: a forget must remove the log
+    # rows that produced the deleted belief, and those rows carry no
+    # ``target_belief_id`` to match on.
+    created_belief_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    actor_type: Mapped[str] = mapped_column(String(32), default="system")
+    actor_id: Mapped[str] = mapped_column(String(128), default="")
+    # The revision the decision was computed against (0 when the transition
+    # does not bump the revision).
+    expected_revision: Mapped[int] = mapped_column(Integer, default=0)
+    revision_after: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Versioned belief ledger (Runtime Closure PR3)
+# ---------------------------------------------------------------------------
+
+
+class BeliefIdentity(Base):
+    """The stable "slot" a line of beliefs is about.
+
+    ``Belief`` conflates four things: the fact, the current state, the
+    history, and a database row identity.  The ledger splits them: the
+    identity is the slot (who, what predicate, which key), and every value
+    that slot has ever held is a :class:`BeliefVersion` with its own
+    validity interval.
+
+    One identity per ``(user_id, subject, predicate, slot_key)``.  The
+    existing ``Belief`` rows stay as the compatibility read model — every
+    read path still works unchanged — while the ledger becomes the
+    authoritative history.
+    """
+
+    __tablename__ = "mm_belief_identities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    subject: Mapped[str] = mapped_column(String(64), default="user")
+    predicate: Mapped[str] = mapped_column(String(64), default="", index=True)
+    # The read-model key this identity projects onto (``lives_in`` and
+    # friends); the identity is the slot, the key is its projection name.
+    slot_key: Mapped[str] = mapped_column(String(128))
+    cardinality: Mapped[str] = mapped_column(String(16), default="multi")
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "subject", "predicate", "slot_key",
+            name="uq_mm_belief_identity_slot",
+        ),
+    )
+
+
+class BeliefVersion(Base):
+    """One value a slot has held, with both clocks.
+
+    Two intervals, deliberately separate:
+
+    - ``valid_from`` / ``valid_to`` — when the fact itself was true
+      (``lives_in Shanghai [2024-01, 2026-05)``).
+    - ``epistemic_from`` / ``epistemic_to`` — when the engine learned it and
+      when it stopped believing it.  A value the user retracted keeps its
+      truth interval but gets its epistemic interval closed.
+
+    ``created_by_proposal`` is the ``proposal_id`` of the publish that
+    opened this version, so every interval is traceable to the exact commit
+    that created it.  ``superseded_by_version`` points at the version that
+    replaced it, which is what makes A→B→A three intervals rather than a
+    revival: returning to Shanghai appends a third version instead of
+    reopening the first.
+    """
+
+    __tablename__ = "mm_belief_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    identity_id: Mapped[int] = mapped_column(Integer, index=True)
+    object: Mapped[str] = mapped_column(String(256), default="")
+    polarity: Mapped[str] = mapped_column(String(16), default="neutral")
+    lifecycle_state: Mapped[str] = mapped_column(String(16), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    # Truth clock.
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Belief clock.
+    epistemic_from: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    epistemic_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Provenance.
+    created_by_proposal: Mapped[str] = mapped_column(String(64), default="", index=True)
+    superseded_by_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The read-model row this version projects onto (0 for versions whose
+    # projection has since been replaced by a newer row of the same slot).
+    belief_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
 # Extraction stats
 # ---------------------------------------------------------------------------
 

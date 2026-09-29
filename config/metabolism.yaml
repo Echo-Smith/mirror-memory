@@ -81,3 +81,11 @@ compaction:
     oldest: 1
     recent: 3
     highest_authority: 2
+
+# Versioned-ledger bounds.  Without them the version table grows without
+# limit: every value a slot ever held is a row.  The cap keeps the newest N
+# per slot; the TTL drops versions whose belief interval closed long ago.
+# The version being opened is never pruned.
+ledger:
+  max_versions_per_identity: 50
+  version_ttl_days: 730
