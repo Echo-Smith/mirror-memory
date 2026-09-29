@@ -47,8 +47,8 @@ class TestPredicateVariantSynonyms:
         ("moved_to", "lives_in"),
         ("relocated_to", "lives_in"),
         # Profession.
-        ("retrained", "profession"),
-        ("became", "profession"),
+        ("retrained", "works_as"),
+        ("became", "works_as"),
     ])
     def test_variant_resolves_to_canonical(self, config, variant, canonical):
         assert config.predicate_synonyms.get(variant) == canonical

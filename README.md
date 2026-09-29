@@ -49,6 +49,7 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 - **Cognitive triples** — subject → predicate → object, with temporal validity intervals
 - **Identity semantics** — SINGLE/MULTI/EVENT cardinality, canonicalization, contradiction handling
 - **Temporal lifecycle** — `valid_from`/`valid_to` intervals; a superseded value is closed, not deleted
+- **Versioned belief ledger** — one identity per slot, one version per value it has held, with the truth clock and the belief clock recorded separately and the proposal that opened each interval; A→B→A is three versions, not a revival
 - **Structured polarity** — `positive`/`negative`/`neutral` on the belief; a retraction is a state change, not a word-list guess at read time
 - **Goal lifecycle** — `active`/`paused`/`cancelled`/`resumed`, so "gave up" then "started again" is a resumption of the same goal
 - **Conflict kinds** — a self-correction closes the old state; a source conflict stays unresolved and requests clarification instead of picking a winner
@@ -70,6 +71,8 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 
 **Runtime**
 - **Single-writer publish** — every state change is a proposal; only the Publisher commits, after checking revision / consent / scope / authority / invariants
+- **Publish protocol** — truth mutations must name the revision they were computed against; the revision bump is a compare-and-swap (concurrent publishers cannot both win); committed proposals are recorded under a unique `proposal_id` + `idempotency_key` so a replay is answered `already_committed`; each commit runs inside a SAVEPOINT so a handler failing halfway leaves the database byte-identical; evidence ids must exist, belong to the user, and come from the claimed session
+- **No write bypasses** — extraction, verification, the API, and the worker all publish; direct repository writes exist only inside the repository and the Publisher themselves
 - **Memory metabolism** — belief lifecycle beyond truth: retention classes (canonical/preference/behavioral/episodic/transient), heat scoring, protection invariants, and hot/warm/dormant/archived tier eligibility. A daily planner proposes tier transitions through the Publisher (protection re-derived at commit; tier moves never bump the state revision) with a full audit log. Rules only — no model decides what to cool or delete
 - **Evidence compaction** — fifty "I like coffee" messages become one digest: >12 support links triggers folding into an `EvidenceDigest` (counts, time span, source/authority distributions) while a representative sample stays live and `correct`/`contradict`/`verify` links are never folded; the Publisher recomputes the selection and refuses a mismatch
 - **Archive & forget** — dormant beliefs past their class's `archive_after_days` leave the default scan (restorable on demand through the Publisher); a forget is one deletion transaction (belief + events + links + digest + audit rows + orphan evidence) closed by a content-free tombstone with an advancing deletion generation that blocks stale workers
@@ -80,7 +83,8 @@ MM_LLM_API_KEY=sk-xxx MM_LLM_MODEL=deepseek-chat uvicorn mirror_memory.server:ap
 - **Benchmark funnel** — 5 stage metrics + failure attribution, not just a score
 - **StateBench** — a dedicated stateful-memory benchmark with a release gate
 - **MetabolismBench** — 29 scripted lifecycle cases (survival / history / correction / conflict / compaction / reactivation / deletion / stale-worker) with semantic-preservation and compaction-efficiency metrics
-- **956 tests** — 0 failures, core paths fully covered
+- **LongRunBench** — one user, one simulated year (5,045 observations, 364 beliefs, 4,989 evidence rows, 100 corrections, 50 conflicts, 20 forgets, 53 metabolism cycles): semantic preservation 1.000, correction loss 0, conflict loss 0, forgotten resurrection 0, wrong archive 0, hot-evidence reduction 0.82. Reference measurements on the author's machine (re-run with `python -m mirror_memory.bench.longrun_cli`; absolute latencies are hardware-dependent): recall p50 ~6 ms / p95 ~24 ms, metabolism cycle p95 ~2 s at 5k evidence
+- **1014 tests** — 0 failures, core paths fully covered
 ## Architecture / 架构
 
 ```
@@ -199,11 +203,48 @@ nothing in it marks which value is current), and trails on the three that are
 pure recall. The architecture's claim is partially demonstrated, with the
 boundary drawn.
 
-**Release gate**: the plan's threshold is state overall ≥ 0.90 and every
+**Release gate (v1.0)**: the plan's threshold is state overall ≥ 0.90 and every
 category ≥ 0.85. At 0.730 the gate is **not** met, so the honest external
 claim is a reproducible measurement, not a proven architectural advantage.
 See [docs/benchmark-funnel.md](docs/benchmark-funnel.md) and
 [docs/mirror-statebench-v1.1-fix-list.md](docs/mirror-statebench-v1.1-fix-list.md).
+
+### StateBench v1.1 — paired forced/production measurement (Runtime Closure)
+
+The v1.1 suite scores the state surface atomically: every case carries a
+state contract (which value must be current, which must be history, which
+must not be current) plus recall and answer tracks. It runs twice under
+identical conditions — `forced` (LLM extraction every turn) and
+`production` (the shipped throttle) — so the two can be compared.
+
+Measured at commit `7b81e3a` with dataset v1.2.0, extractor and answerer both
+DeepSeek-V4-Flash (temperature 0), 200 cases, manifest written per run:
+
+| | forced | production | gap |
+|---|---|---|---|
+| state | 0.925 (185/200) | 0.910 (182/200) | −0.015 |
+| recall | 0.900 (180/200) | 0.895 (179/200) | −0.005 |
+| answer | 0.830 (166/200) | 0.815 (163/200) | −0.015 |
+
+**Release gate: not met — two categories short.** state overall 0.925 ≥ 0.90
+passes; six of seven categories clear the 0.85 floor (contradiction 0.933,
+multi_value 0.967, replacement 0.967, round_trip 0.933, stale_state 0.950,
+temporal_event 0.967). preference_evolution 0.767 and answer 0.830 remain
+below. The forced/production gap (−0.015) is inside the ±0.05 allowance, so
+extraction throttling is not the bottleneck.
+
+The remaining preference_evolution failures are extraction-side: the
+withdrawal claim is filed under a differently-spelled or anonymised object
+("the activity", "fear_of_it", "manuscript" against "novel"), so nothing
+links it to the value it ends — the runtime-side rules that could close it
+are in place and tested. The answer track measures the answerer's quoting
+discipline (the contract wants the memory's surface wording), not engine
+state. Run-to-run variance on this provider is ±0.01 overall and ±0.03–0.05
+per category. See
+[docs/plans/2026-09-28-runtime-closure-pr4.md](docs/plans/2026-09-28-runtime-closure-pr4.md)
+and
+[docs/plans/2026-09-28-runtime-closure-pr4-followup.md](docs/plans/2026-09-28-runtime-closure-pr4-followup.md)
+for the failure taxonomy.
 
 ### Public benchmarks (historical)
 
@@ -260,7 +301,7 @@ See [docs/api-reference.md](docs/api-reference.md).
 ```bash
 pip install "mirror-memory[dev]"
 pytest tests/ -q
-# 956 passed in 13s
+# 1014 passed in 40s
 ```
 
 Runtime invariants (stale writes leave the database byte-identical, Publisher

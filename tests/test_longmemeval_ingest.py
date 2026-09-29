@@ -36,8 +36,9 @@ class CollidingLLM:
     This is the failure shape: the model is told the predicate and object but
     keys its claim on the predicate alone, so every new job, city, or hobby
     arrives under the same key.  ``profession`` is used because the shipped
-    policy declares it ``single``/``current_state`` -- that is what routes the
-    claim into ``update_belief_by_id``, the path that used to crash.
+    policy declares it ``single``/``current_state`` (it folds onto
+    ``works_as``) -- that is what routes the claim into
+    ``update_belief_by_id``, the path that used to crash.
     """
 
     def __init__(self):
@@ -67,8 +68,13 @@ class CollidingLLM:
 
 
 def _profession_rows(session):
-    """The beliefs belonging to the colliding single-cardinality chain."""
-    return [b for b in session.query(Belief).all() if b.predicate == "profession"]
+    """The beliefs belonging to the colliding single-cardinality chain.
+
+    ``profession`` folds onto ``works_as`` in the shipped synonym map (both
+    are the same single-valued slot), so the stored predicate is the
+    canonical one.
+    """
+    return [b for b in session.query(Belief).all() if b.predicate == "works_as"]
 
 
 class TestCollisionStorm:
@@ -142,7 +148,7 @@ class TestCollisionStorm:
 
 def _profession_rows_for(session, user_id):
     return [b for b in session.query(Belief).filter_by(user_id=user_id)
-            if b.predicate == "profession"]
+            if b.predicate == "works_as"]
 
 
 @pytest.mark.skipif(not ORACLE.exists(), reason="LongMemEval oracle not available")

@@ -265,11 +265,14 @@ class TestPolarityPropagation:
         )
         assert new.polarity == "neutral"
 
-    def test_revival_preserves_polarity(self, session):
-        """A revived historical row keeps the polarity it was stored with.
+    def test_returning_value_is_a_new_version_with_its_own_polarity(self, session):
+        """A -> B -> A appends a new version; each version carries its own polarity.
 
-        A -> B -> A: the third turn targets the superseded A row's key and
-        revives it, so the polarity stored on that row must survive.
+        Since the versioned ledger (PR3), the third turn no longer reopens
+        the superseded row — it appends a new version of the slot.  The
+        returning value's polarity comes from its own claim (a re-stated
+        positive preference is positive again), and both historical rows
+        stay closed.
         """
         from mirror_memory.core.repository import update_belief_by_id
 
@@ -285,14 +288,17 @@ class TestPolarityPropagation:
             session, a.id, new_object="tea",
             new_claim_text="User likes tea", new_confidence=0.8,
         )
-        # B -> A: name A's key so the revival branch finds and reopens it.
-        update_belief_by_id(
+        # B -> A: a new version of the slot, not a revival of the old row.
+        _old2, back = update_belief_by_id(
             session, b.id, new_key=a_key, new_object="coffee",
             new_claim_text="User likes coffee again", new_confidence=0.8,
+            polarity="positive",
         )
-        revived = session.get(Belief, a.id)
-        assert revived.status == "active"
-        assert revived.polarity == "positive"
+        assert back.status == "active"
+        assert back.polarity == "positive"
+        assert back.id != a.id
+        # Both historical rows stay closed.
+        assert session.get(Belief, a.id).status == "superseded"
         assert session.get(Belief, b.id).status == "superseded"
 
 

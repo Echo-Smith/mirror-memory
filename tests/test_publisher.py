@@ -108,7 +108,7 @@ class TestPublisherGates:
         revision = get_state_revision(db_session, "u1")
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_CREATE, user_id="u1", session_id="s1",
-            claimed_revision=revision,
+            expected_revision=revision,
             payload={"dimension": "topic", "key": "sleep", "claim_text": "x",
                      "confidence": 0.7},
         ))
@@ -133,7 +133,7 @@ class TestPublisherGates:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=1,  # the live revision has moved on
+            expected_revision=1,  # the live revision has moved on
             payload={"claim_text": "newer"},
         ))
         assert not decision.committed
@@ -149,7 +149,7 @@ class TestPublisherGates:
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=belief.id,
             evidence_ids=[foreign.id],
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert not decision.committed
         assert decision.reason == "evidence_authority_mismatch"
@@ -163,7 +163,7 @@ class TestPublisherGates:
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=belief.id,
             evidence_ids=[evidence.id],
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert decision.committed
 
@@ -171,6 +171,7 @@ class TestPublisherGates:
         set_memory_enabled(db_session, "u1", True)
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=9999,
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert not decision.committed
         assert decision.reason == "target_belief_missing"
@@ -184,6 +185,7 @@ class TestPublisherGates:
         )
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=other.id,
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert not decision.committed
         assert decision.reason == "target_belief_scope_mismatch"
@@ -196,6 +198,7 @@ class TestPublisherGates:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=belief.id,
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert not decision.committed
         assert decision.reason == "resurrection_guard"
@@ -212,6 +215,7 @@ class TestPublisherGates:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=belief.id,
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert not decision.committed
         assert decision.reason == "target_belief_superseded"
@@ -230,7 +234,7 @@ class TestPublisherCommits:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SUPPORT, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
             payload={"claim_text": "sleeps badly"},
         ))
         assert decision.committed
@@ -243,7 +247,7 @@ class TestPublisherCommits:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_UPDATE, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
             payload={"object": "beijing", "claim_text": "lives in Berlin",
                      "confidence": 0.8},
         ))
@@ -258,7 +262,7 @@ class TestPublisherCommits:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_CONTRADICT, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
             payload={"key": belief.key, "claim_text": "actually not"},
         ))
         assert decision.committed
@@ -271,7 +275,7 @@ class TestPublisherCommits:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_VERIFY, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert decision.committed
         assert belief.layer == "L2"
@@ -283,7 +287,7 @@ class TestPublisherCommits:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_CORRECT, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
             payload={"new_claim_text": "sleeps fine actually"},
         ))
         assert decision.committed
@@ -306,7 +310,7 @@ class TestPublisherCommits:
 
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_FORGET, user_id="u1", target_belief_id=belief.id,
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
         ))
         assert decision.committed
         assert db_session.query(Belief).count() == 0
@@ -315,7 +319,7 @@ class TestPublisherCommits:
         set_memory_enabled(db_session, "u1", True)
         decision = Publisher(db_session).publish(StateTransitionProposal(
             transition=TRANSITION_SYNTHESIZE, user_id="u1",
-            claimed_revision=get_state_revision(db_session, "u1"),
+            expected_revision=get_state_revision(db_session, "u1"),
             payload={"content": {"summary": "understood"}, "policy": {},
                      "watermark": "wm1"},
         ))
@@ -339,19 +343,19 @@ class TestRefusalIsANoop:
         refusals = [
             StateTransitionProposal(
                 transition=TRANSITION_SUPPORT, user_id="u1",
-                target_belief_id=belief.id, claimed_revision=1,
+                target_belief_id=belief.id, expected_revision=1,
             ),
             StateTransitionProposal(
                 transition=TRANSITION_UPDATE, user_id="u1",
-                target_belief_id=belief.id, claimed_revision=1,
+                target_belief_id=belief.id, expected_revision=1,
                 payload={"object": "beijing"},
             ),
             StateTransitionProposal(
                 transition=TRANSITION_FORGET, user_id="u1",
-                target_belief_id=belief.id, claimed_revision=1,
+                target_belief_id=belief.id, expected_revision=1,
             ),
             StateTransitionProposal(
-                transition=TRANSITION_SYNTHESIZE, user_id="u1", claimed_revision=1,
+                transition=TRANSITION_SYNTHESIZE, user_id="u1", expected_revision=1,
                 payload={"content": {"x": 1}},
             ),
         ]

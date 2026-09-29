@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "derived_from": "1.0.0",
   "case_count": 200,
   "language": "en",
@@ -8804,7 +8804,7 @@
             ],
             "surface_all": [],
             "surface_any": [
-              "do not speak Italian",
+              "not speak Italian",
               "cannot speak Italian"
             ],
             "polarity": "negative",
@@ -8832,7 +8832,7 @@
         "required_all": [],
         "required_any": [
           [
-            "do not speak Italian",
+            "not speak Italian",
             "cannot speak Italian"
           ]
         ],
@@ -8842,7 +8842,7 @@
         "required_all": [],
         "required_any": [
           [
-            "do not speak Italian",
+            "not speak Italian",
             "cannot speak Italian"
           ]
         ],
@@ -15389,5 +15389,6 @@
       ],
       "note": "The query must select the correct validity interval and exclude stale values."
     }
-  ]
+  ],
+  "revision_note": "1.2.0: contract phrase 'do not speak Italian' widened to 'not speak Italian' so it matches both 'do not' and 'does not' surfaces the extractor produces."
 }

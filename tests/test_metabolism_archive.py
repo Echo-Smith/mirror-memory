@@ -32,7 +32,6 @@ from mirror_memory.core.proposal import (
 from mirror_memory.core.publisher import Publisher
 from mirror_memory.core.repository import (
     delete_user_memories,
-    evidence_for_belief,
     forget_belief,
     get_state_revision,
     link_evidence,
@@ -46,7 +45,6 @@ from mirror_memory.metabolism.planner import (
     REASON_ARCHIVE_TOO_SOON,
     REASON_POLICY_NEVER_ARCHIVES,
     REASON_REHEAT,
-    REASON_SETTLED,
     decide_tier,
     run_metabolism,
 )
@@ -179,7 +177,7 @@ class TestArchiveCycle:
         assert belief.memory_tier == "archived"
 
     def test_archive_does_not_bump_state_revision(self, db_session, config):
-        belief = make_belief(db_session, "rev", days_idle=800)
+        make_belief(db_session, "rev", days_idle=800)
         before = get_state_revision(db_session, "u1")
         run_metabolism(db_session, "u1", config, now=NOW)
         assert get_state_revision(db_session, "u1") == before
@@ -203,7 +201,7 @@ class TestRestore:
                 transition=TRANSITION_TIER_TRANSITION,
                 user_id="u1",
                 target_belief_id=belief.id,
-                claimed_revision=get_state_revision(session, "u1"),
+                expected_revision=get_state_revision(session, "u1"),
                 payload={
                     "from_tier": "archived",
                     "to_tier": "warm",
@@ -326,7 +324,7 @@ class TestForget:
             transition=TRANSITION_SUPPORT,
             user_id="u1",
             target_belief_id=belief.id,
-            claimed_revision=revision,
+            expected_revision=revision,
             payload={"claim_text": "more support"},
         )
         forget_belief(db_session, "u1", belief.id)
@@ -344,7 +342,7 @@ class TestForget:
                 transition=TRANSITION_FORGET,
                 user_id="u1",
                 target_belief_id=belief.id,
-                claimed_revision=get_state_revision(db_session, "u1"),
+                expected_revision=get_state_revision(db_session, "u1"),
             )
         )
         assert decision.committed
@@ -395,7 +393,6 @@ class TestMigration:
     def test_legacy_database_raises_and_yields_sql(self):
         from sqlalchemy import (
             Column,
-            DateTime,
             Integer,
             MetaData,
             String,
@@ -443,7 +440,6 @@ class TestMigration:
         )
 
         from mirror_memory.core.migrate import check_schema, legacy_migration_sql
-        from mirror_memory.core.models import Base
 
         md = MetaData()
         Table(

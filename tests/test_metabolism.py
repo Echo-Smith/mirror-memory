@@ -18,27 +18,36 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
 from sqlalchemy import (
     Column as SAColumn,
+)
+from sqlalchemy import (
     DateTime as SADateTime,
+)
+from sqlalchemy import (
     Integer as SAInteger,
+)
+from sqlalchemy import (
     MetaData,
-    String as SAString,
     Table,
+    create_engine,
+)
+from sqlalchemy import (
+    String as SAString,
 )
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.models import Base
 from mirror_memory.core.repository import (
+    get_state_revision,
     mark_belief_accessed,
     recall_candidates,
     record_claim,
 )
 from mirror_memory.exceptions import ConfigError
 from mirror_memory.metabolism import (
-    DEFAULT_SCAN_TIERS,
     CURRENT_SCAN_TIERS,
+    DEFAULT_SCAN_TIERS,
     LEGAL_TIER_TRANSITIONS,
     TIER_ARCHIVED,
     TIER_DORMANT,
@@ -54,7 +63,6 @@ from mirror_memory.metabolism import (
     tier_eligible,
     tiers_for_mode,
 )
-
 
 # ---------------------------------------------------------------------------
 # Retention classification
@@ -420,6 +428,7 @@ class TestPublisherPassthrough:
             StateTransitionProposal(
                 transition=TRANSITION_CREATE,
                 user_id="u1",
+                expected_revision=get_state_revision(db_session, "u1"),
                 payload={
                     "dimension": "preference",
                     "key": "likes:cycling",
@@ -433,7 +442,7 @@ class TestPublisherPassthrough:
             )
         )
         assert decision.committed
-        belief = decision.detail  # unused; fetch directly
+        # Fetch the stored row directly; the decision carries only the id.
         from mirror_memory.core.repository import get_belief
 
         stored = get_belief(db_session, "u1", "likes:cycling")

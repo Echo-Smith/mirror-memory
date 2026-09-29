@@ -130,8 +130,16 @@ class TestKeyCollision:
         assert new.key != first.key or new.id != first.id
         assert session.query(Belief).filter_by(key=new.key).count() == 1
 
-    def test_revival_path_still_works_after_the_fix(self, session):
-        """Shanghai -> Berlin -> Shanghai must revive, not accumulate rows."""
+    def test_returning_value_appends_a_version(self, session):
+        """Shanghai -> Berlin -> Shanghai appends a row, keeps one active.
+
+        Since the versioned ledger (PR3) the third turn no longer reopens
+        the first Shanghai row: it appends a new version of the slot.  The
+        read model therefore holds three rows (one per stay) with exactly
+        one active, and no UNIQUE collision.  (The ledger's three-version
+        chain is asserted in tests/test_belief_ledger.py, which goes
+        through the Publisher — the only path that writes the ledger.)
+        """
         set_memory_enabled(session, "u1", True)
         shanghai, _ = record_claim(
             session, "u1", dimension="fact", key="lives_in:shanghai",
@@ -143,14 +151,17 @@ class TestKeyCollision:
             new_predicate="lives_in", new_object="beijing",
             new_claim_text="lives in Berlin", new_confidence=0.8, session_id="s2",
         )
-        _old2, revived = update_belief_by_id(
+        _old2, back = update_belief_by_id(
             session, beijing.id,
             new_predicate="lives_in", new_object="shanghai",
             new_claim_text="back in Shanghai", new_confidence=0.8, session_id="s3",
         )
-        assert revived.id == shanghai.id
-        assert revived.status == "active"
+        assert back.status == "active"
+        assert back.id != shanghai.id
+        # Exactly one current value for the slot, three rows of history.
         assert session.query(Belief).filter_by(status="active").count() == 1
+        assert session.query(Belief).count() == 3
+        assert shanghai.status == "superseded"
 
     def test_explicit_distinct_key_is_respected(self, session):
         """A caller-supplied key that is genuinely free is used as given."""

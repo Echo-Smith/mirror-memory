@@ -36,7 +36,6 @@ from mirror_memory.metabolism.planner import (
 )
 from mirror_memory.metabolism.protection import REASON_THIN_EVIDENCE
 
-
 NOW = datetime(2026, 9, 27, 2, 0, 0, tzinfo=UTC)
 
 
@@ -268,7 +267,7 @@ class TestRunMetabolism:
             transition=TRANSITION_TIER_TRANSITION,
             user_id="u1",
             target_belief_id=belief.id,
-            claimed_revision=revision,
+            expected_revision=revision,
             payload={"from_tier": "hot", "to_tier": "warm", "reason": "cooling", "score": 0.2},
         )
         decision = Publisher(db_session).publish(proposal)

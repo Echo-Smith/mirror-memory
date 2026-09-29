@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from mirror_memory.core.models import BeliefEvent, Evidence, EvidenceDigest
 from mirror_memory.core.proposal import (
     TRANSITION_EVIDENCE_COMPACT,
@@ -30,7 +28,6 @@ from mirror_memory.core.repository import (
 )
 from mirror_memory.metabolism.compact import (
     DEFAULT_KEEP_POLICY,
-    EvidenceGraphRow,
     build_digest_fields,
     clamp_policy,
     plan_compaction,
@@ -406,7 +403,7 @@ class TestReadSide:
         assert "13 observations" in summary["digest"]["summary"]
 
     def test_reobserving_a_folded_message_unfolds_it(self, db_session, config):
-        belief = seed_belief(db_session, "reheat", supports=13)
+        seed_belief(db_session, "reheat", supports=13)
         run_metabolism(db_session, "u1", config, now=NOW)
         folded = (
             db_session.query(Evidence)

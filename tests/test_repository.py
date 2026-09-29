@@ -257,11 +257,21 @@ class TestUpdateRevival:
     """Shanghai → Beijing → Shanghai: revive the superseded row."""
 
     def test_round_trip_no_unique_violation(self, db_session):
-        """Key collision regression: reviving a superseded key must not violate UNIQUE."""
+        """Key collision regression: a returning value must not violate UNIQUE.
+
+        Since the versioned ledger (PR3), returning to Shanghai appends a
+        NEW version of the slot rather than reviving the old row: the first
+        stay in Shanghai is history that must stay closed.  The read model
+        gets a disambiguated key for the new row, so no UNIQUE violation,
+        and the old rows keep their superseded status.
+        """
         set_memory_enabled(db_session, "u_revive", True)
 
         # Simulate pipeline: create Shanghai, then UPDATE to Beijing (superseded).
-        from mirror_memory.core.repository import update_belief_by_id
+        from mirror_memory.core.repository import (
+            belief_history,
+            update_belief_by_id,
+        )
 
         b1, _ = record_claim(
             db_session, "u_revive", dimension="fact", key="loc_shanghai",
@@ -277,7 +287,7 @@ class TestUpdateRevival:
         assert old.status == "superseded"
         assert b2.status == "active"
 
-        # Round trip: UPDATE back to Shanghai → should revive, not collide.
+        # Round trip: UPDATE back to Shanghai → a new version, not a revival.
         old2, new2 = update_belief_by_id(
             db_session, b2.id,  # Beijing is active
             new_key="loc_shanghai",
@@ -294,8 +304,11 @@ class TestUpdateRevival:
         assert new2.status == "active"
         assert old2.id == b2.id
         assert old2.status == "superseded"
-        # The original Shanghai row should be revived (same id).
-        assert new2.id == b1.id
+        # The first Shanghai row is NOT reopened — it stays superseded
+        # history, and the returning value is a new row with a distinct key.
+        assert new2.id != b1.id
+        assert b1.status == "superseded"
+        assert new2.key != b1.key
 
     def test_update_preserves_metadata(self, db_session):
         """UPDATE path should preserve value metadata (temporal, context_tags)."""
