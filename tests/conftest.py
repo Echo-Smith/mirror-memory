@@ -9,6 +9,21 @@ from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.core.models import Base
 
 
+@pytest.fixture(autouse=True)
+def _default_tenant_context():
+    """Test entry point: every test runs under the explicit default tenant.
+
+    Mirrors what a MemoryEngine constructor does in production.  Tests that
+    exercise other tenants wrap themselves in tenant_scope(); the
+    fail-closed test clears the context explicitly with no_tenant_scope().
+    """
+    from mirror_memory.core.tenancy import reset_tenant, set_tenant
+
+    token = set_tenant("default", "default")
+    yield
+    reset_tenant(token)
+
+
 @pytest.fixture
 def db_session():
     """In-memory SQLite session with all tables, rolled back after each test."""

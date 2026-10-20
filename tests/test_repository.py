@@ -696,13 +696,20 @@ class TestConcurrentStaleWrite:
 
         results = []
         def bump():
+            # Threads do not inherit the ambient tenant context; this raw
+            # session acts as its own entry point and must set one.
+            from mirror_memory.core.tenancy import reset_tenant, set_tenant
             from mirror_memory.core.repository import bump_state_revision as bsr
-            e = ce(f"sqlite:///{db_path}")
-            with SASession(e) as s:
-                r = bsr(s, "u_atomic")
-                s.commit()
-                results.append(r)
-            e.dispose()
+            token = set_tenant("default", "default")
+            try:
+                e = ce(f"sqlite:///{db_path}")
+                with SASession(e) as s:
+                    r = bsr(s, "u_atomic")
+                    s.commit()
+                    results.append(r)
+                e.dispose()
+            finally:
+                reset_tenant(token)
 
         threads = [threading.Thread(target=bump) for _ in range(10)]
         for t in threads:

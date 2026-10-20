@@ -10,8 +10,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from mirror_memory.core.tenancy import TenantScoped
 
 
 def utcnow() -> datetime:
@@ -30,12 +41,13 @@ class Base(DeclarativeBase):
 # ---------------------------------------------------------------------------
 
 
-class User(Base):
+class User(TenantScoped, Base):
     """Minimal user record.  Extend in your application layer as needed."""
 
     __tablename__ = "mm_users"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64))
     display_name: Mapped[str] = mapped_column(String(128), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -45,7 +57,7 @@ class User(Base):
 # ---------------------------------------------------------------------------
 
 
-class MemoryPreference(Base):
+class MemoryPreference(TenantScoped, Base):
     """User-owned switch for long-term memory.
 
     A missing row means *enabled* so existing accounts keep their current
@@ -54,15 +66,16 @@ class MemoryPreference(Base):
     """
 
     __tablename__ = "mm_memory_preferences"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "user_id"),)
 
-    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     state_revision: Mapped[int] = mapped_column(Integer, default=1)
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
-class ConsentGrant(Base):
+class ConsentGrant(TenantScoped, Base):
     """Feature-level consent grant (finer-grained than MemoryPreference).
 
     A missing row means the feature inherits the global MemoryPreference
@@ -71,9 +84,12 @@ class ConsentGrant(Base):
     """
 
     __tablename__ = "mm_consent_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "user_id", "feature"),
+    )
 
-    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    feature: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64))
+    feature: Mapped[str] = mapped_column(String(64))
     granted: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -83,7 +99,7 @@ class ConsentGrant(Base):
 # ---------------------------------------------------------------------------
 
 
-class Belief(Base):
+class Belief(TenantScoped, Base):
     """A single belief row -- the "current state" of one inferred claim.
 
     Full migration history lives in :class:`BeliefEvent` (append-only,
@@ -97,7 +113,12 @@ class Belief(Base):
     """
 
     __tablename__ = "mm_beliefs"
-    __table_args__ = (UniqueConstraint("user_id", "key", name="uq_mm_beliefs_user_key"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "app_id", "user_id", "key",
+            name="uq_mm_beliefs_user_key",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -182,7 +203,7 @@ class Belief(Base):
 # ---------------------------------------------------------------------------
 
 
-class Evidence(Base):
+class Evidence(TenantScoped, Base):
     """A first-class piece of provenance a belief was derived from.
 
     Before this table, a belief carried a bare list of message ids in
@@ -223,7 +244,12 @@ class Evidence(Base):
     # Which digest group folded this row (EvidenceDigest.id as string).
     compaction_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    __table_args__ = (UniqueConstraint("user_id", "ref", name="uq_mm_evidence_user_ref"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "app_id", "user_id", "ref",
+            name="uq_mm_evidence_user_ref",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +257,7 @@ class Evidence(Base):
 # ---------------------------------------------------------------------------
 
 
-class EvidenceDigest(Base):
+class EvidenceDigest(TenantScoped, Base):
     """The aggregate that survives evidence compaction.
 
     Fifty "I like coffee" messages are one fact with fifty observations.
@@ -274,7 +300,7 @@ class EvidenceDigest(Base):
 # ---------------------------------------------------------------------------
 
 
-class BeliefEvidenceLink(Base):
+class BeliefEvidenceLink(TenantScoped, Base):
     """A typed edge between a belief and one piece of evidence.
 
     The relation is what makes this more than a join table: the same evidence
@@ -283,6 +309,12 @@ class BeliefEvidenceLink(Base):
     message ids -- it owns the set of edges that point at it.
 
     relation values: ``support`` / ``contradict`` / ``verify`` / ``correct``.
+
+    Spike tenancy note: the table has no ``user_id`` of its own.  It carries
+    the tenant columns like every other table so ``with_loader_criteria``
+    filters it directly; its unique key stays ``(belief_id, evidence_id,
+    relation)``, which is tenant-safe because both id columns are globally
+    unique autoincrement values.
     """
 
     __tablename__ = "mm_belief_evidence_links"
@@ -304,7 +336,7 @@ class BeliefEvidenceLink(Base):
 # ---------------------------------------------------------------------------
 
 
-class BeliefEvent(Base):
+class BeliefEvent(TenantScoped, Base):
     """Append-only event log for a belief.
 
     event_type values: created / supported / contradicted / downgraded /
@@ -328,7 +360,7 @@ class BeliefEvent(Base):
 # ---------------------------------------------------------------------------
 
 
-class MemoryTransition(Base):
+class MemoryTransition(TenantScoped, Base):
     """Audit row for one committed storage-tier transition.
 
     Written only by the Publisher (via ``set_belief_tier``) when a
@@ -367,7 +399,7 @@ class MemoryTransition(Base):
 # ---------------------------------------------------------------------------
 
 
-class DeletionTombstone(Base):
+class DeletionTombstone(TenantScoped, Base):
     """The record that a deletion happened — deliberately content-free.
 
     A forget is a deletion *transaction*: the belief, its events, evidence
@@ -402,7 +434,7 @@ class DeletionTombstone(Base):
 # ---------------------------------------------------------------------------
 
 
-class ProposalLog(Base):
+class ProposalLog(TenantScoped, Base):
     """Append-only record of every *committed* proposal.
 
     Two jobs.  **Idempotency**: ``proposal_id`` is unique, so replaying a
@@ -445,7 +477,7 @@ class ProposalLog(Base):
 # ---------------------------------------------------------------------------
 
 
-class BeliefIdentity(Base):
+class BeliefIdentity(TenantScoped, Base):
     """The stable "slot" a line of beliefs is about.
 
     ``Belief`` conflates four things: the fact, the current state, the
@@ -475,13 +507,13 @@ class BeliefIdentity(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "user_id", "subject", "predicate", "slot_key",
+            "tenant_id", "app_id", "user_id", "subject", "predicate", "slot_key",
             name="uq_mm_belief_identity_slot",
         ),
     )
 
 
-class BeliefVersion(Base):
+class BeliefVersion(TenantScoped, Base):
     """One value a slot has held, with both clocks.
 
     Two intervals, deliberately separate:
@@ -529,7 +561,7 @@ class BeliefVersion(Base):
 # ---------------------------------------------------------------------------
 
 
-class ExtractionStats(Base):
+class ExtractionStats(TenantScoped, Base):
     """Per-extraction-call statistics (one row per call, including skips)."""
 
     __tablename__ = "mm_extraction_stats"
@@ -553,7 +585,7 @@ class ExtractionStats(Base):
 # ---------------------------------------------------------------------------
 
 
-class Snapshot(Base):
+class Snapshot(TenantScoped, Base):
     """Versioned snapshot of a user's structured understanding."""
 
     __tablename__ = "mm_snapshots"
@@ -574,16 +606,22 @@ class Snapshot(Base):
 # ---------------------------------------------------------------------------
 
 
-class EvolutionJob(Base):
+class EvolutionJob(TenantScoped, Base):
     """Async per-user synthesis job.  Idempotent, single-user mutex."""
 
     __tablename__ = "mm_evolution_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "app_id", "idempotency_key",
+            name="uq_mm_evolution_jobs_idempotency",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
-    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
     claimed_revision: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -598,7 +636,7 @@ class EvolutionJob(Base):
 # ---------------------------------------------------------------------------
 
 
-class SessionSummary(Base):
+class SessionSummary(TenantScoped, Base):
     """Per-session text summary for fallback retrieval.
 
     Structured beliefs capture "understanding the person"; session summaries
@@ -622,7 +660,7 @@ class SessionSummary(Base):
 # ---------------------------------------------------------------------------
 
 
-class InterventionEvent(Base):
+class InterventionEvent(TenantScoped, Base):
     """Intervention event for verification loop (question injection/answer).
 
     kind values: ``question_injected`` (a verification question was surfaced

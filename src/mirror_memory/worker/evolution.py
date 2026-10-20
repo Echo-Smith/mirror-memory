@@ -113,6 +113,12 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
 def process_pending(session_factory: object, config: MemoryConfig) -> None:
     """Process all pending evolution jobs.
 
+    Tenancy: the job queue is shared across tenants, so the crash-recovery
+    sweep, the queue scan, and the atomic claim run under the explicit
+    ``system_scope`` bypass (grep-able, queue-management only).  Each job is
+    then processed under its own row's tenant context, so every read and
+    write inside the pipeline is tenant-filtered like an API call would be.
+
     Parameters
     ----------
     session_factory:
@@ -120,48 +126,52 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
     config:
         The ``MemoryConfig``.
     """
+    from mirror_memory.core.tenancy import system_scope, tenant_scope
+
     session = session_factory() if callable(session_factory) else session_factory
 
     try:
-        # Crash recovery: expire stale running jobs.
-        lease_cutoff = datetime.now(UTC) - timedelta(seconds=config.worker.job_lease_seconds)
-        session.query(EvolutionJob).filter(
-            EvolutionJob.status == "running",
-            EvolutionJob.started_at < lease_cutoff,
-        ).update({"status": "pending"}, synchronize_session=False)
-        session.commit()
+        with system_scope():
+            # Crash recovery: expire stale running jobs.
+            lease_cutoff = datetime.now(UTC) - timedelta(seconds=config.worker.job_lease_seconds)
+            session.query(EvolutionJob).filter(
+                EvolutionJob.status == "running",
+                EvolutionJob.started_at < lease_cutoff,
+            ).update({"status": "pending"}, synchronize_session=False)
+            session.commit()
 
-        jobs = (
-            session.query(EvolutionJob)
-            .filter(EvolutionJob.status == "pending")
-            .order_by(EvolutionJob.created_at)
-            .limit(JOB_BATCH_LIMIT)
-            .all()
-        )
+            jobs = (
+                session.query(EvolutionJob)
+                .filter(EvolutionJob.status == "pending")
+                .order_by(EvolutionJob.created_at)
+                .limit(JOB_BATCH_LIMIT)
+                .all()
+            )
         if not jobs:
             return
 
         for job in jobs:
-            # Atomic claim: only pending jobs can be claimed.
-            updated = (
-                session.query(EvolutionJob)
-                .filter(
-                    EvolutionJob.id == job.id,
-                    EvolutionJob.status == "pending",
+            with tenant_scope(job.tenant_id, job.app_id):
+                # Atomic claim: only pending jobs can be claimed.
+                updated = (
+                    session.query(EvolutionJob)
+                    .filter(
+                        EvolutionJob.id == job.id,
+                        EvolutionJob.status == "pending",
+                    )
+                    .update(
+                        {
+                            EvolutionJob.status: "running",
+                            EvolutionJob.started_at: datetime.now(UTC),
+                            EvolutionJob.attempt_count: EvolutionJob.attempt_count + 1,
+                        },
+                        synchronize_session=False,
+                    )
                 )
-                .update(
-                    {
-                        EvolutionJob.status: "running",
-                        EvolutionJob.started_at: datetime.now(UTC),
-                        EvolutionJob.attempt_count: EvolutionJob.attempt_count + 1,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            session.commit()
-            if updated == 0:
-                continue  # claimed by another instance
-            _process_single_job(session, job, config)
+                session.commit()
+                if updated == 0:
+                    continue  # claimed by another instance
+                _process_single_job(session, job, config)
     finally:
         session.close()
 
