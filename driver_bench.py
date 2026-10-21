@@ -69,6 +69,21 @@ def iteration(s):
     s.get(Belief, SOME_ID)
 
 
+def big_iteration(s):
+    """Large-statement workload: full-scan selects like the metabolism
+    planner and the recall renderer run."""
+    list(s.query(Belief).filter(Belief.user_id == USER, Belief.status == "active").all())
+    s.query(Belief).filter(
+        Belief.user_id == USER,
+        Belief.status.in_(("active", "superseded")),
+        Belief.memory_tier.in_(("hot", "warm", "dormant")),
+        Belief.key.notin_([f"k{i}" for i in range(20)]),
+        Belief.claim_text.like("%claim%"),
+    ).all()
+    s.query(Belief).filter(Belief.user_id == USER).count()
+    list(s.query(Belief.id).filter(Belief.user_id == USER))
+
+
 _orig_listener = None
 
 
@@ -128,7 +143,7 @@ def _install_orig_listener():
     event.listen(Session, "do_orm_execute", orig_inject)
 
 
-def bench_round(mode, n_iter=60):
+def bench_round(mode, n_iter=60, workload=iteration):
     if mode == "noinject":
         _remove_inject()
         Session.get = ten._tenant_aware_get
@@ -143,22 +158,26 @@ def bench_round(mode, n_iter=60):
         s = factory()
         try:
             for _ in range(n_iter):
-                iteration(s)
+                workload(s)
         finally:
             s.close()
     return time.perf_counter() - t0
 
 
-results = {"noinject": [], "fixed": [], "orig": []}
-bench_round("fixed", 10)  # warm-up
-for cycle in range(7):
-    for mode in ("noinject", "fixed", "orig"):
-        results[mode].append(bench_round(mode))
+def run_suite(label, workload, n_iter):
+    results = {"noinject": [], "fixed": [], "orig": []}
+    bench_round("fixed", 10, workload)  # warm-up
+    for cycle in range(7):
+        for mode in ("noinject", "fixed", "orig"):
+            results[mode].append(bench_round(mode, n_iter, workload))
+    med = {m: statistics.median(v) for m, v in results.items()}
+    print(f"--- {label} (median over 7 interleaved cycles) ---")
+    for m in ("noinject", "fixed", "orig"):
+        print(f"  {m:9s} {med[m] * 1000:8.1f} ms   runs={[round(r * 1000) for r in results[m]]}")
+    print(f"  fixed vs noinject : {100 * (med['fixed'] / med['noinject'] - 1):+.1f}%")
+    print(f"  orig   vs noinject: {100 * (med['orig'] / med['noinject'] - 1):+.1f}%")
+    print(f"  fixed vs orig     : {100 * (med['fixed'] / med['orig'] - 1):+.1f}%")
 
-med = {m: statistics.median(v) for m, v in results.items()}
-print("median per 60 iterations (lower is better):")
-for m in ("noinject", "fixed", "orig"):
-    print(f"  {m:9s} {med[m] * 1000:8.1f} ms   runs={[round(r * 1000) for r in results[m]]}")
-print(f"fixed vs noinject (read-hook cost floor) : {100 * (med['fixed'] / med['noinject'] - 1):+.1f}%")
-print(f"orig   vs noinject                       : {100 * (med['orig'] / med['noinject'] - 1):+.1f}%")
-print(f"fixed vs orig   (improvement)            : {100 * (med['fixed'] / med['orig'] - 1):+.1f}%")
+
+run_suite("mixed read/write (60 iters)", iteration, 60)
+run_suite("large statements (120 iters)", big_iteration, 120)
