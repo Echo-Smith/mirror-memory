@@ -139,6 +139,65 @@ class TenantScoped:
 # ---------------------------------------------------------------------------
 
 
+#: Loader criteria options cached per tenant.  Building the option (and its
+#: criteria lambda) is the per-statement cost of the hook; reusing one
+#: option object per (tenant_id, app_id) keeps every statement execution on
+#: SQLAlchemy's compiled-cache fast path instead of re-analysing a fresh
+#: closure each time.  Tenants are few and bounded; the cap is a guard
+#: against pathological key churn, not a working-set limit.
+_option_cache: dict[tuple[str, str], object] = {}
+_OPTION_CACHE_CAP = 1024
+
+
+def _tenant_loader_option(tenant: tuple[str, str]):
+    option = _option_cache.get(tenant)
+    if option is None:
+        tenant_id, app_id = tenant
+        option = with_loader_criteria(
+            TenantScoped,
+            lambda cls: (cls.tenant_id == tenant_id) & (cls.app_id == app_id),
+            include_aliases=True,
+        )
+        if len(_option_cache) >= _OPTION_CACHE_CAP:
+            _option_cache.clear()
+        _option_cache[tenant] = option
+    return option
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _inject_tenant_criteria(state) -> None:
+    # Column/relationship loads serve an already-validated persistent object;
+    # the owning statement was filtered when it ran.
+    if state.is_column_load or state.is_relationship_load:
+        return
+    if not state.is_orm_statement:
+        return  # text()/Core statements have no entities to attach to
+    if not (state.is_select or state.is_update or state.is_delete):
+        return
+    if in_system_scope():
+        return
+    tenant = _tenant_var.get()
+    if tenant is not None:
+        # Fast path: statements are filtered by attaching the tenant's
+        # cached loader criteria.  The criteria only binds to TenantScoped
+        # entities, so statements over other tables are unaffected, and it
+        # reaches entities inside subqueries too (Query.count()).
+        state.statement = state.statement.options(_tenant_loader_option(tenant))
+        return
+    # Fail-closed decision path (no tenant context): only statements that
+    # actually touch tenant tables must raise; the rest pass through.
+    if _statement_mappers(state):
+        raise TenantContextError(_NO_CONTEXT_MSG)
+    if _statement_touches_tenant_table(state.statement):
+        raise TenantContextError(_NO_CONTEXT_MSG)
+
+
+_NO_CONTEXT_MSG = (
+    "no tenant context: set one with tenant_scope()/set_tenant() "
+    "at the entry point before touching tenant-scoped tables"
+)
+
+
 def _statement_mappers(state) -> list[type]:
     mappers = []
     for mapper in getattr(state, "all_mappers", ()) or ():
@@ -166,7 +225,8 @@ def _statement_touches_tenant_table(statement) -> bool:
 
     Needed because aggregate wrappers such as ``Query.count()`` produce a
     column-only top-level SELECT whose ``all_mappers`` is empty while the
-    tenant entity hides in the subquery.
+    tenant entity hides in the subquery.  Only consulted on the
+    fail-closed path (no ambient tenant), never on the fast path.
     """
     tables = _tenant_table_set()
     if not tables:
@@ -181,83 +241,69 @@ def _statement_touches_tenant_table(statement) -> bool:
     return bool(found)
 
 
-def _is_tenant_statement(state) -> bool:
-    if _statement_mappers(state):
-        return True
-    return _statement_touches_tenant_table(state.statement)
-
-
-@event.listens_for(Session, "do_orm_execute")
-def _inject_tenant_criteria(state) -> None:
-    # Column/relationship loads serve an already-validated persistent object;
-    # the owning statement was filtered when it ran.
-    if state.is_column_load or state.is_relationship_load:
-        return
-    if not _is_tenant_statement(state):
-        return
-    if in_system_scope():
-        return
-    tenant_id, app_id = current_tenant()
-    if not (state.is_select or state.is_update or state.is_delete):
-        return
-    # The closure captures the tenant values themselves: lambda-SQL tracks
-    # closure scalar values as part of its cache key, so a different tenant
-    # compiles a different cached statement -- no cross-tenant cache bleed.
-    state.statement = state.statement.options(
-        with_loader_criteria(
-            TenantScoped,
-            lambda cls: (cls.tenant_id == tenant_id) & (cls.app_id == app_id),
-            include_aliases=True,
-        )
-    )
-
-
 # ---------------------------------------------------------------------------
 # Write path: fill and validate tenant columns at flush
 # ---------------------------------------------------------------------------
 
 
+_tenant_classes: frozenset | None = None
+
+
+def _tenant_class_set() -> frozenset:
+    """Concrete TenantScoped classes, for hash-based type checks in flush."""
+    global _tenant_classes
+    if _tenant_classes is None:
+        classes = set()
+        stack = list(TenantScoped.__subclasses__())
+        while stack:
+            cls = stack.pop()
+            classes.add(cls)
+            stack.extend(cls.__subclasses__())
+        _tenant_classes = frozenset(classes)
+    return _tenant_classes
+
+
 @event.listens_for(Session, "before_flush")
 def _enforce_tenant_on_flush(session, flush_context, instances) -> None:
-    pending = [
-        obj
-        for collection in (session.new, session.dirty, session.deleted)
-        for obj in collection
-        if isinstance(obj, TenantScoped)
-    ]
-    if not pending or in_system_scope():
+    if in_system_scope():
         return
-    tenant_id, app_id = current_tenant()
+    new, dirty, deleted = session.new, session.dirty, session.deleted
+    if not (new or dirty or deleted):
+        return
+    classes = _tenant_class_set()
+    tenant = _tenant_var.get()
+    if tenant is None:
+        # Fail-closed: refuse to flush tenant rows without a context.
+        for collection in (new, dirty, deleted):
+            for obj in collection:
+                if obj.__class__ in classes:
+                    raise TenantContextError(_NO_CONTEXT_MSG)
+        return
+    tenant_id, app_id = tenant
 
-    for obj in session.new:
-        if not isinstance(obj, TenantScoped):
+    for obj in new:
+        if obj.__class__ not in classes:
             continue
         if obj.tenant_id is None and obj.app_id is None:
             obj.tenant_id = tenant_id
             obj.app_id = app_id
-        elif (obj.tenant_id, obj.app_id) != (tenant_id, app_id):
+        elif (obj.tenant_id, obj.app_id) != tenant:
             raise TenantMismatchError(
                 f"new {type(obj).__name__} carries tenant "
                 f"({obj.tenant_id!r}, {obj.app_id!r}) but context is "
                 f"({tenant_id!r}, {app_id!r})"
             )
 
-    for obj in session.dirty:
-        if isinstance(obj, TenantScoped) and (obj.tenant_id, obj.app_id) != (
-            tenant_id,
-            app_id,
-        ):
+    for obj in dirty:
+        if obj.__class__ in classes and (obj.tenant_id, obj.app_id) != tenant:
             raise TenantMismatchError(
                 f"modified {type(obj).__name__} belongs to tenant "
                 f"({obj.tenant_id!r}, {obj.app_id!r}) but context is "
                 f"({tenant_id!r}, {app_id!r})"
             )
 
-    for obj in session.deleted:
-        if isinstance(obj, TenantScoped) and (obj.tenant_id, obj.app_id) != (
-            tenant_id,
-            app_id,
-        ):
+    for obj in deleted:
+        if obj.__class__ in classes and (obj.tenant_id, obj.app_id) != tenant:
             raise TenantMismatchError(
                 f"deleted {type(obj).__name__} belongs to tenant "
                 f"({obj.tenant_id!r}, {obj.app_id!r}) but context is "
@@ -278,9 +324,7 @@ def _tenant_aware_get(self, entity, primary_key, *args, **kwargs):
     if in_system_scope():
         return _original_get(self, entity, primary_key, *args, **kwargs)
 
-    from sqlalchemy import inspect as sa_inspect
-
-    mapper = sa_inspect(entity)
+    mapper = entity.__mapper__
     pk_cols = mapper.primary_key
 
     pk = primary_key if isinstance(primary_key, tuple) else (primary_key,)
