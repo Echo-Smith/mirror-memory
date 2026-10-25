@@ -9,6 +9,14 @@ from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.core.models import Base
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "no_write_fixture_scope: run WITHOUT the blanket test write scope "
+        "(used by the write-guard canary tests)",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _default_tenant_context():
     """Test entry point: every test runs under the explicit default tenant.
@@ -20,6 +28,27 @@ def _default_tenant_context():
     from mirror_memory.core.tenancy import tenant_scope
 
     with tenant_scope("default", "default"):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _test_write_scope(request):
+    """Blanket fixture write scope for test bodies (task 2 design note).
+
+    Test bodies seed data constantly; requiring ~140 per-site
+    fixture_write_scope wraps would bury the meaningful ones in noise.
+    Instead: every test runs inside fixture_write_scope("test body"), and
+    the guard's real teeth are proven by the canary tests marked
+    @pytest.mark.no_write_fixture_scope, which run WITHOUT the blanket
+    scope and assert that direct writes to each classified table raise.
+    Engine code keeps the guard in production (no scope active there).
+    """
+    if request.node.get_closest_marker("no_write_fixture_scope"):
+        yield
+        return
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope("test body (blanket; canaries opt out)"):
         yield
 
 

@@ -51,41 +51,44 @@ def persist_snapshot(
     Snapshot
         The newly created snapshot row.
     """
-    # Compute new version number.
-    latest = (
-        session.query(Snapshot)
-        .filter(Snapshot.user_id == user_id)
-        .order_by(Snapshot.version.desc())
-        .limit(1)
-        .first()
-    )
-    new_version = (latest.version + 1) if latest else 1
+    from mirror_memory.core.tenancy import engine_write_scope
 
-    # Retire old active/shadow snapshots.
-    session.query(Snapshot).filter(
-        Snapshot.user_id == user_id,
-        Snapshot.status.in_(("active", "shadow")),
-    ).update({"status": "retired"}, synchronize_session=False)
+    with engine_write_scope():
+        # Compute new version number.
+        latest = (
+            session.query(Snapshot)
+            .filter(Snapshot.user_id == user_id)
+            .order_by(Snapshot.version.desc())
+            .limit(1)
+            .first()
+        )
+        new_version = (latest.version + 1) if latest else 1
 
-    snapshot = Snapshot(
-        id=uuid.uuid4().hex[:16],
-        user_id=user_id,
-        version=new_version,
-        status="shadow" if shadow else "active",
-        content_json=json.dumps(content, ensure_ascii=False),
-        support_policy_json=json.dumps(policy, ensure_ascii=False),
-        evidence_watermark=watermark,
-        prompt_version="v1",
-    )
-    session.add(snapshot)
-    session.flush()
-    logger.info(
-        "snapshot: persisted user=%s version=%d status=%s",
-        truncate_id(user_id),
-        new_version,
-        snapshot.status,
-    )
-    return snapshot
+        # Retire old active/shadow snapshots.
+        session.query(Snapshot).filter(
+            Snapshot.user_id == user_id,
+            Snapshot.status.in_(("active", "shadow")),
+        ).update({"status": "retired"}, synchronize_session=False)
+
+        snapshot = Snapshot(
+            id=uuid.uuid4().hex[:16],
+            user_id=user_id,
+            version=new_version,
+            status="shadow" if shadow else "active",
+            content_json=json.dumps(content, ensure_ascii=False),
+            support_policy_json=json.dumps(policy, ensure_ascii=False),
+            evidence_watermark=watermark,
+            prompt_version="v1",
+        )
+        session.add(snapshot)
+        session.flush()
+        logger.info(
+            "snapshot: persisted user=%s version=%d status=%s",
+            truncate_id(user_id),
+            new_version,
+            snapshot.status,
+        )
+        return snapshot
 
 
 def promote_shadow_if_ready(session: object, user_id: str) -> bool:

@@ -1,22 +1,41 @@
-"""M1 patch -- whitelist write-guard tests."""
+"""M1 batch-2 task 2 -- whitelist write guard, classified tables.
+
+Canary suite: every test here runs WITHOUT the blanket test write scope
+(@pytest.mark.no_write_fixture_scope), so the guard's teeth are proven
+directly:
+
+- each write class has a counterexample: writing a table of that class
+  outside its sanctioned scope raises
+- the correct scope allows the write
+- a table missing from the classification mapping is refused (new tables
+  must be classified first)
+- an out-of-tree plugin module writing a protected table is intercepted
+- engine-scoped Publisher paths keep working (confirm_rate proposal)
+"""
 
 from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from mirror_memory.core.models import Base, Belief, BeliefEvent, ProposalLog
+from mirror_memory.core.models import Base, Belief, BeliefEvent, EvolutionJob
 from mirror_memory.core.repository import record_claim, set_memory_enabled
 from mirror_memory.core.tenancy import (
+    TABLE_WRITE_CLASSES,
     WriteGuardViolation,
+    consent_write_scope,
+    engine_write_scope,
     fixture_write_scope,
+    queue_write_scope,
+    telemetry_write_scope,
     tenant_scope,
 )
+
+pytestmark = pytest.mark.no_write_fixture_scope
 
 
 def session_at(url):
@@ -25,21 +44,91 @@ def session_at(url):
     return sessionmaker(bind=engine)
 
 
-def test_direct_belief_write_is_refused(tmp_path):
-    factory = session_at(f"sqlite:///{tmp_path}/guard.db")
+# ---------------------------------------------------------------------------
+# Classification completeness: mapping is the single source of truth
+# ---------------------------------------------------------------------------
+
+
+def test_every_tenant_table_is_classified():
+    from mirror_memory.core.models import Base
+    from mirror_memory.core.tenancy import _iter_tenant_classes
+
+    tables = {cls.__tablename__ for cls in _iter_tenant_classes() if hasattr(cls, "__tablename__")}
+    unclassified = tables - set(TABLE_WRITE_CLASSES)
+    assert not unclassified, (
+        f"new tenant table(s) {sorted(unclassified)} lack a write class; "
+        "add them to TABLE_WRITE_CLASSES before writing code against them"
+    )
+    ghosts = set(TABLE_WRITE_CLASSES) - tables
+    assert not ghosts, f"TABLE_WRITE_CLASSES names unknown tables: {sorted(ghosts)}"
+
+
+def test_mapping_covers_exactly_the_tenant_tables():
+    from mirror_memory.core.models import Base
+
+    assert len(TABLE_WRITE_CLASSES) == len(Base.metadata.tables) == 18
+
+
+# ---------------------------------------------------------------------------
+# Per-class counterexamples (wrong scope -> refused; right scope -> allowed)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_class_wrong_scope_refused(tmp_path):
+    factory = session_at(f"sqlite:///{tmp_path}/e.db")
     with tenant_scope("default", "default"):
         s = factory()
-        try:
-            with pytest.raises(WriteGuardViolation):
-                s.add(Belief(user_id="u1", dimension="d", key="k", claim_text="x"))
-                s.commit()
-        finally:
-            s.rollback()
-            s.close()
+        with pytest.raises(WriteGuardViolation):
+            s.add(Belief(user_id="u1", dimension="d", key="k", claim_text="x"))
+        # the right scope allows it
+        with engine_write_scope():
+            s.add(Belief(user_id="u1", dimension="d", key="k2", claim_text="ok"))
+        s.rollback()
+        s.close()
+
+
+def test_queue_class_wrong_scope_refused(tmp_path):
+    factory = session_at(f"sqlite:///{tmp_path}/q.db")
+    with tenant_scope("default", "default"):
+        s = factory()
+        with pytest.raises(WriteGuardViolation):
+            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik"))
+        with queue_write_scope():
+            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2"))
+        s.rollback()
+        s.close()
+
+
+def test_consent_class_wrong_scope_refused(tmp_path):
+    from mirror_memory.core.models import MemoryPreference
+
+    factory = session_at(f"sqlite:///{tmp_path}/c.db")
+    with tenant_scope("default", "default"):
+        s = factory()
+        with pytest.raises(WriteGuardViolation):
+            s.add(MemoryPreference(user_id="u1", enabled=False))
+        with consent_write_scope():
+            s.add(MemoryPreference(user_id="u1", enabled=False))
+        s.rollback()
+        s.close()
+
+
+def test_telemetry_class_wrong_scope_refused(tmp_path):
+    from mirror_memory.core.models import ExtractionStats
+
+    factory = session_at(f"sqlite:///{tmp_path}/t.db")
+    with tenant_scope("default", "default"):
+        s = factory()
+        with pytest.raises(WriteGuardViolation):
+            s.add(ExtractionStats(user_id="u1", trigger="test"))
+        with telemetry_write_scope():
+            s.add(ExtractionStats(user_id="u1", trigger="test"))
+        s.rollback()
+        s.close()
 
 
 def test_direct_event_write_is_refused(tmp_path):
-    factory = session_at(f"sqlite:///{tmp_path}/guard2.db")
+    factory = session_at(f"sqlite:///{tmp_path}/g2.db")
     with tenant_scope("default", "default"):
         s = factory()
         try:
@@ -51,11 +140,12 @@ def test_direct_event_write_is_refused(tmp_path):
             s.close()
 
 
+# ---------------------------------------------------------------------------
+# Out-of-tree plugin bypass (evaluation counterexample from batch 1)
+# ---------------------------------------------------------------------------
+
+
 def test_non_engine_module_write_is_refused(tmp_path):
-    """The evaluation's counterexample: a module OUTSIDE the engine tree
-    (a future server / script / plugin) writes a belief row directly.
-    The whitelist guard has no source-path exemption, so it must be
-    intercepted regardless of where the writing code lives."""
     mod_dir = tmp_path / "some_plugin_pkg"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
@@ -70,7 +160,7 @@ def test_non_engine_module_write_is_refused(tmp_path):
     try:
         import some_plugin_pkg.writer as plugin  # noqa: E402
 
-        factory = session_at(f"sqlite:///{tmp_path}/guard3.db")
+        factory = session_at(f"sqlite:///{tmp_path}/g3.db")
         with tenant_scope("default", "default"):
             s = factory()
             try:
@@ -85,16 +175,20 @@ def test_non_engine_module_write_is_refused(tmp_path):
         sys.modules.pop("some_plugin_pkg", None)
 
 
-def test_fixture_scope_allows_seeding(tmp_path):
+# ---------------------------------------------------------------------------
+# Sanctioned entries still work under the canary (no blanket scope)
+# ---------------------------------------------------------------------------
+
+
+def test_sanctioned_entries_still_write(tmp_path):
     factory = session_at(f"sqlite:///{tmp_path}/ok.db")
     with tenant_scope("default", "default"):
         s = factory()
-        set_memory_enabled(s, "u1", True)
+        set_memory_enabled(s, "u1", True)  # consent-decorated
         s.commit()
-        with fixture_write_scope("test seeding"):
-            belief, event_type = record_claim(
-                s, "u1", dimension="topic", key="k", claim_text="c", confidence=0.8,
-            )
+        belief, event_type = record_claim(  # engine-decorated
+            s, "u1", dimension="topic", key="k", claim_text="c", confidence=0.8,
+        )
         s.commit()
         assert belief is not None and event_type == "created"
         assert s.query(Belief).count() == 1
@@ -119,6 +213,8 @@ def test_confirm_rate_goes_through_proposal_log(tmp_path):
         revision_before = get_state_revision(s, "u1")
 
         assert _update_confirm_rate(s, "u1", belief.id, "confirm", None)
+
+        from mirror_memory.core.models import ProposalLog
 
         logs = s.query(ProposalLog).filter(
             ProposalLog.transition == "CONFIRM_RATE"

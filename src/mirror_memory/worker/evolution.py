@@ -112,16 +112,19 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         session.refresh(stale)
         return stale
 
-    job = EvolutionJob(
-        id=uuid.uuid4().hex[:16],
-        user_id=user_id,
-        evidence_watermark=json.dumps({"latest_update": watermark}),
-        prompt_version=config.worker.prompt_version,
-        idempotency_key=idempotency_key,
-        status="pending",
-    )
-    session.add(job)
-    session.commit()
+    from mirror_memory.core.tenancy import queue_write_scope
+
+    with queue_write_scope():
+        job = EvolutionJob(
+            id=uuid.uuid4().hex[:16],
+            user_id=user_id,
+            evidence_watermark=json.dumps({"latest_update": watermark}),
+            prompt_version=config.worker.prompt_version,
+            idempotency_key=idempotency_key,
+            status="pending",
+        )
+        session.add(job)
+        session.commit()
     return job
 
 

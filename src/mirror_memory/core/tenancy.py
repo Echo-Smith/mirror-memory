@@ -70,7 +70,7 @@ class TenantMismatchError(TenantError):
 
 _tenant_var: ContextVar[tuple[str, str] | None] = ContextVar("mm_tenant", default=None)
 _system_var: ContextVar[tuple[bool, str] | None] = ContextVar("mm_system", default=None)
-_write_guard_var: ContextVar[bool] = ContextVar("mm_write_guard", default=False)
+_write_class_var: ContextVar[str | None] = ContextVar("mm_write_class", default=None)
 _fixture_reason_var: ContextVar[str | None] = ContextVar("mm_fixture_reason", default=None)
 
 #: Name ``session.info`` holds the tenant bound at creation time.
@@ -188,10 +188,10 @@ def system_reason() -> str | None:
 
 
 def in_sanctioned_write() -> bool:
-    """True inside Publisher.publish / repository.record_claim (the
-    sanctioned writers of belief truth-state rows).  The SQL auditor uses
-    this to scope its identity-keyed exemption for UPDATE/DELETE."""
-    return _write_guard_var.get()
+    """True inside any sanctioned write scope (Publisher/claim mutators,
+    queue, consent, telemetry, fixture).  The SQL auditor uses this to
+    scope its identity-keyed exemption for UPDATE/DELETE."""
+    return _write_class_var.get() is not None
 
 
 @contextlib.contextmanager
@@ -453,7 +453,11 @@ def _enforce_tenant_on_flush(session, flush_context, instances) -> None:
         if obj.__class__ not in classes:
             continue
         if obj.tenant_id is None and obj.app_id is None:
-            obj.tenant_id, obj.app_id = tenant
+            # The auto-fill sets guarded columns; open the object's own
+            # write class for the assignment (the write itself was already
+            # sanctioned -- or refused -- where it was authored).
+            with _class_write_scope(_write_class_for(obj.__tablename__) or "engine"):
+                obj.tenant_id, obj.app_id = tenant
         elif (obj.tenant_id, obj.app_id) != tenant:
             raise TenantMismatchError(
                 f"new {type(obj).__name__} carries tenant "
@@ -574,58 +578,113 @@ install_session_hooks()
 
 
 # ---------------------------------------------------------------------------
-# Write guard (M1 task 4 + patch): WHITELIST -- belief truth-state rows are
-# only written through the Publisher / the repository's sanctioned mutators
-# (engine_write_scope) or explicit test seeding (fixture_write_scope).
+# Write guard (M1 task 4 + patch + batch-2 task 2): WHITELIST with a
+# per-table-class mapping as the single source of truth.
+#
+# Every tenant table belongs to exactly one write class; the class names
+# the sanctioned writer scope.  A new TenantScoped table that is not in
+# the mapping fails the classification test (and any write to it raises),
+# so "who may write this table" can never again be an unwritten
+# convention.
 # ---------------------------------------------------------------------------
 
 
 class WriteGuardViolation(AssertionError):
-    """A protected belief-class table was written outside a sanctioned entry."""
+    """A protected table was written outside its sanctioned entry."""
+
+
+#: table name -> write class.  Single source of truth; see
+#: docs/tenancy-context.md "表写入分类" for the rationale per class.
+TABLE_WRITE_CLASSES: dict[str, str] = {
+    # engine: memory content -- owned by the Publisher (and the
+    # repository's sanctioned claim mutators it delegates to)
+    "mm_beliefs": "engine",
+    "mm_belief_events": "engine",
+    "mm_evidence": "engine",
+    "mm_evidence_digests": "engine",
+    "mm_belief_evidence_links": "engine",
+    "mm_belief_identities": "engine",
+    "mm_belief_versions": "engine",
+    "mm_snapshots": "engine",
+    "mm_memory_transitions": "engine",
+    "mm_deletion_tombstones": "engine",
+    "mm_proposal_log": "engine",
+    # queue: the shared job queue -- worker claim/complete/recycle paths
+    "mm_evolution_jobs": "queue",
+    # consent: authorization & runtime configuration switches
+    "mm_memory_preferences": "consent",
+    "mm_consent_grants": "consent",
+    "mm_users": "consent",
+    # telemetry: append-only operational records with named writer entries
+    "mm_extraction_stats": "telemetry",
+    "mm_session_summaries": "telemetry",
+    "mm_intervention_events": "telemetry",
+}
+
+_WRITE_SCOPE_CLASS: dict[str, str] = {
+    "engine": "engine",
+    "queue": "queue",
+    "consent": "consent",
+    "telemetry": "telemetry",
+    "fixture": "fixture",  # test seeding: matches every class
+}
+
+
+def _write_class_for(table: str) -> str | None:
+    return TABLE_WRITE_CLASSES.get(table)
 
 
 @contextlib.contextmanager
-def engine_write_scope() -> Iterator[None]:
-    """Marks the block as a sanctioned engine write (whitelist context).
-
-    Entered by ``Publisher.publish`` and the repository's sanctioned
-    belief mutators.  Production code must not use it directly; test
-    seeding uses :func:`fixture_write_scope`.
-    """
-    token = _write_guard_var.set(True)
+def _class_write_scope(write_class: str, reason: str | None = None) -> Iterator[None]:
+    token = _write_class_var.set(write_class)
+    prev_reason = _fixture_reason_var.set(reason) if reason else None
     try:
         yield
     finally:
-        _write_guard_var.reset(token)
+        if reason and prev_reason is not None:
+            _fixture_reason_var.reset(prev_reason)
+        _write_class_var.reset(token)
+
+
+def engine_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *memory-content* writer scope (Publisher + the
+    repository's sanctioned claim mutators).  Production code must not
+    enter this directly; test seeding uses :func:`fixture_write_scope`."""
+    return _class_write_scope("engine")
 
 
 #: Historical alias.
 publisher_write_scope = engine_write_scope
 
 
-@contextlib.contextmanager
-def fixture_write_scope(reason: str) -> Iterator[None]:
-    """Test-fixture seeding scope for the protected belief tables.
+def queue_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *job-queue* writer scope (worker claim/complete/recycle,
+    enqueue)."""
+    return _class_write_scope("queue")
+
+
+def consent_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *authorization/configuration* writer scope (memory
+    preference toggles, consent grants, user records)."""
+    return _class_write_scope("consent")
+
+
+def telemetry_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *telemetry* writer scope (extraction stats, session
+    summaries, intervention events)."""
+    return _class_write_scope("telemetry")
+
+
+def fixture_write_scope(reason: str) -> contextlib.AbstractContextManager[None]:
+    """Test-fixture seeding scope: grants writes to every class.
 
     Explicit (never blanket): each seeding/tuning helper that must write
-    beliefs directly enters this scope with a reason.  Recorded so the
-    write path stays auditable.
+    protected tables directly enters this scope with a reason.  Recorded
+    so the write path stays auditable.
     """
     if not reason or not reason.strip():
         raise ValueError("fixture_write_scope requires a non-empty reason")
-    token = _write_guard_var.set(True)
-    _fixture_reason_var.set(reason)
-    try:
-        yield
-    finally:
-        _fixture_reason_var.set(None)
-        _write_guard_var.reset(token)
-
-
-def _protected_classes() -> tuple[type, ...]:
-    from mirror_memory.core.models import Belief, BeliefEvent
-
-    return (Belief, BeliefEvent)
+    return _class_write_scope("fixture", reason)
 
 
 def _write_guard_enabled() -> bool:
@@ -635,16 +694,17 @@ def _write_guard_enabled() -> bool:
 
 
 def install_write_guard() -> None:
-    """Authoring-time write guard for the protected belief tables.
+    """Authoring-time write guard for every classified tenant table.
 
     Enforced at *mutation* time (attribute ``set`` events), not flush
     time: a mutation's caller chain reflects who authored it, while
     flushes are deferred and often executed by a later engine call, which
     would mis-attribute test-authored or sanctioned-authored writes.
 
-    Whitelist semantics: any set outside a sanctioned context raises --
-    there is no source-path exemption (a bypass in a future module,
-    however it is packaged or named, is intercepted).  Idempotent; called
+    Whitelist semantics: a write is allowed only when the active write
+    class matches the table's class (or the active class is ``fixture``).
+    There is no source-path exemption -- a bypass in a future module,
+    however it is packaged or named, is intercepted.  Idempotent; called
     once after the models import.
     """
     from sqlalchemy import event
@@ -654,14 +714,31 @@ def install_write_guard() -> None:
     install_write_guard._installed = True  # type: ignore[attr-defined]
 
     def _guarded_set(target, value, oldvalue, initiator):
-        if _write_guard_var.get() or not _write_guard_enabled():
+        if not _write_guard_enabled():
             return value
+        active = _write_class_var.get()
+        if active == "fixture":
+            return value
+        required = _write_class_for(target.__tablename__)
+        if required is not None and active == required:
+            return value
+        scope_hint = {
+            "engine": "engine_write_scope (Publisher / claim mutators)",
+            "queue": "queue_write_scope (worker / enqueue)",
+            "consent": "consent_write_scope (preference/consent setters)",
+            "telemetry": "telemetry_write_scope (stats/summary/intervention recorders)",
+        }.get(required, "an unclassified table -- add it to TABLE_WRITE_CLASSES")
         raise WriteGuardViolation(
-            f"{type(target).__name__}.{initiator.key} is only writable "
-            "through the Publisher or the repository's sanctioned entries "
-            "(engine_write_scope); test fixtures use fixture_write_scope()"
+            f"{type(target).__name__}.{initiator.key} (table "
+            f"{target.__tablename__!r}, write class {required!r}) is only "
+            f"writable inside {scope_hint}; test fixtures use "
+            "fixture_write_scope(reason)"
         )
 
-    for cls in _protected_classes():
+    from mirror_memory.core.models import Base
+
+    for cls in _iter_tenant_classes():
+        if not hasattr(cls, "__tablename__"):
+            continue
         for attr in cls.__mapper__.column_attrs:
             event.listen(getattr(cls, attr.key), "set", _guarded_set)

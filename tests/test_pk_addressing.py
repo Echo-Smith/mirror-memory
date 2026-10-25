@@ -27,12 +27,16 @@ from sqlalchemy import create_engine, orm
 from sqlalchemy.orm import sessionmaker
 
 from mirror_memory.core.models import Base, Belief
+import pytest
+
 from mirror_memory.core.tenancy import (
     TenantMismatchError,
     WriteGuardViolation,
     fixture_write_scope,
     tenant_scope,
 )
+
+pytestmark = pytest.mark.no_write_fixture_scope
 
 
 def session_at(url):

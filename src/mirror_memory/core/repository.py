@@ -75,22 +75,40 @@ from mirror_memory.metabolism.protection import REASON_USER_CORRECTION
 logger = logging.getLogger(__name__)
 
 
-def _sanctioned_claim_writer(fn):
-    """Mark a repository entry as a sanctioned writer of belief rows.
+def _sanctioned_writer(write_class: str):
+    """Mark a repository entry as a sanctioned writer for a table class.
 
-    The M1 write guard refuses Belief/BeliefEvent writes outside the
-    Publisher or these entries (see core.tenancy.publisher_write_scope).
+    The M1 write guard (core.tenancy) only allows writes to a classified
+    table while the matching class scope is active; this decorator opens
+    that scope around the entry point.
     """
     import functools
 
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        from mirror_memory.core.tenancy import publisher_write_scope
+    from mirror_memory.core.tenancy import (
+        consent_write_scope,
+        engine_write_scope,
+        telemetry_write_scope,
+    )
 
-        with publisher_write_scope():
-            return fn(*args, **kwargs)
+    scopes = {
+        "engine": engine_write_scope,
+        "consent": consent_write_scope,
+        "telemetry": telemetry_write_scope,
+    }
+    scope = scopes[write_class]
 
-    return wrapper
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with scope():
+                return fn(*args, **kwargs)
+        return wrapper
+
+    return decorator
+
+
+#: Historical name for the engine-class variant.
+_sanctioned_claim_writer = lambda fn: _sanctioned_writer("engine")(fn)  # noqa: E731
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +122,7 @@ def is_memory_enabled(session: Session, user_id: str) -> bool:
     return pref.enabled if pref is not None else True
 
 
+@_sanctioned_writer("consent")
 def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryPreference:
     """Enable or disable memory for a user.
 
@@ -146,6 +165,7 @@ def get_state_revision(session: Session, user_id: str) -> int:
     return result if result is not None else 1
 
 
+@_sanctioned_writer("consent")
 def bump_state_revision(session: Session, user_id: str) -> int:
     """Atomic increment of the memory state revision.
 
@@ -173,6 +193,7 @@ def bump_state_revision(session: Session, user_id: str) -> int:
     return new_rev
 
 
+@_sanctioned_writer("consent")
 def cas_bump_state_revision(session: Session, user_id: str, expected: int) -> int | None:
     """Compare-and-swap the state revision: ``expected -> expected + 1``.
 
@@ -224,6 +245,7 @@ def is_feature_enabled(session: Session, user_id: str, feature: str) -> bool:
     return is_memory_enabled(session, user_id)
 
 
+@_sanctioned_writer("consent")
 def set_feature_consent(session: Session, user_id: str, feature: str, granted: bool) -> None:
     """Set feature-level consent for a user."""
     existing = session.get(ConsentGrant, (user_id, feature))
@@ -2235,6 +2257,7 @@ QUESTION_INJECTED_KIND = "question_injected"
 QUESTION_ANSWERED_KIND = "question_answered"
 
 
+@_sanctioned_writer("telemetry")
 def record_intervention_event(
     session: Session,
     user_id: str,
@@ -2352,6 +2375,7 @@ def has_unanswered_injection(session: Session, user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_writer("telemetry")
 def record_extraction_stats(
     session: Session,
     user_id: str,
@@ -2843,6 +2867,7 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
     }
 
 
+@_sanctioned_writer("telemetry")
 def store_session_summary(
     session: Session,
     user_id: str,

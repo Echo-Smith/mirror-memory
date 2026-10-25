@@ -94,6 +94,21 @@ Worker **不允许**继承调度方的上下文——租户的唯一来源是任
 | 租户表的 SQL 缺 `tenant_id = ?` / `app_id = ?` 绑定条件（测试期） | `AuditViolation` |
 | 为性能关闭 `propagate_to_loaders` 或缩小注入范围 | 评审拒绝（硬原则） |
 
+## 表写入分类（任务 2，唯一事实源 `core.tenancy.TABLE_WRITE_CLASSES`）
+
+新表必须先在此分类（映射缺表 → 测试报错），再写代码。
+
+| 类别 | 表 | 允许的写入作用域 / 入口 |
+|---|---|---|
+| engine（记忆内容） | mm_beliefs, mm_belief_events, mm_evidence, mm_evidence_digests, mm_belief_evidence_links, mm_belief_identities, mm_belief_versions, mm_snapshots, mm_memory_transitions, mm_deletion_tombstones, mm_proposal_log | `engine_write_scope()`：Publisher 发布与仓储认可 claim mutator（`@_sanctioned_writer("engine")`） |
+| queue（任务队列） | mm_evolution_jobs | `queue_write_scope()`：worker claim/complete/recycle、enqueue |
+| consent（授权配置） | mm_memory_preferences, mm_consent_grants, mm_users | `consent_write_scope()`：偏好/授权/用户设置函数（`@_sanctioned_writer("consent")`） |
+| telemetry（运行记录） | mm_extraction_stats, mm_session_summaries, mm_intervention_events | `telemetry_write_scope()`：各记录函数（`@_sanctioned_writer("telemetry")`） |
+
+测试侧：测试体默认运行在 `fixture_write_scope("test body")`（conftest autouse）；
+守卫的真实拦截力由金丝雀测试（`@pytest.mark.no_write_fixture_scope`）证明——
+逐类反例、跨树插件模块反例、映射完备性检查都在金丝雀套件中。
+
 ## 工具速查
 
 | 工具 | 场景 |
