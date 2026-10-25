@@ -111,6 +111,8 @@ jobs:
           done
 
       - name: "Attribution: large-statement -6.5% (index removal vs noise)"
+        env:
+          FIX: ${{ inputs.fix_rev || '17a244b' }}
         run: |
           set -u
           git checkout -q "$FIX" -- src tests pyproject.toml
