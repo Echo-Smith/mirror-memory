@@ -24,6 +24,20 @@ def _default_tenant_context():
 
 
 @pytest.fixture(autouse=True)
+def _scope_strict():
+    """Task 1b: unregistered engine system_scope call sites fail tests."""
+    import os
+
+    old = os.environ.get("MM_SCOPE_STRICT")
+    os.environ["MM_SCOPE_STRICT"] = "1"
+    yield
+    if old is None:
+        os.environ.pop("MM_SCOPE_STRICT", None)
+    else:
+        os.environ["MM_SCOPE_STRICT"] = old
+
+
+@pytest.fixture(autouse=True)
 def _sql_auditor():
     """M1: the SQL auditor is always on during tests (MM_SQL_AUDIT=0 to
     disable for performance measurement runs)."""
@@ -34,6 +48,26 @@ def _sql_auditor():
     if os.environ.get("MM_SQL_AUDIT", "1") != "0":
         install_sql_auditor()
     yield
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Report the auditor verdict-cache statistics for the whole run
+    (task 1a: numbers must come from the full suite, not single runs)."""
+    import os
+
+    if os.environ.get("MM_SQL_AUDIT", "1") == "0":
+        return
+    try:
+        from mirror_memory.core.sql_audit import auditor_cache_stats
+    except Exception:  # noqa: BLE001
+        return
+    distinct, hits, misses = auditor_cache_stats()
+    total = hits + misses
+    rate = f"{hits / total * 100:.1f}%" if total else "n/a"
+    print(
+        f"\nsql-auditor cache: distinct_sql_texts={distinct} "
+        f"hits={hits} misses={misses} hit_rate={rate}"
+    )
 
 
 @pytest.fixture

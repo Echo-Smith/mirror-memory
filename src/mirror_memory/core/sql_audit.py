@@ -241,8 +241,24 @@ def audit_sql(sql: str) -> None:
     hundreds of thousands, and the verdict depends only on the statement
     text (bound parameters never affect the rules).  First-seen text pays
     one sqlglot parse; repeats are a dict hit.
+
+    Task-1a invariant: the cache holds ONLY the context-independent
+    structural verdict (which tenant tables appear, whether each carries
+    the tenant predicates, whether the statement is PK-addressed).  All
+    context decisions -- system_scope, no_audit_scope, audit enabled --
+    are re-evaluated on EVERY execution by the listener, before this
+    function is called; a cached "clean" can therefore never turn into an
+    out-of-scope pass.  The guard below makes that contract a hard error
+    if a future refactor moves a context check in here.
     """
     global _cache_hits, _cache_misses
+
+    if in_system_scope() or _disabled_var.get():
+        raise RuntimeError(
+            "audit_sql() must never run inside system_scope/no_audit_scope: "
+            "context pass/fail decisions are re-made per execution by the "
+            "listener and must stay out of the verdict cache"
+        )
 
     if _exempt(sql):
         with _violations_lock:

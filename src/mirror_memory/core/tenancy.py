@@ -115,16 +115,66 @@ def system_scope(reason: str) -> Iterator[None]:
 
     The only sanctioned bypass.  *reason* is mandatory and recorded; the
     test-time SQL auditor logs every statement executed under it together
-    with this reason, and the second M1 batch adds a CI whitelist check so
-    new call sites cannot appear unreviewed.
+    with this reason.
+
+    Allowlist (task 1b): call sites inside engine code
+    (``mirror_memory.*``) must be registered in
+    ``tenancy_system_scope_allowlist.yaml``.  Unregistered engine callers
+    raise during tests (``MM_SCOPE_STRICT=1``, set by conftest) and log a
+    warning in production.  Test code is exempt -- it verifies the
+    mechanism, including this check.
     """
     if not reason or not reason.strip():
         raise ValueError("system_scope requires a non-empty reason")
+    _check_allowlist()
     token = _system_var.set((True, reason))
     try:
         yield
     finally:
         _system_var.reset(token)
+
+
+def _system_scope_caller() -> tuple[str, str] | None:
+    """(module, function) of the first caller outside contextlib/this module."""
+    import contextlib as _cl
+    import sys
+
+    frame = sys._getframe(1)
+    own = (__file__, _cl.__file__)
+    try:
+        while frame is not None:
+            path = frame.f_code.co_filename
+            if path not in own and "contextlib.py" not in path:
+                return (frame.f_globals.get("__name__", "?"), frame.f_code.co_name)
+            frame = frame.f_back
+        return None
+    finally:
+        del frame
+
+
+def _check_allowlist() -> None:
+    import logging
+
+    caller = _system_scope_caller()
+    if caller is None:
+        return
+    module, _func = caller
+    if not module.startswith("mirror_memory."):
+        return  # tests / host code; the static scan covers engine sources
+    try:
+        from mirror_memory.core.scope_registry import assert_scope_allowed
+    except Exception:  # noqa: BLE001 -- registry unavailable: fail open to warn
+        logging.getLogger(__name__).warning(
+            "system_scope: scope registry unavailable (caller=%s)", caller
+        )
+        return
+    assert_scope_allowed(caller, strict=_scope_strict())
+
+
+def _scope_strict() -> bool:
+    import os
+
+    return os.environ.get("MM_SCOPE_STRICT", "0") == "1"
 
 
 def in_system_scope() -> bool:

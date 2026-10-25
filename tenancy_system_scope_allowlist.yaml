@@ -1,0 +1,19 @@
+# system_scope usage allowlist (M1 batch-2 task 1b)
+#
+# system_scope is the ONLY cross-tenant bypass.  Every call site in engine
+# code must be registered here with a reason and a reviewer; the runtime
+# check (tests enforce, production warns) and the CI AST scan
+# (tools/check_system_scope.py) both compare against this file.
+#
+# Entries that no longer have a matching call site fail the CI scan too --
+# an allowlist with ghosts hides real drift.
+
+- module: mirror_memory.worker.evolution
+  function: process_pending
+  reason: >
+    The evolution job queue is shared across tenants: crash-recovery sweep
+    and the pending-job scan must see every tenant's jobs.  Each job is
+    then processed inside tenant_scope(job.tenant_id, job.app_id) with a
+    session bound to that tenant.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-25"

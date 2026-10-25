@@ -152,3 +152,68 @@ def test_installed_listener_catches_real_leak():
     with pytest.raises(AuditViolation):
         with engine.connect() as conn:
             conn.execute(sa_text("SELECT id FROM mm_beliefs")).all()
+
+
+# ---------------------------------------------------------------------------
+# Task 1a: the verdict cache must never cache a context "pass"
+# ---------------------------------------------------------------------------
+
+LEAK_SQL = "SELECT id FROM mm_beliefs WHERE id = ? AND user_id = ?"  # no tenant predicates
+
+
+def test_cache_context_pass_not_stored_scope_first():
+    """Order 1: the same SQL first runs inside system_scope (passed),
+    then outside -- the cached structural verdict must still fail it."""
+    from sqlalchemy import create_engine
+
+    from mirror_memory.core.tenancy import system_scope
+
+    from mirror_memory.core.models import Base
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with system_scope(reason="task-1a: first run inside system scope"):
+        with engine.connect() as conn:
+            conn.exec_driver_sql(LEAK_SQL, (1, "u1")).all()
+
+    # outside any scope the same statement must raise
+    with pytest.raises(AuditViolation):
+        with engine.connect() as conn:
+            conn.exec_driver_sql(LEAK_SQL, (1, "u1")).all()
+
+
+def test_cache_context_pass_not_stored_outside_first():
+    """Order 2: the same SQL first fails outside, then runs inside
+    system_scope -- the cached *violation* must not leak into the scoped
+    run (and afterwards must still fail outside)."""
+    from sqlalchemy import create_engine
+
+    from mirror_memory.core.tenancy import system_scope
+
+    from mirror_memory.core.models import Base
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with pytest.raises(AuditViolation):
+        with engine.connect() as conn:
+            conn.exec_driver_sql(LEAK_SQL, (1, "u1")).all()
+
+    with system_scope(reason="task-1a: scoped run after an out-of-scope failure"):
+        with engine.connect() as conn:
+            conn.exec_driver_sql(LEAK_SQL, (1, "u1")).all()
+
+    with pytest.raises(AuditViolation):
+        with engine.connect() as conn:
+            conn.exec_driver_sql(LEAK_SQL, (1, "u1")).all()
+
+
+def test_audit_sql_refuses_to_run_inside_context_pass():
+    """Hard guard: if a future refactor routes scoped statements into
+    audit_sql, the invariant becomes a loud error instead of a cached
+    'pass'."""
+    from mirror_memory.core.sql_audit import audit_sql
+    from mirror_memory.core.tenancy import system_scope
+
+    with system_scope(reason="task-1a invariant guard"):
+        with pytest.raises(RuntimeError):
+            audit_sql(LEAK_SQL)
