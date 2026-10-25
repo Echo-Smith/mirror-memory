@@ -1,0 +1,237 @@
+name: tenancy-perf-decompose
+
+# M1 "开销分解" (Notion handoff 2026-10-25 decision (b)):
+# attribute the longrun +28% into schema cost vs code-path cost, split
+# fixture vs body time, and cProfile-classify the delta into 5 buckets.
+# Measurement only — no feature code changes.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decompose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (single venv shared by all groups)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev]"
+
+      # ------------------------------------------------------------------
+      # Group definitions
+      #   base   : 7f783bc
+      #   schema : 17a244b code, do_orm_execute + before_flush disabled,
+      #            session.get wrapper kept (structurally required by the
+      #            composite PK -- verified: disabling it fails 11 tests)
+      #   full   : 17a244b as committed
+      # ------------------------------------------------------------------
+      - name: "Group timing: longrun interleaved base/schema/full x3"
+        env:
+          BASE: 7f783bc
+        run: |
+          set -u
+          measure() {
+            local label="$1"; shift
+            local start end rc_line
+            start=$(python -c 'import time; print(time.monotonic())')
+            pytest -q -p no:cacheprovider -p perf_groups_plugin "$@" > /tmp/pytest_out.txt 2>&1 || true
+            end=$(python -c 'import time; print(time.monotonic())')
+            rc_line=$(grep -oE '[0-9]+ (passed|failed)' /tmp/pytest_out.txt | tail -1)
+            echo "$label secs=$(python -c "print(f'{$end-$start:.1f}')") | $rc_line" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          use_base() {
+            git checkout -q "$BASE" -- src tests pyproject.toml
+            mkdir -p /tmp/spike_tests
+            mv tests/test_tenant_isolation.py /tmp/spike_tests/ 2>/dev/null || true
+            mv tests/test_tenant_cache_security.py /tmp/spike_tests/ 2>/dev/null || true
+          }
+          use_fix() {
+            git checkout -q 17a244b -- src tests pyproject.toml
+            mkdir -p /tmp/spike_tests
+            mv tests/test_tenant_isolation.py /tmp/spike_tests/ 2>/dev/null || true
+            mv tests/test_tenant_cache_security.py /tmp/spike_tests/ 2>/dev/null || true
+          }
+          restore_spike_tests() {
+            mv /tmp/spike_tests/test_tenant_isolation.py tests/ 2>/dev/null || true
+            mv /tmp/spike_tests/test_tenant_cache_security.py tests/ 2>/dev/null || true
+          }
+
+          echo "=== LONGRUN: interleaved base/schema/full x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          for round in 1 2 3; do
+            use_base
+            measure "longrun base   r$round" tests/test_longrun_bench.py
+            use_fix
+            MM_GROUP=schema measure "longrun schema r$round" tests/test_longrun_bench.py
+            measure "longrun full   r$round" tests/test_longrun_bench.py
+          done
+          restore_spike_tests
+
+      - name: "Fixture vs body: pytest --durations=0, base vs full (longrun + full suite)"
+        run: |
+          set -u
+          use_base() {
+            git checkout -q 7f783bc -- src tests pyproject.toml
+            mkdir -p /tmp/spike_tests
+            mv tests/test_tenant_isolation.py /tmp/spike_tests/ 2>/dev/null || true
+            mv tests/test_tenant_cache_security.py /tmp/spike_tests/ 2>/dev/null || true
+          }
+          use_fix() {
+            git checkout -q 17a244b -- src tests pyproject.toml
+            mkdir -p /tmp/spike_tests
+            mv tests/test_tenant_isolation.py /tmp/spike_tests/ 2>/dev/null || true
+            mv tests/test_tenant_cache_security.py /tmp/spike_tests/ 2>/dev/null || true
+          }
+          restore_spike_tests() {
+            mv /tmp/spike_tests/test_tenant_isolation.py tests/ 2>/dev/null || true
+            mv /tmp/spike_tests/test_tenant_cache_security.py tests/ 2>/dev/null || true
+          }
+          phase_sums() {  # $1 = pytest output file, $2 = label
+            python - "$1" "$2" <<'PYEOF'
+          import re, sys
+          path, label = sys.argv[1], sys.argv[2]
+          sums = {"setup": 0.0, "call": 0.0, "teardown": 0.0}
+          n = 0
+          for line in open(path, errors="replace"):
+              m = re.match(r"^(\d+\.\d+)s (setup|call|teardown)\s", line)
+              if m:
+                  sums[m.group(2)] += float(m.group(1))
+                  n += 1
+          print(f"{label}: entries={n} setup={sums['setup']:.1f}s call={sums['call']:.1f}s teardown={sums['teardown']:.1f}s")
+          PYEOF
+          }
+          echo "=== PHASE SPLITS (durations=0) ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          use_base
+          pytest tests/test_longrun_bench.py -q --durations=0 -p no:cacheprovider > /tmp/dur_base_longrun.txt 2>&1 || true
+          pytest -q --durations=0 -p no:cacheprovider > /tmp/dur_base_full.txt 2>&1 || true
+          use_fix
+          pytest tests/test_longrun_bench.py -q --durations=0 -p no:cacheprovider > /tmp/dur_full_longrun.txt 2>&1 || true
+          pytest -q --durations=0 -p no:cacheprovider > /tmp/dur_full_full.txt 2>&1 || true
+          restore_spike_tests
+          phase_sums /tmp/dur_base_longrun.txt "longrun BASE  "
+          phase_sums /tmp/dur_full_longrun.txt "longrun FULL  "
+          phase_sums /tmp/dur_base_full.txt   "full-suite BASE  "
+          phase_sums /tmp/dur_full_full.txt   "full-suite FULL  "
+          # top-10 call-time deltas on the longrun file
+          python - <<'PYEOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re
+          def calls(path):
+              out = {}
+              for line in open(path, errors="replace"):
+                  m = re.match(r"^(\d+\.\d+)s call\s+(\S+)", line)
+                  if m:
+                      out[m.group(2)] = float(m.group(1))
+              return out
+          b = calls("/tmp/dur_base_longrun.txt")
+          f = calls("/tmp/dur_full_longrun.txt")
+          deltas = sorted(
+              ((tid, f.get(tid, 0.0) - b.get(tid, 0.0), b.get(tid, 0.0), f.get(tid, 0.0))
+               for tid in set(b) | set(f)),
+              key=lambda x: -abs(x[1]),
+          )
+          print("top-10 longrun call-time deltas (full - base):")
+          for tid, d, bt, ft in deltas[:10]:
+              print(f"  {d:+6.2f}s  ({bt:5.2f} -> {ft:5.2f})  {tid}")
+          PYEOF
+
+      - name: "cProfile: longrun base vs full, top-15 deltas + 5-category attribution"
+        run: |
+          set -u
+          git checkout -q 7f783bc -- src tests pyproject.toml
+          pytest tests/test_longrun_bench.py -q -p no:cacheprovider > /dev/null 2>&1 || true
+          python -m cProfile -o /tmp/base.prof -m pytest tests/test_longrun_bench.py -q -p no:cacheprovider > /dev/null 2>&1 || true
+          git checkout -q 17a244b -- src tests pyproject.toml
+          pytest tests/test_longrun_bench.py -q -p no:cacheprovider > /dev/null 2>&1 || true
+          python -m cProfile -o /tmp/full.prof -m pytest tests/test_longrun_bench.py -q -p no:cacheprovider > /dev/null 2>&1 || true
+          python - <<'PYEOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import pstats
+
+          def load(path):
+              st = pstats.Stats(path)
+              out = {}
+              for func, (cc, nc, tt, ct, callers) in st.stats.items():
+                  if func[0] == "~":
+                      continue
+                  key = (func[0], func[1], func[2])
+                  out[key] = (ct, tt, nc)
+              return out, st.total_tt
+
+          base, base_tot = load("/tmp/base.prof")
+          full, full_tot = load("/tmp/full.prof")
+          print(f"cProfile totals: base={base_tot:.1f}s full={full_tot:.1f}s delta={full_tot-base_tot:+.1f}s")
+
+          def category(file, name):
+              f = file.lower()
+              if "tenancy.py" in f:
+                  if "flush" in name or "get" in name:
+                      return "(ii) before_flush / get wrapper"
+                  return "(i) injection & compile (tenancy)"
+              if "lambdas" in f or "cache_key" in f:
+                  return "(i) injection & compile (lambda/cachekey)"
+              if "ddl" in f or "conftest" in f or "fixture" in name or "_pytest" in f:
+                  return "(iii) DDL / fixtures"
+              if "sqlite3" in f or "dbapi2" in f:
+                  return "(iv) SQLite execution"
+              return "(v) other"
+
+          cats = {}
+          keys = set(base) | set(full)
+          deltas = []
+          for key in keys:
+              fct = full.get(key, (0, 0, 0))[0]
+              bct = base.get(key, (0, 0, 0))[0]
+              d = fct - bct
+              deltas.append((d, key, bct, fct))
+          deltas.sort(reverse=True)
+          for d, key, bct, fct in deltas:
+              c = category(key[0], key[2])
+              cats[c] = cats.get(c, 0.0) + d
+
+          print("category sums of cumulative-time delta (full - base):")
+          for c in sorted(cats, key=cats.get, reverse=True):
+              print(f"  {cats[c]:+8.2f}s  {c}")
+          print()
+          print("top-15 functions by cumulative-time delta:")
+          for d, (file, lineno, name), bct, fct in deltas[:15]:
+              short = file.split("site-packages/")[-1].split("mirror-memory-spike/")[-1]
+              print(f"  {d:+7.2f}s ({bct:6.2f}->{fct:6.2f}) {short}:{lineno}({name})")
+          PYEOF
+
+      - name: "Queue-head/tail pure口径: target call time via --durations"
+        run: |
+          set -u
+          git checkout -q 17a244b -- src tests pyproject.toml
+          TARGET="tests/test_longrun_bench.py::TestOracleDetectsDamage::test_resurrection_is_caught"
+          target_call() {  # $1 = label, $2 = output file, rest = pytest path args
+            local label="$1"; local out="$2"; shift 2
+            pytest -q --durations=0 -p no:cacheprovider "$@" > "$out" 2>&1 || true
+            python - "$out" "$label" <<'PYEOF'
+          import re, sys
+          path, label = sys.argv[1], sys.argv[2]
+          for line in open(path, errors="replace"):
+              m = re.match(r"^(\d+\.\d+)s call\s+(\S*resurrection\S*)", line)
+              if m:
+                  print(f"{label}: target call = {m.group(1)}s")
+                  break
+          PYEOF
+          }
+          echo "=== QUEUE HEAD/TAIL (pure target call time, x3) ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          for r in 1 2 3; do
+            target_call "head r$r" /tmp/h$r.txt "$TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          for r in 1 2 3; do
+            target_call "tail r$r" /tmp/t$r.txt tests/test_tenant_isolation.py "$TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Final sanity (full suite, all groups' integrity)
+        run: |
+          git checkout -q 17a244b -- src tests pyproject.toml
+          pytest -q -p no:cacheprovider 2>&1 | tail -2 | tee -a "$GITHUB_STEP_SUMMARY"
