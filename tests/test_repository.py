@@ -697,12 +697,17 @@ class TestConcurrentStaleWrite:
         results = []
         def bump():
             from mirror_memory.core.repository import bump_state_revision as bsr
-            e = ce(f"sqlite:///{db_path}")
-            with SASession(e) as s:
-                r = bsr(s, "u_atomic")
-                s.commit()
-                results.append(r)
-            e.dispose()
+            from mirror_memory.core.tenancy import tenant_scope
+
+            # Threads do not inherit the ambient tenant context; this raw
+            # session acts as its own entry point and opens its own scope.
+            with tenant_scope("default", "default"):
+                e = ce(f"sqlite:///{db_path}")
+                with SASession(e) as s:
+                    r = bsr(s, "u_atomic")
+                    s.commit()
+                    results.append(r)
+                e.dispose()
 
         threads = [threading.Thread(target=bump) for _ in range(10)]
         for t in threads:

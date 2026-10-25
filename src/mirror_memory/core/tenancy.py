@@ -70,6 +70,7 @@ class TenantMismatchError(TenantError):
 
 _tenant_var: ContextVar[tuple[str, str] | None] = ContextVar("mm_tenant", default=None)
 _system_var: ContextVar[tuple[bool, str] | None] = ContextVar("mm_system", default=None)
+_uow_var: ContextVar[bool] = ContextVar("mm_uow", default=False)
 
 #: Name ``session.info`` holds the tenant bound at creation time.
 BOUND_TENANT_KEY = "mm_bound_tenant"
@@ -133,6 +134,28 @@ def in_system_scope() -> bool:
 def system_reason() -> str | None:
     state = _system_var.get()
     return state[1] if state else None
+
+
+def in_unit_of_work() -> bool:
+    """True while a session flush is emitting unit-of-work statements.
+
+    The SQL auditor uses this to scope its identity-keyed exemption: the
+    ORM flush addresses rows purely by primary key, which is safe only
+    because those objects were tenant-validated at load and flush time.
+    """
+    return _uow_var.get()
+
+
+@event.listens_for(Session, "before_flush")
+def _mark_uow_start(session, flush_context, instances) -> None:
+    session.info["mm_uow_token"] = _uow_var.set(True)
+
+
+@event.listens_for(Session, "after_flush")
+def _mark_uow_end(session, flush_context) -> None:
+    token = session.info.pop("mm_uow_token", None)
+    if token is not None:
+        _uow_var.reset(token)
 
 
 @contextlib.contextmanager

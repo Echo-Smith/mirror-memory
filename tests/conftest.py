@@ -23,6 +23,19 @@ def _default_tenant_context():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _sql_auditor():
+    """M1: the SQL auditor is always on during tests (MM_SQL_AUDIT=0 to
+    disable for performance measurement runs)."""
+    import os
+
+    from mirror_memory.core.sql_audit import install_sql_auditor
+
+    if os.environ.get("MM_SQL_AUDIT", "1") != "0":
+        install_sql_auditor()
+    yield
+
+
 @pytest.fixture
 def db_session():
     """In-memory SQLite session with all tables, rolled back after each test."""
