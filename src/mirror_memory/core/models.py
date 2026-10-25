@@ -626,6 +626,13 @@ class EvolutionJob(TenantScoped, Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str] = mapped_column(String(64), default="")
+    # I1/I3 fencing (M1 batch-2 task 3): a monotonically increasing lease
+    # generation.  claim increments it; every completion/failure/renewal
+    # UPDATE carries WHERE lease_token = <holder's token>, so a worker
+    # whose lease expired (and was re-claimed by another worker) cannot
+    # commit -- its UPDATE matches zero rows and its transaction rolls back.
+    lease_token: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

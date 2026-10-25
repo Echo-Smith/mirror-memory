@@ -111,6 +111,8 @@ class TestProcessPending:
             {
                 EvolutionJob.status: "running",
                 EvolutionJob.started_at: datetime.now(UTC) - timedelta(seconds=600),
+                # fencing: an expired lease is what crash recovery sweeps
+                EvolutionJob.lease_expires_at: datetime.now(UTC) - timedelta(seconds=300),
             },
             synchronize_session=False,
         )

@@ -143,6 +143,10 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
     tenant scope* -- sessions are single-tenant by design, so the scan
     session is never reused for tenant work.
 
+    Fencing (task 3, I1/I3): the crash-recovery sweep expires *leases*
+    (``lease_expires_at``), not just old ``started_at``; a re-claim bumps
+    ``lease_token`` so the previous holder's commit matches zero rows.
+
     Parameters
     ----------
     session_factory:
@@ -156,11 +160,14 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
 
     try:
         with system_scope(reason="evolution worker: crash-recovery sweep and pending-job scan"):
-            # Crash recovery: expire stale running jobs.
-            lease_cutoff = datetime.now(UTC) - timedelta(seconds=config.worker.job_lease_seconds)
+            # Crash recovery: expire leases whose holder is gone.  The
+            # lease_token is deliberately NOT reset -- it is the monotonic
+            # fencing generation (I3).
+            now = datetime.now(UTC)
             session.query(EvolutionJob).filter(
                 EvolutionJob.status == "running",
-                EvolutionJob.started_at < lease_cutoff,
+                EvolutionJob.lease_expires_at.isnot(None),
+                EvolutionJob.lease_expires_at < now,
             ).update({"status": "pending"}, synchronize_session=False)
             session.commit()
 
@@ -180,6 +187,86 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
         session.close()
 
 
+class LeaseLost(RuntimeError):
+    """The job's lease was taken over by another worker (I3 fencing).
+
+    Raised when a completion/failure/renewal UPDATE matches zero rows
+    because ``lease_token`` moved on.  The caller must roll back the same
+    transaction: any memory writes the old holder made are discarded."""
+
+
+def _claim_job(session: object, job_id: str, lease_seconds: int) -> int | None:
+    """Atomically claim a pending job; returns the new lease token.
+
+    The conditional UPDATE is the claim (only one writer can flip
+    ``pending -> running`` and bump the token); SQLite serialises writers,
+    and PostgreSQL gets real row-level contention in M2's ported tests.
+    """
+    now = datetime.now(UTC)
+    updated = (
+        session.query(EvolutionJob)
+        .filter(
+            EvolutionJob.id == job_id,
+            EvolutionJob.status == "pending",
+        )
+        .update(
+            {
+                EvolutionJob.status: "running",
+                EvolutionJob.started_at: now,
+                EvolutionJob.attempt_count: EvolutionJob.attempt_count + 1,
+                EvolutionJob.lease_token: EvolutionJob.lease_token + 1,
+                EvolutionJob.lease_expires_at: now + timedelta(seconds=lease_seconds),
+            },
+            synchronize_session=False,
+        )
+    )
+    session.commit()
+    if updated == 0:
+        return None
+    token = session.query(EvolutionJob.lease_token).filter(
+        EvolutionJob.id == job_id
+    ).scalar()
+    return int(token)
+
+
+def _renew_lease(session: object, job_id: str, token: int, lease_seconds: int) -> bool:
+    """Extend the lease; False when the lease was lost."""
+    now = datetime.now(UTC)
+    updated = (
+        session.query(EvolutionJob)
+        .filter(
+            EvolutionJob.id == job_id,
+            EvolutionJob.status == "running",
+            EvolutionJob.lease_token == token,
+        )
+        .update(
+            {EvolutionJob.lease_expires_at: now + timedelta(seconds=lease_seconds)},
+            synchronize_session=False,
+        )
+    )
+    session.commit()
+    return updated == 1
+
+
+def _set_job_state(session: object, job_id: str, token: int, changes: dict) -> None:
+    """Queue bookkeeping with fencing: the UPDATE only lands while the
+    caller still holds *token*; otherwise :class:`LeaseLost`."""
+    updated = (
+        session.query(EvolutionJob)
+        .filter(
+            EvolutionJob.id == job_id,
+            EvolutionJob.lease_token == token,
+        )
+        .update(changes, synchronize_session=False)
+    )
+    session.commit()
+    if updated == 0:
+        raise LeaseLost(
+            f"job {job_id}: lease token {token} no longer held; "
+            "the job was re-claimed by another worker"
+        )
+
+
 def _claim_and_process(session_factory: object, job: EvolutionJob, config: MemoryConfig) -> None:
     """Claim and process one job inside a session bound to the job's tenant."""
     from mirror_memory.core.tenancy import tenant_scope
@@ -187,30 +274,13 @@ def _claim_and_process(session_factory: object, job: EvolutionJob, config: Memor
     with tenant_scope(job.tenant_id, job.app_id):
         session = session_factory() if callable(session_factory) else session_factory
         try:
-            # Re-read the job in this session (it is bound to the job's
-            # tenant; the scan session's objects are not reused).
+            token = _claim_job(session, job.id, config.worker.job_lease_seconds)
+            if token is None:
+                return  # claimed by another worker
             job_row = session.get(EvolutionJob, job.id)
-            if job_row is None or job_row.status != "pending":
-                return  # claimed by another instance or expired
-            updated = (
-                session.query(EvolutionJob)
-                .filter(
-                    EvolutionJob.id == job.id,
-                    EvolutionJob.status == "pending",
-                )
-                .update(
-                    {
-                        EvolutionJob.status: "running",
-                        EvolutionJob.started_at: datetime.now(UTC),
-                        EvolutionJob.attempt_count: EvolutionJob.attempt_count + 1,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            session.commit()
-            if updated == 0:
-                return  # claimed by another instance
-            _process_single_job(session, job_row, config)
+            if job_row is None:
+                return
+            _process_single_job(session, job_row, config, token)
         finally:
             session.close()
 
@@ -224,6 +294,7 @@ def _process_single_job(
     session: object,
     job: EvolutionJob,
     config: MemoryConfig,
+    lease_token: int | None = None,
 ) -> None:
     """Process a single evolution job through the 6-node pipeline.
 
@@ -231,14 +302,26 @@ def _process_single_job(
     evidence read at the start; the revision guard and the memory-enabled
     check sit immediately before the write, so any state change that happened
     during the compute aborts the publish and leaves the database untouched.
+
+    Fencing (task 3): with *lease_token*, the completion/failure UPDATE only
+    lands while this worker still holds the lease; on :class:`LeaseLost` the
+    transaction (including the publish's memory writes) rolls back.
     """
+    token = lease_token
     try:
         from mirror_memory.core.repository import get_state_revision, is_memory_enabled
+
+        # Renew the lease after the compute-heavy nodes: the publish below
+        # must not race an expiry that happened while the LLM was thinking.
+        if token is not None and not _renew_lease(
+            session, job.id, token, config.worker.job_lease_seconds
+        ):
+            raise LeaseLost(f"job {job.id}: lease lost before publish")
 
         # Consent gate: a disabled user's beliefs must not even be read into
         # a compute payload, let alone published.
         if not is_memory_enabled(session, job.user_id):
-            _block_job(session, job, "memory_disabled")
+            _block_job(session, job, "memory_disabled", token)
             return
 
         # We intentionally ignore job.claimed_revision here (a snapshot from
@@ -300,46 +383,93 @@ def _process_single_job(
                 "evolution: publish refused (job=%s reason=%s)",
                 truncate_id(job.id), decision.reason,
             )
-            _block_job(session, job, decision.reason)
+            _block_job(session, job, decision.reason, token)
             return
 
-        _set_job_state(session, job, {
+        _set_job_state(session, job.id, token, {
             "status": "completed",
             "completed_at": datetime.now(UTC),
             "error_code": "",
         })
         logger.info("evolution: completed job=%s", truncate_id(job.id))
 
+    except LeaseLost:
+        # Another worker re-claimed the job after our lease expired: every
+        # memory write in THIS transaction (the publish above included)
+        # must not survive.  Roll back; the new owner manages the row.
+        session.rollback()
+        logger.warning(
+            "evolution: lease lost (job=%s); rolled back this worker's writes",
+            truncate_id(job.id),
+        )
     except Exception as exc:
-        _set_job_state(session, job, {
+        changes = {
             "status": "failed" if job.attempt_count >= config.worker.max_attempts else "pending",
             "error_code": type(exc).__name__,
-        })
+        }
+        try:
+            _set_job_state(session, job.id, token, changes)
+        except LeaseLost:
+            session.rollback()
+            logger.warning(
+                "evolution: lease lost while failing (job=%s); writes rolled back",
+                truncate_id(job.id),
+            )
+            return
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job.id), type(exc).__name__)
 
 
-def _set_job_state(session: object, job: EvolutionJob, changes: dict) -> None:
+def _set_job_state(session: object, job_id: str, token: int | None, changes: dict) -> None:
     """Queue bookkeeping: job-state writes go through an explicit bulk
     UPDATE (tenant-filtered by the hook) rather than attribute mutation.
-    The in-session object is expired so subsequent reads reflect the row."""
-    session.query(EvolutionJob).filter(
-        EvolutionJob.id == job.id,
-    ).update(changes, synchronize_session=False)
+    With a lease token the UPDATE is fenced (I3); without one (legacy
+    direct calls in tests) it behaves as an unfenced UPDATE."""
+    if token is None:
+        session.query(EvolutionJob).filter(
+            EvolutionJob.id == job_id,
+        ).update(changes, synchronize_session=False)
+        session.commit()
+        return
+    updated = (
+        session.query(EvolutionJob)
+        .filter(
+            EvolutionJob.id == job_id,
+            EvolutionJob.lease_token == token,
+        )
+        .update(changes, synchronize_session=False)
+    )
+    if updated == 0:
+        # Fence fired: commit NOTHING from this holder's transaction (the
+        # publish and any other writes roll back with it) and surface the
+        # loss.  The check precedes the commit on purpose -- committing
+        # first would persist exactly the writes the fence exists to
+        # discard.
+        session.rollback()
+        raise LeaseLost(
+            f"job {job_id}: lease token {token} no longer held; "
+            "the job was re-claimed by another worker"
+        )
     session.commit()
-    session.expire(job)
 
 
-def _block_job(session: object, job: EvolutionJob, reason: str) -> None:
+def _block_job(session: object, job: EvolutionJob, reason: str, token: int | None = None) -> None:
     """Terminal-state a job whose publish was refused.
 
     The job is marked ``cancelled`` rather than ``completed``: nothing was
     written, and the next ``enqueue_job`` for the user must be free to run.
     """
-    _set_job_state(session, job, {
-        "status": "cancelled",
-        "completed_at": datetime.now(UTC),
-        "error_code": reason,
-    })
+    try:
+        _set_job_state(session, job.id, token, {
+            "status": "cancelled",
+            "completed_at": datetime.now(UTC),
+            "error_code": reason,
+        })
+    except LeaseLost:
+        session.rollback()
+        logger.warning(
+            "evolution: lease lost while blocking (job=%s); new owner decides",
+            truncate_id(job.id),
+        )
 
 
 # ---------------------------------------------------------------------------
