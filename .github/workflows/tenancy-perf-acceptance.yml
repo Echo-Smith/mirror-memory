@@ -7,6 +7,13 @@ name: tenancy-perf-acceptance
 
 on:
   workflow_dispatch:
+    inputs:
+      base_rev:
+        description: "Baseline revision"
+        default: "7f783bc"
+      fix_rev:
+        description: "Fixed revision to measure"
+        default: "17a244b"
 
 jobs:
   measure:
@@ -28,8 +35,8 @@ jobs:
 
       - name: Interleaved measurement (base vs fix)
         env:
-          BASE: 7f783bc
-          FIX: 17a244b
+          BASE: ${{ inputs.base_rev || '7f783bc' }}
+          FIX: ${{ inputs.fix_rev || '17a244b' }}
         run: |
           set -u
           measure() {  # $1 = label; remaining args passed to pytest
@@ -80,7 +87,7 @@ jobs:
 
       - name: Queue-head vs queue-tail accumulation check (fix revision)
         env:
-          FIX: 17a244b
+          FIX: ${{ inputs.fix_rev || '17a244b' }}
           TARGET: tests/test_longrun_bench.py::TestOracleDetectsDamage::test_resurrection_is_caught
         run: |
           set -u
@@ -106,7 +113,7 @@ jobs:
       - name: "Attribution: large-statement -6.5% (index removal vs noise)"
         run: |
           set -u
-          git checkout -q 17a244b -- src tests pyproject.toml
+          git checkout -q "$FIX" -- src tests pyproject.toml
           echo "=== ATTRIBUTION: driver_bench large-statements, no-index vs restored-index ===" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "--- as committed (indexes removed) ---" | tee -a "$GITHUB_STEP_SUMMARY"
           python driver_bench.py 2>&1 | tail -8 | tee -a "$GITHUB_STEP_SUMMARY"
@@ -123,9 +130,9 @@ jobs:
           print("indexes restored:", src.count('default="", index=True'))
           EOF
           python driver_bench.py 2>&1 | tail -8 | tee -a "$GITHUB_STEP_SUMMARY"
-          git checkout -q 17a244b -- src
+          git checkout -q "$FIX" -- src
 
       - name: Final sanity (full suite on fix revision, all spike tests included)
         run: |
-          git checkout -q 17a244b -- src tests pyproject.toml
+          git checkout -q "$FIX" -- src tests pyproject.toml
           pytest -q -p no:cacheprovider 2>&1 | tail -2 | tee -a "$GITHUB_STEP_SUMMARY"
