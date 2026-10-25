@@ -30,3 +30,25 @@ jobs:
       - name: Run interleaved micro-benchmark
         run: |
           python driver_bench.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Full-suite timing with junit counts (task-0 methodology)
+        run: |
+          # Same-revision trend check: record wall time AND the exact
+          # passed count from junit so week-over-week numbers stay
+          # comparable (count changes invalidate comparison).
+          start=$(python -c 'import time; print(time.monotonic())')
+          python -m pytest -q -p no:cacheprovider --junitxml=/tmp/suite.xml > /tmp/pytest_out.txt 2>&1 || true
+          end=$(python -c 'import time; print(time.monotonic())')
+          secs=$(python -c "print(f'{$end-$start:.1f}')")
+          counts=$(python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/suite.xml').getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          t = sum(int(s.get('tests', 0)) for s in suites)
+          f = sum(int(s.get('failures', 0)) for s in suites)
+          e = sum(int(s.get('errors', 0)) for s in suites)
+          sk = sum(int(s.get('skipped', 0)) for s in suites)
+          print(f"tests={t} passed={t-f-e-sk} failed={f} errors={e} skipped={sk}")
+          PY
+          )
+          echo "full-suite (auditor+guard on): ${secs}s | $counts" | tee -a "$GITHUB_STEP_SUMMARY"
