@@ -69,7 +69,9 @@ jobs:
             if [ "$rev" = "$FIX" ]; then export MM_SQL_AUDIT=0; else unset MM_SQL_AUDIT || true; fi
             local start end
             start=$(python -c 'import time; print(time.monotonic())')
-            python -m pytest -q -p no:cacheprovider --junitxml="$xml" $(tr '\n' ' ' < "$IDS") > /tmp/pytest_out.txt 2>&1 || true
+            # run_ids.py passes each line as one argv entry -- parametrized
+            # IDs containing spaces survive (shell word-splitting mangles them)
+            python tools/run_ids.py "$IDS" -q -p no:cacheprovider --junitxml="$xml" > /tmp/pytest_out.txt 2>&1 || true
             end=$(python -c 'import time; print(time.monotonic())')
             echo "full $rev round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(tail -1 /tmp/pytest_out.txt | grep -oE '[0-9]+ (passed|failed|skipped)([^|]*)' | head -1)"
           }
