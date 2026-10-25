@@ -102,13 +102,15 @@ Worker **不允许**继承调度方的上下文——租户的唯一来源是任
 | `system_scope(reason)` | 跨租户队列扫描/维护（唯一旁路，必须写 reason） |
 | `no_tenant_scope()` | 仅测试：模拟入口缺失，验证 fail-closed |
 | `TenantAwareExecutor` / `submit_with_tenant` | 线程池 |
-| `engine_write_scope()` | 引擎认可写入口内部标记（Publisher、仓储 mutator、worker 记账）；应用代码不需要直接用 |
+| `engine_write_scope()` | 引擎认可写入口内部标记（Publisher、仓储认可 mutator）；**应用/插件代码不得使用** |
+| `fixture_write_scope(reason)` | 仅测试夹具：直接造信念数据时显式进入（reason 必填） |
 | `no_audit_scope()` | 仅测试：机制类测试里故意发原生 SQL 时使用 |
 
 ## 错误类型
 
 - `TenantContextMissing`：拿不到租户（fail-closed，最常见）。
 - `TenantMismatchError`：上下文与会话/对象不一致（会话跨租户、
-  租户列被改、写入了别的租户的行）。
-- `WriteGuardViolation`：信念类表被写入口之外的路经写入（仅引擎来源触发）。
+  租户列被改、写入了别的租户的行、`session.merge()` 试图并入他租户行）。
+- `WriteGuardViolation`：信念类表被写在认可入口之外（白名单语义，
+  **任何来源**的越界写都拦——包括未来的 server/脚本/插件）。
 - `AuditViolation`：SQL 审计器规则违规（测试期）。

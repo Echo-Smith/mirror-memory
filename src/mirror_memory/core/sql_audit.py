@@ -119,18 +119,28 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
                 )
         return
 
-    # Identity-keyed exemption: the ORM unit of work addresses rows purely
-    # by primary key (expired-attribute refresh SELECT, dirty-row UPDATE,
-    # cascade DELETE).  Those objects were tenant-validated when loaded
-    # (filtered SELECT) and again at flush (before_flush checks); a
-    # PK-addressed statement cannot cross tenants.  Scope: exactly one
-    # tenant table, a WHERE that is a pure AND-chain of
-    # ``pk_column = :placeholder`` equalities, nothing else.
-    if _is_identity_keyed(stmt, touched, tenant_tables, exp):
+    # Identity-keyed exemption (documented limitation): ORM unit-of-work
+    # statements and expired-attribute refreshes address rows purely by
+    # primary key, and a session-scoped cache of "who authored this
+    # mutation" is unreliable (flushes are deferred).  Composite PKs that
+    # would put tenant_id into every UOW WHERE are not available on
+    # SQLite (CompileError: no autoincrement for composite PKs).  The
+    # PK-addressing surface is therefore closed by dedicated layers, each
+    # with its own tests (tests/test_pk_addressing.py): the whitelist
+    # write guard intercepts foreign-PK objects at construction, the
+    # merge wrapper refuses cross-tenant merges, and the flush checks
+    # refuse dirty/deleted rows from another tenant.
+    if len(touched) == 1 and _is_identity_keyed(stmt, touched, tenant_tables, exp):
         return
 
     # Collect the tenant columns constrained by bound equalities anywhere
     # in the statement (WHERE, JOIN ON, subquery WHERE, HAVING).
+    # Note: there is NO identity-keyed exemption.  Every tenant table's
+    # primary key leads with (tenant_id, app_id), so ORM unit-of-work
+    # statements carry the tenant predicates natively; a PK-addressed
+    # statement without them (raw SQL, merge-by-id of another tenant) is a
+    # violation.  UOW statements' tenant safety additionally rests on
+    # load-time filtering and the authoring-time write guard.
     covered: dict[str, set[str]] = {}
 
     def _attribute(table_ref: str) -> str | None:
@@ -166,15 +176,8 @@ def _is_identity_keyed(stmt, touched: dict[str, str], tenant_tables: set[str], e
     ``AND``-joined equalities between that table's PK columns and bound
     parameters.
 
-    Unconditionally exempt: ORM unit-of-work statements address rows purely
-    by primary key, and their tenant safety is enforced where it actually
-    lives -- load-time filtering (loader criteria) and the write guard --
-    not in the statement text.  (Scoping this exemption by flush-time state
-    is unreliable: a test-authored mutation is often flushed by a later
-    engine call, so attribution at cursor time is wrong in both
-    directions.)  The auditor's real target is query-shaped statements:
-    SELECTs and filtered bulk operations, where a missing tenant predicate
-    is a genuine cross-tenant read/write surface.
+    See the caller for why identity-keyed statements are exempt and which
+    layers close the residual surface instead.
     """
     if len(touched) != 1:
         return False
@@ -219,24 +222,65 @@ def tenant_pk_columns() -> dict[str, set[str]]:
     return _pk_columns_cache
 
 
+_verdict_cache: dict[str, AuditViolation | None] = {}
+_VERDICT_CACHE_CAP = 100_000
+_cache_hits = 0
+_cache_misses = 0
+
+
+def auditor_cache_stats() -> tuple[int, int, int]:
+    """(distinct texts, cache hits, misses) for the report."""
+    return len(_verdict_cache), _cache_hits, _cache_misses
+
+
 def audit_sql(sql: str) -> None:
-    """Audit one statement; raise :class:`AuditViolation` on any rule breach."""
-    import sqlglot
+    """Audit one statement; raise :class:`AuditViolation` on any rule breach.
+
+    Verdicts are cached by SQL text: the different statement shapes in a
+    test run number in the hundreds while executions number in the
+    hundreds of thousands, and the verdict depends only on the statement
+    text (bound parameters never affect the rules).  First-seen text pays
+    one sqlglot parse; repeats are a dict hit.
+    """
+    global _cache_hits, _cache_misses
 
     if _exempt(sql):
         with _violations_lock:
             _exemptions_seen.append(sql.strip()[:120])
         return
 
+    if sql in _verdict_cache:
+        _cache_hits += 1
+        verdict = _verdict_cache[sql]
+    else:
+        _cache_misses += 1
+        try:
+            verdict = _judge(sql)
+        except AuditViolation as exc:
+            verdict = exc
+        if len(_verdict_cache) >= _VERDICT_CACHE_CAP:
+            _verdict_cache.clear()
+        _verdict_cache[sql] = verdict
+    if verdict is not None:
+        raise verdict
+
+
+def _judge(sql: str) -> AuditViolation | None:
+    import sqlglot
+
     try:
         stmt = sqlglot.parse_one(sql, read="sqlite")
     except Exception as exc:
-        raise AuditViolation(
+        return AuditViolation(
             f"SQL auditor could not parse statement (fail closed): {sql[:200]!r} ({exc})"
-        ) from exc
+        )
     if stmt is None:
-        raise AuditViolation(f"SQL auditor parsed an empty statement: {sql[:200]!r}")
-    _analyse_statement(stmt, _tenant_table_names())
+        return AuditViolation(f"SQL auditor parsed an empty statement: {sql[:200]!r}")
+    try:
+        _analyse_statement(stmt, _tenant_table_names())
+        return None
+    except AuditViolation as exc:
+        return exc
 
 
 # ---------------------------------------------------------------------------

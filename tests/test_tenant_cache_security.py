@@ -28,6 +28,7 @@ from mirror_memory.core.tenancy import (
     TenantContextMissing,
     TenantMismatchError,
     _LOADER_OPTION,
+    fixture_write_scope,
     tenant_scope,
 )
 
@@ -39,7 +40,7 @@ def session_at(url):
 
 
 def seed_belief(factory, tenant, user, key, claim):
-    with tenant_scope(*tenant):
+    with tenant_scope(*tenant), fixture_write_scope("cache-security seed"):
         s = factory()
         s.add(
             Belief(

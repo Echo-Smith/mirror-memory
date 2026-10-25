@@ -29,6 +29,7 @@ from mirror_memory.core.repository import get_state_revision, record_claim, set_
 from mirror_memory.core.tenancy import (
     TenantContextError,
     TenantMismatchError,
+    WriteGuardViolation,
     no_tenant_scope,
     system_scope,
     tenant_scope,
@@ -470,7 +471,9 @@ def test_missing_context_raises(raw_session_factory):
                 s.query(Belief).all()
             with pytest.raises(TenantContextError):
                 s.query(Belief).filter(Belief.user_id == USER).first()
-            with pytest.raises(TenantContextError):
+            with pytest.raises((TenantContextError, WriteGuardViolation)):
+                # construction may trip the whitelist guard first; either
+                # way the write must not succeed without a tenant context
                 s.add(Belief(user_id=USER, dimension="topic", key="k"))
                 s.commit()
         finally:
@@ -487,11 +490,13 @@ def test_mismatched_tenant_write_raises(raw_session_factory):
     with tenant_scope(*T_B):
         s = raw_session_factory()
         try:
-            s.add(Belief(
-                user_id=USER, dimension="topic", key="k",
-                tenant_id="tA", app_id="app",
-            ))
-            with pytest.raises(TenantMismatchError):
+            with pytest.raises((TenantMismatchError, WriteGuardViolation)):
+                # construction may trip the whitelist guard first; either
+                # way the mismatched write must be refused
+                s.add(Belief(
+                    user_id=USER, dimension="topic", key="k",
+                    tenant_id="tA", app_id="app",
+                ))
                 s.commit()
         finally:
             s.rollback()

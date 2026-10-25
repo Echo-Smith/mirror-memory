@@ -37,6 +37,7 @@ from sqlalchemy import (
 )
 
 from mirror_memory.config.loader import load_config
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.core.models import Base
 from mirror_memory.core.repository import (
     get_state_revision,
@@ -336,7 +337,8 @@ class TestRepositoryMetabolism:
         belief = _claim(db_session, key="k")
         assert belief.last_supported_at is not None
         before = belief.last_supported_at
-        belief.last_supported_at = before - timedelta(days=30)
+        with fixture_write_scope("metabolism test: backdate support clock"):
+            belief.last_supported_at = before - timedelta(days=30)
         record_claim(
             db_session, "u1", dimension="preference", key="k",
             claim_text="likes coffee a lot", relation="supports",
@@ -346,7 +348,8 @@ class TestRepositoryMetabolism:
     def test_current_mode_skips_dormant_beliefs(self, db_session):
         hot = _claim(db_session, key="coffee", claim_text="likes coffee")
         dormant = _claim(db_session, key="tea", claim_text="likes tea")
-        dormant.memory_tier = "dormant"
+        with fixture_write_scope("metabolism test: set tier"):
+            dormant.memory_tier = "dormant"
         db_session.flush()
 
         current = recall_candidates(db_session, "u1", query="coffee tea", temporal_mode="current")
@@ -358,15 +361,17 @@ class TestRepositoryMetabolism:
 
     def test_archived_never_enters_the_default_scan(self, db_session):
         archived = _claim(db_session, key="old", claim_text="likes old things")
-        archived.memory_tier = "archived"
+        with fixture_write_scope("metabolism test: set tier"):
+            archived.memory_tier = "archived"
         db_session.flush()
         for mode in ("current", "historical", "all"):
             assert archived not in recall_candidates(db_session, "u1", query="old things", temporal_mode=mode)
 
     def test_historical_mode_reaches_superseded_dormant(self, db_session):
         old = _claim(db_session, key="lives_in:shanghai", predicate="lives_in", cardinality="single")
-        old.status = "superseded"
-        old.memory_tier = "dormant"
+        with fixture_write_scope("metabolism test: set status/tier"):
+            old.status = "superseded"
+            old.memory_tier = "dormant"
         db_session.flush()
         found = recall_candidates(db_session, "u1", query="shanghai", temporal_mode="historical")
         assert old in found

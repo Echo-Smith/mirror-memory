@@ -13,6 +13,7 @@ import pytest
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.models import MemoryTransition
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.core.proposal import (
     TRANSITION_TIER_TRANSITION,
     StateTransitionProposal,
@@ -66,12 +67,15 @@ def make_belief(
         evidence = record_evidence(session, "u1", ref=f"{key}:m{i}", content=f"msg {i}")
         link_evidence(session, belief.id, evidence.id, relation="support")
     stale = NOW - timedelta(days=days_old)
-    belief.last_evidence_at = stale
-    belief.last_supported_at = stale
-    belief.memory_tier = tier
-    belief.importance_score = importance
-    if status != "active":
-        belief.status = status
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope("metabolism test: tune belief clocks/tier"):
+        belief.last_evidence_at = stale
+        belief.last_supported_at = stale
+        belief.memory_tier = tier
+        belief.importance_score = importance
+        if status != "active":
+            belief.status = status
     session.flush()
     return belief
 
@@ -95,7 +99,8 @@ class TestDecideTier:
         # 0.3*1 + 0.08 + 0.15 = 0.53 → target warm → would demote, but idle
         # 0 < 180 → blocked.  Use enough support to stay hot instead.
         hot_belief = make_belief(db_session, "hotone", days_old=0, support_links=5)
-        hot_belief.access_count = 20
+        with fixture_write_scope("metabolism test: tune access count"):
+            hot_belief.access_count = 20
         decision = decide_tier(
             hot_belief, support_count=5, correct_count=0, pending_verification=False, now=NOW
         )
@@ -145,8 +150,9 @@ class TestDecideTier:
 
     def test_dormant_belief_recalled_reheats_to_hot(self, db_session):
         belief = make_belief(db_session, "back", days_old=1, tier="dormant")
-        belief.access_count = 10
-        belief.last_accessed_at = NOW
+        with fixture_write_scope("metabolism test: tune access telemetry"):
+            belief.access_count = 10
+            belief.last_accessed_at = NOW
         decision = decide_tier(
             belief, support_count=2, correct_count=0, pending_verification=False, now=NOW
         )
@@ -208,8 +214,9 @@ class TestRunMetabolism:
     def test_recall_reheats_dormant_on_next_cycle(self, db_session, config):
         belief = make_belief(db_session, "revive", days_old=400, tier="dormant")
         # The user asks about it and recall surfaces it.
-        belief.access_count = 5
-        belief.last_accessed_at = NOW - timedelta(days=1)
+        with fixture_write_scope("metabolism test: tune access telemetry"):
+            belief.access_count = 5
+            belief.last_accessed_at = NOW - timedelta(days=1)
         report = run_metabolism(db_session, "u1", config, now=NOW)
         assert belief.memory_tier == "hot"
         assert any(d.reason == REASON_REHEAT for d in report.decisions)
@@ -316,7 +323,8 @@ class TestPublisherTierInvariants:
 
     def test_answered_verification_no_longer_blocks(self, db_session):
         belief = make_belief(db_session, "answered", support_links=2)
-        belief.last_evidence_at = NOW - timedelta(days=400)
+        with fixture_write_scope("metabolism test: age evidence clock"):
+            belief.last_evidence_at = NOW - timedelta(days=400)
         db_session.flush()
         record_intervention_event(
             db_session, "u1", "s1", kind="question_injected",

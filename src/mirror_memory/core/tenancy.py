@@ -70,6 +70,8 @@ class TenantMismatchError(TenantError):
 
 _tenant_var: ContextVar[tuple[str, str] | None] = ContextVar("mm_tenant", default=None)
 _system_var: ContextVar[tuple[bool, str] | None] = ContextVar("mm_system", default=None)
+_write_guard_var: ContextVar[bool] = ContextVar("mm_write_guard", default=False)
+_fixture_reason_var: ContextVar[str | None] = ContextVar("mm_fixture_reason", default=None)
 
 #: Name ``session.info`` holds the tenant bound at creation time.
 BOUND_TENANT_KEY = "mm_bound_tenant"
@@ -490,17 +492,42 @@ def install_session_hooks() -> None:
     """
     Session.__init__ = _tenant_bound_session_init  # type: ignore[assignment]
     Session.get = _tenant_aware_get  # type: ignore[assignment]
+    Session.merge = _tenant_aware_merge  # type: ignore[assignment]
+
+
+_original_merge = Session.merge
+
+
+def _tenant_aware_merge(self, entity, *args, **kwargs):
+    """merge() loads by primary key WITHOUT the loader criteria (its
+    internal fetch is not an ORM-context statement), so a caller could
+    pull another tenant's row into this session by PK alone.  After the
+    merge, any TenantScoped instance whose tenant disagrees with the
+    ambient context is evicted and reported as missing."""
+    result = _original_merge(self, entity, *args, **kwargs)
+    if in_system_scope():
+        return result
+    tenant = _tenant_var.get()
+    if tenant is None:
+        return result
+    if isinstance(result, TenantScoped) and (result.tenant_id, result.app_id) != tenant:
+        self.expunge(result)
+        raise TenantMismatchError(
+            f"merge() would pull a {type(result).__name__} row of tenant "
+            f"({result.tenant_id!r}, {result.app_id!r}) into a session "
+            f"running as {tenant!r}; refused"
+        )
+    return result
 
 
 install_session_hooks()
 
 
 # ---------------------------------------------------------------------------
-# Write guard (M1 task 4): belief truth-state rows are only written through
-# the Publisher or the sanctioned claim entry (repository.record_claim).
+# Write guard (M1 task 4 + patch): WHITELIST -- belief truth-state rows are
+# only written through the Publisher / the repository's sanctioned mutators
+# (engine_write_scope) or explicit test seeding (fixture_write_scope).
 # ---------------------------------------------------------------------------
-
-_write_guard_var: ContextVar[bool] = ContextVar("mm_write_guard", default=False)
 
 
 class WriteGuardViolation(AssertionError):
@@ -509,12 +536,11 @@ class WriteGuardViolation(AssertionError):
 
 @contextlib.contextmanager
 def engine_write_scope() -> Iterator[None]:
-    """Marks the block as a sanctioned engine write.
+    """Marks the block as a sanctioned engine write (whitelist context).
 
-    Used by ``Publisher.publish`` (belief truth-state changes),
-    ``repository.record_claim`` and the repository's belief mutators, and
-    worker/queue bookkeeping.  The write guard (belief tables) and the SQL
-    auditor's identity-keyed exemption both key off this context.
+    Entered by ``Publisher.publish`` and the repository's sanctioned
+    belief mutators.  Production code must not use it directly; test
+    seeding uses :func:`fixture_write_scope`.
     """
     token = _write_guard_var.set(True)
     try:
@@ -525,6 +551,25 @@ def engine_write_scope() -> Iterator[None]:
 
 #: Historical alias.
 publisher_write_scope = engine_write_scope
+
+
+@contextlib.contextmanager
+def fixture_write_scope(reason: str) -> Iterator[None]:
+    """Test-fixture seeding scope for the protected belief tables.
+
+    Explicit (never blanket): each seeding/tuning helper that must write
+    beliefs directly enters this scope with a reason.  Recorded so the
+    write path stays auditable.
+    """
+    if not reason or not reason.strip():
+        raise ValueError("fixture_write_scope requires a non-empty reason")
+    token = _write_guard_var.set(True)
+    _fixture_reason_var.set(reason)
+    try:
+        yield
+    finally:
+        _fixture_reason_var.set(None)
+        _write_guard_var.reset(token)
 
 
 def _protected_classes() -> tuple[type, ...]:
@@ -539,44 +584,6 @@ def _write_guard_enabled() -> bool:
     return os.environ.get("MM_WRITE_AUDIT", "1") != "0"
 
 
-def stack_has_engine_frame() -> bool:
-    """True when the call stack passes through engine code.
-
-    Shared by the write guard (fire only on engine-originated writes) and
-    the SQL auditor (exempt test-fixture identity-keyed writes).  Skips
-    this module's own frames and SQLAlchemy internals: the flush always
-    runs through them, so only other mirror_memory modules count.
-    """
-    import sys
-
-    frame = sys._getframe(1)
-    try:
-        while frame is not None:
-            path = frame.f_code.co_filename
-            if (
-                "/mirror_memory/" in path
-                and "/tests/" not in path
-                and "core/tenancy.py" not in path
-                and "site-packages" not in path
-            ):
-                return True
-            frame = frame.f_back
-        return False
-    finally:
-        del frame  # break the reference cycle
-
-
-def _write_originates_from_engine() -> bool:
-    """Guard predicate: engine-originated writes always fire; test fixture
-    writes are exempt unless MM_WRITE_AUDIT=strict (used by the guard's
-    own tests)."""
-    import os
-
-    if os.environ.get("MM_WRITE_AUDIT") == "strict":
-        return True
-    return stack_has_engine_frame()
-
-
 def install_write_guard() -> None:
     """Authoring-time write guard for the protected belief tables.
 
@@ -584,7 +591,11 @@ def install_write_guard() -> None:
     time: a mutation's caller chain reflects who authored it, while
     flushes are deferred and often executed by a later engine call, which
     would mis-attribute test-authored or sanctioned-authored writes.
-    Idempotent; called once after the models import.
+
+    Whitelist semantics: any set outside a sanctioned context raises --
+    there is no source-path exemption (a bypass in a future module,
+    however it is packaged or named, is intercepted).  Idempotent; called
+    once after the models import.
     """
     from sqlalchemy import event
 
@@ -595,12 +606,10 @@ def install_write_guard() -> None:
     def _guarded_set(target, value, oldvalue, initiator):
         if _write_guard_var.get() or not _write_guard_enabled():
             return value
-        if not _write_originates_from_engine():
-            return value
         raise WriteGuardViolation(
             f"{type(target).__name__}.{initiator.key} is only writable "
-            "through the Publisher or the repository's sanctioned entries; "
-            "wrap the write in engine_write_scope() or publish a proposal"
+            "through the Publisher or the repository's sanctioned entries "
+            "(engine_write_scope); test fixtures use fixture_write_scope()"
         )
 
     for cls in _protected_classes():

@@ -19,6 +19,7 @@ from mirror_memory.core.repository import (
     record_claim,
     update_belief_by_id,
 )
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.memory.atom import (
     ACTION_CONTRADICT,
     ACTION_CREATE,
@@ -355,7 +356,8 @@ class TestUpdateClosesInterval:
             claim_text="lives in Shanghai", confidence=0.8,
             predicate="lives_in", object="shanghai", session_id="s1",
         )
-        belief.valid_to = datetime(2025, 1, 1)
+        with fixture_write_scope("temporal test: close interval"):
+            belief.valid_to = datetime(2025, 1, 1)
         db_session.flush()
 
         old, _new = update_belief_by_id(
@@ -372,8 +374,9 @@ class TestUpdateClosesInterval:
             claim_text="lives in Shanghai", confidence=0.8,
             predicate="lives_in", object="shanghai", session_id="s1",
         )
-        belief.valid_from = datetime(2024, 5, 1)
-        belief.valid_to = datetime(2026, 5, 1)
+        with fixture_write_scope("temporal test: set interval"):
+            belief.valid_from = datetime(2024, 5, 1)
+            belief.valid_to = datetime(2026, 5, 1)
         db_session.flush()
 
         window = window_from_belief(belief)
@@ -396,8 +399,11 @@ def _location_belief(session, key, obj, valid_from=None, valid_to=None):
         claim_text=f"lives in {obj}", confidence=0.8,
         predicate="lives_in", object=obj, session_id="s1",
     )
-    belief.valid_from = valid_from
-    belief.valid_to = valid_to
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope("temporal test: tune validity interval"):
+        belief.valid_from = valid_from
+        belief.valid_to = valid_to
     session.flush()
     return belief
 
@@ -522,7 +528,8 @@ class TestMoveScenario:
             claim_text="lives in Shanghai", confidence=0.8,
             predicate="lives_in", object="shanghai", session_id="s1",
         )
-        shanghai.valid_from = datetime(2020, 1, 1)
+        with fixture_write_scope("temporal test: set interval"):
+            shanghai.valid_from = datetime(2020, 1, 1)
         db_session.flush()
 
         old, new = update_belief_by_id(

@@ -125,10 +125,14 @@ def test_counterexample_unparseable_fails_closed():
 
 
 def test_installed_listener_catches_real_leak():
+    import os
+
+    if os.environ.get("MM_SQL_AUDIT", "1") == "0":
+        pytest.skip("auditor disabled for this run (MM_SQL_AUDIT=0)")
     from sqlalchemy import create_engine, text as sa_text
 
     from mirror_memory.core.models import Base, Belief
-    from mirror_memory.core.tenancy import tenant_scope
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
 
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
@@ -137,7 +141,7 @@ def test_installed_listener_catches_real_leak():
     from sqlalchemy.orm import sessionmaker
 
     factory = sessionmaker(bind=engine)
-    with tenant_scope("tA", "app"):
+    with tenant_scope("tA", "app"), fixture_write_scope("auditor integration seed"):
         s = factory()
         s.add(Belief(user_id="u1", dimension="d", key="k", claim_text="ok"))
         s.commit()

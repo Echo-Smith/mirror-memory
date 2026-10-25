@@ -6,6 +6,7 @@ import pytest
 from mirror_memory.api import MemoryEngine
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.models import InterventionEvent
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.core.repository import (
     get_belief,
     get_pending_verification,
@@ -52,7 +53,10 @@ def _seed_hypothesis(session, user_id="u1", *, key="i_want", confidence=0.85, or
         confidence=confidence,
         session_id=origin,
     )
-    belief.last_evidence_session_id = last
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope("verification test: tune evidence session"):
+        belief.last_evidence_session_id = last
     session.flush()
     return belief
 
@@ -104,7 +108,8 @@ class TestQuestionCandidates:
     def test_sorted_by_tier_times_confirm_rate(self, db_session, cfg):
         low = _seed_hypothesis(db_session, key="i_want")  # dimension goal
         high = _seed_hypothesis(db_session, key="i_have", origin="s3", last="s4")
-        high.dimension = "fact"  # tier 2 beats goal tier 1 (default tiers)
+        with fixture_write_scope("verification test: set dimension"):
+            high.dimension = "fact"  # tier 2 beats goal tier 1 (default tiers)
         db_session.flush()
         cfg.question_value_tiers = {"goal": 1, "fact": 2}
         candidates = get_question_candidates(db_session, "u1", cfg, limit=2)
