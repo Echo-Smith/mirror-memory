@@ -67,8 +67,8 @@ jobs:
             for rev in "$BASE" "$FIX"; do
               git checkout -q "$rev" -- src tests pyproject.toml
               move_spike_tests
-              if [ "$rev" = "$FIX" ]; then EXTRA_ENV="MM_SQL_AUDIT=0"; else EXTRA_ENV=""; fi
-              R=$(env $EXTRA_ENV measure "full $rev round$round")
+              if [ "$rev" = "$FIX" ]; then export MM_SQL_AUDIT=0; else unset MM_SQL_AUDIT || true; fi
+              R=$(measure "full $rev round$round")
               echo "$R" | tee -a "$GITHUB_STEP_SUMMARY"
               echo "$R" >> "$FULL_RESULTS"
             done
@@ -80,6 +80,7 @@ jobs:
             for rev in "$BASE" "$FIX"; do
               git checkout -q "$rev" -- src tests pyproject.toml
               move_spike_tests
+              if [ "$rev" = "$FIX" ]; then export MM_SQL_AUDIT=0; else unset MM_SQL_AUDIT || true; fi
               R=$(measure "longrun $rev round$round" tests/test_longrun_bench.py)
               echo "$R" | tee -a "$GITHUB_STEP_SUMMARY"
             done
