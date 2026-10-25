@@ -52,7 +52,15 @@ with ten.tenant_scope(*TENANT):
 
 
 def iteration(s):
-    """One mixed read/write workload round (read-heavy like recall)."""
+    """One workload round mirroring the longrun benchmark's top statement
+    shapes (measured: driver_shapes.py, 182k statements):
+
+    1. MemoryPreference full-entity SELECT  (is_memory_enabled / session.get)
+    2. Belief full-entity SELECT            (list_active_beliefs)
+    3. Evidence full-entity SELECT          (evidence graph loads)
+    4. scalar column SELECT                 (get_state_revision)
+    5. INSERT + ORM UPDATE ... RETURNING    (record_claim / bump revision)
+    """
     set_memory_enabled(s, USER, True)
     s.commit()
     for i in range(3):
@@ -63,6 +71,12 @@ def iteration(s):
         )
     s.commit()
     list_active_beliefs(s, USER, limit=50)
+    list(
+        s.query(Belief)
+        .filter(Belief.user_id == USER, Belief.status == "active")
+        .limit(20)
+        .all()
+    )
     for _ in range(5):
         get_state_revision(s, USER)
     s.query(Belief).filter(Belief.user_id == USER, Belief.status == "active").count()

@@ -1,11 +1,13 @@
-"""Security stress tests for the per-tenant loader-option cache.
+"""Security stress tests for the tenant loader-criteria option.
 
-The perf fix (spike/v1-tenancy-perf @ e4bfb80) caches one
-``with_loader_criteria`` option per ``(tenant_id, app_id)`` with a 1024
-cap.  A wrong cache key or a bad eviction is a direct cross-tenant data
-leak, so this module hammers the paths the acceptance plan calls out:
-eviction churn, look-alike keys, threads, tenant switches on one session,
-and lambda-SQL statement-cache reuse across tenants.
+The criteria template is a *tenant-agnostic* lambda whose comparisons bind
+to two module-level ``bindparam`` callables reading the ambient tenant at
+execution time (spike/v1-tenancy-perf).  There is no per-tenant option
+cache at all, so the historical leak vector -- a wrong cache key or bad
+eviction -- is structurally gone; this module keeps hammering the paths
+the acceptance plan calls out: massive tenant churn, look-alike keys,
+threads, tenant switches on one session, and lambda-SQL statement-cache
+reuse across tenants.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from sqlalchemy.orm import sessionmaker
 from mirror_memory.core.models import Base, Belief
 from mirror_memory.core.tenancy import (
     TenantContextError,
-    _option_cache,
+    _LOADER_OPTION,
     tenant_scope,
 )
 
@@ -43,26 +45,24 @@ def seed_belief(s, tenant, user, key, claim):
 
 
 # ---------------------------------------------------------------------------
-# 1. Eviction churn: more tenants than the cache cap, random interleaved reads
+# 1. Tenant churn far beyond any caching bound: one shared option serves
+#    every tenant, values resolved per execution -- no leak possible
 # ---------------------------------------------------------------------------
 
 
-def test_option_cache_eviction_never_leaks(tmp_path):
-    from mirror_memory.core.tenancy import _OPTION_CACHE_CAP
-
+def test_tenant_churn_never_leaks(tmp_path):
     factory = session_at(f"sqlite:///{tmp_path}/churn.db")
     s = factory()
     tenants = [(f"tenant-{i:05d}", "app") for i in range(1500)]
     for tenant in tenants:
         seed_belief(s, tenant, "u1", "k", f"CLAIM-{tenant[0]}")
 
-    assert len(_option_cache) < _OPTION_CACHE_CAP or True  # starting point
+    assert _LOADER_OPTION is not None  # the shared singleton is in use
 
-    # Deterministic sweeps across all tenants (7 passes => the 1500 keys
-    # cross the 1024 cap many times), sampling the cache size so eviction
-    # is provably observed.
+    # Deterministic sweeps across all tenants (7 passes).  With no
+    # per-tenant cache there is no eviction to observe; what must hold is
+    # that every one of the 10,500 reads sees exactly its own tenant's row.
     order = [i % len(tenants) for i in range(10_500)]
-    observed_lens = [len(_option_cache)]
     for idx in order:
         tenant = tenants[idx]
         with tenant_scope(*tenant):
@@ -71,17 +71,6 @@ def test_option_cache_eviction_never_leaks(tmp_path):
             assert rows[0].claim_text == f"CLAIM-{tenant[0]}"
             assert rows[0].tenant_id == tenant[0]
             assert rows[0].app_id == tenant[1]
-        if len(observed_lens) < 500 or idx % 50 == 0:
-            observed_lens.append(len(_option_cache))
-
-    # Eviction must actually have happened: the sampled size must drop at
-    # least once (saw-tooth fill/clear cycles).
-    drops = sum(
-        1 for a, b in zip(observed_lens, observed_lens[1:]) if b < a
-    )
-    assert drops >= 1, (
-        f"no eviction observed; sampled sizes: {observed_lens[:20]}..."
-    )
     s.close()
 
 

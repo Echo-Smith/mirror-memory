@@ -27,7 +27,7 @@ import contextlib
 from contextvars import ContextVar
 from typing import Iterator
 
-from sqlalchemy import Column, String, event
+from sqlalchemy import Column, String, bindparam, event
 from sqlalchemy.orm import Mapped, Session, with_loader_criteria
 from sqlalchemy.orm.decl_api import declared_attr
 from sqlalchemy.sql import visitors
@@ -139,29 +139,30 @@ class TenantScoped:
 # ---------------------------------------------------------------------------
 
 
-#: Loader criteria options cached per tenant.  Building the option (and its
-#: criteria lambda) is the per-statement cost of the hook; reusing one
-#: option object per (tenant_id, app_id) keeps every statement execution on
-#: SQLAlchemy's compiled-cache fast path instead of re-analysing a fresh
-#: closure each time.  Tenants are few and bounded; the cap is a guard
-#: against pathological key churn, not a working-set limit.
-_option_cache: dict[tuple[str, str], object] = {}
-_OPTION_CACHE_CAP = 1024
+#: One *tenant-agnostic* loader-criteria option, shared by every execution.
+#: The criteria template is a lambda over the entity class whose comparisons
+#: bind to two module-level ``bindparam`` objects with ``callable_`` hooks
+#: that read the ambient tenant at execution time.  Consequences:
+#: - the tenant never appears in the option or the cached expression, so
+#:   there is no per-tenant option cache (and no cache-key leak vector);
+#: - ``track_closure_variables=False`` stops SQLAlchemy from re-running the
+#:   lambda body per execution (it has nothing bind-eligible to track), so
+#:   the ``==``/``&`` expression construction cost disappears from the hot
+#:   path; the bind values are still resolved per execution by the engine.
+_tenant_bind = bindparam("mm_spike_tenant", callable_=lambda: _tenant_var.get()[0])
+_app_bind = bindparam("mm_spike_app", callable_=lambda: _tenant_var.get()[1])
 
 
-def _tenant_loader_option(tenant: tuple[str, str]):
-    option = _option_cache.get(tenant)
-    if option is None:
-        tenant_id, app_id = tenant
-        option = with_loader_criteria(
-            TenantScoped,
-            lambda cls: (cls.tenant_id == tenant_id) & (cls.app_id == app_id),
-            include_aliases=True,
-        )
-        if len(_option_cache) >= _OPTION_CACHE_CAP:
-            _option_cache.clear()
-        _option_cache[tenant] = option
-    return option
+def _criteria_template(cls):
+    return (cls.tenant_id == _tenant_bind) & (cls.app_id == _app_bind)
+
+
+_LOADER_OPTION = with_loader_criteria(
+    TenantScoped,
+    _criteria_template,
+    include_aliases=True,
+    track_closure_variables=False,
+)
 
 
 @event.listens_for(Session, "do_orm_execute")
@@ -176,13 +177,12 @@ def _inject_tenant_criteria(state) -> None:
         return
     if in_system_scope():
         return
-    tenant = _tenant_var.get()
-    if tenant is not None:
-        # Fast path: statements are filtered by attaching the tenant's
-        # cached loader criteria.  The criteria only binds to TenantScoped
-        # entities, so statements over other tables are unaffected, and it
-        # reaches entities inside subqueries too (Query.count()).
-        state.statement = state.statement.options(_tenant_loader_option(tenant))
+    if _tenant_var.get() is not None:
+        # Fast path: attach the shared tenant-agnostic criteria.  It only
+        # binds to TenantScoped entities (values resolved at execution),
+        # so statements over other tables are unaffected, and it reaches
+        # entities inside subqueries too (Query.count()).
+        state.statement = state.statement.options(_LOADER_OPTION)
         return
     # Fail-closed decision path (no tenant context): only statements that
     # actually touch tenant tables must raise; the rest pass through.
