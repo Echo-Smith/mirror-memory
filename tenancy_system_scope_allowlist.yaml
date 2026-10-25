@@ -17,3 +17,12 @@
     session bound to that tenant.
   reviewer: Echo-Smith
   reviewed_at: "2026-10-25"
+
+- module: mirror_memory.core.schema_migration
+  function: upgrade_database
+  reason: >
+    The tenancy backfill copies every pre-tenancy row into the new shape
+    while stamping the configured default tenant -- inherently cross-tenant
+    maintenance, executed once per database at upgrade time.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-25"
