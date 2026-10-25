@@ -1,0 +1,32 @@
+name: perf-regression-bench
+
+# M0 "固定的性能测量环境" — the interleaved in-process micro-benchmark
+# (driver_bench.py) as a recurring performance regression check.
+# Report-only: ratios are published to the step summary; hard gate
+# thresholds are intentionally deferred until the M1 decomposition
+# (tenancy-perf-decompose) fixes the acceptance口径.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"  # weekly, Monday 03:00 UTC
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev]"
+
+      - name: Run interleaved micro-benchmark
+        run: |
+          python driver_bench.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
