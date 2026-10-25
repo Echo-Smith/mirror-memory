@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,8 @@ class MemoryEngine:
         llm_api_key: str | None = None,
         llm_model: str = "gpt-4o-mini",
         llm_base_url: str | None = None,
+        tenant_id: str = "default",
+        app_id: str = "default",
     ) -> None:
         if config is not None:
             self._config = config
@@ -76,6 +79,10 @@ class MemoryEngine:
 
         self._database_url = database_url
         self._llm_client = llm_client or self._build_llm(llm_api_key, llm_model, llm_base_url)
+        # M1 tenancy: the engine entry point pins an explicit tenant; every
+        # session it opens is created inside that scope and therefore bound
+        # to it at creation time (see core.tenancy).
+        self._tenant = (tenant_id, app_id)
         self._initialized = False
         self._pipeline = None  # lazy-initialized
 
@@ -105,11 +112,24 @@ class MemoryEngine:
         check_schema(self._engine)
         self._initialized = True
 
+    @contextmanager
     def _session(self):
-        """Create a new database session."""
+        """Open a session bound to this engine's tenant.
+
+        The session is created inside the tenant scope, so tenancy binds it
+        at creation time (core.tenancy session binding); the scope also
+        covers the work done with the session.
+        """
         from sqlalchemy.orm import Session
 
-        return Session(self._engine)
+        from mirror_memory.core.tenancy import tenant_scope
+
+        with tenant_scope(*self._tenant):
+            session = Session(self._engine)
+            try:
+                yield session
+            finally:
+                session.close()
 
     def _get_pipeline(self):
         """Lazy-initialize the extraction pipeline (singleton per engine)."""

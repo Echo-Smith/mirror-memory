@@ -113,6 +113,13 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
 def process_pending(session_factory: object, config: MemoryConfig) -> None:
     """Process all pending evolution jobs.
 
+    Tenancy (M1): the job queue is shared across tenants, so the
+    crash-recovery sweep and the queue scan run under the explicit
+    ``system_scope`` bypass (the only one, with a recorded reason).  Each
+    job is then processed in a *fresh session created inside the job's own
+    tenant scope* -- sessions are single-tenant by design, so the scan
+    session is never reused for tenant work.
+
     Parameters
     ----------
     session_factory:
@@ -120,29 +127,48 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
     config:
         The ``MemoryConfig``.
     """
+    from mirror_memory.core.tenancy import system_scope
+
     session = session_factory() if callable(session_factory) else session_factory
 
     try:
-        # Crash recovery: expire stale running jobs.
-        lease_cutoff = datetime.now(UTC) - timedelta(seconds=config.worker.job_lease_seconds)
-        session.query(EvolutionJob).filter(
-            EvolutionJob.status == "running",
-            EvolutionJob.started_at < lease_cutoff,
-        ).update({"status": "pending"}, synchronize_session=False)
-        session.commit()
+        with system_scope(reason="evolution worker: crash-recovery sweep and pending-job scan"):
+            # Crash recovery: expire stale running jobs.
+            lease_cutoff = datetime.now(UTC) - timedelta(seconds=config.worker.job_lease_seconds)
+            session.query(EvolutionJob).filter(
+                EvolutionJob.status == "running",
+                EvolutionJob.started_at < lease_cutoff,
+            ).update({"status": "pending"}, synchronize_session=False)
+            session.commit()
 
-        jobs = (
-            session.query(EvolutionJob)
-            .filter(EvolutionJob.status == "pending")
-            .order_by(EvolutionJob.created_at)
-            .limit(JOB_BATCH_LIMIT)
-            .all()
-        )
+            jobs = (
+                session.query(EvolutionJob)
+                .filter(EvolutionJob.status == "pending")
+                .order_by(EvolutionJob.created_at)
+                .limit(JOB_BATCH_LIMIT)
+                .all()
+            )
         if not jobs:
             return
 
         for job in jobs:
-            # Atomic claim: only pending jobs can be claimed.
+            _claim_and_process(session_factory, job, config)
+    finally:
+        session.close()
+
+
+def _claim_and_process(session_factory: object, job: EvolutionJob, config: MemoryConfig) -> None:
+    """Claim and process one job inside a session bound to the job's tenant."""
+    from mirror_memory.core.tenancy import tenant_scope
+
+    with tenant_scope(job.tenant_id, job.app_id):
+        session = session_factory() if callable(session_factory) else session_factory
+        try:
+            # Re-read the job in this session (it is bound to the job's
+            # tenant; the scan session's objects are not reused).
+            job_row = session.get(EvolutionJob, job.id)
+            if job_row is None or job_row.status != "pending":
+                return  # claimed by another instance or expired
             updated = (
                 session.query(EvolutionJob)
                 .filter(
@@ -160,10 +186,10 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
             )
             session.commit()
             if updated == 0:
-                continue  # claimed by another instance
-            _process_single_job(session, job, config)
-    finally:
-        session.close()
+                return  # claimed by another instance
+            _process_single_job(session, job_row, config)
+        finally:
+            session.close()
 
 
 # ---------------------------------------------------------------------------
