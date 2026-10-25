@@ -229,36 +229,30 @@ def parse_verdict(raw: str) -> str:
     return "unclear"
 
 
-def _update_confirm_rate(session: object, belief: object, verdict: str) -> None:
-    """Update belief's confirm_rate using Beta(1,1) shrinkage.
+def _update_confirm_rate(session: object, user_id: str, belief_id: int, verdict: str, config: object) -> bool:
+    """Fold a verification verdict into the belief's Beta confirm counters.
 
-    Called after every verdict (including unclear, which is a no-op for
-    counts but keeps the rate computation consistent).
+    Routed through the Publisher like every other belief write (M1 task 4):
+    the CONFIRM_RATE transition touches only ``value_json`` telemetry, never
+    bumps the state revision, and lands in the proposal log for audit.
+
+    Returns ``True`` when the proposal committed.
     """
-    import json as _json
+    import uuid
 
-    from mirror_memory.core.constants import BETA_PRIOR_ALPHA, BETA_PRIOR_BETA
+    from mirror_memory.core.proposal import TRANSITION_CONFIRM_RATE, StateTransitionProposal
+    from mirror_memory.core.publisher import Publisher
 
-    try:
-        val = _json.loads(belief.value_json or "{}")
-    except (TypeError, ValueError):
-        val = {}
-
-    alpha = val.get("confirm_alpha", BETA_PRIOR_ALPHA)
-    beta = val.get("confirm_beta", BETA_PRIOR_BETA)
-
-    if verdict == "confirm":
-        alpha += 1
-    elif verdict == "deny":
-        beta += 1
-    # unclear: no count update
-
-    total = alpha + beta
-    val["confirm_alpha"] = alpha
-    val["confirm_beta"] = beta
-    val["confirm_rate"] = round(alpha / total, 4) if total > 0 else 0.5
-    belief.value_json = _json.dumps(val, ensure_ascii=False)
-    session.flush()
+    decision = Publisher(session, config).publish(
+        StateTransitionProposal(
+            transition=TRANSITION_CONFIRM_RATE,
+            user_id=user_id,
+            target_belief_id=belief_id,
+            payload={"verdict": verdict},
+            actor_type="user",
+        )
+    )
+    return decision.committed
 
 
 def run_verification_judgment(
@@ -368,12 +362,8 @@ def run_verification_judgment(
                 logger.info(
                     "verification: %s refused (%s)", transition, decision.reason
                 )
-        if verdict == "confirm":
-            _update_confirm_rate(session, belief, "confirm")
-        elif verdict == "deny":
-            _update_confirm_rate(session, belief, "deny")
-        else:
-            _update_confirm_rate(session, belief, "unclear")
+        if verdict in ("confirm", "deny", "unclear"):
+            _update_confirm_rate(session, user_id, belief.id, verdict, config)
         # unclear: record event only -- belief state unchanged.
 
         record_intervention_event(

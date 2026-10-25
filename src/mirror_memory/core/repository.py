@@ -75,6 +75,24 @@ from mirror_memory.metabolism.protection import REASON_USER_CORRECTION
 logger = logging.getLogger(__name__)
 
 
+def _sanctioned_claim_writer(fn):
+    """Mark a repository entry as a sanctioned writer of belief rows.
+
+    The M1 write guard refuses Belief/BeliefEvent writes outside the
+    Publisher or these entries (see core.tenancy.publisher_write_scope).
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from mirror_memory.core.tenancy import publisher_write_scope
+
+        with publisher_write_scope():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # Memory preference
 # ---------------------------------------------------------------------------
@@ -637,6 +655,7 @@ def pending_verification_keys(session: Session, user_id: str) -> set[str]:
     return {str(key)} if key else set()
 
 
+@_sanctioned_claim_writer
 def mark_belief_accessed(session: Session, belief_ids: list[int], *, now: datetime | None = None) -> int:
     """Record that recall actually surfaced these beliefs.
 
@@ -1520,6 +1539,7 @@ def _is_elaboration(new_text: str, old_text: str | None) -> bool:
     return bool(old_distinctive & content_tokens(new_text, min_length=6))
 
 
+@_sanctioned_claim_writer
 def record_claim(
     session: Session,
     user_id: str,
@@ -1790,6 +1810,7 @@ def record_claim(
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_claim_writer
 def confirm_belief(
     session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
 ) -> Belief | None:
@@ -1806,6 +1827,7 @@ def confirm_belief(
     return belief
 
 
+@_sanctioned_claim_writer
 def reject_belief(
     session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
 ) -> Belief | None:
@@ -1826,6 +1848,7 @@ def reject_belief(
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_claim_writer
 def support_belief_by_id(
     session: Session,
     belief_id: int,
@@ -1955,6 +1978,7 @@ def _disambiguate_key(session: Session, user_id: str, key: str) -> str:
         suffix += 1
 
 
+@_sanctioned_claim_writer
 def update_belief_by_id(
     session: Session,
     old_belief_id: int,
@@ -2100,6 +2124,7 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+@_sanctioned_claim_writer
 def update_belief_value(
     session: Session,
     user_id: str,
@@ -2516,6 +2541,7 @@ def _write_deletion_tombstone(
     return tombstone
 
 
+@_sanctioned_claim_writer
 def forget_belief(
     session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
 ) -> bool:
@@ -2658,6 +2684,7 @@ def forget_session_summary(session: Session, user_id: str, session_id: str) -> b
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_claim_writer
 def correct_belief(
     session: Session,
     user_id: str,

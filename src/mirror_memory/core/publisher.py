@@ -44,6 +44,7 @@ from sqlalchemy.orm import Session
 
 from mirror_memory.core.models import Belief, Evidence, ProposalLog, utcnow
 from mirror_memory.core.proposal import (
+    TRANSITION_CONFIRM_RATE,
     TRANSITION_CONTRADICT,
     TRANSITION_CORRECT,
     TRANSITION_CREATE,
@@ -152,7 +153,9 @@ class Publisher:
             # The savepoint is the Publisher's own atomicity boundary: the
             # revision CAS, the handler's writes, and the proposal-log row
             # either all land or none do.
-            with self._session.begin_nested():
+            from mirror_memory.core.tenancy import publisher_write_scope
+
+            with publisher_write_scope(), self._session.begin_nested():
                 revision_after, belief_id = self._commit(proposal)
                 self._record_commit(proposal, revision_after, belief_id)
         except StaleRevisionError as exc:
@@ -420,6 +423,7 @@ class Publisher:
             TRANSITION_FORGET: self._commit_forget,
             TRANSITION_VERIFY: self._commit_verify,
             TRANSITION_REJECT: self._commit_reject,
+            TRANSITION_CONFIRM_RATE: self._commit_confirm_rate,
             TRANSITION_SYNTHESIZE: self._commit_synthesize,
             TRANSITION_TIER_TRANSITION: self._commit_tier_transition,
             TRANSITION_EVIDENCE_COMPACT: self._commit_evidence_compact,
@@ -628,6 +632,39 @@ class Publisher:
             bump_revision=False,
         )
         return proposal.target_belief_id
+
+    def _commit_confirm_rate(self, proposal: StateTransitionProposal) -> int | None:
+        """CONFIRM_RATE folds a verification verdict into the belief's Beta
+        counters (value_json telemetry only).  No revision bump: the claim,
+        status, and confidence are untouched."""
+        import json as _json
+
+        from mirror_memory.core.constants import BETA_PRIOR_ALPHA, BETA_PRIOR_BETA
+
+        belief = self._session.get(Belief, proposal.target_belief_id)
+        if belief is None:
+            return None
+        verdict = (proposal.payload or {}).get("verdict", "unclear")
+
+        try:
+            val = _json.loads(belief.value_json or "{}")
+        except (TypeError, ValueError):
+            val = {}
+
+        alpha = val.get("confirm_alpha", BETA_PRIOR_ALPHA)
+        beta = val.get("confirm_beta", BETA_PRIOR_BETA)
+        if verdict == "confirm":
+            alpha += 1
+        elif verdict == "deny":
+            beta += 1
+        # unclear: no count update
+        total = alpha + beta
+        val["confirm_alpha"] = alpha
+        val["confirm_beta"] = beta
+        val["confirm_rate"] = round(alpha / total, 4) if total > 0 else 0.5
+        belief.value_json = _json.dumps(val, ensure_ascii=False)
+        self._session.flush()
+        return belief.id
 
     def _commit_synthesize(self, proposal: StateTransitionProposal) -> int:
         """SYNTHESIZE publishes derived state (a snapshot), never a belief.

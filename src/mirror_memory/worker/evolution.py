@@ -64,9 +64,20 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         .first()
     )
     if existing:
-        existing.evidence_watermark = json.dumps({"latest_update": watermark})
-        existing.idempotency_key = idempotency_key
+        # Queue bookkeeping via explicit bulk UPDATE (tenant-filtered by
+        # the hook) rather than identity-keyed attribute mutation.
+        session.query(EvolutionJob).filter(
+            EvolutionJob.id == existing.id,
+            EvolutionJob.status.in_(("pending", "running")),
+        ).update(
+            {
+                EvolutionJob.evidence_watermark: json.dumps({"latest_update": watermark}),
+                EvolutionJob.idempotency_key: idempotency_key,
+            },
+            synchronize_session=False,
+        )
         session.commit()
+        session.refresh(existing)
         return existing
 
     # Promote shadow if ready.
@@ -83,13 +94,22 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         .first()
     )
     if stale:
-        stale.status = "pending"
-        stale.attempt_count = 0
-        stale.error_code = ""
-        stale.started_at = None
-        stale.completed_at = None
-        stale.evidence_watermark = json.dumps({"latest_update": watermark})
+        session.query(EvolutionJob).filter(
+            EvolutionJob.id == stale.id,
+            EvolutionJob.status.in_(("completed", "failed")),
+        ).update(
+            {
+                EvolutionJob.status: "pending",
+                EvolutionJob.attempt_count: 0,
+                EvolutionJob.error_code: "",
+                EvolutionJob.started_at: None,
+                EvolutionJob.completed_at: None,
+                EvolutionJob.evidence_watermark: json.dumps({"latest_update": watermark}),
+            },
+            synchronize_session=False,
+        )
         session.commit()
+        session.refresh(stale)
         return stale
 
     job = EvolutionJob(
@@ -280,17 +300,29 @@ def _process_single_job(
             _block_job(session, job, decision.reason)
             return
 
-        job.status = "completed"
-        job.completed_at = datetime.now(UTC)
-        job.error_code = ""
-        session.commit()
+        _set_job_state(session, job.id, {
+            "status": "completed",
+            "completed_at": datetime.now(UTC),
+            "error_code": "",
+        })
         logger.info("evolution: completed job=%s", truncate_id(job.id))
 
     except Exception as exc:
-        job.status = "failed" if job.attempt_count >= config.worker.max_attempts else "pending"
-        job.error_code = type(exc).__name__
-        session.commit()
+        _set_job_state(session, job.id, {
+            "status": "failed" if job.attempt_count >= config.worker.max_attempts else "pending",
+            "error_code": type(exc).__name__,
+        })
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job.id), type(exc).__name__)
+
+
+def _set_job_state(session: object, job_id: str, changes: dict) -> None:
+    """Queue bookkeeping: job-state writes go through an explicit bulk
+    UPDATE (tenant-filtered by the hook) rather than attribute mutation."""
+    session.query(EvolutionJob).filter(
+        EvolutionJob.id == job_id,
+        EvolutionJob.status == "running",
+    ).update(changes, synchronize_session=False)
+    session.commit()
 
 
 def _block_job(session: object, job: EvolutionJob, reason: str) -> None:
@@ -299,10 +331,11 @@ def _block_job(session: object, job: EvolutionJob, reason: str) -> None:
     The job is marked ``cancelled`` rather than ``completed``: nothing was
     written, and the next ``enqueue_job`` for the user must be free to run.
     """
-    job.status = "cancelled"
-    job.completed_at = datetime.now(UTC)
-    job.error_code = reason
-    session.commit()
+    _set_job_state(session, job.id, {
+        "status": "cancelled",
+        "completed_at": datetime.now(UTC),
+        "error_code": reason,
+    })
 
 
 # ---------------------------------------------------------------------------

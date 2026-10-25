@@ -309,6 +309,8 @@ def test_bulk_update_and_delete_are_tenant_scoped(raw_session_factory):
     seed_belief_via_claim(raw_session_factory, T_B, claim_text="FROM_TENANT_B")
 
     with tenant_scope(*T_B):
+        from mirror_memory.core.sql_audit import no_audit_scope
+
         s = raw_session_factory()
         try:
             bulk_update = sa_update(Belief).values(claim_text="BULKED").execution_options(
@@ -324,10 +326,13 @@ def test_bulk_update_and_delete_are_tenant_scoped(raw_session_factory):
             bulk_delete = sa_delete(Belief).where(Belief.key == "nonexistent")
             s.execute(bulk_delete)
             # query-API bulk delete of everything visible in this tenant
-            visible = s.query(Belief).all()
-            for row in visible:
-                s.delete(row)
-            s.commit()
+            # (mechanic test of hook-level isolation: audit off for the
+            # hand-rolled per-row delete)
+            with no_audit_scope():
+                visible = s.query(Belief).all()
+                for row in visible:
+                    s.delete(row)
+                s.commit()
         finally:
             s.close()
 
@@ -426,7 +431,7 @@ def test_update_confirm_rate_cannot_cross_tenants(raw_session_factory):
         s = raw_session_factory()
         try:
             belief_b = s.query(Belief).filter(Belief.user_id == USER).first()
-            _update_confirm_rate(s, belief_b, "confirm")
+            _update_confirm_rate(s, "u1", belief_b.id, "confirm", None)
             s.commit()
         finally:
             s.close()

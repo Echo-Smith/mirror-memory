@@ -111,8 +111,13 @@ def promote_shadow_if_ready(session: object, user_id: str) -> bool:
         .count()
     )
     if distinct_sessions >= 2:
-        latest_snap.status = "active"
-        session.flush()
+        # Queue/state bookkeeping via explicit bulk UPDATE (tenant-filtered
+        # by the hook) rather than identity-keyed attribute mutation.
+        session.query(Snapshot).filter(
+            Snapshot.id == latest_snap.id,
+            Snapshot.status == "shadow",
+        ).update({"status": "active"}, synchronize_session=False)
+        session.expire(latest_snap)
         logger.info(
             "snapshot: shadow promoted user=%s version=%d",
             truncate_id(user_id),

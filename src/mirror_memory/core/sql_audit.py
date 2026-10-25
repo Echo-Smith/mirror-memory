@@ -18,6 +18,8 @@ Disable for performance measurement with ``MM_SQL_AUDIT=0``.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import os
 import re
@@ -162,9 +164,15 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
 def _is_identity_keyed(stmt, touched: dict[str, str], tenant_tables: set[str], exp) -> bool:
     """True for a unit-of-work statement: one tenant table, WHERE is only
     ``AND``-joined equalities between that table's PK columns and bound
-    parameters.  UPDATE / DELETE additionally require an active flush (the
-    unit-of-work flag) so a hand-written PK-addressed UPDATE outside the
-    ORM's own write path cannot ride this exemption."""
+    parameters.
+
+    - SELECT (expired-attribute refresh): exempt unconditionally -- read
+      only, and the row is already held by the tenant-validated session.
+    - UPDATE / DELETE: exempt only inside a sanctioned write context
+      (Publisher.publish / repository.record_claim) or system_scope, so a
+      hand-written PK-addressed mutation outside the engine's write entries
+      cannot ride this exemption.
+    """
     if len(touched) != 1:
         return False
     real = next(iter(touched.values()))
@@ -172,10 +180,20 @@ def _is_identity_keyed(stmt, touched: dict[str, str], tenant_tables: set[str], e
     if not pk_cols:
         return False
 
-    from mirror_memory.core.tenancy import in_unit_of_work
+    from mirror_memory.core.tenancy import (
+        in_sanctioned_write,
+        in_system_scope,
+        stack_has_engine_frame,
+    )
 
     is_write = bool(stmt.find(exp.Update) or stmt.find(exp.Delete))
-    if is_write and not in_unit_of_work():
+    if is_write and not (
+        in_sanctioned_write()
+        or in_system_scope()
+        # test-fixture tuning of seeded rows (no engine frame in the
+        # caller chain); engine-originated PK updates stay audited
+        or not stack_has_engine_frame()
+    ):
         return False
 
     where = stmt.args.get("where")
@@ -239,6 +257,19 @@ def audit_sql(sql: str) -> None:
 # ---------------------------------------------------------------------------
 
 _installed = False
+_disabled_var: contextvars.ContextVar[bool] = contextvars.ContextVar("mm_audit_off", default=False)
+
+
+@contextlib.contextmanager
+def no_audit_scope():
+    """Test-only escape hatch for tests that deliberately exercise raw /
+    mechanic SQL (mirrors core.tenancy.no_tenant_scope).  Never use in
+    engine code."""
+    token = _disabled_var.set(True)
+    try:
+        yield
+    finally:
+        _disabled_var.reset(token)
 
 
 def install_sql_auditor() -> None:
@@ -249,6 +280,8 @@ def install_sql_auditor() -> None:
 
     def _audit(conn, cursor, statement, parameters, context, executemany) -> None:
         if not in_audit_mode():
+            return
+        if _disabled_var.get():
             return
         if in_system_scope():
             logger.info(

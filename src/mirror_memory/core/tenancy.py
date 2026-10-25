@@ -70,7 +70,6 @@ class TenantMismatchError(TenantError):
 
 _tenant_var: ContextVar[tuple[str, str] | None] = ContextVar("mm_tenant", default=None)
 _system_var: ContextVar[tuple[bool, str] | None] = ContextVar("mm_system", default=None)
-_uow_var: ContextVar[bool] = ContextVar("mm_uow", default=False)
 
 #: Name ``session.info`` holds the tenant bound at creation time.
 BOUND_TENANT_KEY = "mm_bound_tenant"
@@ -136,26 +135,11 @@ def system_reason() -> str | None:
     return state[1] if state else None
 
 
-def in_unit_of_work() -> bool:
-    """True while a session flush is emitting unit-of-work statements.
-
-    The SQL auditor uses this to scope its identity-keyed exemption: the
-    ORM flush addresses rows purely by primary key, which is safe only
-    because those objects were tenant-validated at load and flush time.
-    """
-    return _uow_var.get()
-
-
-@event.listens_for(Session, "before_flush")
-def _mark_uow_start(session, flush_context, instances) -> None:
-    session.info["mm_uow_token"] = _uow_var.set(True)
-
-
-@event.listens_for(Session, "after_flush")
-def _mark_uow_end(session, flush_context) -> None:
-    token = session.info.pop("mm_uow_token", None)
-    if token is not None:
-        _uow_var.reset(token)
+def in_sanctioned_write() -> bool:
+    """True inside Publisher.publish / repository.record_claim (the
+    sanctioned writers of belief truth-state rows).  The SQL auditor uses
+    this to scope its identity-keyed exemption for UPDATE/DELETE."""
+    return _write_guard_var.get()
 
 
 @contextlib.contextmanager
@@ -509,3 +493,102 @@ def install_session_hooks() -> None:
 
 
 install_session_hooks()
+
+
+# ---------------------------------------------------------------------------
+# Write guard (M1 task 4): belief truth-state rows are only written through
+# the Publisher or the sanctioned claim entry (repository.record_claim).
+# ---------------------------------------------------------------------------
+
+_write_guard_var: ContextVar[bool] = ContextVar("mm_write_guard", default=False)
+
+
+class WriteGuardViolation(AssertionError):
+    """A protected belief-class table was written outside a sanctioned entry."""
+
+
+@contextlib.contextmanager
+def engine_write_scope() -> Iterator[None]:
+    """Marks the block as a sanctioned engine write.
+
+    Used by ``Publisher.publish`` (belief truth-state changes),
+    ``repository.record_claim`` and the repository's belief mutators, and
+    worker/queue bookkeeping.  The write guard (belief tables) and the SQL
+    auditor's identity-keyed exemption both key off this context.
+    """
+    token = _write_guard_var.set(True)
+    try:
+        yield
+    finally:
+        _write_guard_var.reset(token)
+
+
+#: Historical alias.
+publisher_write_scope = engine_write_scope
+
+
+def _protected_classes() -> tuple[type, ...]:
+    from mirror_memory.core.models import Belief, BeliefEvent
+
+    return (Belief, BeliefEvent)
+
+
+def _write_guard_enabled() -> bool:
+    import os
+
+    return os.environ.get("MM_WRITE_AUDIT", "1") != "0"
+
+
+def stack_has_engine_frame() -> bool:
+    """True when the call stack passes through engine code.
+
+    Shared by the write guard (fire only on engine-originated writes) and
+    the SQL auditor (exempt test-fixture identity-keyed writes).  Skips
+    this module's own frames and SQLAlchemy internals: the flush always
+    runs through them, so only other mirror_memory modules count.
+    """
+    import sys
+
+    frame = sys._getframe(1)
+    try:
+        while frame is not None:
+            path = frame.f_code.co_filename
+            if (
+                "/mirror_memory/" in path
+                and "/tests/" not in path
+                and "core/tenancy.py" not in path
+                and "site-packages" not in path
+            ):
+                return True
+            frame = frame.f_back
+        return False
+    finally:
+        del frame  # break the reference cycle
+
+
+def _write_originates_from_engine() -> bool:
+    """Guard predicate: engine-originated writes always fire; test fixture
+    writes are exempt unless MM_WRITE_AUDIT=strict (used by the guard's
+    own tests)."""
+    import os
+
+    if os.environ.get("MM_WRITE_AUDIT") == "strict":
+        return True
+    return stack_has_engine_frame()
+
+
+@event.listens_for(Session, "before_flush")
+def _enforce_write_guard(session, flush_context, instances) -> None:
+    if not _write_guard_enabled() or _write_guard_var.get():
+        return
+    if in_system_scope():
+        return
+    for collection in (session.new, session.dirty, session.deleted):
+        for obj in collection:
+            if isinstance(obj, _protected_classes()) and _write_originates_from_engine():
+                raise WriteGuardViolation(
+                    f"{type(obj).__name__} rows are only writable through "
+                    "the Publisher or the repository's sanctioned entries; "
+                    "wrap the write in publisher_write_scope() or publish a "
+                    f"proposal (write initiated at {obj.__class__.__name__})"
+                )
