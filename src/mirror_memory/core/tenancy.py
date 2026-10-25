@@ -577,18 +577,32 @@ def _write_originates_from_engine() -> bool:
     return stack_has_engine_frame()
 
 
-@event.listens_for(Session, "before_flush")
-def _enforce_write_guard(session, flush_context, instances) -> None:
-    if not _write_guard_enabled() or _write_guard_var.get():
+def install_write_guard() -> None:
+    """Authoring-time write guard for the protected belief tables.
+
+    Enforced at *mutation* time (attribute ``set`` events), not flush
+    time: a mutation's caller chain reflects who authored it, while
+    flushes are deferred and often executed by a later engine call, which
+    would mis-attribute test-authored or sanctioned-authored writes.
+    Idempotent; called once after the models import.
+    """
+    from sqlalchemy import event
+
+    if getattr(install_write_guard, "_installed", False):
         return
-    if in_system_scope():
-        return
-    for collection in (session.new, session.dirty, session.deleted):
-        for obj in collection:
-            if isinstance(obj, _protected_classes()) and _write_originates_from_engine():
-                raise WriteGuardViolation(
-                    f"{type(obj).__name__} rows are only writable through "
-                    "the Publisher or the repository's sanctioned entries; "
-                    "wrap the write in publisher_write_scope() or publish a "
-                    f"proposal (write initiated at {obj.__class__.__name__})"
-                )
+    install_write_guard._installed = True  # type: ignore[attr-defined]
+
+    def _guarded_set(target, value, oldvalue, initiator):
+        if _write_guard_var.get() or not _write_guard_enabled():
+            return value
+        if not _write_originates_from_engine():
+            return value
+        raise WriteGuardViolation(
+            f"{type(target).__name__}.{initiator.key} is only writable "
+            "through the Publisher or the repository's sanctioned entries; "
+            "wrap the write in engine_write_scope() or publish a proposal"
+        )
+
+    for cls in _protected_classes():
+        for attr in cls.__mapper__.column_attrs:
+            event.listen(getattr(cls, attr.key), "set", _guarded_set)

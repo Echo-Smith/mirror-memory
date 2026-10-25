@@ -300,7 +300,7 @@ def _process_single_job(
             _block_job(session, job, decision.reason)
             return
 
-        _set_job_state(session, job.id, {
+        _set_job_state(session, job, {
             "status": "completed",
             "completed_at": datetime.now(UTC),
             "error_code": "",
@@ -308,21 +308,22 @@ def _process_single_job(
         logger.info("evolution: completed job=%s", truncate_id(job.id))
 
     except Exception as exc:
-        _set_job_state(session, job.id, {
+        _set_job_state(session, job, {
             "status": "failed" if job.attempt_count >= config.worker.max_attempts else "pending",
             "error_code": type(exc).__name__,
         })
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job.id), type(exc).__name__)
 
 
-def _set_job_state(session: object, job_id: str, changes: dict) -> None:
+def _set_job_state(session: object, job: EvolutionJob, changes: dict) -> None:
     """Queue bookkeeping: job-state writes go through an explicit bulk
-    UPDATE (tenant-filtered by the hook) rather than attribute mutation."""
+    UPDATE (tenant-filtered by the hook) rather than attribute mutation.
+    The in-session object is expired so subsequent reads reflect the row."""
     session.query(EvolutionJob).filter(
-        EvolutionJob.id == job_id,
-        EvolutionJob.status == "running",
+        EvolutionJob.id == job.id,
     ).update(changes, synchronize_session=False)
     session.commit()
+    session.expire(job)
 
 
 def _block_job(session: object, job: EvolutionJob, reason: str) -> None:
@@ -331,7 +332,7 @@ def _block_job(session: object, job: EvolutionJob, reason: str) -> None:
     The job is marked ``cancelled`` rather than ``completed``: nothing was
     written, and the next ``enqueue_job`` for the user must be free to run.
     """
-    _set_job_state(session, job.id, {
+    _set_job_state(session, job, {
         "status": "cancelled",
         "completed_at": datetime.now(UTC),
         "error_code": reason,

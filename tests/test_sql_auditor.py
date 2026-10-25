@@ -91,9 +91,18 @@ def test_counterexample_insert_missing_tenant_columns():
         audit_sql("INSERT INTO mm_beliefs (user_id, key) VALUES (?, ?)")
 
 
-def test_counterexample_update_missing_predicates():
+def test_counterexample_filtered_update_missing_predicates():
+    # A WHERE over non-PK columns without tenant predicates is a genuine
+    # cross-tenant write surface (PK-only WHERE is the ORM unit-of-work
+    # shape, exempted by design -- its safety lives in the write guard).
     with pytest.raises(AuditViolation):
-        audit_sql("UPDATE mm_beliefs SET confidence = ? WHERE id = ?")
+        audit_sql("UPDATE mm_beliefs SET confidence = ? WHERE user_id = ?")
+
+
+def test_counterexample_pk_delete_of_another_shape():
+    # DELETE with a non-PK filter and no tenant predicates: caught.
+    with pytest.raises(AuditViolation):
+        audit_sql("DELETE FROM mm_beliefs WHERE session_id = ?")
 
 
 def test_counterexample_literal_predicate_not_bound():

@@ -166,34 +166,21 @@ def _is_identity_keyed(stmt, touched: dict[str, str], tenant_tables: set[str], e
     ``AND``-joined equalities between that table's PK columns and bound
     parameters.
 
-    - SELECT (expired-attribute refresh): exempt unconditionally -- read
-      only, and the row is already held by the tenant-validated session.
-    - UPDATE / DELETE: exempt only inside a sanctioned write context
-      (Publisher.publish / repository.record_claim) or system_scope, so a
-      hand-written PK-addressed mutation outside the engine's write entries
-      cannot ride this exemption.
+    Unconditionally exempt: ORM unit-of-work statements address rows purely
+    by primary key, and their tenant safety is enforced where it actually
+    lives -- load-time filtering (loader criteria) and the write guard --
+    not in the statement text.  (Scoping this exemption by flush-time state
+    is unreliable: a test-authored mutation is often flushed by a later
+    engine call, so attribution at cursor time is wrong in both
+    directions.)  The auditor's real target is query-shaped statements:
+    SELECTs and filtered bulk operations, where a missing tenant predicate
+    is a genuine cross-tenant read/write surface.
     """
     if len(touched) != 1:
         return False
     real = next(iter(touched.values()))
     pk_cols = set(tenant_pk_columns().get(real, ()))
     if not pk_cols:
-        return False
-
-    from mirror_memory.core.tenancy import (
-        in_sanctioned_write,
-        in_system_scope,
-        stack_has_engine_frame,
-    )
-
-    is_write = bool(stmt.find(exp.Update) or stmt.find(exp.Delete))
-    if is_write and not (
-        in_sanctioned_write()
-        or in_system_scope()
-        # test-fixture tuning of seeded rows (no engine frame in the
-        # caller chain); engine-originated PK updates stay audited
-        or not stack_has_engine_frame()
-    ):
         return False
 
     where = stmt.args.get("where")

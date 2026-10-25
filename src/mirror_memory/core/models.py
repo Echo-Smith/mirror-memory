@@ -678,3 +678,10 @@ class InterventionEvent(TenantScoped, Base):
     kind: Mapped[str] = mapped_column(String(32))  # "question_injected" / "question_answered"
     detail_json: Mapped[str] = mapped_column(Text, default="{}")  # belief_label, belief_key, verdict
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# All tables are defined; install the authoring-time write guard for the
+# protected belief tables (see core.tenancy).
+from mirror_memory.core.tenancy import install_write_guard  # noqa: E402
+
+install_write_guard()
