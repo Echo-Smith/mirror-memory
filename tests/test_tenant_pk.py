@@ -166,16 +166,6 @@ PK_WITH_TENANT = (
 )
 
 
-def test_pg_auditor_rejects_pk_only_update():
-    if not IS_PG:
-        pytest.skip("the exemption is retired on PostgreSQL only")
-    assert _dialect(PK_ONLY, "postgresql") is not None
-
-
-def test_pg_auditor_accepts_pk_update_with_tenant_predicates():
-    assert _dialect(PK_WITH_TENANT, "postgresql") is None
-
-
 def test_pk_only_update_violates_on_every_dialect():
     """The PK-addressing exemption is retired on BOTH dialects: the
     composite ORM mapping puts the tenant columns into every unit-of-work
