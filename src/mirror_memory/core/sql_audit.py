@@ -330,6 +330,12 @@ def install_sql_auditor() -> None:
             return
         if _disabled_var.get():
             return
+        if _single_tenant_active():
+            # Task 6: single-tenant mode skips per-statement injection by
+            # design; the engine's startup check refused any database with
+            # more than one tenant, and before_flush refuses foreign-tenant
+            # writes, so an unpredicated read cannot cross tenants.
+            return
         if in_system_scope():
             logger.info(
                 "sql-audit: system_scope(reason=%r) statement: %s",
@@ -340,6 +346,12 @@ def install_sql_auditor() -> None:
 
     event.listen(Engine, "before_cursor_execute", _audit)
     _installed = True
+
+
+def _single_tenant_active() -> bool:
+    from mirror_memory.core.tenancy import _single_tenant_mode
+
+    return _single_tenant_mode.get()
 
 
 def in_system_scope() -> bool:

@@ -281,6 +281,17 @@ _tenant_bind = bindparam("mm_tenant_id", callable_=lambda: current_tenant()[0])
 _app_bind = bindparam("mm_app_id", callable_=lambda: current_tenant()[1])
 
 
+#: End-side single-tenant mode (task 6): skip the per-statement criteria
+#: injection; before_flush validation, write guard, tenant columns and the
+#: session.get/merge wrappers all stay on.
+_single_tenant_mode: ContextVar[bool] = ContextVar("mm_single_tenant", default=False)
+
+
+def set_single_tenant_mode(enabled: bool) -> None:
+    """Enable end-side single-tenant mode for this context tree."""
+    _single_tenant_mode.set(enabled)
+
+
 def _criteria_template(cls):
     return (cls.tenant_id == _tenant_bind) & (cls.app_id == _app_bind)
 
@@ -352,6 +363,11 @@ def _inject_tenant_criteria(state) -> None:
     tenant = _tenant_var.get()
     if tenant is not None:
         _check_session_tenant(state.session, tenant)
+        if _single_tenant_mode.get():
+            # Task 6: one fixed tenant on the device; the per-statement
+            # injection is the cloud multi-tenant cost and is skipped.
+            # Fail-closed / flush / guard layers remain active.
+            return
         # Fast path: attach the shared tenant-agnostic criteria.  It only
         # binds to TenantScoped entities (values resolved at execution), so
         # statements over other tables are unaffected, and it reaches

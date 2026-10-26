@@ -322,6 +322,11 @@ def create_app(
             database_url=_engine._database_url,
             llm_client=_engine._llm_client,
         )
+        if getattr(_engine, "_single_tenant", False) and _tenant_key_registry:
+            raise RuntimeError(
+                "single-tenant mode is mutually exclusive with the server "
+                "tenant middleware"
+            )
         keys_file = os.environ.get("MM_TENANT_KEYS_FILE")
         if keys_file:
             load_tenant_keys_file(keys_file)

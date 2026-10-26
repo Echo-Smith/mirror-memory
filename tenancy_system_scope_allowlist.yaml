@@ -26,3 +26,12 @@
     maintenance, executed once per database at upgrade time.
   reviewer: Echo-Smith
   reviewed_at: "2026-10-25"
+
+- module: mirror_memory.api
+  function: _verify_single_tenant_startup
+  reason: >
+    Startup invariant for end-side single-tenant mode: reads the DISTINCT
+    tenant set once to refuse multi-tenant databases or a mismatched
+    configuration.  Runs a single bounded query at engine construction.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-25"
