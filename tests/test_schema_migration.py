@@ -50,7 +50,9 @@ from sqlalchemy.orm import DeclarativeBase
 def main(db_path: str, models_dir: str) -> None:
     import importlib
     mod = importlib.import_module("base_models")
-    engine = create_engine(f"sqlite:///{db_path}")
+    from sqlalchemy.engine import URL
+
+    engine = create_engine(URL.create("sqlite", database=db_path))
     mod.Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     s = Session()
@@ -107,7 +109,9 @@ def base_db(tmp_path):
 
 
 def _engine(db_path):
-    return create_engine(f"sqlite:///{db_path}")
+    from sqlalchemy.engine import URL
+
+    return create_engine(URL.create("sqlite", database=str(db_path)))
 
 
 import contextlib  # noqa: E402
@@ -121,6 +125,15 @@ def downgrade_scope():
 
     with no_audit_scope():
         yield
+
+
+def _read_claims(engine) -> list[str]:
+    """Read belief claim_text from whatever schema is present (reflection)."""
+    from sqlalchemy import MetaData, select, Table
+
+    table = Table("mm_beliefs", MetaData(), autoload_with=engine)
+    with engine.connect() as conn:
+        return list(conn.execute(select(table.c.claim_text)).scalars())
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +166,7 @@ def test_upgrade_downgrade_upgrade_roundtrip(base_db):
         c["name"] for c in insp.get_columns("mm_beliefs")
     }
     with downgrade_scope():
-        with eng.connect() as conn:
-            claim = conn.execute(text("SELECT claim_text FROM mm_beliefs")).scalar_one()
-            assert claim == "User has trouble sleeping"
+        assert _read_claims(eng) == ["User has trouble sleeping"]
 
     # --- upgrade 2: same data again --------------------------------------
     counts2 = upgrade_database(eng, default_tenant="legacy", default_app="app")
@@ -221,19 +232,23 @@ def test_refuses_without_default_tenant(base_db):
 
 
 def test_mid_migration_failure_restores_backup(base_db, monkeypatch):
+    """A failing step leaves the database exactly as it was (SQLite: the
+    pre-migration file backup is restored)."""
     eng = _engine(base_db)
     from mirror_memory.core import schema_migration as sm
 
-    monkeypatch.setattr(sm, "_row_counts", lambda *a, **k: {"mm_beliefs": 999})
-    with pytest.raises(Exception):
+    def boom(engine):
+        raise sm.MigrationError("simulated verification failure")
+
+    monkeypatch.setattr(sm, "_verify_tenancy", boom)
+    with pytest.raises(sm.MigrationError):
         sm.upgrade_database(eng, default_tenant="legacy", default_app="app")
-    # backup restored: database is back to the base schema with data intact
+    # backup restored: base schema, data intact, version not advanced
     insp = inspect(eng)
     assert "tenant_id" not in {c["name"] for c in insp.get_columns("mm_beliefs")}
+    assert sm.current_version(eng) == 0
     with downgrade_scope():
-        with eng.connect() as conn:
-            claim = conn.execute(text("SELECT claim_text FROM mm_beliefs")).scalar_one()
-            assert claim == "User has trouble sleeping"
+        assert _read_claims(eng) == ["User has trouble sleeping"]
 
 
 def test_schema_parity_by_construction(base_db):
