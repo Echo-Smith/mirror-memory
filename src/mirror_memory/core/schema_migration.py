@@ -38,7 +38,6 @@ from __future__ import annotations
 import logging
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import (
@@ -57,7 +56,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.schema import DDLElement
 
-from mirror_memory.core.models import Base
+from mirror_memory.core.models import Base, utcnow
 from mirror_memory.core.tenancy import system_scope
 
 logger = logging.getLogger(__name__)
@@ -207,7 +206,7 @@ def _version_table(metadata: MetaData) -> Table:
         "mm_schema_version",
         metadata,
         Column("version", Integer, primary_key=True),
-        Column("applied_at", DateTime, default=datetime.utcnow),
+        Column("applied_at", DateTime, default=utcnow),
         Column("note", String(200), default=""),
     )
 
