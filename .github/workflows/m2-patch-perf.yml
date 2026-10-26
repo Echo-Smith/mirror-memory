@@ -17,7 +17,12 @@ on:
         default: "3b9e623"
       fix_rev:
         description: "Revision to measure"
-        required: true
+        default: "HEAD"
+  # workflow_dispatch needs the file on the default branch, which the M2
+  # branch must not touch; the input defaults below are exactly the
+  # acceptance revisions, so a push to this branch measures the right trio.
+  push:
+    branches: ["feat/m2-postgres"]
 
 jobs:
   measure:
@@ -40,9 +45,9 @@ jobs:
 
       - name: Interleaved measurement (base vs mid vs fix, x3, auditor off)
         env:
-          BASE: ${{ inputs.base_rev }}
-          MID: ${{ inputs.mid_rev }}
-          FIX: ${{ inputs.fix_rev }}
+          BASE: ${{ inputs.base_rev || '7f783bc' }}
+          MID: ${{ inputs.mid_rev || '3b9e623' }}
+          FIX: ${{ inputs.fix_rev || 'HEAD' }}
         run: |
           set -u -o pipefail
           use_rev() {
@@ -93,7 +98,7 @@ jobs:
 
       - name: Final sanity (fix revision, SQLite, auditor + guard on)
         env:
-          FIX: ${{ inputs.fix_rev }}
+          FIX: ${{ inputs.fix_rev || 'HEAD' }}
         run: |
           git checkout -f -q "$FIX" -- src tests pyproject.toml
           unset MM_SQL_AUDIT || true
