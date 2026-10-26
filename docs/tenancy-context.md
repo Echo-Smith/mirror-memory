@@ -124,6 +124,23 @@ Worker **不允许**继承调度方的上下文——租户的唯一来源是任
 Publisher——这是设计事实（证据是观察记录，不是状态变迁），已在收尾
 补丁中显式登记；其余 engine 表的状态变更全部经 Publisher。
 
+### 调用方白名单（M2 任务 4）
+
+上表的"合法调用方"不是注释而是可执行的约束：`tenancy_writer_callers.yaml`
+按函数列出允许调用它的模块，`tools/check_writer_callers.py` 用 AST 扫描
+比对，CI 与本地均可运行：
+
+```
+python tools/check_writer_callers.py          # 双向检查，有漂移则非零退出
+python tools/check_writer_callers.py --list   # 打印当前调用方
+```
+
+两个方向都判失败：**未登记的调用方**（多出来的写路径）与**幽灵条目**
+（登记了但已不再调用）。后者同样致命——一份高于现实的清单不再是代码的
+描述。`@_sanctioned_writer` 是唯一能打开写入类作用域的装饰器，因此它的
+调用方就是能力的持有者；新增调用方必须与调用代码同一个提交里更新
+`tenancy_writer_callers.yaml`。
+
 测试侧：fixture **setup** 阶段默认在 `fixture_write_scope` 内（autouse
 hookwrapper）；**测试体**不再有全局豁免——直写表的测试体必须声明
 `@pytest.mark.fixture_writes(reason="...")`（reason 必填）。守卫的真实

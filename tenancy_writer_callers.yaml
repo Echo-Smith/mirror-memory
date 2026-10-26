@@ -1,0 +1,125 @@
+# Sanctioned write functions and their legitimate callers (M2 task 4)
+#
+# Every function decorated with ``_sanctioned_writer`` opens a write-class
+# scope, which is the ONLY way a classified tenant table becomes writable
+# from engine code.  That makes the decorator a privileged primitive: a new
+# caller is a new write path.  This file is the static gate -- it lists, for
+# each sanctioned writer, the modules allowed to call it.
+#
+# Both directions fail CI (tools/check_writer_callers.py):
+#   - a call from an unlisted module is an unreviewed write path;
+#   - a listed module that no longer calls the function is a ghost entry,
+#     and ghosts hide the drift that makes the list meaningless.
+#
+# Adding a caller is a reviewed decision: add the module here in the same
+# commit that adds the call.
+
+writers:
+  # ---- engine class: memory content (Publisher + repository mutators) ----
+  record_evidence:
+    reason: >
+      Writes mm_evidence rows.  The extraction pipeline records provenance
+      for the claims it just extracted.
+    callers:
+      - mirror_memory.extraction.pipeline
+
+  link_evidence:
+    reason: >
+      Writes mm_belief_evidence_links (typed belief<->evidence edges).  The
+      extraction pipeline links each new claim to its sources.
+    callers:
+      - mirror_memory.extraction.pipeline
+
+  apply_evidence_compaction:
+    reason: >
+      Folds hot evidence into digests (mm_evidence_digests, mm_evidence
+      retention state).  Publisher-only: compaction is a committed
+      metabolism step, never an extraction side effect.
+    callers:
+      - mirror_memory.core.publisher
+
+  set_belief_tier:
+    reason: >
+      Moves a belief between storage tiers and writes the mm_memory_transitions
+      audit row.  Publisher-only, on a committed TIER_TRANSITION proposal.
+    callers:
+      - mirror_memory.core.publisher
+
+  get_or_create_identity:
+    reason: >
+      Writes mm_belief_identities (the stable slot a line of beliefs is
+      about).  Reached from the ledger's append path and from the
+      backfill.
+    callers:
+      - mirror_memory.core.repository
+
+  append_belief_version:
+    reason: >
+      Writes mm_belief_versions.  The Publisher appends a version per
+      committed value change; the repository backfills the ledger for
+      rows that predate it.
+    callers:
+      - mirror_memory.core.publisher
+      - mirror_memory.core.repository
+
+  _write_deletion_tombstone:
+    reason: >
+      Writes mm_deletion_tombstones (content-free deletion records and the
+      generation barrier).  Only the deletion paths of the repository may
+      create one.
+    callers:
+      - mirror_memory.core.repository
+
+  # ---- consent class: authorization and runtime configuration ----
+  set_memory_enabled:
+    reason: >
+      Writes mm_memory_preferences.  The API exposes it as the user-facing
+      switch; the longrun bench drives it to exercise the disabled path.
+    callers:
+      - mirror_memory.api
+      - mirror_memory.bench.longrun
+
+  set_feature_consent:
+    reason: >
+      Writes mm_consent_grants (per-feature consent).  API-only: consent is
+      changed by the user-facing surface, never by engine internals.
+    callers:
+      - mirror_memory.api
+
+  bump_state_revision:
+    reason: >
+      Increments mm_memory_preferences.state_revision.  A revision bump must
+      accompany any change that invalidates in-flight work, so the consent
+      setters and the publisher's commit path may both bump it.
+    callers:
+      - mirror_memory.core.repository
+
+  cas_bump_state_revision:
+    reason: >
+      Compare-and-swap variant of the revision bump: the publish commit
+      either lands on the expected revision or loses the race.  Publisher
+      only.
+    callers:
+      - mirror_memory.core.publisher
+
+  # ---- telemetry class: append-only operational records ----
+  record_intervention_event:
+    reason: >
+      Writes mm_intervention_events (verification question injected /
+      answered).  The verification loop owns these records.
+    callers:
+      - mirror_memory.extraction.verification
+
+  record_extraction_stats:
+    reason: >
+      Writes mm_extraction_stats (one row per extraction or judgment call).
+      The verification loop records its own judgment calls.
+    callers:
+      - mirror_memory.extraction.verification
+
+  store_session_summary:
+    reason: >
+      Writes mm_session_summaries.  The extraction pipeline stores the
+      session fallback summary alongside the structured claims.
+    callers:
+      - mirror_memory.extraction.pipeline
