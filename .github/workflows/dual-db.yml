@@ -58,11 +58,16 @@ jobs:
 
       - name: Wait for PostgreSQL (postgres leg only)
         if: matrix.db == 'postgres'
+        env:
+          # matrix.database_url is a SQLAlchemy URL; psycopg.connect wants a
+          # plain conninfo, so strip the "+psycopg" driver segment.  (The
+          # first two CI runs lost this race differently: the URL never
+          # connected at all.)
+          CONNINFO: ${{ matrix.database_url }}
         run: |
-          # the postgres image boots twice (initdb phase, then final start);
-          # 30x2s once lost that race -- wait longer than init can take
+          conn="${CONNINFO/postgresql+psycopg:/postgres:}"
           for i in $(seq 1 60); do
-            if python -c "import psycopg; psycopg.connect('${{ matrix.database_url }}').close()" 2>/dev/null; then
+            if python -c "import psycopg; psycopg.connect('$conn').close()" 2>/dev/null; then
               echo "postgres ready after attempt $i"; exit 0
             fi
             sleep 3

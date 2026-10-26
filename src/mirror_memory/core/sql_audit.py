@@ -37,27 +37,43 @@ class AuditViolation(AssertionError):
 
 # ---------------------------------------------------------------------------
 # Whitelist -- every entry documents why it is safe
+#
+# Shape rules (M2 patch, after the pg_catalog incident): a whitelist pattern
+# must describe the WHOLE statement.  A prefix anchor alone is a hole --
+# ``^\s*begin\b`` also matches ``BEGIN; SELECT * FROM mm_beliefs`` sent as
+# one query string (psycopg runs multi-statement queries), and
+# ``^\s*create\s+table\b`` also matched ``CREATE TABLE stolen AS SELECT *
+# FROM mm_beliefs``.  Every pattern therefore either anchors the end
+# (``;?\s*$``) or rejects statement separators, and DDL that can read rows
+# (CREATE TABLE ... AS SELECT) is explicitly excluded.
+#
+# PostgreSQL catalog introspection is NOT in this list any more: it used to
+# be three prefix regexes, and ``FROM pg_catalog.`` appearing anywhere in
+# the text whitelisted the whole statement -- including
+# ``SELECT * FROM mm_beliefs WHERE id IN (SELECT 1 FROM pg_catalog.pg_class)``.
+# Catalog statements are now recognised structurally after parsing (see
+# ``_is_catalog_only``), and mixed statements go through the normal rules.
 # ---------------------------------------------------------------------------
 
 _EXEMPT_PATTERNS = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"^\s*select\s+1\s*;?\s*$",  # health check: no tables
-        r"^\s*begin\b",              # transaction control, no tables
-        r"^\s*commit\b",
-        r"^\s*rollback\b",
-        r"^\s*savepoint\b",          # publisher savepoints, no tables
-        r"^\s*release\b",
-        r"^\s*pragma\b",             # sqlite introspection (table_info etc.)
-        r"^\s*create\s+(table|index|unique\s+index|savepoint)\b",  # DDL in create_all
-        r"^\s*drop\s+table\b",       # DDL in teardown
-        r"^\s*alter\s+table\b",      # additive migration DDL (check_schema), no row access
-        # PostgreSQL catalog introspection issued by SQLAlchemy itself
-        # (create_all / drop_all / has_table): metadata queries over the
-        # pg_catalog relations, never over tenant data.
-        r"^\s*select\s+[\s\S]*?\bfrom\s+pg_catalog\.",
-        r"^\s*select\s+[\s\S]*?\bfrom\s+pg_[a-z_]+\b",
-        r"^\s*select\s+pg_catalog\.",
+        r"^\s*begin\s*(work|transaction)?\s*;?\s*$",  # transaction control
+        r"^\s*commit\s*(work|transaction)?\s*;?\s*$",
+        r'^\s*rollback\s*(work\s*|transaction\s*|to\s+savepoint\s+[a-z0-9_"]+\s*)?;?\s*$',
+        r'^\s*savepoint\s+[a-z0-9_"]+\s*;?\s*$',  # publisher savepoints
+        r'^\s*release\s*(savepoint\s*)?[a-z0-9_"]+\s*;?\s*$',
+        # sqlite introspection: single pragma, single statement
+        r"^\s*pragma\s+[a-z0-9_.]+\s*(\([^);]*\)|=\s*[^;]*)?\s*;?\s*$",
+        # DDL in create_all / teardown.  CTAS reads rows, so CREATE TABLE
+        # ... AS SELECT must NOT match (the negative lookahead rejects it).
+        r"^\s*create\s+(temp(?:orary)?\s+)?table\b(?![\s\S]*\bas\s+select\b)[^;]*;?\s*$",
+        r"^\s*create\s+(unique\s+)?index\b[^;]*;?\s*$",
+        r"^\s*create\s+savepoint\b[^;]*;?\s*$",
+        r"^\s*drop\s+table\s+(if\s+exists\s+)?[^;]*;?\s*$",
+        # additive migration DDL (check_schema): no row access, one statement
+        r"^\s*alter\s+table\s+[^;]*;?\s*$",
     )
 )
 
@@ -381,10 +397,56 @@ def _judge(sql: str) -> AuditViolation | None:
     if stmt is None:
         return AuditViolation(f"SQL auditor parsed an empty statement: {sql[:200]!r}")
     try:
+        if _is_catalog_only(stmt):
+            with _violations_lock:
+                _exemptions_seen.append(sql.strip()[:120])
+            return None
         _analyse_statement(stmt, _tenant_table_names())
         return None
     except AuditViolation as exc:
         return exc
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL catalog introspection (structural, M2 patch)
+#
+# The old text whitelist exempted any statement with ``FROM pg_catalog.``
+# anywhere in it, which also whitelisted
+# ``SELECT * FROM mm_beliefs WHERE id IN (SELECT 1 FROM pg_catalog.pg_class)``.
+# Catalog statements are now recognised from the parse tree instead: every
+# relation the statement touches (FROM, JOIN, subquery, UNION branch, CTE
+# body) must be a catalog relation.  Anything mixed with a real table falls
+# through to the normal tenant rules, and a statement that cannot be parsed
+# is still a violation (fail closed).
+# ---------------------------------------------------------------------------
+
+#: Schemas whose contents are engine metadata, never tenant data.
+_CATALOG_SCHEMAS = ("pg_catalog", "information_schema")
+
+
+def _is_catalog_relation(table) -> bool:
+    schema = (table.db or "").lower()
+    name = (table.name or "").lower()
+    if schema in _CATALOG_SCHEMAS:
+        return True
+    # unqualified system relations (search_path-resolved); PostgreSQL
+    # reserves the pg_ prefix, so a bare pg_* relation cannot be user data
+    return not schema and name.startswith("pg_")
+
+
+def _is_catalog_only(stmt) -> bool:
+    """True when every relation in the statement is a catalog relation.
+
+    A statement with no FROM at all (e.g. ``SELECT pg_catalog.version()``)
+    is handled by the caller: it references no table, so the tenant rules
+    pass it without a catalog exemption.
+    """
+    import sqlglot.expressions as exp
+
+    tables = list(stmt.find_all(exp.Table))
+    if not tables:
+        return False
+    return all(_is_catalog_relation(table) for table in tables)
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from mirror_memory.core.sql_audit import AuditViolation, audit_sql
+from mirror_memory.core.sql_audit import AuditViolation, _dialect_var, audit_sql
 
 
 def test_select_with_both_predicates_passes():
@@ -217,3 +217,93 @@ def test_audit_sql_refuses_to_run_inside_context_pass():
     with system_scope(reason="task-1a invariant guard"):
         with pytest.raises(RuntimeError):
             audit_sql(LEAK_SQL)
+
+
+# ---------------------------------------------------------------------------
+# M2 patch: the catalog whitelist is structural, not textual
+#
+# The old text patterns exempted any statement containing ``FROM
+# pg_catalog.`` ANYWHERE -- which whitelisted tenant reads wrapped in a
+# catalog subquery -- and ``SELECT pg_catalog.`` as a prefix, which
+# whitelisted ``SELECT pg_catalog.version() FROM mm_beliefs``.  Catalog
+# statements are now recognised from the parse tree (every relation must
+# be pg_catalog / information_schema); a mixed statement falls through to
+# the normal tenant rules.  The other whitelist patterns were tightened
+# the same way: a prefix anchor alone is a hole, because psycopg runs
+# multi-statement query strings (``BEGIN; SELECT ...``).
+# ---------------------------------------------------------------------------
+
+
+def _audit_as(sql: str, dialect: str):
+    token = _dialect_var.set(dialect)
+    try:
+        audit_sql(sql)
+        return None
+    except AuditViolation as exc:
+        return exc
+
+
+@pytest.mark.parametrize(
+    "label, sql",
+    [
+        ("catalog subquery", "SELECT * FROM mm_beliefs WHERE id IN (SELECT 1 FROM pg_catalog.pg_class)"),
+        ("catalog join", "SELECT c.relname FROM pg_catalog.pg_class c JOIN mm_beliefs b ON b.key = c.relname"),
+        ("catalog union", "SELECT id FROM mm_beliefs UNION SELECT 1 FROM pg_catalog.pg_class"),
+        ("catalog cte", "WITH c AS (SELECT 1 FROM pg_catalog.pg_class) SELECT * FROM mm_beliefs, c"),
+        ("catalog function + tenant FROM", "SELECT pg_catalog.version() FROM mm_beliefs"),
+        ("bare pg_ prefix mix", "SELECT * FROM mm_beliefs WHERE EXISTS (SELECT 1 FROM pg_tables)"),
+    ],
+)
+@pytest.mark.parametrize("dialect", ["postgresql", "sqlite"])
+def test_counterexample_catalog_mix_is_a_violation(label, sql, dialect):
+    assert _audit_as(sql, dialect) is not None, (label, dialect)
+
+
+@pytest.mark.parametrize(
+    "label, sql",
+    [
+        ("reflection join", "SELECT c.relname FROM pg_catalog.pg_class c "
+                            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid"),
+        ("catalog function only", "SELECT pg_catalog.version()"),
+        ("information_schema columns", "SELECT column_name FROM information_schema.columns "
+                                       "WHERE table_name = 'mm_beliefs'"),
+        ("bare pg_ relation", "SELECT relname FROM pg_class ORDER BY relname LIMIT 1"),
+    ],
+)
+def test_catalog_only_statements_pass(label, sql):
+    """SQLAlchemy's own create_all / reflection statements: every relation
+    is a catalog relation, so they carry no tenant data and stay exempt."""
+    assert _audit_as(sql, "postgresql") is None
+
+
+@pytest.mark.parametrize(
+    "label, sql",
+    [
+        ("BEGIN smuggle", "BEGIN; SELECT * FROM mm_beliefs"),
+        ("COMMIT smuggle", "COMMIT; SELECT * FROM mm_beliefs"),
+        ("SAVEPOINT smuggle", "SAVEPOINT sa_1; SELECT * FROM mm_beliefs"),
+        ("PRAGMA smuggle", "PRAGMA table_info(mm_beliefs); SELECT * FROM mm_beliefs"),
+        ("CREATE TABLE smuggle", "CREATE TABLE mm_tmp (id int); SELECT * FROM mm_beliefs"),
+        ("DROP TABLE smuggle", "DROP TABLE IF EXISTS mm_tmp; SELECT * FROM mm_beliefs"),
+        ("ALTER TABLE smuggle", "ALTER TABLE mm_tmp ADD COLUMN c int; SELECT * FROM mm_beliefs"),
+    ],
+)
+def test_counterexample_multi_statement_smuggle_is_a_violation(label, sql):
+    """A whitelist prefix must not whitewash the rest of a multi-statement
+    query string (psycopg executes them all)."""
+    assert _audit_as(sql, "postgresql") is not None
+
+
+def test_counterexample_create_table_as_select_is_a_violation():
+    """CTAS reads every row of the source table and parks them in a new
+    one -- the old ``create table`` prefix exempted it wholesale."""
+    assert _audit_as("CREATE TABLE stolen AS SELECT * FROM mm_beliefs", "postgresql") is not None
+
+
+def test_single_statement_ddl_still_exempt():
+    assert _audit_as("CREATE TABLE mm_tmp (id int)", "postgresql") is None
+    assert _audit_as("DROP TABLE IF EXISTS mm_tmp", "postgresql") is None
+    assert _audit_as("ALTER TABLE mm_tmp ADD COLUMN c VARCHAR(64)", "postgresql") is None
+    assert _audit_as("SAVEPOINT sa_1", "postgresql") is None
+    assert _audit_as("ROLLBACK TO SAVEPOINT sa_1", "postgresql") is None
+    assert _audit_as("RELEASE SAVEPOINT sa_1", "postgresql") is None
