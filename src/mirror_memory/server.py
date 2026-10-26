@@ -199,6 +199,7 @@ _engine: MemoryEngine | None = None
 
 import hashlib  # noqa: E402
 import hmac  # noqa: E402
+import threading  # noqa: E402
 
 #: sha256(key) -> (tenant_id, app_id).  Raw keys never live here.
 _tenant_key_registry: dict[str, tuple[str, str]] = {}
@@ -226,24 +227,64 @@ def _release_engine(engine: "MemoryEngine") -> None:
             logger.warning("tenant engine eviction: pool dispose failed", exc_info=True)
 
 
-class _TenantEngineCache(dict):
-    """dict with LRU eviction; insertion order = recency order."""
+class _TenantEngineCache:
+    """Thread-safe bounded LRU cache (insertion order = recency order).
 
-    def touch(self, key) -> None:
-        if key in self:
-            value = dict.__getitem__(self, key)
-            dict.__delitem__(self, key)
-            dict.__setitem__(self, key, value)
+    get/insert/evict run under one lock.  Engine CREATION is also
+    serialised by the caller holding the same lock across
+    miss -> create -> insert (the task's option 1), which guarantees at
+    most one engine is ever created per tenant even under a thundering
+    herd; the cost is that one tenant's first request waits behind
+    another tenant's engine creation (a metadata create_all, a few ms).
+    Evicted engines are collected in the lock and returned to the CALLER
+    -- pool.dispose happens outside, so a slow dispose never blocks other
+    tenants' requests.
+    """
 
-    def __setitem__(self, key, value):
-        if key in self:
-            dict.__delitem__(self, key)
-        dict.__setitem__(self, key, value)
-        while dict.__len__(self) > _engine_cache_limit():
-            oldest = next(iter(self))
-            evicted = dict.__getitem__(self, oldest)
-            dict.__delitem__(self, oldest)
-            _release_engine(evicted)
+    def __init__(self):
+        self._data: dict[tuple[str, str], MemoryEngine] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        """Return the cached engine (marking it recently used) or None."""
+        with self._lock:
+            engine = self._data.get(key)
+            if engine is not None:
+                del self._data[key]
+                self._data[key] = engine
+            return engine
+
+    def get_or_create(self, key, create) -> tuple[MemoryEngine, list]:
+        """Return the engine for *key*, creating it via *create()* when
+        absent.  Returns (engine, evicted_engines) -- dispose the evicted
+        list OUTSIDE the lock."""
+        with self._lock:
+            engine = self._data.get(key)
+            if engine is not None:
+                del self._data[key]
+                self._data[key] = engine
+                return engine, []
+            engine = create()
+            self._data[key] = engine
+            evicted = []
+            while len(self._data) > _engine_cache_limit():
+                oldest = next(iter(self._data))
+                evicted.append(self._data.pop(oldest))
+            return engine, evicted
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def items(self):
+        with self._lock:
+            return list(self._data.items())
+
+    def clear(self) -> list:
+        """Drop everything; returns the engines for outside-lock disposal."""
+        with self._lock:
+            dropped = list(self._data.values())
+            self._data.clear()
+            return dropped
 
 
 _tenant_engines: _TenantEngineCache = _TenantEngineCache()
@@ -293,9 +334,13 @@ def _resolve_tenant(presented: str | None) -> tuple[str, str]:
 def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
     """Per-tenant engine cache (LRU, bounded by MM_TENANT_ENGINE_CACHE):
     each engine binds its own sessions inside its tenant scope (engines
-    are single-tenant by construction)."""
-    engine = _tenant_engines.get(tenant)
-    if engine is None:
+    are single-tenant by construction).
+
+    Concurrency: miss -> create -> insert is one critical section
+    (get_or_create), so concurrent first requests for a tenant share ONE
+    engine; evictions are disposed outside the lock."""
+
+    def _create() -> MemoryEngine:
         engine = MemoryEngine(
             config=_app_state["config"],
             database_url=_app_state["database_url"],
@@ -304,9 +349,11 @@ def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
             app_id=tenant[1],
         )
         engine._ensure_db()
-        _tenant_engines[tenant] = engine
-    else:
-        _tenant_engines.touch(tenant)  # mark recently used
+        return engine
+
+    engine, evicted = _tenant_engines.get_or_create(tenant, _create)
+    for dropped in evicted:
+        _release_engine(dropped)
     return engine
 
 
@@ -380,7 +427,8 @@ def create_app(
         logger.info("mirror-memory engine initialized")
         yield
         _engine = None
-        _tenant_engines.clear()
+        for dropped in _tenant_engines.clear():
+            _release_engine(dropped)
 
     app = FastAPI(
         title="mirror-memory",
