@@ -127,10 +127,42 @@ jobs:
             timed "tail round$round" tests/test_tenant_isolation.py "$TARGET"
           done
 
+      - name: Multi-tenant vs single-tenant longrun (interleaved x3, fix revision)
+        env:
+          FIX: ${{ inputs.fix_rev || '2cedfa7' }}
+        run: |
+          set -u -o pipefail
+          use_rev() {
+            local rev="$1"
+            git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
+            for f in $(git ls-files -- src tests); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            for f in $(find tests src -name '*.py' 2>/dev/null); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            git checkout -q "$rev" -- src tests pyproject.toml
+            git reset -q HEAD -- src tests || true
+          }
+          use_rev "$FIX"
+          export MM_SQL_AUDIT=0
+          echo "=== MULTI vs SINGLE tenant longrun (interleaved x3) ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          for round in 1 2 3; do
+            for mode in multi single; do
+              if [ "$mode" = "single" ]; then export MM_SINGLE_TENANT=1; else unset MM_SINGLE_TENANT || true; fi
+              start=$(python -c 'import time; print(time.monotonic())')
+              python -m pytest -q -p no:cacheprovider tests/test_longrun_bench.py > /tmp/pytest_out.txt 2>&1 || true
+              end=$(python -c 'import time; print(time.monotonic())')
+              echo "longrun-$mode round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/pytest_out.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+            done
+          done
+          unset MM_SINGLE_TENANT || true
+
       - name: Final sanity (full suite on fix revision, all tests, auditor + guard on)
         env:
           FIX: ${{ inputs.fix_rev || '2cedfa7' }}
         run: |
           git checkout -q "$FIX" -- src tests pyproject.toml
           unset MM_SQL_AUDIT || true
+          unset MM_SINGLE_TENANT || true
           python -m pytest -q -p no:cacheprovider 2>&1 | tail -2 | tee -a "$GITHUB_STEP_SUMMARY"
