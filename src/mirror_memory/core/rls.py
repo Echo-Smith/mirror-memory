@@ -225,15 +225,14 @@ def maintenance_engine_for(bind) -> Engine | None:
         maint_url = _maintenance_urls.get(key)
         if maint_url is None:
             return None
-    import sqlalchemy
+    from mirror_memory.core.pg_engine import build_engine
 
     size = max(1, int(os.environ.get("MM_PG_MAINTENANCE_POOL_SIZE", "2")))
-    engine = sqlalchemy.create_engine(
+    engine = build_engine(
         maint_url,
+        application_name="mirror-memory-maintenance",
         pool_size=size,
         max_overflow=size,
-        pool_pre_ping=True,
-        connect_args={"application_name": "mirror-memory-maintenance"},
     )
     with _registry_lock:
         existing = _maintenance_engines.get(key)
