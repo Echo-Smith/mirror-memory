@@ -18,11 +18,10 @@ on:
       fix_rev:
         description: "Revision to measure"
         default: "HEAD"
-  # workflow_dispatch needs the file on the default branch, which the M2
-  # branch must not touch; the input defaults below are exactly the
-  # acceptance revisions, so a push to this branch measures the right trio.
-  push:
-    branches: ["feat/m2-postgres"]
+  # Batch-1 patch acceptance is recorded (run 40356521579).  The push
+  # trigger that produced it is retired so that batch-2 pushes do not
+  # re-run a 150-minute historical measurement; the batch-2 final runs
+  # from m2-rls-perf.yml on its own trigger branch.
 
 jobs:
   measure:
