@@ -1,0 +1,99 @@
+name: dual-db
+
+# M2 task 0: the full suite on BOTH databases.  SQLite (in-memory, the
+# end-side shape) and PostgreSQL 16 service container (the hosted shape).
+# The SQL auditor and the write guard are on in both (they are autouse
+# fixtures in conftest; this workflow never disables them).
+
+on:
+  push:
+    branches: [main, "feat/m2-postgres"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - db: sqlite
+            database_url: ""
+          - db: postgres
+            # Postgres service container exposes 5432 on the job network
+            database_url: "postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test"
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+          pip install "sqlglot>=25.0"
+
+      - name: Wait for PostgreSQL (postgres leg only)
+        if: matrix.db == 'postgres'
+        run: |
+          for i in $(seq 1 30); do
+            if python -c "import psycopg; psycopg.connect('${{ matrix.database_url }}').close()" 2>/dev/null; then
+              echo "postgres ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres not ready"; exit 1
+
+      - name: Full suite (${{ matrix.db }})
+        env:
+          MM_DATABASE_URL: ${{ matrix.database_url }}
+        run: |
+          start=$(python -c 'import time; print(time.monotonic())')
+          python -m pytest -q -p no:cacheprovider --junitxml=/tmp/suite.xml > /tmp/pytest_out.txt 2>&1 || true
+          end=$(python -c 'import time; print(time.monotonic())')
+          secs=$(python -c "print(f'{$end-$start:.1f}')")
+          counts=$(python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/suite.xml').getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          t = sum(int(s.get('tests', 0)) for s in suites)
+          f = sum(int(s.get('failures', 0)) for s in suites)
+          e = sum(int(s.get('errors', 0)) for s in suites)
+          sk = sum(int(s.get('skipped', 0)) for s in suites)
+          print(f"tests={t} passed={t-f-e-sk} failed={f} errors={e} skipped={sk}")
+          PY
+          )
+          echo "${{ matrix.db }} full suite: ${secs}s | $counts" | tee -a "$GITHUB_STEP_SUMMARY"
+          tail -3 /tmp/pytest_out.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          # fail the leg if anything did not pass
+          python -c "import sys;sys.exit(0 if 'failed=0 errors=0' in '''$counts''' else 1)"
+
+      - name: Auditor cache stats (${{ matrix.db }})
+        if: always()
+        run: |
+          grep -h "sql-auditor cache" /tmp/pytest_out.txt \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: static checks
+        if: matrix.db == 'sqlite'
+        run: |
+          python tools/check_system_scope.py | tee -a "$GITHUB_STEP_SUMMARY"
