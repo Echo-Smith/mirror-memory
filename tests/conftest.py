@@ -42,7 +42,7 @@ def pytest_fixture_setup(fixturedef, request):
         return
     from mirror_memory.core.tenancy import fixture_write_scope
 
-    with fixture_write_scope(f"fixture setup: {fixturedef.argname}"):
+    with fixture_write_scope("fixture setup: " + fixturedef.argname):
         yield
 
 
@@ -78,7 +78,7 @@ def _body_write_scope(request):
         return
     from mirror_memory.core.tenancy import fixture_write_scope
 
-    with fixture_write_scope(f"test body (declared): {_marker_reason(request)}"):
+    with fixture_write_scope("test body (declared): " + _marker_reason(request)):
         yield
 
 
@@ -143,17 +143,91 @@ def pytest_sessionfinish(session, exitstatus):
     )
 
 
+def _pg_url() -> str | None:
+    """PostgreSQL URL for this test run (task 0), or None for SQLite."""
+    import os
+
+    url = os.environ.get("MM_DATABASE_URL", "")
+    return url if url.startswith("postgres") else None
+
+
+@pytest.fixture(autouse=True)
+def _pg_engine_reaper():
+    """PostgreSQL only: record engines created during a test and dispose
+    them afterwards.
+
+    Several test modules build their own engines (helper fixtures, worker
+    factories, migration tests).  Under SQLite those are in-memory and
+    cheap; under PostgreSQL each keeps pooled connections alive, and 271
+    tests' worth exhausts the server's connection slots.  This reaper
+    disposes every engine created while the test ran.
+    """
+    if _pg_url() is None:
+        yield
+        return
+    from sqlalchemy import create_engine as _create_engine
+
+    import sqlalchemy
+
+    created: list = []
+    original = sqlalchemy.create_engine
+
+    def recording_create_engine(*args, **kwargs):
+        engine = original(*args, **kwargs)
+        created.append(engine)
+        return engine
+
+    sqlalchemy.create_engine = recording_create_engine
+    try:
+        yield
+    finally:
+        sqlalchemy.create_engine = original
+        for engine in created:
+            try:
+                engine.dispose()
+            except Exception:  # noqa: BLE001 -- cleanup must not fail a test
+                pass
+
+
 @pytest.fixture
 def db_session():
-    """In-memory SQLite session with all tables, rolled back after each test."""
-    engine = create_engine("sqlite://", echo=False)
+    """Per-test database session.
+
+    SQLite (default): in-memory; tables dropped after each test.
+
+    PostgreSQL (``MM_DATABASE_URL``): the test runs against the shared
+    database with the schema rebuilt around it (``drop_all`` +
+    ``create_all`` from ``Base.metadata``).  Chosen over
+    transaction-rollback because much of the suite manages its own
+    transactions and opens several sessions per test -- a rollback
+    harness would fight both.  Chosen over schema/database-per-test
+    because it needs no identifier construction at all: everything goes
+    through metadata DDL, so there is no SQL-text assembly here.  Cost
+    measured locally: ~0.15 s per rebuild.
+    """
+    pg = _pg_url()
+    if pg is None:
+        engine = create_engine("sqlite://", echo=False)
+        Base.metadata.create_all(engine)
+        SessionFactory = sessionmaker(bind=engine)
+        session = SessionFactory()
+        yield session
+        session.rollback()
+        session.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+        return
+    engine = create_engine(pg, echo=False)
+    Base.metadata.drop_all(engine)  # clean slate (previous test leftovers)
     Base.metadata.create_all(engine)
     SessionFactory = sessionmaker(bind=engine)
     session = SessionFactory()
-    yield session
-    session.rollback()
-    session.close()
-    Base.metadata.drop_all(engine)
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
+        engine.dispose()
 
 
 @pytest.fixture

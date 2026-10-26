@@ -52,6 +52,12 @@ _EXEMPT_PATTERNS = tuple(
         r"^\s*create\s+(table|index|unique\s+index|savepoint)\b",  # DDL in create_all
         r"^\s*drop\s+table\b",       # DDL in teardown
         r"^\s*alter\s+table\b",      # additive migration DDL (check_schema), no row access
+        # PostgreSQL catalog introspection issued by SQLAlchemy itself
+        # (create_all / drop_all / has_table): metadata queries over the
+        # pg_catalog relations, never over tenant data.
+        r"^\s*select\s+[\s\S]*?\bfrom\s+pg_catalog\.",
+        r"^\s*select\s+[\s\S]*?\bfrom\s+pg_[a-z_]+\b",
+        r"^\s*select\s+pg_catalog\.",
     )
 )
 
@@ -101,7 +107,10 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
         return
 
     insert = stmt.find(exp.Insert)
-    if insert is not None and not stmt.find(exp.Select):
+    if insert is not None:
+        # Covers both INSERT ... VALUES and INSERT ... SELECT: the target
+        # column list is what matters (the PG dialect renders executemany
+        # inserts as INSERT ... SELECT CAST(...), same column list).
         target = insert.this  # a Schema(table, columns) for INSERT INTO t (...)
         table = target.this if isinstance(target, exp.Schema) else target
         real = table.name if isinstance(table, exp.Table) else None
@@ -281,14 +290,61 @@ def audit_sql(sql: str) -> None:
         raise verdict
 
 
+_PG_PLACEHOLDER_RE = re.compile(
+    # PostgreSQL driver placeholders, optionally with an explicit cast:
+    #   %(name)s::TIMESTAMP WITHOUT TIME ZONE  ->  ?
+    #   %(name)s::VARCHAR(64)                  ->  ?
+    # sqlglot cannot parse the psycopg placeholder form at all, and the
+    # cast is irrelevant to the tenant rules (it only pins the bind value's
+    # type).  The cast tail is a sequence of type words (each optionally
+    # with a parenthesised length), stopped by any SQL keyword so it never
+    # swallows a following predicate.
+    r"%\([A-Za-z0-9_]+\)s"
+    r"(?:::"
+    r"[A-Za-z0-9_\[\]]+(?:\([0-9, ]+\))?"
+    r"(?:[ ](?!AND\b|OR\b|WHERE\b|FROM\b|GROUP\b|ORDER\b|LIMIT\b|RETURNING\b|VALUES\b|SET\b)"
+    r"[A-Za-z0-9_\[\]]+(?:\([0-9, ]+\))?)*"
+    r")?"
+)
+
+
+_LIKE_ESCAPE_RE = re.compile(
+    # PostgreSQL renders the LIKE escape character as a bare inline literal
+    # right after the bind placeholder:   claim_text ILIKE ? '\'
+    # (there is no bind parameter for ESCAPE and this dialect omits the
+    # keyword).  sqlglot rejects that shape; the escape clause is
+    # irrelevant to the tenant rules, so it is dropped before parsing.
+    # The literal is: apostrophe, backslash, apostrophe.
+    r"(?<=\?)[ ]+(?:'\\\\'|'\\'|'')"
+)
+
+
+def _normalise_placeholders(sql: str) -> str:
+    """Rewrite driver placeholders / dialect-specific noise to one form."""
+    normalised = _PG_PLACEHOLDER_RE.sub("?", sql)
+    return _LIKE_ESCAPE_RE.sub("", normalised)
+
+
 def _judge(sql: str) -> AuditViolation | None:
     import sqlglot
 
-    try:
-        stmt = sqlglot.parse_one(sql, read="sqlite")
-    except Exception as exc:
+    normalised = _normalise_placeholders(sql)
+    # Dialect fallback: SQLite SQL (the default) and PostgreSQL SQL differ
+    # in ways sqlglot cares about -- ILIKE, ::casts, RETURNING placement.
+    # Parse with the matching dialect and fall back to the other one; the
+    # structural rules below are dialect-neutral.
+    stmt = None
+    last_exc: Exception | None = None
+    for dialect in ("sqlite", "postgres"):
+        try:
+            stmt = sqlglot.parse_one(normalised, read=dialect)
+            if stmt is not None:
+                break
+        except Exception as exc:  # noqa: BLE001 -- try the next dialect
+            last_exc = exc
+    if stmt is None:
         return AuditViolation(
-            f"SQL auditor could not parse statement (fail closed): {sql[:200]!r} ({exc})"
+            f"SQL auditor could not parse statement (fail closed): {sql[:200]!r} ({last_exc})"
         )
     if stmt is None:
         return AuditViolation(f"SQL auditor parsed an empty statement: {sql[:200]!r}")
