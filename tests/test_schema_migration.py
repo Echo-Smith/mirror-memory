@@ -255,3 +255,68 @@ def test_schema_parity_by_construction(base_db):
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
     assert verify_schema_parity(eng) == []
+
+
+def test_upgrade_installs_the_tenant_primary_key(base_db):
+    """M2 task 3: the migrated database exposes the composite tenant PK
+    wherever the dialect can host it.
+
+    PostgreSQL converts the constraint (catalog ALTER, no table rewrite).
+    SQLite keeps a single-column physical key -- a composite key over an
+    autoincrement column is a CompileError there -- and closes the
+    PK-addressing surface with the fallback layers instead.
+    """
+    import os  # noqa: F401 -- kept for the fixture's dialect note
+
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    insp = inspect(eng)
+    tenant_tables = [
+        t.name for t in Base.metadata.sorted_tables if insp.has_table(t.name)
+    ]
+    assert tenant_tables
+    # The legacy database this fixture builds is always SQLite (its base
+    # models come from a SQLite-seeded file), so the physical key stays
+    # single-column here on both matrix legs: the migration reads the
+    # target engine's dialect, and that engine is SQLite either way.
+    is_pg = eng.dialect.name == "postgresql"
+    for name in tenant_tables:
+        live = insp.get_pk_constraint(name)["constrained_columns"]
+        wanted = [c.name for c in Base.metadata.tables[name].primary_key.columns]
+        if is_pg:
+            assert live == wanted, (name, live, wanted)
+        else:
+            autoinc = Base.metadata.tables[name]._autoincrement_column
+            if autoinc is not None:
+                assert live == [autoinc.name], (name, live)
+            else:
+                assert live == wanted, (name, live, wanted)
+
+
+def test_upgrade_is_reentrant_on_the_primary_key_step(base_db):
+    """A second upgrade must not re-run the conversion or fail on it."""
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    before = {
+        t.name: inspect(eng).get_pk_constraint(t.name)["constrained_columns"]
+        for t in Base.metadata.sorted_tables
+        if inspect(eng).has_table(t.name)
+    }
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    after = {
+        t.name: inspect(eng).get_pk_constraint(t.name)["constrained_columns"]
+        for t in Base.metadata.sorted_tables
+        if inspect(eng).has_table(t.name)
+    }
+    assert after == before
+
+
+def test_primary_key_swap_is_postgres_only():
+    """The SQLite renderer refuses the catalog ALTER instead of silently
+    emitting something that would rebuild the table."""
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+
+    from mirror_memory.core.schema_migration import MigrationError, PrimaryKeySwap
+
+    with pytest.raises(MigrationError):
+        str(PrimaryKeySwap("mm_beliefs").compile(dialect=sqlite_dialect.dialect()))

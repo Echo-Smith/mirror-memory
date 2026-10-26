@@ -45,9 +45,11 @@ import functools
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator
 
-from sqlalchemy import Column, String, bindparam, event
+from sqlalchemy import Column, PrimaryKeyConstraint, String, bindparam, event
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Mapped, Session, with_loader_criteria
 from sqlalchemy.orm.decl_api import declared_attr
+from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql import visitors
 
 
@@ -262,6 +264,26 @@ class TenantScoped:
     few (low cardinality), every tenant predicate pairs the two columns,
     and the composite unique/PK constraints that lead with them already
     serve point lookups.
+
+    Primary key (M2 task 3): every tenant table declares
+    ``PRIMARY KEY (tenant_id, app_id, id)`` -- or the tenant prefix plus
+    the table's own business key where one exists (``user_id``,
+    ``feature``).  Two consequences matter:
+
+    - The ORM's unit-of-work WHERE clause names the tenant columns, so
+      PostgreSQL (where the physical constraint is composite) can enforce
+      tenant predicates on PK-addressed writes without an exemption.
+    - ``session.get()`` needs the full key; the wrapper below supplies the
+      ambient tenant for legacy single-value lookups so the ~40 call sites
+      stay unchanged.
+
+    SQLite cannot host a composite primary key on an autoincrement column
+    (``CompileError: SQLite does not support autoincrement for composite
+    primary keys``), so its DDL is narrowed back to a single-column
+    ``PRIMARY KEY (id)`` by the compiler hook below.  The *mapping* stays
+    composite there too, which keeps ``session.get``/identity-map
+    behaviour identical across dialects; only the physical constraint
+    differs, and SQLite keeps the three-layer PK-addressing fallback.
     """
 
     @declared_attr
@@ -271,6 +293,69 @@ class TenantScoped:
     @declared_attr
     def app_id(cls) -> Mapped[str]:  # noqa: N805
         return Column(String(64), nullable=False, default="")
+
+
+#: How many leading primary-key columns are tenant columns.
+TENANT_PK_PREFIX = 2
+
+
+def is_tenant_primary_key(constraint) -> bool:
+    """True for a PK shaped ``(tenant_id, app_id, ...)``."""
+    names = [c.name for c in constraint.columns]
+    return len(names) > TENANT_PK_PREFIX and names[:TENANT_PK_PREFIX] == [
+        "tenant_id",
+        "app_id",
+    ]
+
+
+@compiles(CreateColumn, "sqlite")
+def _relax_sqlite_composite_autoincrement(element, compiler, **kw):
+    """Drop ``autoincrement=True`` from a tenant table's id in SQLite DDL.
+
+    SQLAlchemy raises ``CompileError: SQLite does not support
+    autoincrement for composite primary keys`` while *rendering* the
+    column.  The flag is only consulted for the DDL here (the rowid alias
+    an ``INTEGER PRIMARY KEY`` gets is enough to generate values), so it is
+    relaxed for the duration of the render and restored immediately --
+    the in-memory mapping other dialects and the ORM's own insert logic
+    read stays untouched.
+    """
+    column = element.element
+    if (
+        column.autoincrement is True
+        and len(column.table.primary_key.columns) > 1
+        and is_tenant_primary_key(column.table.primary_key)
+    ):
+        column.autoincrement = "auto"
+        try:
+            return compiler.visit_create_column(element, **kw)
+        finally:
+            column.autoincrement = True
+    return compiler.visit_create_column(element, **kw)
+
+
+@compiles(PrimaryKeyConstraint, "sqlite")
+def _narrow_sqlite_tenant_pk(constraint, compiler, **kw):
+    """Render a tenant PK that includes an autoincrement column as the
+    single-column PK SQLite requires.
+
+    SQLite's ``AUTOINCREMENT`` (and the implicit rowid alias an
+    ``INTEGER PRIMARY KEY`` gets) only works for a single-column primary
+    key.  Only that shape is narrowed -- pure string keyed tables
+    (``mm_users``, ``mm_memory_preferences``, ``mm_consent_grants``,
+    ``mm_snapshots``, ``mm_evolution_jobs``) keep the full composite
+    constraint on SQLite and are row-unique per tenant there too.
+
+    The Python-side mapping stays composite on both dialects, so
+    ``session.get``, the identity map and the unit-of-work WHERE clauses
+    behave identically; the write-safety story for the narrowed tables on
+    SQLite comes from the fallback layers in
+    ``tests/test_pk_addressing.py``.
+    """
+    autoinc = [c for c in constraint.columns if c.autoincrement is True]
+    if is_tenant_primary_key(constraint) and len(autoinc) == 1:
+        return "PRIMARY KEY (%s)" % compiler.preparer.format_column(autoinc[0])
+    return compiler.visit_primary_key_constraint(constraint, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -544,10 +629,13 @@ def _tenant_aware_get(self, entity, primary_key, *args, **kwargs):
     pk_cols = mapper.primary_key
 
     pk = primary_key if isinstance(primary_key, tuple) else (primary_key,)
-    if len(pk_cols) - len(pk) == 2 and pk_cols[0].key == "tenant_id":
+    if len(pk_cols) - len(pk) == TENANT_PK_PREFIX and pk_cols[0].key == "tenant_id":
         # Legacy business key (pre-tenancy PK): the caller addresses a row
         # inside the ambient tenant, so the tenant prefix is supplied here
-        # rather than at each of the get() call sites.
+        # rather than at each get() call site.  The full key is
+        # ``(tenant_id, app_id, ...)`` for every tenant table, so a single
+        # value map to ``(tenant, app, value)`` and a two-value business
+        # key (``ConsentGrant``) to ``(tenant, app, k1, k2)``.
         pk = tenant + tuple(pk)
         primary_key = pk
 

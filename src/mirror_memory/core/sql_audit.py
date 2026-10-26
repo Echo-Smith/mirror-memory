@@ -128,18 +128,23 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
                 )
         return
 
-    # Identity-keyed exemption (documented limitation): ORM unit-of-work
-    # statements and expired-attribute refreshes address rows purely by
-    # primary key, and a session-scoped cache of "who authored this
-    # mutation" is unreliable (flushes are deferred).  Composite PKs that
-    # would put tenant_id into every UOW WHERE are not available on
-    # SQLite (CompileError: no autoincrement for composite PKs).  The
-    # PK-addressing surface is therefore closed by dedicated layers, each
-    # with its own tests (tests/test_pk_addressing.py): the whitelist
-    # write guard intercepts foreign-PK objects at construction, the
-    # merge wrapper refuses cross-tenant merges, and the flush checks
-    # refuse dirty/deleted rows from another tenant.
-    if len(touched) == 1 and _is_identity_keyed(stmt, touched, tenant_tables, exp):
+    # Identity-keyed exemption -- SQLite only (M2 task 3 retired it on
+    # PostgreSQL).  ORM unit-of-work statements address rows by primary
+    # key; on PostgreSQL every tenant table's primary key now leads with
+    # ``(tenant_id, app_id)``, so those statements carry the tenant
+    # predicates natively and need no exemption.  SQLite cannot host that
+    # constraint on its autoincrement tables (the DDL narrows back to a
+    # single column), so the UOW WHERE there is PK-only and the surface is
+    # closed by dedicated layers, each with its own test
+    # (tests/test_pk_addressing.py): the whitelist write guard intercepts
+    # foreign-PK objects at construction, the merge wrapper refuses
+    # cross-tenant merges, and the flush checks refuse dirty/deleted rows
+    # from another tenant.
+    if (
+        len(touched) == 1
+        and _identity_exemption_dialect()
+        and _is_identity_keyed(stmt, touched, tenant_tables, exp)
+    ):
         return
 
     # Collect the tenant columns constrained by bound equalities anywhere
@@ -231,15 +236,35 @@ def tenant_pk_columns() -> dict[str, set[str]]:
     return _pk_columns_cache
 
 
-_verdict_cache: dict[str, AuditViolation | None] = {}
+_verdict_cache: dict[tuple[str, bool], AuditViolation | None] = {}
 _VERDICT_CACHE_CAP = 100_000
 _cache_hits = 0
 _cache_misses = 0
 
+#: The dialect of the statement currently being audited.  Set by the
+#: execution listener right before :func:`audit_sql` and read by the
+#: structural judge.  ``audit_sql`` called directly (unit tests) defaults
+#: to SQLite rules -- the historical behaviour.
+_dialect_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "mm_audit_dialect", default="sqlite"
+)
+
 
 def auditor_cache_stats() -> tuple[int, int, int]:
-    """(distinct texts, cache hits, misses) for the report."""
+    """(distinct entries, cache hits, misses) for the report."""
     return len(_verdict_cache), _cache_hits, _cache_misses
+
+
+def _identity_exemption_dialect() -> bool:
+    """Whether the PK-addressing exemption applies to the current dialect.
+
+    M2 task 3: PostgreSQL tenant tables carry ``PRIMARY KEY (tenant_id,
+    app_id, ...)``, so their unit-of-work statements name the tenant
+    columns and the exemption is retired there.  SQLite physically keeps a
+    single-column PK (autoincrement limitation) and keeps the exemption,
+    backed by the three fallback layers.
+    """
+    return _dialect_var.get() != "postgresql"
 
 
 def audit_sql(sql: str) -> None:
@@ -274,9 +299,16 @@ def audit_sql(sql: str) -> None:
             _exemptions_seen.append(sql.strip()[:120])
         return
 
-    if sql in _verdict_cache:
+    # The verdict depends on the statement text AND on the dialect (the
+    # PK-addressing exemption is PostgreSQL-only), so the cache key carries
+    # both.  Cross-dialect text (``UPDATE t SET v=? WHERE tenant_id=? AND
+    # app_id=? AND id=?``) therefore never serves a SQLite verdict to a
+    # PostgreSQL run or the reverse.
+    cache_key = (sql, _identity_exemption_dialect())
+
+    if cache_key in _verdict_cache:
         _cache_hits += 1
-        verdict = _verdict_cache[sql]
+        verdict = _verdict_cache[cache_key]
     else:
         _cache_misses += 1
         try:
@@ -285,7 +317,7 @@ def audit_sql(sql: str) -> None:
             verdict = exc
         if len(_verdict_cache) >= _VERDICT_CACHE_CAP:
             _verdict_cache.clear()
-        _verdict_cache[sql] = verdict
+        _verdict_cache[cache_key] = verdict
     if verdict is not None:
         raise verdict
 
@@ -398,7 +430,11 @@ def install_sql_auditor() -> None:
                 system_reason(), statement[:160],
             )
             return
-        audit_sql(statement)
+        token = _dialect_var.set(conn.dialect.name)
+        try:
+            audit_sql(statement)
+        finally:
+            _dialect_var.reset(token)
 
     event.listen(Engine, "before_cursor_execute", _audit)
     _installed = True

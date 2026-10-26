@@ -53,6 +53,16 @@
   reviewer: Echo-Smith
   reviewed_at: "2026-10-26"
 
+- module: mirror_memory.core.schema_migration
+  function: _emit_primary_key_swaps
+  reason: >
+    Converting each tenant table's primary key to the composite tenant key
+    is a catalog operation over the whole table, not a row-scoped query;
+    there is no tenant to scope it to (the ALTER names no rows).  Reached
+    only from Step1Tenancy's PostgreSQL path inside upgrade_database.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-26"
+
 - module: mirror_memory.api
   function: _verify_single_tenant_startup
   reason: >

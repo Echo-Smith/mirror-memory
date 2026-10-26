@@ -105,6 +105,45 @@ def _compile_add_column(element, compiler, **kw):
     )
 
 
+class PrimaryKeySwap(DDLElement):
+    """Replace a table's primary key with a composite one (PostgreSQL).
+
+    ``DROP CONSTRAINT IF EXISTS`` + ``ADD CONSTRAINT ... PRIMARY KEY`` is a
+    catalog change: the replacement index is built while the old one still
+    serves reads, so the table is neither rewritten nor held under an
+    exclusive lock for the whole operation.  Column names come from
+    ``Base.metadata`` at compile time; nothing is interpolated from the
+    database or from a caller.
+    """
+
+    inherit_cache = True
+
+    def __init__(self, table: str) -> None:
+        self.table = table
+
+
+@compiles(PrimaryKeySwap)
+def _compile_primary_key_swap(element, compiler, **kw):
+    if compiler.dialect.name != "postgresql":
+        raise MigrationError(
+            "PrimaryKeySwap is a PostgreSQL catalog ALTER; SQLite keeps its "
+            "single-column physical key"
+        )
+    preparer = compiler.preparer
+    model_table = Base.metadata.tables[element.table]
+    constraint = preparer.quote(model_table.name + "_pkey")
+    columns = ", ".join(
+        preparer.format_column(column)
+        for column in model_table.primary_key.columns
+    )
+    return "ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s, ADD CONSTRAINT %s PRIMARY KEY (%s)" % (
+        preparer.format_table(model_table),
+        constraint,
+        constraint,
+        columns,
+    )
+
+
 class AlterColumnClause(DDLElement):
     """ALTER TABLE t ALTER COLUMN c <clause> (clause is a fixed keyword
     string chosen by the step, never caller input)."""
@@ -360,6 +399,7 @@ class Step1Tenancy:
                 ["tenant_id", "app_id"],
                 DEFAULT_BACKFILL_BATCH,
             )
+        _replace_primary_keys(engine, existing)
         for name in existing:
             with engine.begin() as conn:
                 for col in ("tenant_id", "app_id"):
@@ -410,6 +450,64 @@ def _literal(value: str):
     from sqlalchemy import literal
 
     return literal(value)
+
+
+def _replace_primary_keys(engine: Engine, names: list) -> None:
+    """Convert the named tables to the tenant composite primary key (PG).
+
+    The ALTER is emitted through SQLAlchemy's own DDL pipeline: a throwaway
+    ``MetaData`` carries the statement as an ``after_create`` hook, and
+    ``create_all(checkfirst=True)`` runs it (every real table already
+    exists, so only the hook fires).  That keeps execution inside the
+    library's DDL machinery instead of a hand-rolled execute call, and the
+    statement itself is compiled by ``PrimaryKeySwap`` from the model's own
+    table -- column and constraint identifiers come from
+    ``Base.metadata``, never from caller or database text.
+
+    PostgreSQL only: a catalog ALTER builds the replacement index while the
+    old one still serves reads, so no table rewrite and no long exclusive
+    lock.  SQLite keeps its single-column physical key (a composite key
+    over an autoincrement column is impossible) and its three fallback
+    layers.
+    """
+    if not _is_postgres(engine):
+        return
+    insp = inspect(engine)
+    targets = []
+    for name in names:
+        wanted = [column.name for column in Base.metadata.tables[name].primary_key.columns]
+        if list(insp.get_pk_constraint(name)["constrained_columns"]) != wanted:
+            targets.append(name)
+    if not targets:
+        return
+    _emit_primary_key_swaps(engine, targets)
+
+
+def _emit_primary_key_swaps(engine: Engine, names: list) -> None:
+    """Run the conversion inside the migration's cross-tenant scope."""
+    in_scope = _SwapPlan(names)
+    with system_scope(reason=_MIGRATION_REASON):
+        in_scope.run(engine)
+
+
+class _SwapPlan:
+    """A metadata whose only job is to carry the ALTER statements.
+
+    ``create_all`` executes a metadata's DDL; attaching the swaps as
+    ``after_create`` hooks means the library's own execution path runs
+    them, and ``checkfirst`` keeps it from trying to create the tables.
+    """
+
+    def __init__(self, names: list) -> None:
+        self.names = names
+
+    def run(self, engine: Engine) -> None:
+        from sqlalchemy import event
+
+        metadata = MetaData()
+        for name in self.names:
+            event.listen(metadata, "after_create", PrimaryKeySwap(name))
+        metadata.create_all(engine, checkfirst=True)
 
 
 # ---------------------------------------------------------------------------

@@ -114,13 +114,14 @@ class Belief(TenantScoped, Base):
 
     __tablename__ = "mm_beliefs"
     __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint(
             "tenant_id", "app_id", "user_id", "key",
             name="uq_mm_beliefs_user_key",
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     dimension: Mapped[str] = mapped_column(String(64), index=True)
     key: Mapped[str] = mapped_column(String(128))
@@ -220,7 +221,7 @@ class Evidence(TenantScoped, Base):
 
     __tablename__ = "mm_evidence"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     session_id: Mapped[str | None] = mapped_column(String(128), index=True)
     ref: Mapped[str] = mapped_column(String(128), default="")
@@ -245,6 +246,7 @@ class Evidence(TenantScoped, Base):
     compaction_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint(
             "tenant_id", "app_id", "user_id", "ref",
             name="uq_mm_evidence_user_ref",
@@ -272,8 +274,9 @@ class EvidenceDigest(TenantScoped, Base):
     """
 
     __tablename__ = "mm_evidence_digests"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     belief_id: Mapped[int] = mapped_column(Integer, index=True, unique=True)
     # Total typed-link counts across the belief's whole history — including
@@ -319,13 +322,14 @@ class BeliefEvidenceLink(TenantScoped, Base):
 
     __tablename__ = "mm_belief_evidence_links"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     belief_id: Mapped[int] = mapped_column(Integer, index=True)
     evidence_id: Mapped[int] = mapped_column(Integer, index=True)
     relation: Mapped[str] = mapped_column(String(16), default="support")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint("belief_id", "evidence_id", "relation",
                          name="uq_mm_belief_evidence_link"),
     )
@@ -344,8 +348,9 @@ class BeliefEvent(TenantScoped, Base):
     """
 
     __tablename__ = "mm_belief_events"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     belief_id: Mapped[int] = mapped_column(Integer, index=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     event_type: Mapped[str] = mapped_column(String(32))
@@ -374,8 +379,9 @@ class MemoryTransition(TenantScoped, Base):
     """
 
     __tablename__ = "mm_memory_transitions"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     entity_type: Mapped[str] = mapped_column(String(16), default="belief")
     entity_id: Mapped[int] = mapped_column(Integer, index=True)
@@ -416,8 +422,9 @@ class DeletionTombstone(TenantScoped, Base):
     """
 
     __tablename__ = "mm_deletion_tombstones"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     generation: Mapped[int] = mapped_column(Integer, default=1)
     # "belief" / "session" / "user" — what kind of scope was deleted.
@@ -450,8 +457,9 @@ class ProposalLog(TenantScoped, Base):
     """
 
     __tablename__ = "mm_proposal_log"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     proposal_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), default="", index=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -494,7 +502,7 @@ class BeliefIdentity(TenantScoped, Base):
 
     __tablename__ = "mm_belief_identities"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     subject: Mapped[str] = mapped_column(String(64), default="user")
     predicate: Mapped[str] = mapped_column(String(64), default="", index=True)
@@ -506,6 +514,7 @@ class BeliefIdentity(TenantScoped, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint(
             "tenant_id", "app_id", "user_id", "subject", "predicate", "slot_key",
             name="uq_mm_belief_identity_slot",
@@ -533,8 +542,9 @@ class BeliefVersion(TenantScoped, Base):
     """
 
     __tablename__ = "mm_belief_versions"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     identity_id: Mapped[int] = mapped_column(Integer, index=True)
     object: Mapped[str] = mapped_column(String(256), default="")
@@ -565,8 +575,9 @@ class ExtractionStats(TenantScoped, Base):
     """Per-extraction-call statistics (one row per call, including skips)."""
 
     __tablename__ = "mm_extraction_stats"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     trigger: Mapped[str] = mapped_column(String(32), default="")
@@ -589,8 +600,9 @@ class Snapshot(TenantScoped, Base):
     """Versioned snapshot of a user's structured understanding."""
 
     __tablename__ = "mm_snapshots"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64))
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(16), default="shadow")
@@ -611,13 +623,14 @@ class EvolutionJob(TenantScoped, Base):
 
     __tablename__ = "mm_evolution_jobs"
     __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint(
             "tenant_id", "app_id", "idempotency_key",
             name="uq_mm_evolution_jobs_idempotency",
         ),
     )
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64))
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
@@ -653,8 +666,9 @@ class SessionSummary(TenantScoped, Base):
     """
 
     __tablename__ = "mm_session_summaries"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     session_id: Mapped[str] = mapped_column(String(128), index=True)
     summary_text: Mapped[str] = mapped_column(Text, default="")
@@ -678,8 +692,9 @@ class InterventionEvent(TenantScoped, Base):
     """
 
     __tablename__ = "mm_intervention_events"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     session_id: Mapped[str] = mapped_column(String(128))
     kind: Mapped[str] = mapped_column(String(32))  # "question_injected" / "question_answered"
