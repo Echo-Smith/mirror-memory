@@ -159,21 +159,29 @@ def _pg_url() -> str | None:
 
 @pytest.fixture(autouse=True)
 def _pg_engine_reaper():
-    """PostgreSQL only: record engines created during a test and dispose
-    them afterwards.
+    """PostgreSQL only: close every engine pool opened during a test.
 
     Several test modules build their own engines (helper fixtures, worker
     factories, migration tests).  Under SQLite those are in-memory and
-    cheap; under PostgreSQL each keeps pooled connections alive, and 271
-    tests' worth exhausts the server's connection slots.  This reaper
-    disposes every engine created while the test ran.
+    cheap; under PostgreSQL each keeps pooled server connections alive, and
+    a full-suite run exhausts the server's connection slots (CI run
+    40338513001: 271 cascading 'too many clients' errors from test_worker
+    onward).  Two sweeps:
+
+    - ``sqlalchemy.create_engine`` is patched so engines created through
+      the module attribute are tracked and disposed directly;
+    - modules that imported the name at their own import time bypass that,
+      so teardown ALSO walks ``gc`` for every live ``Engine`` and disposes
+      it -- refcount delays and cycles would otherwise hold server
+      connections until long after the test finished.
     """
     if _pg_url() is None:
         yield
         return
-    from sqlalchemy import create_engine as _create_engine
+    import gc
 
     import sqlalchemy
+    from sqlalchemy.engine import Engine
 
     created: list = []
     original = sqlalchemy.create_engine
@@ -183,16 +191,27 @@ def _pg_engine_reaper():
         created.append(engine)
         return engine
 
+    def _dispose_all() -> None:
+        seen = set()
+        for engine in created:
+            seen.add(id(engine))
+            try:
+                engine.dispose()
+            except Exception:  # noqa: BLE001 -- cleanup must not fail a test
+                pass
+        for obj in gc.get_objects():
+            if isinstance(obj, Engine) and id(obj) not in seen:
+                try:
+                    obj.dispose()
+                except Exception:  # noqa: BLE001
+                    pass
+
     sqlalchemy.create_engine = recording_create_engine
     try:
         yield
     finally:
         sqlalchemy.create_engine = original
-        for engine in created:
-            try:
-                engine.dispose()
-            except Exception:  # noqa: BLE001 -- cleanup must not fail a test
-                pass
+        _dispose_all()
 
 
 @pytest.fixture
