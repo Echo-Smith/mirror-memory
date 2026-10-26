@@ -126,6 +126,7 @@ def test_asyncio_gather_fifty_tenants(tmp_path):
 
 
 # 4. worker reads the tenant from the job record, not the scheduler
+@pytest.mark.fixture_writes(reason="worker context test: enqueue job row directly")
 def test_worker_uses_job_tenant_not_scheduler_context(tmp_path):
     from mirror_memory.config.loader import load_config
     from mirror_memory.core.models import EvolutionJob, Snapshot

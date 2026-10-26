@@ -202,8 +202,51 @@ import hmac  # noqa: E402
 
 #: sha256(key) -> (tenant_id, app_id).  Raw keys never live here.
 _tenant_key_registry: dict[str, tuple[str, str]] = {}
-#: (tenant_id, app_id) -> MemoryEngine, created lazily per tenant
-_tenant_engines: dict[tuple[str, str], MemoryEngine] = {}
+#: Bounded LRU cache of per-tenant engines (closeout task 3): an unbounded
+#: dict would leak one engine (and its connection pool) per tenant forever.
+#: Bound is MM_TENANT_ENGINE_CACHE (default 32); evicted engines get their
+#: pool disposed.
+_TENANT_ENGINE_CACHE_DEFAULT = 32
+
+
+def _engine_cache_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("MM_TENANT_ENGINE_CACHE", _TENANT_ENGINE_CACHE_DEFAULT)))
+    except ValueError:
+        return _TENANT_ENGINE_CACHE_DEFAULT
+
+
+def _release_engine(engine: "MemoryEngine") -> None:
+    """Dispose an evicted engine's connection pool."""
+    pool = getattr(getattr(engine, "_engine", None), "pool", None)
+    if pool is not None:
+        try:
+            pool.dispose()
+        except Exception:  # noqa: BLE001 -- eviction must never break a request
+            logger.warning("tenant engine eviction: pool dispose failed", exc_info=True)
+
+
+class _TenantEngineCache(dict):
+    """dict with LRU eviction; insertion order = recency order."""
+
+    def touch(self, key) -> None:
+        if key in self:
+            value = dict.__getitem__(self, key)
+            dict.__delitem__(self, key)
+            dict.__setitem__(self, key, value)
+
+    def __setitem__(self, key, value):
+        if key in self:
+            dict.__delitem__(self, key)
+        dict.__setitem__(self, key, value)
+        while dict.__len__(self) > _engine_cache_limit():
+            oldest = next(iter(self))
+            evicted = dict.__getitem__(self, oldest)
+            dict.__delitem__(self, oldest)
+            _release_engine(evicted)
+
+
+_tenant_engines: _TenantEngineCache = _TenantEngineCache()
 _app_state: dict[str, Any] = {}
 
 
@@ -248,8 +291,9 @@ def _resolve_tenant(presented: str | None) -> tuple[str, str]:
 
 
 def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
-    """Per-tenant engine cache: each engine binds its own sessions inside
-    its tenant scope (engines are single-tenant by construction)."""
+    """Per-tenant engine cache (LRU, bounded by MM_TENANT_ENGINE_CACHE):
+    each engine binds its own sessions inside its tenant scope (engines
+    are single-tenant by construction)."""
     engine = _tenant_engines.get(tenant)
     if engine is None:
         engine = MemoryEngine(
@@ -261,6 +305,8 @@ def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
         )
         engine._ensure_db()
         _tenant_engines[tenant] = engine
+    else:
+        _tenant_engines.touch(tenant)  # mark recently used
     return engine
 
 

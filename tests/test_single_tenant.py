@@ -162,3 +162,41 @@ def test_flush_checks_still_active_in_single_tenant(tmp_path):
         s.rollback()
         s.close()
     set_single_tenant_mode(False)
+
+
+def test_session_binding_check_skipped_in_single_tenant(tmp_path):
+    """Closeout task 3: the per-statement session-binding comparison is
+    skipped in single-tenant mode (the engine pinned the tenant at
+    construction and startup refused any mismatched database).  A session
+    created OUTSIDE any tenant scope still works here -- previously that
+    raised TenantMismatchError."""
+    from mirror_memory.core.tenancy import no_tenant_scope
+
+    url = f"sqlite:///{tmp_path}/binding.db"
+    make_engine(url, single_tenant_mode=True)
+    raw = create_engine(url)
+    Base.metadata.create_all(raw)
+    factory = sessionmaker(bind=raw)
+
+    set_single_tenant_mode(True)
+    # session created with NO ambient tenant -> binding is None; the
+    # mismatch branch must be skipped in this mode
+    s = factory()
+    s.query(Belief).all()
+    s.close()
+    # ...and a session created under the fixed tenant keeps working
+    with tenant_scope("tA", "app"):
+        s2 = factory()
+        s2.query(Belief).all()
+        s2.close()
+    set_single_tenant_mode(False)
+
+    # contrast: in MULTI-tenant mode the same scopeless session fails
+    with pytest.raises(Exception) as excinfo:
+        with no_tenant_scope():
+            s3 = factory()
+            s3.query(Belief).all()
+            s3.close()
+    from mirror_memory.core.tenancy import TenantContextMissing, TenantMismatchError
+
+    assert isinstance(excinfo.value, (TenantContextMissing, TenantMismatchError))

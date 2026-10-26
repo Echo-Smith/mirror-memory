@@ -585,6 +585,7 @@ class TestForgetInvalidatesDerived:
         snaps = db_session.query(Snapshot).filter_by(user_id="u_snap").all()
         assert len(snaps) == 0
 
+    @pytest.mark.fixture_writes(reason="forget test: construct a pending EvolutionJob row")
     def test_forget_cancels_pending_jobs(self, db_session):
         from mirror_memory.core.repository import forget_belief
 

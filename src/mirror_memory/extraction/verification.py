@@ -314,24 +314,30 @@ def run_verification_judgment(
             trigger="verification",
             model=str(getattr(llm_client, "model", "") or ""),
         )
+        # The stats row was constructed inside the telemetry write scope;
+        # the latency/error updates below are the same telemetry write, so
+        # they run in the same scope (the write guard fires at
+        # attribute-set time, and the constructor's scope has exited).
+        from mirror_memory.core.tenancy import telemetry_write_scope
 
-        payload = (
-            f"[Hypothesis]\n{(belief.claim_text or belief.key).strip()}\n\n"
-            f"[User reply]\n{(user_text or '').strip()}"
-        )
-        started = time.monotonic()
-        try:
-            raw = llm_client.generate(
-                system_prompt=system_prompt,
-                payload_text=payload,
-                fallback=lambda: "unclear",
+        with telemetry_write_scope():
+            payload = (
+                f"[Hypothesis]\n{(belief.claim_text or belief.key).strip()}\n\n"
+                f"[User reply]\n{(user_text or '').strip()}"
             )
-        except Exception:
-            logger.warning("verification: LLM call failed; falling back to unclear", exc_info=True)
-            raw = "unclear"
-            stats.status = "error"
-            stats.error = "llm_failed_fallback"
-        stats.latency_ms = int((time.monotonic() - started) * 1000)
+            started = time.monotonic()
+            try:
+                raw = llm_client.generate(
+                    system_prompt=system_prompt,
+                    payload_text=payload,
+                    fallback=lambda: "unclear",
+                )
+            except Exception:
+                logger.warning("verification: LLM call failed; falling back to unclear", exc_info=True)
+                raw = "unclear"
+                stats.status = "error"
+                stats.error = "llm_failed_fallback"
+            stats.latency_ms = int((time.monotonic() - started) * 1000)
 
         verdict = parse_verdict(raw)
         if verdict in ("confirm", "deny"):
@@ -377,7 +383,10 @@ def run_verification_judgment(
                 "belief_label": str(detail.get("belief_label") or ""),
             },
         )
-        stats.claims_out = 1 if verdict in {"confirm", "deny"} else 0
+        from mirror_memory.core.tenancy import telemetry_write_scope
+
+        with telemetry_write_scope():
+            stats.claims_out = 1 if verdict in {"confirm", "deny"} else 0
         logger.info("verification: verdict=%s belief=%s", verdict, belief.key)
         return True
     except Exception:  # noqa: BLE001 -- verification is optional, fail-open

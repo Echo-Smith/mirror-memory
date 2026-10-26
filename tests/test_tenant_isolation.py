@@ -137,6 +137,7 @@ def test_same_user_key_coexists_across_tenants(raw_session_factory):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.fixture_writes(reason="isolation test: seed deterministic ExtractionStats row")
 def test_tenant_b_cannot_read_tenant_a_content(shared_db_url):
     engine_a = make_engine(shared_db_url, T_A)
     engine_b = make_engine(shared_db_url, T_B)
@@ -516,6 +517,7 @@ def test_mismatched_tenant_write_raises(raw_session_factory):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.fixture_writes(reason="isolation test: seed BeliefIdentity rows directly")
 def test_belief_identity_slot_is_per_tenant(raw_session_factory):
     with tenant_scope(*T_A):
         s = raw_session_factory()

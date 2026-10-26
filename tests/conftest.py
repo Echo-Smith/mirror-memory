@@ -15,6 +15,71 @@ def pytest_configure(config):
         "no_write_fixture_scope: run WITHOUT the blanket test write scope "
         "(used by the write-guard canary tests)",
     )
+    config.addinivalue_line(
+        "markers",
+        "fixture_writes(reason): the test body itself writes protected tables "
+        "directly (seeding/tuning); reason is mandatory",
+    )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_fixture_setup(fixturedef, request):
+    """Open the fixture write scope around FIXTURE SETUP only (closeout).
+
+    Fixtures seed data by definition, so they run under
+    fixture_write_scope.  The test BODY no longer does: writes from a test
+    body need @pytest.mark.fixture_writes(reason=...), and engine-code
+    writes remain governed by the classified scopes (guard active in test
+    bodies -- that is the point of the narrowing).
+
+    Internal autouse fixtures (underscore-prefixed conftest machinery)
+    are skipped: their contexts must survive into the test body, and this
+    wrapper's token-reset on setup-exit would clobber a nested scope that
+    a suspended yield-fixture still holds open.
+    """
+    if fixturedef.argname.startswith("_"):
+        yield
+        return
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope(f"fixture setup: {fixturedef.argname}"):
+        yield
+
+
+def _marker_reason(request) -> str:
+    """Extract the mandatory reason from a fixture_writes marker."""
+    writes_marker = request.node.get_closest_marker("fixture_writes")
+    reason = (writes_marker.kwargs or {}).get("reason") or (
+        writes_marker.args[0] if writes_marker.args else ""
+    )
+    if not reason:
+        raise pytest.UsageError(
+            "@pytest.mark.fixture_writes requires a reason=... argument"
+        )
+    return reason
+
+
+@pytest.fixture(autouse=True)
+def _body_write_scope(request):
+    """Write scope for the TEST BODY (closeout patch, task 1).
+
+    Default: NO blanket scope -- the write guard is live in test bodies.
+    A test that must write protected tables directly declares
+    @pytest.mark.fixture_writes(reason="...") and runs under
+    fixture_write_scope for its body.  Canary tests
+    (@pytest.mark.no_write_fixture_scope) keep running bare either way.
+    """
+    if request.node.get_closest_marker("no_write_fixture_scope"):
+        yield
+        return
+    writes_marker = request.node.get_closest_marker("fixture_writes")
+    if writes_marker is None:
+        yield
+        return
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope(f"test body (declared): {_marker_reason(request)}"):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -28,27 +93,6 @@ def _default_tenant_context():
     from mirror_memory.core.tenancy import tenant_scope
 
     with tenant_scope("default", "default"):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def _test_write_scope(request):
-    """Blanket fixture write scope for test bodies (task 2 design note).
-
-    Test bodies seed data constantly; requiring ~140 per-site
-    fixture_write_scope wraps would bury the meaningful ones in noise.
-    Instead: every test runs inside fixture_write_scope("test body"), and
-    the guard's real teeth are proven by the canary tests marked
-    @pytest.mark.no_write_fixture_scope, which run WITHOUT the blanket
-    scope and assert that direct writes to each classified table raise.
-    Engine code keeps the guard in production (no scope active there).
-    """
-    if request.node.get_closest_marker("no_write_fixture_scope"):
-        yield
-        return
-    from mirror_memory.core.tenancy import fixture_write_scope
-
-    with fixture_write_scope("test body (blanket; canaries opt out)"):
         yield
 
 

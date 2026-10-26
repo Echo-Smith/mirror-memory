@@ -330,8 +330,14 @@ def _session_bound_tenant(session: Session) -> tuple[str, str] | None:
 
 
 def _check_session_tenant(session: Session, tenant: tuple[str, str] | None) -> None:
-    """The ambient tenant must match the tenant the session was created in."""
-    if tenant is None:
+    """The ambient tenant must match the tenant the session was created in.
+
+    Single-tenant mode (task 3 closeout): the engine pinned THE tenant at
+    construction and the startup check refused any database holding a
+    different one, so a bound/ambient mismatch cannot cross tenants --
+    the per-statement binding comparison is skipped (before_flush tenant
+    validation and the write guard stay on)."""
+    if tenant is None or _single_tenant_mode.get():
         return
     bound = _session_bound_tenant(session)
     if bound is not None and bound != tenant:
@@ -729,32 +735,43 @@ def install_write_guard() -> None:
         return
     install_write_guard._installed = True  # type: ignore[attr-defined]
 
-    def _guarded_set(target, value, oldvalue, initiator):
-        if not _write_guard_enabled():
-            return value
-        active = _write_class_var.get()
-        if active == "fixture":
-            return value
-        required = _write_class_for(target.__tablename__)
-        if required is not None and active == required:
-            return value
-        scope_hint = {
-            "engine": "engine_write_scope (Publisher / claim mutators)",
-            "queue": "queue_write_scope (worker / enqueue)",
-            "consent": "consent_write_scope (preference/consent setters)",
-            "telemetry": "telemetry_write_scope (stats/summary/intervention recorders)",
-        }.get(required, "an unclassified table -- add it to TABLE_WRITE_CLASSES")
-        raise WriteGuardViolation(
-            f"{type(target).__name__}.{initiator.key} (table "
-            f"{target.__tablename__!r}, write class {required!r}) is only "
-            f"writable inside {scope_hint}; test fixtures use "
-            "fixture_write_scope(reason)"
-        )
+    def _make_guard(required: str | None):
+        """Per-class guard closure (closeout task 2 fast path).
+
+        The hot path is one contextvar read plus at most two string
+        comparisons -- no dict lookup, no env read.  The enabled-flag env
+        read happens only when no scope is active AND the write would be
+        refused (disabled guard = never raise).  Protection scope is
+        unchanged: every classified column is guarded, mismatches raise.
+        """
+
+        def _guarded_set(target, value, oldvalue, initiator):
+            active = _write_class_var.get()
+            if active is not None:
+                if active == "fixture" or active == required:
+                    return value
+            elif not _write_guard_enabled():
+                return value
+            scope_hint = {
+                "engine": "engine_write_scope (Publisher / claim mutators)",
+                "queue": "queue_write_scope (worker / enqueue)",
+                "consent": "consent_write_scope (preference/consent setters)",
+                "telemetry": "telemetry_write_scope (stats/summary/intervention recorders)",
+            }.get(required, "an unclassified table -- add it to TABLE_WRITE_CLASSES")
+            raise WriteGuardViolation(
+                f"{type(target).__name__}.{initiator.key} (table "
+                f"{target.__tablename__!r}, write class {required!r}) is only "
+                f"writable inside {scope_hint}; test fixtures use "
+                "fixture_write_scope(reason)"
+            )
+
+        return _guarded_set
 
     from mirror_memory.core.models import Base
 
     for cls in _iter_tenant_classes():
         if not hasattr(cls, "__tablename__"):
             continue
+        guard = _make_guard(_write_class_for(cls.__tablename__))
         for attr in cls.__mapper__.column_attrs:
-            event.listen(getattr(cls, attr.key), "set", _guarded_set)
+            event.listen(getattr(cls, attr.key), "set", guard)

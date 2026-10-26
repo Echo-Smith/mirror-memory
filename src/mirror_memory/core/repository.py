@@ -282,6 +282,7 @@ CONFLICT_SOURCE_CONFLICT = "source_conflict"
 EVIDENCE_AUTHORITIES = ("user", "assistant", "system", "derived")
 
 
+@_sanctioned_writer("engine")
 def record_evidence(
     session: Session,
     user_id: str,
@@ -341,6 +342,7 @@ def record_evidence(
     return row
 
 
+@_sanctioned_writer("engine")
 def link_evidence(
     session: Session,
     belief_id: int,
@@ -563,6 +565,7 @@ def digests_for_beliefs(session: Session, belief_ids: list[int]) -> dict[int, Ev
     return {digest.belief_id: digest for digest in session.scalars(stmt)}
 
 
+@_sanctioned_writer("engine")
 def apply_evidence_compaction(
     session: Session,
     belief: Belief,
@@ -710,6 +713,7 @@ _TIER_METABOLISM_STATE = {
 }
 
 
+@_sanctioned_writer("engine")
 def set_belief_tier(
     session: Session,
     belief_id: int,
@@ -758,6 +762,7 @@ def set_belief_tier(
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_writer("engine")
 def get_or_create_identity(
     session: Session,
     user_id: str,
@@ -806,6 +811,7 @@ def _slot_key_for(belief: Belief) -> str:
     return belief.key
 
 
+@_sanctioned_writer("engine")
 def append_belief_version(
     session: Session,
     belief: Belief,
@@ -2534,6 +2540,7 @@ def _scope_hash(scope: str, identity: str) -> str:
     return _short_hash(f"{scope}:{identity}")
 
 
+@_sanctioned_writer("engine")
 def _write_deletion_tombstone(
     session: Session,
     user_id: str,

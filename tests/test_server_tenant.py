@@ -219,3 +219,44 @@ def test_forged_tenant_headers_ignored(tmp_path, app_url):
         assert r.status_code == 200
         claims = [x["claim_text"] for x in r.json()["beliefs"]]
         assert claims == ["A"]
+
+
+# ---------------------------------------------------------------------------
+# Closeout task 3: LRU bound on the per-tenant engine cache
+# ---------------------------------------------------------------------------
+
+
+def test_engine_cache_lru_evicts_and_disposes(tmp_path, app_url, monkeypatch):
+    from mirror_memory import server as server_mod
+
+    monkeypatch.setenv("MM_TENANT_ENGINE_CACHE", "2")
+    for i in range(4):
+        _seed(app_url, (f"t{i}", "app"), f"key-{i}", f"T{i}")
+    app = server_mod.create_app(
+        config=load_config("config/"), database_url=app_url
+    )
+    with TestClient(app) as client:
+        disposed = []
+        orig_release = server_mod._release_engine
+
+        def tracking_release(engine):
+            disposed.append(getattr(engine, "_tenant", None))
+            orig_release(engine)
+
+        monkeypatch.setattr(server_mod, "_release_engine", tracking_release)
+        for i in range(4):
+            r = client.get(
+                "/beliefs", params={"user_id": "u1"},
+                headers={"Authorization": f"Bearer key-{i}"},
+            )
+            assert r.status_code == 200
+        assert len(server_mod._tenant_engines) == 2  # bounded
+        assert len(disposed) == 2  # two evicted, pools disposed
+        # the two resident engines answer correctly (no cross-bleed)
+        for i in (2, 3):
+            r = client.get(
+                "/beliefs", params={"user_id": "u1"},
+                headers={"Authorization": f"Bearer key-{i}"},
+            )
+            claims = [x["claim_text"] for x in r.json()["beliefs"]]
+            assert claims == [f"T{i}"]
