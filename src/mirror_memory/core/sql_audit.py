@@ -260,16 +260,18 @@ _PG_PLACEHOLDER_RE = re.compile(
     # PostgreSQL driver placeholders, optionally with an explicit cast:
     #   %(name)s::TIMESTAMP WITHOUT TIME ZONE  ->  ?
     #   %(name)s::VARCHAR(64)                  ->  ?
+    #   %(name)s::TEXT[] (inside ARRAY[...]')  ->  ?
     # sqlglot cannot parse the psycopg placeholder form at all, and the
     # cast is irrelevant to the tenant rules (it only pins the bind value's
     # type).  The cast tail is a sequence of type words (each optionally
-    # with a parenthesised length), stopped by any SQL keyword so it never
-    # swallows a following predicate.
+    # with a parenthesised length and/or an ``[]`` array suffix -- as ONE
+    # unit, so a word never swallows the ``]`` that closes an enclosing
+    # ARRAY[...] literal) and stops before any SQL keyword.
     r"%\([A-Za-z0-9_]+\)s"
     r"(?:::"
-    r"[A-Za-z0-9_\[\]]+(?:\([0-9, ]+\))?"
+    r"[A-Za-z0-9_]+(?:\([0-9, ]+\))?(?:\[\])?"
     r"(?:[ ](?!AND\b|OR\b|WHERE\b|FROM\b|GROUP\b|ORDER\b|LIMIT\b|RETURNING\b|VALUES\b|SET\b)"
-    r"[A-Za-z0-9_\[\]]+(?:\([0-9, ]+\))?)*"
+    r"[A-Za-z0-9_]+(?:\([0-9, ]+\))?(?:\[\])?)*"
     r")?"
 )
 

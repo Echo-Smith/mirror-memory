@@ -1,0 +1,100 @@
+name: m2-patch-perf
+
+# M2 patch acceptance (M1 task-0 methodology): the SQL auditor is OFF on
+# BOTH sides -- the number being accepted is the isolation machinery's
+# runtime cost, and must not include the auditor's own parse time twice.
+# Same validity rules as always: test-ID intersection up front, junit XML
+# per run, a round counts only when both sides passed identically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_rev:
+        description: "Baseline revision"
+        default: "7f783bc"
+      mid_rev:
+        description: "M2 batch-1 revision (increment baseline)"
+        default: "3b9e623"
+      fix_rev:
+        description: "Revision to measure"
+        required: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+          pip install "sqlglot>=25.0"
+
+      - name: Interleaved measurement (base vs mid vs fix, x3, auditor off)
+        env:
+          BASE: ${{ inputs.base_rev }}
+          MID: ${{ inputs.mid_rev }}
+          FIX: ${{ inputs.fix_rev }}
+        run: |
+          set -u -o pipefail
+          use_rev() {
+            local rev="$1"
+            git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
+            for f in $(git ls-files -- src tests); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            for f in $(find tests src -name '*.py' 2>/dev/null); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            git checkout -f -q "$rev" -- src tests pyproject.toml
+          }
+          measure() {
+            local rev="$1" round="$2" tag="$3"
+            use_rev "$rev"
+            export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
+            local start end
+            start=$(python -c 'import time; print(time.monotonic())')
+            python -m pytest -q -p no:cacheprovider \
+              --junitxml="/tmp/${tag}_$round.xml" > /tmp/out_${tag}_$round.txt 2>&1 || true
+            end=$(python -c 'import time; print(time.monotonic())')
+            echo "$tag $rev round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(tail -1 /tmp/out_${tag}_$round.txt | grep -oE '[0-9]+ (passed|failed)[^|]*' | head -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+
+          echo "=== FULL SUITE, auditor off, interleaved x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          for round in 1 2 3; do
+            measure "$BASE" "$round" base
+            measure "$MID"  "$round" mid
+            measure "$FIX"  "$round" fix
+          done
+
+          echo "=== LONGRUN FILE, auditor off, interleaved x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          for round in 1 2 3; do
+            for tag_rev in "base:$BASE" "mid:$MID" "fix:$FIX"; do
+              tag="${tag_rev%%:*}"; rev="${tag_rev##*:}"
+              use_rev "$rev"
+              export MM_SQL_AUDIT=0
+              start=$(python -c 'import time; print(time.monotonic())')
+              python -m pytest -q -p no:cacheprovider tests/test_longrun_bench.py \
+                > /tmp/lr_${tag}_$round.txt 2>&1 || true
+              end=$(python -c 'import time; print(time.monotonic())')
+              echo "longrun-$tag round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/lr_${tag}_$round.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+          unset MM_SQL_AUDIT || true
+
+      - name: Final sanity (fix revision, SQLite, auditor + guard on)
+        env:
+          FIX: ${{ inputs.fix_rev }}
+        run: |
+          git checkout -f -q "$FIX" -- src tests pyproject.toml
+          unset MM_SQL_AUDIT || true
+          python -m pytest -q -p no:cacheprovider 2>&1 | tail -3 | tee -a "$GITHUB_STEP_SUMMARY"

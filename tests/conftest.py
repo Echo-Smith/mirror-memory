@@ -20,6 +20,12 @@ def pytest_configure(config):
         "fixture_writes(reason): the test body itself writes protected tables "
         "directly (seeding/tuning); reason is mandatory",
     )
+    config.addinivalue_line(
+        "markers",
+        "postgres_only(reason): the test exercises PostgreSQL catalog "
+        "behaviour that SQLite cannot express; mandatory reason, mirrored "
+        "on the sqlite_only side by dialect-conditional skips",
+    )
 
 
 @pytest.hookimpl(hookwrapper=True)

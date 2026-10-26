@@ -36,13 +36,17 @@ run without ``confirm_backup=True`` and prints a ready ``pg_dump`` command.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import (
     Column,
     DateTime,
+    Index,
     Integer,
     MetaData,
     String,
@@ -53,8 +57,9 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.schema import DDLElement
+from sqlalchemy.schema import CreateIndex, DDLElement, DropIndex
 
 from mirror_memory.core.models import Base, utcnow
 from mirror_memory.core.tenancy import system_scope
@@ -70,6 +75,25 @@ _MIGRATION_REASON = (
 
 #: Backfill batch size (configurable per the task's "batched backfill").
 DEFAULT_BACKFILL_BATCH = 5000
+
+#: How long any single migration DDL waits for its lock before failing
+#: (``MM_MIGRATION_LOCK_TIMEOUT``, e.g. "250ms", "3s", "1min").  Failing
+#: fast and retrying beats queueing behind a long-running reader: a queued
+#: ``ACCESS EXCLUSIVE`` request blocks every later reader on that table.
+DEFAULT_LOCK_TIMEOUT = "3s"
+
+_LOCK_TIMEOUT_PATTERN = re.compile(r"^\d+(\.\d+)?(ms|s|min|h)$")
+
+#: How many times a lock-starved step is retried
+#: (``MM_MIGRATION_LOCK_RETRIES``).
+DEFAULT_LOCK_RETRIES = 3
+
+_RETRY_SLEEP_SECONDS = 2.0
+
+#: Suffix of the throwaway unique index the composite primary key is built
+#: from.  ``ADD CONSTRAINT ... PRIMARY KEY USING INDEX`` renames it to the
+#: constraint name, so the build-time name never collides with it.
+_PKEY_BUILD_SUFFIX = "__pkey_build"
 
 
 class MigrationError(RuntimeError):
@@ -105,14 +129,17 @@ def _compile_add_column(element, compiler, **kw):
 
 
 class PrimaryKeySwap(DDLElement):
-    """Replace a table's primary key with a composite one (PostgreSQL).
+    """Attach a table's build index as its composite primary key (PG).
 
-    ``DROP CONSTRAINT IF EXISTS`` + ``ADD CONSTRAINT ... PRIMARY KEY`` is a
-    catalog change: the replacement index is built while the old one still
-    serves reads, so the table is neither rewritten nor held under an
-    exclusive lock for the whole operation.  Column names come from
-    ``Base.metadata`` at compile time; nothing is interpolated from the
-    database or from a caller.
+    Emits ``ALTER TABLE ... DROP CONSTRAINT IF EXISTS <old>, ADD CONSTRAINT
+    <table>_pkey PRIMARY KEY USING INDEX <build index>``.  The USING INDEX
+    form is the point of the whole design: PostgreSQL adopts the already
+    built index instead of scanning the table again, so the swap holds its
+    brief lock for a catalog update only -- no scan, no rewrite, and reads
+    are never blocked behind an index build.
+
+    Identifiers come from ``Base.metadata`` at compile time; nothing is
+    interpolated from the database or from a caller.
     """
 
     inherit_cache = True
@@ -131,15 +158,111 @@ def _compile_primary_key_swap(element, compiler, **kw):
     preparer = compiler.preparer
     model_table = Base.metadata.tables[element.table]
     constraint = preparer.quote(model_table.name + "_pkey")
-    columns = ", ".join(
-        preparer.format_column(column)
-        for column in model_table.primary_key.columns
-    )
-    return "ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s, ADD CONSTRAINT %s PRIMARY KEY (%s)" % (
+    build = preparer.quote(model_table.name + _PKEY_BUILD_SUFFIX)
+    return "ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s, ADD CONSTRAINT %s PRIMARY KEY USING INDEX %s" % (
         preparer.format_table(model_table),
         constraint,
         constraint,
-        columns,
+        build,
+    )
+
+
+class SetLockTimeout(DDLElement):
+    """Bound the wait for any one migration DDL lock.
+
+    A queued ``ACCESS EXCLUSIVE`` request blocks every later reader on the
+    table, so the migration fails fast on ``lock_timeout`` and retries
+    instead of queueing indefinitely.  The value is an operator setting
+    (``MM_MIGRATION_LOCK_TIMEOUT``), validated against a strict duration
+    grammar before it ever reaches statement text.
+    """
+
+    inherit_cache = True
+
+    def __init__(self, value: str) -> None:
+        if not _LOCK_TIMEOUT_PATTERN.match(value):
+            raise MigrationRefused(
+                "MM_MIGRATION_LOCK_TIMEOUT must match "
+                + _LOCK_TIMEOUT_PATTERN.pattern
+                + "; got " + repr(value)
+            )
+        self.value = value
+
+
+@compiles(SetLockTimeout)
+def _compile_set_lock_timeout(element, compiler, **kw):
+    return "SET lock_timeout = '%s'" % (element.value,)
+
+
+class AddNotNullCheck(DDLElement):
+    """Add a NOT VALID ``CHECK (col IS NOT NULL)`` (PostgreSQL).
+
+    NOT VALID means existing rows are not scanned at ADD time -- the
+    constraint only gates new writes, and the ADD holds its lock for a
+    catalog update only.
+    """
+
+    inherit_cache = True
+
+    def __init__(self, table: str, column: str) -> None:
+        self.table = table
+        self.column = column
+
+    @property
+    def constraint_name(self) -> str:
+        return "chk_" + self.table + "__mm_notnull_" + self.column
+
+
+@compiles(AddNotNullCheck)
+def _compile_add_not_null_check(element, compiler, **kw):
+    preparer = compiler.preparer
+    return "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s IS NOT NULL) NOT VALID" % (
+        preparer.quote(element.table),
+        preparer.quote(element.constraint_name),
+        preparer.quote(element.column),
+    )
+
+
+class ValidateConstraint(DDLElement):
+    """Scan once to prove every existing row satisfies the constraint.
+
+    Runs under ``SHARE UPDATE EXCLUSIVE``: reads and writes continue
+    throughout.  After it succeeds, ``SET NOT NULL`` skips its own full
+    scan on PostgreSQL 12+.
+    """
+
+    inherit_cache = True
+
+    def __init__(self, table: str, constraint: str) -> None:
+        self.table = table
+        self.constraint = constraint
+
+
+@compiles(ValidateConstraint)
+def _compile_validate_constraint(element, compiler, **kw):
+    preparer = compiler.preparer
+    return "ALTER TABLE %s VALIDATE CONSTRAINT %s" % (
+        preparer.quote(element.table),
+        preparer.quote(element.constraint),
+    )
+
+
+class DropConstraintByName(DDLElement):
+    """``ALTER TABLE ... DROP CONSTRAINT IF EXISTS <name>``."""
+
+    inherit_cache = True
+
+    def __init__(self, table: str, constraint: str) -> None:
+        self.table = table
+        self.constraint = constraint
+
+
+@compiles(DropConstraintByName)
+def _compile_drop_constraint_by_name(element, compiler, **kw):
+    preparer = compiler.preparer
+    return "ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s" % (
+        preparer.quote(element.table),
+        preparer.quote(element.constraint),
     )
 
 
@@ -380,29 +503,56 @@ class Step1Tenancy:
             self._apply_sqlite(engine)
 
     def _apply_postgres(self, engine: Engine) -> None:
+        """Tenant columns without a blocking NOT NULL.
+
+        1. add the columns nullable (brief metadata-only locks, bounded by
+           ``lock_timeout``);
+        2. backfill in batches, one transaction per batch;
+        3. prove NOT NULL without blocking anyone: add the CHECK constraint
+           ``NOT VALID`` (catalog update -- existing rows are not scanned),
+           ``VALIDATE`` it (``SHARE UPDATE EXCLUSIVE``, reads and writes
+           continue), then ``SET NOT NULL`` -- PostgreSQL 12+ uses the
+           validated CHECK to skip its own full scan -- and finally drop
+           the helper CHECK.
+        """
         insp = inspect(engine)
         existing = [t.name for t in Base.metadata.sorted_tables if insp.has_table(t.name)]
         if not existing:
             return
         tenant_id, app_id = self.default_tenant
+
+        add = [_lock_timeout_element()]
         for name in existing:
             cols = _table_columns(engine, name)
-            with engine.begin() as conn:
-                if "tenant_id" not in cols:
-                    conn.execute(AddColumn(name, "tenant_id", "VARCHAR(64)"))
-                if "app_id" not in cols:
-                    conn.execute(AddColumn(name, "app_id", "VARCHAR(64)"))
+            if "tenant_id" not in cols:
+                add.append(AddColumn(name, "tenant_id", "VARCHAR(64)"))
+            if "app_id" not in cols:
+                add.append(AddColumn(name, "app_id", "VARCHAR(64)"))
+        _DDLPlan(add).run(engine)
+
+        for name in existing:
             _backfill_column(
                 engine, name,
                 {"tenant_id": tenant_id, "app_id": app_id},
                 ["tenant_id", "app_id"],
                 DEFAULT_BACKFILL_BATCH,
             )
+
+        notnull = [_lock_timeout_element()]
         for name in existing:
-            with engine.begin() as conn:
-                for col in ("tenant_id", "app_id"):
-                    conn.execute(AlterColumnClause(name, col, "SET NOT NULL"))
-                    conn.execute(AlterColumnClause(name, col, "SET DEFAULT ''"))
+            live_checks = {
+                c["name"] for c in inspect(engine).get_check_constraints(name)
+            }
+            for col in ("tenant_id", "app_id"):
+                check = AddNotNullCheck(name, col)
+                if check.constraint_name in live_checks:
+                    continue  # re-entry: the constraint survived a retry
+                notnull.append(check)
+                notnull.append(ValidateConstraint(name, check.constraint_name))
+                notnull.append(AlterColumnClause(name, col, "SET NOT NULL"))
+                notnull.append(AlterColumnClause(name, col, "SET DEFAULT ''"))
+                notnull.append(DropConstraintByName(name, check.constraint_name))
+        _DDLPlan(notnull).run(engine)
 
     def _apply_sqlite(self, engine: Engine) -> None:
         tenant_id, app_id = self.default_tenant
@@ -601,29 +751,19 @@ def _literal(value: str):
 def _replace_primary_keys(engine: Engine, names: list) -> None:
     """Convert the named tables to the tenant composite primary key (PG).
 
-    The ALTER is emitted through SQLAlchemy's own DDL pipeline: a throwaway
-    ``MetaData`` carries the statement as an ``after_create`` hook, and
-    ``create_all(checkfirst=True)`` runs it (every real table already
-    exists, so only the hook fires).  The statement itself is compiled by
-    ``PrimaryKeySwap`` from the model's own table, so column and constraint
-    identifiers come from ``Base.metadata`` -- never from caller input or
-    from text read out of the database.
-
-    PostgreSQL only: a catalog ALTER builds the replacement index while the
-    old one still serves reads, so no table rewrite and no long exclusive
-    lock.  SQLite returns immediately and keeps its three fallback layers.
+    Tables whose live key already matches are skipped, which is what makes
+    a re-run after a partial failure continue rather than fail.  Each
+    conversion is retried on lock timeout (``MM_MIGRATION_LOCK_RETRIES``)
+    -- see :func:`_swap_primary_key` for the per-table recipe.
     """
     if not _is_postgres(engine):
         return
     insp = inspect(engine)
-    targets = []
     for name in names:
         wanted = [column.name for column in Base.metadata.tables[name].primary_key.columns]
-        if list(insp.get_pk_constraint(name)["constrained_columns"]) != wanted:
-            targets.append(name)
-    if not targets:
-        return
-    _emit_primary_key_swaps(engine, targets)
+        if list(insp.get_pk_constraint(name)["constrained_columns"]) == wanted:
+            continue
+        _swap_primary_key(engine, name)
 
 
 def _emit_primary_key_swaps(engine: Engine, names: list) -> None:
@@ -633,29 +773,136 @@ def _emit_primary_key_swaps(engine: Engine, names: list) -> None:
     so there is no tenant to scope it to; the explicit scope plus its
     allowlist entry is how that is stated rather than implied.
     """
-    plan = _SwapPlan(names)
+    elements = [_lock_timeout_element()]
+    for name in names:
+        build = _pkey_build_index(name)
+        elements.append(_drop_build_index(build))
+        elements.append(_create_build_index(build))
+        elements.append(PrimaryKeySwap(name))
     with system_scope(reason=_MIGRATION_REASON):
-        plan.run(engine)
+        _DDLPlan(elements, autocommit=True).run(engine)
 
 
-class _SwapPlan:
-    """A metadata whose only job is to carry the ALTER statements.
+def _pkey_build_index(name: str) -> Index:
+    """The throwaway unique index the composite PK is adopted from.
 
-    ``create_all`` executes a metadata's DDL; attaching the swaps as
-    ``after_create`` hooks means SQLAlchemy's own execution path runs them,
-    and ``checkfirst`` keeps it from trying to create the tables.
+    ``postgresql_concurrently`` makes both DDL forms render ``CONCURRENTLY``
+    (``CreateIndex``/``DropIndex`` read the index's dialect options); the
+    build name differs from the final constraint name because ``PRIMARY KEY
+    USING INDEX`` renames the adopted index.
+    """
+    table = Base.metadata.tables[name]
+    return Index(
+        name + _PKEY_BUILD_SUFFIX,
+        *[table.c[column.name] for column in table.primary_key.columns],
+        unique=True,
+        postgresql_concurrently=True,
+    )
+
+
+def _drop_build_index(build: Index) -> DropIndex:
+    """Drop a leftover build index -- a failed CONCURRENTLY attempt leaves
+    an INVALID index behind, and a fresh build must not adopt or keep it."""
+    return DropIndex(build, if_exists=True)
+
+
+def _create_build_index(build: Index) -> CreateIndex:
+    """Build the unique index without blocking reads or writes."""
+    return CreateIndex(build)
+
+
+def _lock_timeout_element() -> SetLockTimeout:
+    return SetLockTimeout(_migration_lock_timeout())
+
+
+def _migration_lock_timeout() -> str:
+    return os.environ.get("MM_MIGRATION_LOCK_TIMEOUT", DEFAULT_LOCK_TIMEOUT)
+
+
+def _migration_lock_retries() -> int:
+    raw = os.environ.get("MM_MIGRATION_LOCK_RETRIES", str(DEFAULT_LOCK_RETRIES))
+    try:
+        retries = int(raw)
+    except ValueError as exc:
+        raise MigrationRefused(
+            "MM_MIGRATION_LOCK_RETRIES must be an integer; got " + repr(raw)
+        ) from exc
+    if retries < 1:
+        raise MigrationRefused("MM_MIGRATION_LOCK_RETRIES must be >= 1")
+    return retries
+
+
+def _is_lock_not_available(exc: OperationalError) -> bool:
+    """True for a lock_timeout failure (SQLSTATE 55P03) -- the shape the
+    retry loop exists for.  Anything else is a real error."""
+    text = str(exc)
+    return "55P03" in text or "lock timeout" in text.lower()
+
+
+def _swap_primary_key(engine: Engine, name: str) -> None:
+    """Convert one table's primary key without a blocking build.
+
+    1. drop any leftover build index -- a failed CONCURRENTLY attempt
+       leaves an INVALID index behind, and ``IF NOT EXISTS`` would silently
+       keep it;
+    2. ``CREATE UNIQUE INDEX CONCURRENTLY`` (outside any transaction) --
+       reads and writes continue throughout; the build waits for open
+       snapshots instead of blocking them;
+    3. ``ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY USING INDEX``
+       adopts the built index: the catalog update is the only lock held,
+       so no scan of the table ever runs under the exclusive lock.
+
+    Retried on lock timeout; every DDL waits at most
+    ``MM_MIGRATION_LOCK_TIMEOUT`` before failing instead of queueing.
+    """
+    retries = _migration_lock_retries()
+    for attempt in range(1, retries + 1):
+        try:
+            _emit_primary_key_swaps(engine, [name])
+            return
+        except OperationalError as exc:
+            if not _is_lock_not_available(exc) or attempt == retries:
+                raise
+            logger.warning(
+                "migration: lock timeout on primary key swap for %r "
+                "(attempt %d/%d); retrying",
+                name, attempt, retries,
+            )
+            time.sleep(_RETRY_SLEEP_SECONDS)
+
+
+class _DDLPlan:
+    """A batch of DDL elements emitted through SQLAlchemy's own pipeline.
+
+    The elements ride as ``after_create`` hooks on a throwaway
+    ``MetaData``, in registration order, so they execute on one connection
+    under one isolation level without this module assembling statements
+    itself.  ``autocommit`` selects a connection where every statement
+    commits immediately -- required by ``CREATE INDEX CONCURRENTLY``,
+    which cannot run inside a transaction block.  ``checkfirst`` keeps
+    ``create_all`` from touching the real tables: only the hooks fire.
     """
 
-    def __init__(self, names: list) -> None:
-        self.names = names
+    def __init__(self, elements: list, autocommit: bool = False) -> None:
+        self.elements = elements
+        self.autocommit = autocommit
 
     def run(self, engine: Engine) -> None:
         from sqlalchemy import event
 
         metadata = MetaData()
-        for name in self.names:
-            event.listen(metadata, "after_create", PrimaryKeySwap(name))
-        metadata.create_all(engine, checkfirst=True)
+        bind = engine
+        conn = None
+        if self.autocommit:
+            conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+            bind = conn
+        try:
+            for element in self.elements:
+                event.listen(metadata, "after_create", element)
+            metadata.create_all(bind=bind, checkfirst=True)
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _verify_tenant_primary_keys(engine: Engine) -> None:
