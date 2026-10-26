@@ -144,33 +144,15 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
                 )
         return
 
-    # Identity-keyed exemption -- SQLite only (M2 task 3 retired it on
-    # PostgreSQL).  ORM unit-of-work statements address rows by primary
-    # key; on PostgreSQL every tenant table's primary key now leads with
-    # ``(tenant_id, app_id)``, so those statements carry the tenant
-    # predicates natively and need no exemption.  SQLite cannot host that
-    # constraint on its autoincrement tables (the DDL narrows back to a
-    # single column), so the UOW WHERE there is PK-only and the surface is
-    # closed by dedicated layers, each with its own test
-    # (tests/test_pk_addressing.py): the whitelist write guard intercepts
-    # foreign-PK objects at construction, the merge wrapper refuses
-    # cross-tenant merges, and the flush checks refuse dirty/deleted rows
-    # from another tenant.
-    if (
-        len(touched) == 1
-        and _identity_exemption_dialect()
-        and _is_identity_keyed(stmt, touched, tenant_tables, exp)
-    ):
-        return
-
-    # Collect the tenant columns constrained by bound equalities anywhere
-    # in the statement (WHERE, JOIN ON, subquery WHERE, HAVING).
-    # Note: there is NO identity-keyed exemption.  Every tenant table's
-    # primary key leads with (tenant_id, app_id), so ORM unit-of-work
-    # statements carry the tenant predicates natively; a PK-addressed
-    # statement without them (raw SQL, merge-by-id of another tenant) is a
-    # violation.  UOW statements' tenant safety additionally rests on
-    # load-time filtering and the authoring-time write guard.
+    # There is NO identity-keyed exemption (M2 task 3 retired it on
+    # PostgreSQL; the M2 patch then retired it on SQLite too, after the
+    # composite mapping proved every unit-of-work statement there carries
+    # the tenant columns as well).  Every tenant table's primary key leads
+    # with (tenant_id, app_id), so ORM unit-of-work statements carry the
+    # tenant predicates natively; a PK-addressed statement without them
+    # (raw SQL, merge-by-id of another tenant) is a violation.  Runtime
+    # safety additionally rests on load-time filtering, the authoring-time
+    # write guard, the merge wrapper and the flush checks -- all retained.
     covered: dict[str, set[str]] = {}
 
     def _attribute(table_ref: str) -> str | None:
@@ -201,66 +183,15 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
             )
 
 
-def _is_identity_keyed(stmt, touched: dict[str, str], tenant_tables: set[str], exp) -> bool:
-    """True for a unit-of-work statement: one tenant table, WHERE is only
-    ``AND``-joined equalities between that table's PK columns and bound
-    parameters.
-
-    See the caller for why identity-keyed statements are exempt and which
-    layers close the residual surface instead.
-    """
-    if len(touched) != 1:
-        return False
-    real = next(iter(touched.values()))
-    pk_cols = set(tenant_pk_columns().get(real, ()))
-    if not pk_cols:
-        return False
-
-    where = stmt.args.get("where")
-    if where is None:
-        return False
-    condition = where.this
-
-    def _pk_chain(node) -> bool:
-        if isinstance(node, exp.And):
-            return _pk_chain(node.this) and _pk_chain(node.expression)
-        if isinstance(node, exp.EQ):
-            col, val = node.this, node.expression
-            if not (isinstance(col, exp.Column) and _is_bound(val)):
-                return False
-            if col.name in pk_cols and (not col.table or col.table in touched):
-                return True
-            return False
-        return False
-
-    return _pk_chain(condition)
-
-
-_pk_columns_cache: dict[str, set[str]] | None = None
-
-
-def tenant_pk_columns() -> dict[str, set[str]]:
-    """Primary-key column names per tenant table."""
-    global _pk_columns_cache
-    if _pk_columns_cache is None:
-        from mirror_memory.core.models import Base
-
-        _pk_columns_cache = {
-            name: {col.name for col in table.primary_key.columns}
-            for name, table in Base.metadata.tables.items()
-        }
-    return _pk_columns_cache
-
-
-_verdict_cache: dict[tuple[str, bool], AuditViolation | None] = {}
+_verdict_cache: dict[str, AuditViolation | None] = {}
 _VERDICT_CACHE_CAP = 100_000
 _cache_hits = 0
 _cache_misses = 0
 
 #: The dialect of the statement currently being audited.  Set by the
-#: execution listener right before :func:`audit_sql` and read by the
-#: structural judge.  ``audit_sql`` called directly (unit tests) defaults
-#: to SQLite rules -- the historical behaviour.
+#: execution listener right before :func:`audit_sql`.  The judge itself is
+#: dialect-independent (the PK-addressing exemption is retired on every
+#: dialect); tests use the same var to pin a dialect for statement probes.
 _dialect_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "mm_audit_dialect", default="sqlite"
 )
@@ -269,18 +200,6 @@ _dialect_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 def auditor_cache_stats() -> tuple[int, int, int]:
     """(distinct entries, cache hits, misses) for the report."""
     return len(_verdict_cache), _cache_hits, _cache_misses
-
-
-def _identity_exemption_dialect() -> bool:
-    """Whether the PK-addressing exemption applies to the current dialect.
-
-    M2 task 3: PostgreSQL tenant tables carry ``PRIMARY KEY (tenant_id,
-    app_id, ...)``, so their unit-of-work statements name the tenant
-    columns and the exemption is retired there.  SQLite physically keeps a
-    single-column PK (autoincrement limitation) and keeps the exemption,
-    backed by the three fallback layers.
-    """
-    return _dialect_var.get() != "postgresql"
 
 
 def audit_sql(sql: str) -> None:
@@ -315,12 +234,11 @@ def audit_sql(sql: str) -> None:
             _exemptions_seen.append(sql.strip()[:120])
         return
 
-    # The verdict depends on the statement text AND on the dialect (the
-    # PK-addressing exemption is PostgreSQL-only), so the cache key carries
-    # both.  Cross-dialect text (``UPDATE t SET v=? WHERE tenant_id=? AND
-    # app_id=? AND id=?``) therefore never serves a SQLite verdict to a
-    # PostgreSQL run or the reverse.
-    cache_key = (sql, _identity_exemption_dialect())
+    # The verdict depends only on the statement text: the judge is
+    # dialect-independent (the PK-addressing exemption is retired on every
+    # dialect), bound parameters never affect the rules, and no context
+    # reaches this function.
+    cache_key = sql
 
     if cache_key in _verdict_cache:
         _cache_hits += 1

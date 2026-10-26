@@ -191,8 +191,10 @@ def system_reason() -> str | None:
 
 def in_sanctioned_write() -> bool:
     """True inside any sanctioned write scope (Publisher/claim mutators,
-    queue, consent, telemetry, fixture).  The SQL auditor uses this to
-    scope its identity-keyed exemption for UPDATE/DELETE."""
+    queue, consent, telemetry, fixture).  Reporting/diagnostic hook: the
+    write guard itself classifies by table, and the SQL auditor no longer
+    special-cases sanctioned scopes for UPDATE/DELETE (the identity-keyed
+    exemption was retired in M2)."""
     return _write_class_var.get() is not None
 
 

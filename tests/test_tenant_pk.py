@@ -1,11 +1,14 @@
-"""M2 task 3 -- tenant composite primary keys and the PG auditor exemption.
+"""M2 task 3 -- tenant composite primary keys, and the auditor's
+PK-addressing exemption fully retired.
 
-On PostgreSQL every tenant table's primary key leads with
-``(tenant_id, app_id)``, so an ORM unit-of-work statement names the tenant
-columns in its WHERE clause.  That is what lets the auditor drop its
-PK-addressing exemption on PostgreSQL only; SQLite physically keeps a
-single-column PK (autoincrement limitation) and keeps the exemption backed
-by the three fallback layers in ``tests/test_pk_addressing.py``.
+On every dialect the tenant tables' primary key leads with
+``(tenant_id, app_id)`` at the ORM level, so an ORM unit-of-work statement
+names the tenant columns in its WHERE clause.  That let the auditor drop
+its PK-addressing exemption -- first on PostgreSQL, then on SQLite too
+once the composite mapping proved every UOW statement there carries the
+tenant columns as well.  SQLite's physical key stays single-column
+(autoincrement limitation); the runtime layers in
+``tests/test_pk_addressing.py`` all remain as defense in depth.
 
 The tests here run on whichever database the suite targets, so the same
 file proves both dialects.
@@ -173,22 +176,21 @@ def test_pg_auditor_accepts_pk_update_with_tenant_predicates():
     assert _dialect(PK_WITH_TENANT, "postgresql") is None
 
 
-def test_sqlite_auditor_keeps_the_pk_addressing_exemption():
-    if IS_PG:
-        pytest.skip("SQLite keeps the exemption; this asserts the dialect split")
-    assert _dialect(PK_ONLY, "sqlite") is None
+def test_pk_only_update_violates_on_every_dialect():
+    """The PK-addressing exemption is retired on BOTH dialects: the
+    composite ORM mapping puts the tenant columns into every unit-of-work
+    statement on SQLite too, so nothing needs the exemption any more."""
+    for dialect in ("postgresql", "sqlite"):
+        assert _dialect(PK_ONLY, dialect) is not None, dialect
 
 
-def test_verdict_cache_is_dialect_keyed():
-    """The same statement text must not share a verdict across dialects:
-    the PK-only UPDATE passes on SQLite and must still fail on PG."""
-    sqlite_verdict = _dialect(PK_ONLY, "sqlite")
-    pg_verdict = _dialect(PK_ONLY, "postgresql")
-    assert sqlite_verdict is None
-    assert pg_verdict is not None
-    # And the reverse order, proving neither lookup overwrote the other.
-    assert _dialect(PK_ONLY, "sqlite") is None
-    assert _dialect(PK_ONLY, "postgresql") is not None
+def test_verdict_cache_shares_one_verdict_per_text():
+    """The judge is dialect-independent now: the same statement text yields
+    the same verdict no matter which dialect audited it first."""
+    for dialect in ("sqlite", "postgresql", "sqlite"):
+        assert _dialect(PK_ONLY, dialect) is not None
+    for dialect in ("postgresql", "sqlite"):
+        assert _dialect(PK_WITH_TENANT, dialect) is None
 
 
 # ---------------------------------------------------------------------------
