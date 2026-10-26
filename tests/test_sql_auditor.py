@@ -307,3 +307,39 @@ def test_single_statement_ddl_still_exempt():
     assert _audit_as("SAVEPOINT sa_1", "postgresql") is None
     assert _audit_as("ROLLBACK TO SAVEPOINT sa_1", "postgresql") is None
     assert _audit_as("RELEASE SAVEPOINT sa_1", "postgresql") is None
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2 task 0: tenant table names must not look like catalog relations
+# ---------------------------------------------------------------------------
+
+
+def test_counterexample_pg_prefixed_tenant_table_would_escape_the_audit(monkeypatch):
+    """The hazard the metadata check exists for: an unqualified ``pg_*``
+    relation is classified as PostgreSQL catalog metadata, so a tenant
+    table with that prefix would be read without any tenant predicate and
+    the auditor would wave the statement through."""
+    import mirror_memory.core.sql_audit as audit
+
+    monkeypatch.setattr(audit, "_tenant_table_names", lambda: {"pg_beliefs_t0", "mm_beliefs"})
+    # same shape against a real tenant table is a violation ...
+    assert _audit_as("SELECT * FROM mm_beliefs WHERE user_id = ?", "postgresql") is not None
+    # ... but the reserved prefix makes the identical statement pass
+    assert _audit_as("SELECT * FROM pg_beliefs_t0 WHERE user_id = ?", "postgresql") is None
+
+
+def test_counterexample_pg_prefixed_tenant_table_name_is_refused():
+    from mirror_memory.core.tenancy import TenantError, assert_tenant_table_names
+
+    with pytest.raises(TenantError, match="pg_beliefs"):
+        assert_tenant_table_names(["mm_beliefs", "pg_beliefs"])
+    with pytest.raises(TenantError):
+        assert_tenant_table_names(["PG_Shadow"])  # case-insensitive, like the auditor
+
+
+def test_live_metadata_passes_the_table_name_check():
+    from mirror_memory.core.models import Base
+    from mirror_memory.core.tenancy import assert_tenant_table_names
+
+    assert_tenant_table_names(Base.metadata.tables)
+    assert not any(name.startswith("pg_") for name in Base.metadata.tables)

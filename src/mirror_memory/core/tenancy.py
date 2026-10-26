@@ -300,6 +300,29 @@ class TenantScoped:
 #: How many leading primary-key columns are tenant columns.
 TENANT_PK_PREFIX = 2
 
+#: Table-name prefixes a tenant table must never use.  PostgreSQL reserves
+#: ``pg_`` for system relations, and the SQL auditor leans on that: an
+#: unqualified ``pg_*`` relation is classified as catalog metadata and the
+#: statement is exempted from the tenant rules.  A tenant table carrying
+#: the prefix would therefore be audited as if it held no tenant data.
+RESERVED_TABLE_PREFIXES = ("pg_",)
+
+
+def assert_tenant_table_names(names) -> None:
+    """Refuse tenant table names the auditor would mistake for catalog
+    relations (M2 batch-2 task 0).  Checked once after the models import."""
+    offending = sorted(
+        name for name in names
+        if str(name).lower().startswith(RESERVED_TABLE_PREFIXES)
+    )
+    if offending:
+        raise TenantError(
+            f"tenant table name(s) {offending} start with a reserved prefix "
+            f"{RESERVED_TABLE_PREFIXES}: the SQL auditor treats unqualified "
+            "pg_* relations as PostgreSQL catalog metadata and would exempt "
+            "statements on them from the tenant rules"
+        )
+
 
 def is_tenant_primary_key(constraint) -> bool:
     """True for a PK shaped ``(tenant_id, app_id, ...)``."""
