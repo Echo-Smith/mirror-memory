@@ -415,7 +415,7 @@ class Step1Tenancy:
             cols = _table_columns(engine, table.name)
             if "tenant_id" in cols and "app_id" in cols:
                 continue
-            new = table.tometadata(fresh_meta, name=table.name + _TEMP_SUFFIX)
+            new = table.to_metadata(fresh_meta, name=table.name + _TEMP_SUFFIX)
             # Copy only columns that exist on BOTH sides: a base-schema row
             # may predate columns added by later steps (lease_token etc.),
             # and the new table's defaults fill those in.
