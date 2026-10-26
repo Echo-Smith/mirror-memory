@@ -1,0 +1,125 @@
+name: m2-perf-acceptance
+
+# M2 acceptance: SQLite full-suite ratio against the M2 baseline revision.
+#
+# Methodology (unchanged from M1 batch-2 task 0): both revisions run the
+# IDENTICAL test set (ID intersection collected up front), every run emits
+# junit XML, and a round counts only when both sides passed the same number
+# of tests with zero failures/errors.
+#
+# Unlike the M1 workflow, the SQL auditor and the write guard stay ON for
+# BOTH sides and BOTH database legs: M2 never buys performance by turning
+# isolation checking off, so measurement must not either.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_rev:
+        description: "Baseline revision (pre-M2 main)"
+        default: "7f783bc"
+      fix_rev:
+        description: "Revision to measure"
+        required: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (one venv, shared by both revisions)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+          # cross-revision parity: install the union of both sides' extras
+          pip install "sqlglot>=25.0"
+
+      - name: Collect test-ID intersection
+        env:
+          BASE: ${{ inputs.base_rev }}
+          FIX: ${{ inputs.fix_rev }}
+        run: |
+          set -eu
+          python tools/perf_ids.py collect "$BASE" "$FIX" --out /tmp/ids.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s /tmp/ids.txt
+
+      - name: Interleaved SQLite measurement on the intersection
+        env:
+          BASE: ${{ inputs.base_rev }}
+          FIX: ${{ inputs.fix_rev }}
+        run: |
+          set -u -o pipefail
+          use_rev() {  # worktree src/tests must match the rev EXACTLY
+            local rev="$1"
+            git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
+            for f in $(git ls-files -- src tests); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            for f in $(find tests src -name '*.py' 2>/dev/null); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            git checkout -q "$rev" -- src tests pyproject.toml
+            git reset -q HEAD -- src tests || true
+          }
+          measure() {
+            local rev="$1" round="$2" xml="$3"
+            use_rev "$rev"
+            local start end
+            start=$(python -c 'import time; print(time.monotonic())')
+            python tools/run_ids.py /tmp/ids.txt -q -p no:cacheprovider \
+              --junitxml="$xml" > /tmp/pytest_out.txt 2>&1 || true
+            end=$(python -c 'import time; print(time.monotonic())')
+            echo "sqlite $rev round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(tail -1 /tmp/pytest_out.txt | grep -oE '[0-9]+ (passed|failed)([^|]*)' | head -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+
+          echo "=== SQLITE FULL SUITE (intersection IDs), interleaved base/fix x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          for round in 1 2 3; do
+            measure "$BASE" "$round" "/tmp/base_$round.xml"
+            measure "$FIX"  "$round" "/tmp/fix_$round.xml"
+            if python tools/perf_ids.py verify "/tmp/base_$round.xml" "/tmp/fix_$round.xml" | tee -a "$GITHUB_STEP_SUMMARY"; then
+              echo "round $round: VALID" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "round $round: INVALID (discarded from ratios)" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: PostgreSQL full-suite timing (fix revision only, recorded not judged)
+        env:
+          FIX: ${{ inputs.fix_rev }}
+        run: |
+          set -u
+          git checkout -q "$FIX" -- src tests pyproject.toml
+          start=$(python -c 'import time; print(time.monotonic())')
+          MM_DATABASE_URL="postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test" \
+            python -m pytest -q -p no:cacheprovider tests/test_tenant_pk.py tests/test_schema_migration.py \
+            > /tmp/pg_out.txt 2>&1 || true
+          end=$(python -c 'import time; print(time.monotonic())')
+          echo "postgres subset secs=$(python -c "print(f'{$end-$start:.1f}')") | $(tail -1 /tmp/pg_out.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Final sanity (fix revision, SQLite, auditor + guard on, zero warnings)
+        env:
+          FIX: ${{ inputs.fix_rev }}
+        run: |
+          git checkout -q "$FIX" -- src tests pyproject.toml
+          unset MM_SQL_AUDIT || true
+          python -m pytest -q -p no:cacheprovider 2>&1 | tail -3 | tee -a "$GITHUB_STEP_SUMMARY"
