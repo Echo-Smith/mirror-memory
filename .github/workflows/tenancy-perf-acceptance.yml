@@ -32,6 +32,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[server,llm,dev]"
+          # cross-revision parity: the BASE revision may lack optional
+          # extras the fix side declares (and vice versa) -- install the
+          # union explicitly so both sides can import the same modules
+          pip install "sqlglot>=25.0"
 
       - name: Collect test-ID intersection (task 0 methodology)
         env:
@@ -47,7 +51,7 @@ jobs:
           BASE: ${{ inputs.base_rev || '7f783bc' }}
           FIX: ${{ inputs.fix_rev || '2cedfa7' }}
         run: |
-          set -u
+          set -u -o pipefail
           use_rev() {  # worktree src/tests must match the rev EXACTLY:
             # plain checkout never deletes files absent from the rev, which
             # silently changes the executed test set (task-0 lesson).
