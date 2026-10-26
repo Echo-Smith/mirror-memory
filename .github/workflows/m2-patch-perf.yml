@@ -1,10 +1,10 @@
 name: m2-patch-perf
 
-# M2 patch acceptance (M1 task-0 methodology): the SQL auditor is OFF on
-# BOTH sides -- the number being accepted is the isolation machinery's
-# runtime cost, and must not include the auditor's own parse time twice.
-# Same validity rules as always: test-ID intersection up front, junit XML
-# per run, a round counts only when both sides passed identically.
+# M2 patch acceptance (M1 batch-2 task 0 methodology): the SQL auditor is
+# OFF on BOTH sides; the test set is the ID INTERSECTION across the three
+# revisions (collected up front, pytest IDs passed one-argv via run_ids.py
+# so spaces survive); every run emits junit XML and a round counts only
+# when all three sides passed the same number of tests with zero failures.
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ on:
 jobs:
   measure:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +42,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[server,llm,dev,postgres]"
           pip install "sqlglot>=25.0"
+
+      - name: Collect test-ID intersection across the three revisions
+        env:
+          BASE: ${{ inputs.base_rev || '7f783bc' }}
+          MID: ${{ inputs.mid_rev || '3b9e623' }}
+          FIX: ${{ inputs.fix_rev || 'HEAD' }}
+        run: |
+          set -eu
+          # perf_ids pins PYTHONPATH to each revision's own src (the shared
+          # editable install would otherwise import one revision's code for
+          # both collections)
+          python tools/perf_ids.py collect "$BASE" "$FIX" --out /tmp/ids_bf.txt
+          python tools/perf_ids.py collect "$MID" "$FIX" --out /tmp/ids_mf.txt
+          sort /tmp/ids_bf.txt > /tmp/a.txt
+          sort /tmp/ids_mf.txt > /tmp/b.txt
+          comm -12 /tmp/a.txt /tmp/b.txt > /tmp/ids.txt
+          wc -l < /tmp/ids.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s /tmp/ids.txt
 
       - name: Interleaved measurement (base vs mid vs fix, x3, auditor off)
         env:
@@ -67,27 +85,37 @@ jobs:
             export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
             local start end
             start=$(python -c 'import time; print(time.monotonic())')
-            python -m pytest -q -p no:cacheprovider \
+            python tools/run_ids.py /tmp/ids.txt -q -p no:cacheprovider \
               --junitxml="/tmp/${tag}_$round.xml" > /tmp/out_${tag}_$round.txt 2>&1 || true
             end=$(python -c 'import time; print(time.monotonic())')
             echo "$tag $rev round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(tail -1 /tmp/out_${tag}_$round.txt | grep -oE '[0-9]+ (passed|failed)[^|]*' | head -1)" | tee -a "$GITHUB_STEP_SUMMARY"
           }
 
-          echo "=== FULL SUITE, auditor off, interleaved x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "=== FULL SUITE (intersection IDs), auditor off, interleaved x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
           for round in 1 2 3; do
             measure "$BASE" "$round" base
             measure "$MID"  "$round" mid
             measure "$FIX"  "$round" fix
+            if python tools/perf_ids.py verify "/tmp/base_$round.xml" "/tmp/fix_$round.xml" \
+              | tee -a "$GITHUB_STEP_SUMMARY"; then
+              echo "round $round: base/fix VALID" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+            if python tools/perf_ids.py verify "/tmp/mid_$round.xml" "/tmp/fix_$round.xml" \
+              | tee -a "$GITHUB_STEP_SUMMARY"; then
+              echo "round $round: mid/fix VALID" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
           done
 
-          echo "=== LONGRUN FILE, auditor off, interleaved x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "=== LONGRUN FILE (same intersection's longrun ids), x3 ===" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep "test_longrun_bench" /tmp/ids.txt > /tmp/lr_ids.txt || true
+          test -s /tmp/lr_ids.txt
           for round in 1 2 3; do
             for tag_rev in "base:$BASE" "mid:$MID" "fix:$FIX"; do
               tag="${tag_rev%%:*}"; rev="${tag_rev##*:}"
               use_rev "$rev"
               export MM_SQL_AUDIT=0
               start=$(python -c 'import time; print(time.monotonic())')
-              python -m pytest -q -p no:cacheprovider tests/test_longrun_bench.py \
+              python tools/run_ids.py /tmp/lr_ids.txt -q -p no:cacheprovider \
                 > /tmp/lr_${tag}_$round.txt 2>&1 || true
               end=$(python -c 'import time; print(time.monotonic())')
               echo "longrun-$tag round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/lr_${tag}_$round.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
