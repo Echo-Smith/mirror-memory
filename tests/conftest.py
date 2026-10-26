@@ -9,6 +9,140 @@ from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.core.models import Base
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "no_write_fixture_scope: run WITHOUT the blanket test write scope "
+        "(used by the write-guard canary tests)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "fixture_writes(reason): the test body itself writes protected tables "
+        "directly (seeding/tuning); reason is mandatory",
+    )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_fixture_setup(fixturedef, request):
+    """Open the fixture write scope around FIXTURE SETUP only (closeout).
+
+    Fixtures seed data by definition, so they run under
+    fixture_write_scope.  The test BODY no longer does: writes from a test
+    body need @pytest.mark.fixture_writes(reason=...), and engine-code
+    writes remain governed by the classified scopes (guard active in test
+    bodies -- that is the point of the narrowing).
+
+    Internal autouse fixtures (underscore-prefixed conftest machinery)
+    are skipped: their contexts must survive into the test body, and this
+    wrapper's token-reset on setup-exit would clobber a nested scope that
+    a suspended yield-fixture still holds open.
+    """
+    if fixturedef.argname.startswith("_"):
+        yield
+        return
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope(f"fixture setup: {fixturedef.argname}"):
+        yield
+
+
+def _marker_reason(request) -> str:
+    """Extract the mandatory reason from a fixture_writes marker."""
+    writes_marker = request.node.get_closest_marker("fixture_writes")
+    reason = (writes_marker.kwargs or {}).get("reason") or (
+        writes_marker.args[0] if writes_marker.args else ""
+    )
+    if not reason:
+        raise pytest.UsageError(
+            "@pytest.mark.fixture_writes requires a reason=... argument"
+        )
+    return reason
+
+
+@pytest.fixture(autouse=True)
+def _body_write_scope(request):
+    """Write scope for the TEST BODY (closeout patch, task 1).
+
+    Default: NO blanket scope -- the write guard is live in test bodies.
+    A test that must write protected tables directly declares
+    @pytest.mark.fixture_writes(reason="...") and runs under
+    fixture_write_scope for its body.  Canary tests
+    (@pytest.mark.no_write_fixture_scope) keep running bare either way.
+    """
+    if request.node.get_closest_marker("no_write_fixture_scope"):
+        yield
+        return
+    writes_marker = request.node.get_closest_marker("fixture_writes")
+    if writes_marker is None:
+        yield
+        return
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope(f"test body (declared): {_marker_reason(request)}"):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _default_tenant_context():
+    """Test entry point: every test runs under the explicit default tenant.
+
+    Mirrors what a MemoryEngine constructor does in production.  Tests that
+    exercise other tenants wrap themselves in tenant_scope(); the fail-closed
+    tests clear the context explicitly with no_tenant_scope().
+    """
+    from mirror_memory.core.tenancy import tenant_scope
+
+    with tenant_scope("default", "default"):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _scope_strict():
+    """Task 1b: unregistered engine system_scope call sites fail tests."""
+    import os
+
+    old = os.environ.get("MM_SCOPE_STRICT")
+    os.environ["MM_SCOPE_STRICT"] = "1"
+    yield
+    if old is None:
+        os.environ.pop("MM_SCOPE_STRICT", None)
+    else:
+        os.environ["MM_SCOPE_STRICT"] = old
+
+
+@pytest.fixture(autouse=True)
+def _sql_auditor():
+    """M1: the SQL auditor is always on during tests (MM_SQL_AUDIT=0 to
+    disable for performance measurement runs)."""
+    import os
+
+    from mirror_memory.core.sql_audit import install_sql_auditor
+
+    if os.environ.get("MM_SQL_AUDIT", "1") != "0":
+        install_sql_auditor()
+    yield
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Report the auditor verdict-cache statistics for the whole run
+    (task 1a: numbers must come from the full suite, not single runs)."""
+    import os
+
+    if os.environ.get("MM_SQL_AUDIT", "1") == "0":
+        return
+    try:
+        from mirror_memory.core.sql_audit import auditor_cache_stats
+    except Exception:  # noqa: BLE001
+        return
+    distinct, hits, misses = auditor_cache_stats()
+    total = hits + misses
+    rate = f"{hits / total * 100:.1f}%" if total else "n/a"
+    print(
+        f"\nsql-auditor cache: distinct_sql_texts={distinct} "
+        f"hits={hits} misses={misses} hit_rate={rate}"
+    )
+
+
 @pytest.fixture
 def db_session():
     """In-memory SQLite session with all tables, rolled back after each test."""

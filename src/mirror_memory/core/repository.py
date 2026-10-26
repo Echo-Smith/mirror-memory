@@ -75,6 +75,42 @@ from mirror_memory.metabolism.protection import REASON_USER_CORRECTION
 logger = logging.getLogger(__name__)
 
 
+def _sanctioned_writer(write_class: str):
+    """Mark a repository entry as a sanctioned writer for a table class.
+
+    The M1 write guard (core.tenancy) only allows writes to a classified
+    table while the matching class scope is active; this decorator opens
+    that scope around the entry point.
+    """
+    import functools
+
+    from mirror_memory.core.tenancy import (
+        consent_write_scope,
+        engine_write_scope,
+        telemetry_write_scope,
+    )
+
+    scopes = {
+        "engine": engine_write_scope,
+        "consent": consent_write_scope,
+        "telemetry": telemetry_write_scope,
+    }
+    scope = scopes[write_class]
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with scope():
+                return fn(*args, **kwargs)
+        return wrapper
+
+    return decorator
+
+
+#: Historical name for the engine-class variant.
+_sanctioned_claim_writer = lambda fn: _sanctioned_writer("engine")(fn)  # noqa: E731
+
+
 # ---------------------------------------------------------------------------
 # Memory preference
 # ---------------------------------------------------------------------------
@@ -86,6 +122,7 @@ def is_memory_enabled(session: Session, user_id: str) -> bool:
     return pref.enabled if pref is not None else True
 
 
+@_sanctioned_writer("consent")
 def set_memory_enabled(session: Session, user_id: str, enabled: bool) -> MemoryPreference:
     """Enable or disable memory for a user.
 
@@ -128,6 +165,7 @@ def get_state_revision(session: Session, user_id: str) -> int:
     return result if result is not None else 1
 
 
+@_sanctioned_writer("consent")
 def bump_state_revision(session: Session, user_id: str) -> int:
     """Atomic increment of the memory state revision.
 
@@ -155,6 +193,7 @@ def bump_state_revision(session: Session, user_id: str) -> int:
     return new_rev
 
 
+@_sanctioned_writer("consent")
 def cas_bump_state_revision(session: Session, user_id: str, expected: int) -> int | None:
     """Compare-and-swap the state revision: ``expected -> expected + 1``.
 
@@ -206,6 +245,7 @@ def is_feature_enabled(session: Session, user_id: str, feature: str) -> bool:
     return is_memory_enabled(session, user_id)
 
 
+@_sanctioned_writer("consent")
 def set_feature_consent(session: Session, user_id: str, feature: str, granted: bool) -> None:
     """Set feature-level consent for a user."""
     existing = session.get(ConsentGrant, (user_id, feature))
@@ -242,6 +282,7 @@ CONFLICT_SOURCE_CONFLICT = "source_conflict"
 EVIDENCE_AUTHORITIES = ("user", "assistant", "system", "derived")
 
 
+@_sanctioned_writer("engine")
 def record_evidence(
     session: Session,
     user_id: str,
@@ -301,6 +342,7 @@ def record_evidence(
     return row
 
 
+@_sanctioned_writer("engine")
 def link_evidence(
     session: Session,
     belief_id: int,
@@ -523,6 +565,7 @@ def digests_for_beliefs(session: Session, belief_ids: list[int]) -> dict[int, Ev
     return {digest.belief_id: digest for digest in session.scalars(stmt)}
 
 
+@_sanctioned_writer("engine")
 def apply_evidence_compaction(
     session: Session,
     belief: Belief,
@@ -637,6 +680,7 @@ def pending_verification_keys(session: Session, user_id: str) -> set[str]:
     return {str(key)} if key else set()
 
 
+@_sanctioned_claim_writer
 def mark_belief_accessed(session: Session, belief_ids: list[int], *, now: datetime | None = None) -> int:
     """Record that recall actually surfaced these beliefs.
 
@@ -669,6 +713,7 @@ _TIER_METABOLISM_STATE = {
 }
 
 
+@_sanctioned_writer("engine")
 def set_belief_tier(
     session: Session,
     belief_id: int,
@@ -717,6 +762,7 @@ def set_belief_tier(
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_writer("engine")
 def get_or_create_identity(
     session: Session,
     user_id: str,
@@ -765,6 +811,7 @@ def _slot_key_for(belief: Belief) -> str:
     return belief.key
 
 
+@_sanctioned_writer("engine")
 def append_belief_version(
     session: Session,
     belief: Belief,
@@ -1520,6 +1567,7 @@ def _is_elaboration(new_text: str, old_text: str | None) -> bool:
     return bool(old_distinctive & content_tokens(new_text, min_length=6))
 
 
+@_sanctioned_claim_writer
 def record_claim(
     session: Session,
     user_id: str,
@@ -1790,6 +1838,7 @@ def record_claim(
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_claim_writer
 def confirm_belief(
     session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
 ) -> Belief | None:
@@ -1806,6 +1855,7 @@ def confirm_belief(
     return belief
 
 
+@_sanctioned_claim_writer
 def reject_belief(
     session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
 ) -> Belief | None:
@@ -1826,6 +1876,7 @@ def reject_belief(
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_claim_writer
 def support_belief_by_id(
     session: Session,
     belief_id: int,
@@ -1955,6 +2006,7 @@ def _disambiguate_key(session: Session, user_id: str, key: str) -> str:
         suffix += 1
 
 
+@_sanctioned_claim_writer
 def update_belief_by_id(
     session: Session,
     old_belief_id: int,
@@ -2100,6 +2152,7 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+@_sanctioned_claim_writer
 def update_belief_value(
     session: Session,
     user_id: str,
@@ -2210,6 +2263,7 @@ QUESTION_INJECTED_KIND = "question_injected"
 QUESTION_ANSWERED_KIND = "question_answered"
 
 
+@_sanctioned_writer("telemetry")
 def record_intervention_event(
     session: Session,
     user_id: str,
@@ -2327,6 +2381,7 @@ def has_unanswered_injection(session: Session, user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_writer("telemetry")
 def record_extraction_stats(
     session: Session,
     user_id: str,
@@ -2485,6 +2540,7 @@ def _scope_hash(scope: str, identity: str) -> str:
     return _short_hash(f"{scope}:{identity}")
 
 
+@_sanctioned_writer("engine")
 def _write_deletion_tombstone(
     session: Session,
     user_id: str,
@@ -2516,6 +2572,7 @@ def _write_deletion_tombstone(
     return tombstone
 
 
+@_sanctioned_claim_writer
 def forget_belief(
     session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
 ) -> bool:
@@ -2658,6 +2715,7 @@ def forget_session_summary(session: Session, user_id: str, session_id: str) -> b
 # ---------------------------------------------------------------------------
 
 
+@_sanctioned_claim_writer
 def correct_belief(
     session: Session,
     user_id: str,
@@ -2816,6 +2874,7 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
     }
 
 
+@_sanctioned_writer("telemetry")
 def store_session_summary(
     session: Session,
     user_id: str,

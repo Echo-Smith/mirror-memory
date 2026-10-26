@@ -43,6 +43,12 @@ TRANSITION_EVIDENCE_COMPACT = "EVIDENCE_COMPACT"
 # another transition, because a denial is a user decision with its own
 # invariant -- not an inference.
 TRANSITION_REJECT = "REJECT"
+# Verification-loop bookkeeping: fold a verdict into the belief's Beta
+# confirm-rate counters.  Touches only ``value_json`` telemetry -- never the
+# claim, status, or confidence -- so like a tier move it does not bump the
+# state revision.  It is still routed through the Publisher so every belief
+# write has one audited entry point.
+TRANSITION_CONFIRM_RATE = "CONFIRM_RATE"
 
 STATE_TRANSITIONS = (
     TRANSITION_CREATE,
@@ -56,10 +62,12 @@ STATE_TRANSITIONS = (
     TRANSITION_TIER_TRANSITION,
     TRANSITION_EVIDENCE_COMPACT,
     TRANSITION_REJECT,
+    TRANSITION_CONFIRM_RATE,
 )
 
 # Transitions that mutate belief rows.  SYNTHESIZE writes derived state
 # (snapshots) rather than beliefs, which is why it is listed separately.
+# CONFIRM_RATE mutates a belief row's telemetry (value_json counters).
 BELIEF_MUTATING_TRANSITIONS = (
     TRANSITION_CREATE,
     TRANSITION_SUPPORT,
@@ -70,6 +78,7 @@ BELIEF_MUTATING_TRANSITIONS = (
     TRANSITION_TIER_TRANSITION,
     TRANSITION_EVIDENCE_COMPACT,
     TRANSITION_REJECT,
+    TRANSITION_CONFIRM_RATE,
 )
 
 # The transitions that assert something about the *truth* state, and

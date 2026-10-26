@@ -401,6 +401,7 @@ class TestLedgerCapacity:
         # Five values, cap of three: the two oldest are gone.
         assert [v.object for v in versions] == ["c", "d", "e"]
 
+    @pytest.mark.fixture_writes(reason="ledger test: tune version epistemic_to in body")
     def test_ttl_prunes_long_closed_versions(self, db_session, config):
         set_memory_enabled(db_session, "u1", True)
         belief = _pre_ledger_belief(db_session)

@@ -13,6 +13,7 @@ gate and the revision guard pass.  Everything upstream is pure Compute.
 import json
 
 from mirror_memory.config.loader import load_config
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.core.models import (
     Belief,
     BeliefEvent,
@@ -376,7 +377,8 @@ class TestEvidenceAccounting:
 
         scored = score_belief(belief, now=datetime.now(UTC))
         # Same belief with fewer than MULTI_EVIDENCE_THRESHOLD evidence items.
-        belief.evidence_json = json.dumps([1])
+        with fixture_write_scope("invariants test: trim evidence refs"):
+            belief.evidence_json = json.dumps([1])
         plain = score_belief(belief, now=datetime.now(UTC))
         assert scored > plain
 

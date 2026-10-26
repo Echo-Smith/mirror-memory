@@ -585,6 +585,7 @@ class TestForgetInvalidatesDerived:
         snaps = db_session.query(Snapshot).filter_by(user_id="u_snap").all()
         assert len(snaps) == 0
 
+    @pytest.mark.fixture_writes(reason="forget test: construct a pending EvolutionJob row")
     def test_forget_cancels_pending_jobs(self, db_session):
         from mirror_memory.core.repository import forget_belief
 
@@ -697,12 +698,17 @@ class TestConcurrentStaleWrite:
         results = []
         def bump():
             from mirror_memory.core.repository import bump_state_revision as bsr
-            e = ce(f"sqlite:///{db_path}")
-            with SASession(e) as s:
-                r = bsr(s, "u_atomic")
-                s.commit()
-                results.append(r)
-            e.dispose()
+            from mirror_memory.core.tenancy import tenant_scope
+
+            # Threads do not inherit the ambient tenant context; this raw
+            # session acts as its own entry point and opens its own scope.
+            with tenant_scope("default", "default"):
+                e = ce(f"sqlite:///{db_path}")
+                with SASession(e) as s:
+                    r = bsr(s, "u_atomic")
+                    s.commit()
+                    results.append(r)
+                e.dispose()
 
         threads = [threading.Thread(target=bump) for _ in range(10)]
         for t in threads:

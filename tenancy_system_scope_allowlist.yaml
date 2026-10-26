@@ -1,0 +1,37 @@
+# system_scope usage allowlist (M1 batch-2 task 1b)
+#
+# system_scope is the ONLY cross-tenant bypass.  Every call site in engine
+# code must be registered here with a reason and a reviewer; the runtime
+# check (tests enforce, production warns) and the CI AST scan
+# (tools/check_system_scope.py) both compare against this file.
+#
+# Entries that no longer have a matching call site fail the CI scan too --
+# an allowlist with ghosts hides real drift.
+
+- module: mirror_memory.worker.evolution
+  function: process_pending
+  reason: >
+    The evolution job queue is shared across tenants: crash-recovery sweep
+    and the pending-job scan must see every tenant's jobs.  Each job is
+    then processed inside tenant_scope(job.tenant_id, job.app_id) with a
+    session bound to that tenant.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-25"
+
+- module: mirror_memory.core.schema_migration
+  function: upgrade_database
+  reason: >
+    The tenancy backfill copies every pre-tenancy row into the new shape
+    while stamping the configured default tenant -- inherently cross-tenant
+    maintenance, executed once per database at upgrade time.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-25"
+
+- module: mirror_memory.api
+  function: _verify_single_tenant_startup
+  reason: >
+    Startup invariant for end-side single-tenant mode: reads the DISTINCT
+    tenant set once to refuse multi-tenant databases or a mismatched
+    configuration.  Runs a single bounded query at engine construction.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-25"

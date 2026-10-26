@@ -374,7 +374,11 @@ def run_longrun(
         re-dated to the simulated day.  Fixture setup, not an engine path.
         """
         when = stamp(day).replace(tzinfo=None)  # the engine stores naive UTC
-        with engine._session() as session:
+        from mirror_memory.core.tenancy import publisher_write_scope
+
+        # Fixture setup, not an engine path: re-dating the rows the bench
+        # just wrote is a sanctioned bench writer.
+        with publisher_write_scope(), engine._session() as session:
             for belief in session.scalars(select(Belief).where(Belief.user_id == user_id)):
                 current = belief.last_evidence_at
                 if current is not None and current.tzinfo is not None:

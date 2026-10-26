@@ -62,7 +62,9 @@ class TestEnqueueJob:
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="test", confidence=0.5, session_id="s1")
         j1 = enqueue_job(db_session, "u1", config)
-        j1.status = "completed"
+        db_session.query(EvolutionJob).filter(
+            EvolutionJob.id == j1.id
+        ).update({"status": "completed"}, synchronize_session=False)
         db_session.commit()
         j2 = enqueue_job(db_session, "u1", config)
         assert j2.id == j1.id
@@ -101,8 +103,19 @@ class TestProcessPending:
                      claim_text="test", confidence=0.5, session_id="s1")
         job = enqueue_job(db_session, "u1", config)
         job_id = job.id
-        job.status = "running"
-        job.started_at = datetime.now(UTC) - timedelta(seconds=600)
+        # simulate a crashed claim via an explicit filtered UPDATE (the
+        # deferred identity-keyed flush would trip the SQL auditor)
+        db_session.query(EvolutionJob).filter(
+            EvolutionJob.id == job_id
+        ).update(
+            {
+                EvolutionJob.status: "running",
+                EvolutionJob.started_at: datetime.now(UTC) - timedelta(seconds=600),
+                # fencing: an expired lease is what crash recovery sweeps
+                EvolutionJob.lease_expires_at: datetime.now(UTC) - timedelta(seconds=300),
+            },
+            synchronize_session=False,
+        )
         db_session.commit()
 
         def factory():

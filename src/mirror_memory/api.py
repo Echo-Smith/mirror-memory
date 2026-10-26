@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,9 @@ class MemoryEngine:
         llm_api_key: str | None = None,
         llm_model: str = "gpt-4o-mini",
         llm_base_url: str | None = None,
+        tenant_id: str = "default",
+        app_id: str = "default",
+        single_tenant_mode: bool | None = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -76,6 +80,18 @@ class MemoryEngine:
 
         self._database_url = database_url
         self._llm_client = llm_client or self._build_llm(llm_api_key, llm_model, llm_base_url)
+        # M1 tenancy: the engine entry point pins an explicit tenant; every
+        # session it opens is created inside that scope and therefore bound
+        # to it at creation time (see core.tenancy).
+        self._tenant = (tenant_id, app_id)
+        # Task 6: end-side single-tenant mode (None -> env MM_SINGLE_TENANT).
+        import os
+
+        self._single_tenant = (
+            single_tenant_mode
+            if single_tenant_mode is not None
+            else os.environ.get("MM_SINGLE_TENANT", "0") == "1"
+        )
         self._initialized = False
         self._pipeline = None  # lazy-initialized
 
@@ -103,13 +119,80 @@ class MemoryEngine:
         # the ORM now expects; fail with instructions instead of a mid-query
         # "no such column" error.
         check_schema(self._engine)
+        if self._single_tenant:
+            self._verify_single_tenant_startup()
+            from mirror_memory.core.tenancy import set_single_tenant_mode
+
+            set_single_tenant_mode(True)
         self._initialized = True
 
+    def _verify_single_tenant_startup(self) -> None:
+        """Fail-closed startup checks for end-side single-tenant mode.
+
+        Refuses when (a) the server tenant registry / key file is also
+        configured (mutually exclusive), (b) the database already holds
+        more than one tenant, or (c) the stored tenant differs from the
+        configured one.
+        """
+        import os
+
+        from sqlalchemy import text as _text
+
+        from mirror_memory.core.tenancy import system_scope
+
+        if os.environ.get("MM_TENANT_KEYS_FILE"):
+            raise RuntimeError(
+                "single-tenant mode is mutually exclusive with the server "
+                "tenant middleware (MM_TENANT_KEYS_FILE is set)"
+            )
+        try:
+            from mirror_memory import server as _server
+
+            if _server._tenant_key_registry:
+                raise RuntimeError(
+                    "single-tenant mode is mutually exclusive with the "
+                    "server tenant middleware (tenant keys registered)"
+                )
+        except ImportError:
+            pass
+        with system_scope(reason="single-tenant startup: distinct-tenant check"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    _text(
+                        "SELECT DISTINCT tenant_id, app_id FROM mm_beliefs "
+                        "LIMIT 2"
+                    )
+                ).all()
+        stored = {(r[0], r[1]) for r in rows}
+        if len(stored) > 1:
+            raise RuntimeError(
+                f"single-tenant mode refused: database holds multiple "
+                f"tenants {sorted(stored)}"
+            )
+        if stored and stored != {self._tenant}:
+            raise RuntimeError(
+                f"single-tenant mode refused: database tenant "
+                f"{sorted(stored)} != configured {self._tenant}"
+            )
+
+    @contextmanager
     def _session(self):
-        """Create a new database session."""
+        """Open a session bound to this engine's tenant.
+
+        The session is created inside the tenant scope, so tenancy binds it
+        at creation time (core.tenancy session binding); the scope also
+        covers the work done with the session.
+        """
         from sqlalchemy.orm import Session
 
-        return Session(self._engine)
+        from mirror_memory.core.tenancy import tenant_scope
+
+        with tenant_scope(*self._tenant):
+            session = Session(self._engine)
+            try:
+                yield session
+            finally:
+                session.close()
 
     def _get_pipeline(self):
         """Lazy-initialize the extraction pipeline (singleton per engine)."""

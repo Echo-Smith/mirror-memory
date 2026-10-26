@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.core.models import BeliefEvent, Evidence, EvidenceDigest
 from mirror_memory.core.proposal import (
     TRANSITION_EVIDENCE_COMPACT,
@@ -266,7 +267,8 @@ class TestPublisherCompaction:
         import json
 
         belief = seed_belief(db_session, "disputed", supports=13)
-        belief.value_json = json.dumps({"clarification_status": "needs_clarification"})
+        with fixture_write_scope("compaction test: mark conflict"):
+            belief.value_json = json.dumps({"clarification_status": "needs_clarification"})
         db_session.flush()
         plan = plan_compaction(_graph(db_session, belief.id), belief.id)
         assert plan is not None
@@ -317,7 +319,8 @@ def safe_ids(raw):
 class TestCycleCompaction:
     def test_cycle_proposes_and_commits_compaction(self, db_session, config):
         belief = seed_belief(db_session, "cycle", supports=13)
-        belief.last_evidence_at = NOW  # fresh: no tier move, pure compaction
+        with fixture_write_scope("compaction test: freshen evidence clock"):
+            belief.last_evidence_at = NOW  # fresh: no tier move, pure compaction
         db_session.flush()
         report = run_metabolism(db_session, "u1", config, now=NOW)
         assert report.compaction_proposals == 1
@@ -336,7 +339,8 @@ class TestCycleCompaction:
         import json
 
         belief = seed_belief(db_session, "shielded", supports=13)
-        belief.value_json = json.dumps({"clarification_status": "needs_clarification"})
+        with fixture_write_scope("compaction test: mark conflict"):
+            belief.value_json = json.dumps({"clarification_status": "needs_clarification"})
         db_session.flush()
         report = run_metabolism(db_session, "u1", config, now=NOW)
         assert report.compaction_proposals == 0
@@ -432,8 +436,9 @@ class TestEvidenceIntentRendering:
         from mirror_memory.render.renderer import render_memory_block
 
         belief = seed_belief(db_session, "why:coffee", supports=13)
-        belief.claim_text = "likes coffee"
-        belief.key = "why:coffee"
+        with fixture_write_scope("compaction test: set claim text/key"):
+            belief.claim_text = "likes coffee"
+            belief.key = "why:coffee"
         run_metabolism(db_session, "u1", config, now=NOW)
 
         block = render_memory_block(
@@ -448,7 +453,8 @@ class TestEvidenceIntentRendering:
         from mirror_memory.render.renderer import render_memory_block
 
         belief = seed_belief(db_session, "plain:coffee", supports=13)
-        belief.claim_text = "likes coffee"
+        with fixture_write_scope("compaction test: set claim text"):
+            belief.claim_text = "likes coffee"
         run_metabolism(db_session, "u1", config, now=NOW)
 
         block = render_memory_block(

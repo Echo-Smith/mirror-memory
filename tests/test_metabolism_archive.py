@@ -23,6 +23,7 @@ from mirror_memory.core.models import (
     EvidenceDigest,
     MemoryTransition,
 )
+from mirror_memory.core.tenancy import fixture_write_scope
 from mirror_memory.core.proposal import (
     TRANSITION_FORGET,
     TRANSITION_SUPPORT,
@@ -68,13 +69,16 @@ def make_belief(
             observed_at=NOW - timedelta(days=days_idle),
         )
         link_evidence(session, belief.id, evidence.id, relation="support")
-    belief.last_evidence_at = NOW - timedelta(days=days_idle)
-    belief.last_accessed_at = NOW - timedelta(days=days_idle)
-    belief.last_supported_at = belief.last_evidence_at
-    belief.memory_tier = tier
-    belief.importance_score = importance
-    if status != "active":
-        belief.status = status
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with fixture_write_scope("archive test: tune belief clocks/tier"):
+        belief.last_evidence_at = NOW - timedelta(days=days_idle)
+        belief.last_accessed_at = NOW - timedelta(days=days_idle)
+        belief.last_supported_at = belief.last_evidence_at
+        belief.memory_tier = tier
+        belief.importance_score = importance
+        if status != "active":
+            belief.status = status
     session.flush()
     return belief
 
@@ -123,8 +127,9 @@ class TestArchiveDecision:
 
     def test_recent_recall_beats_the_archive_clock(self, db_session):
         belief = make_belief(db_session, "revived", days_idle=800)
-        belief.access_count = 10
-        belief.last_accessed_at = NOW - timedelta(days=1)
+        with fixture_write_scope("archive test: tune access telemetry"):
+            belief.access_count = 10
+            belief.last_accessed_at = NOW - timedelta(days=1)
         decision = decide_tier(
             belief, support_count=2, correct_count=0,
             pending_verification=False, now=NOW,
@@ -238,8 +243,9 @@ class TestRestore:
         engine._ensure_db()
         with engine._session() as session:
             belief = make_belief(session, "api-restore", days_idle=800)
-            belief.memory_tier = "archived"
-            belief.metabolism_state = "compacted"
+            with fixture_write_scope("archive test: pre-archive tier state"):
+                belief.memory_tier = "archived"
+                belief.metabolism_state = "compacted"
             belief_id = belief.id
             session.commit()
         assert engine.restore_belief(user_id="u1", belief_id=belief_id) is True
@@ -352,7 +358,8 @@ class TestForget:
         from mirror_memory.render.renderer import render_memory_block
 
         belief = self._seed(db_session, key="gone")
-        belief.confidence = 0.8
+        with fixture_write_scope("archive test: raise confidence"):
+            belief.confidence = 0.8
         forget_belief(db_session, "u1", belief.id)
         block = render_memory_block(
             db_session, "u1", config=config, language="en",
