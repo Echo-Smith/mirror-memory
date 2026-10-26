@@ -61,11 +61,20 @@ def _use_rev(rev: str) -> None:
 
 def _collect_ids(rev: str) -> set[str]:
     _use_rev(rev)
+    import os
+
+    # The revision switch moves src/ in the WORKTREE, but a venv that
+    # installed the package editable still points at whichever checkout it
+    # was created from.  Collection has to import the revision under test,
+    # or both sides collect the same (wrong) set of parametrizations.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.abspath("src")
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
         capture_output=True,
         text=True,
         check=True,
+        env=env,
     )
     ids = set()
     for line in proc.stdout.splitlines():

@@ -320,3 +320,46 @@ def test_primary_key_swap_is_postgres_only():
 
     with pytest.raises(MigrationError):
         str(PrimaryKeySwap("mm_beliefs").compile(dialect=sqlite_dialect.dialect()))
+
+
+def test_database_already_at_version_1_advances_to_step_2(base_db):
+    """An M1-era database (tenant columns in place, version 1 recorded) must
+    be able to advance without re-running the tenancy step.
+
+    This is what makes the primary-key conversion a version step rather
+    than part of step 1: a database migrated by an earlier release already
+    has the tenant columns, so it can only pick up what it is missing.
+    """
+    from mirror_memory.core import schema_migration as sm
+
+    eng = _engine(base_db)
+    # Advance to version 1 only, the way the previous release left a
+    # database: tenant columns plus the version row, single-column key.
+    upgrade_database(
+        eng,
+        default_tenant="legacy",
+        default_app="app",
+        steps=[sm.Step1Tenancy()],
+    )
+    assert sm.current_version(eng) == 1
+    before = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
+    assert before[:2] != ["tenant_id", "app_id"], before
+
+    # The full plan now runs only the steps above version 1.
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == 2
+    after = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
+    if eng.dialect.name == "postgresql":
+        assert after == ["tenant_id", "app_id", "id"], after
+    else:
+        assert after == before, after  # SQLite keeps its physical key
+
+
+def test_primary_key_step_is_a_noop_when_already_applied():
+    """needed() must report False once the key matches, so a re-run neither
+    issues DDL nor advances the version twice."""
+    from mirror_memory.core import schema_migration as sm
+
+    step = sm.Step2TenantPrimaryKeys()
+    if not sm._is_postgres(create_engine("sqlite://")):
+        assert step.needed(create_engine("sqlite://")) is False

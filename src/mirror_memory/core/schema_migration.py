@@ -399,7 +399,6 @@ class Step1Tenancy:
                 ["tenant_id", "app_id"],
                 DEFAULT_BACKFILL_BATCH,
             )
-        _replace_primary_keys(engine, existing)
         for name in existing:
             with engine.begin() as conn:
                 for col in ("tenant_id", "app_id"):
@@ -450,64 +449,6 @@ def _literal(value: str):
     from sqlalchemy import literal
 
     return literal(value)
-
-
-def _replace_primary_keys(engine: Engine, names: list) -> None:
-    """Convert the named tables to the tenant composite primary key (PG).
-
-    The ALTER is emitted through SQLAlchemy's own DDL pipeline: a throwaway
-    ``MetaData`` carries the statement as an ``after_create`` hook, and
-    ``create_all(checkfirst=True)`` runs it (every real table already
-    exists, so only the hook fires).  That keeps execution inside the
-    library's DDL machinery instead of a hand-rolled execute call, and the
-    statement itself is compiled by ``PrimaryKeySwap`` from the model's own
-    table -- column and constraint identifiers come from
-    ``Base.metadata``, never from caller or database text.
-
-    PostgreSQL only: a catalog ALTER builds the replacement index while the
-    old one still serves reads, so no table rewrite and no long exclusive
-    lock.  SQLite keeps its single-column physical key (a composite key
-    over an autoincrement column is impossible) and its three fallback
-    layers.
-    """
-    if not _is_postgres(engine):
-        return
-    insp = inspect(engine)
-    targets = []
-    for name in names:
-        wanted = [column.name for column in Base.metadata.tables[name].primary_key.columns]
-        if list(insp.get_pk_constraint(name)["constrained_columns"]) != wanted:
-            targets.append(name)
-    if not targets:
-        return
-    _emit_primary_key_swaps(engine, targets)
-
-
-def _emit_primary_key_swaps(engine: Engine, names: list) -> None:
-    """Run the conversion inside the migration's cross-tenant scope."""
-    in_scope = _SwapPlan(names)
-    with system_scope(reason=_MIGRATION_REASON):
-        in_scope.run(engine)
-
-
-class _SwapPlan:
-    """A metadata whose only job is to carry the ALTER statements.
-
-    ``create_all`` executes a metadata's DDL; attaching the swaps as
-    ``after_create`` hooks means the library's own execution path runs
-    them, and ``checkfirst`` keeps it from trying to create the tables.
-    """
-
-    def __init__(self, names: list) -> None:
-        self.names = names
-
-    def run(self, engine: Engine) -> None:
-        from sqlalchemy import event
-
-        metadata = MetaData()
-        for name in self.names:
-            event.listen(metadata, "after_create", PrimaryKeySwap(name))
-        metadata.create_all(engine, checkfirst=True)
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +536,149 @@ def _verify_column(engine: Engine, table_name: str, column: str) -> None:
 # Runner
 # ---------------------------------------------------------------------------
 
-DEFAULT_STEPS: list = [Step1Tenancy()]
+# ---------------------------------------------------------------------------
+# Step 2: tenant composite primary keys (M2 task 3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Step2TenantPrimaryKeys:
+    """Install ``PRIMARY KEY (tenant_id, app_id, ...)`` on tenant tables.
+
+    A separate step from the tenancy conversion, not part of it: a database
+    already migrated to version 1 by an earlier release has the tenant
+    columns but a single-column key, and it must be able to advance without
+    re-running the step that already succeeded.
+
+    PostgreSQL: each table's PK constraint is dropped and re-added with the
+    tenant columns leading.  That is a catalog change -- the replacement
+    index is built while the old one still serves reads -- so the table is
+    never rewritten and never held under an exclusive lock for the whole
+    operation.  Re-entrant: tables whose key already matches are skipped,
+    so a re-run after a partial failure continues where it stopped.
+
+    SQLite: nothing is altered, by design.  A composite key over an
+    autoincrement column is impossible there (``CompileError``), so the
+    physical key stays single-column and write safety comes from the three
+    fallback layers (see ``tests/test_pk_addressing.py``).  The step still
+    records its version, so both databases advance through the same
+    sequence.
+    """
+
+    version: int = 2
+    name: str = "tenant composite primary keys"
+
+    def needed(self, engine: Engine) -> bool:
+        if not _is_postgres(engine):
+            return False  # SQLite's physical key is intentionally single-column
+        insp = inspect(engine)
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            wanted = [column.name for column in table.primary_key.columns]
+            if list(insp.get_pk_constraint(table.name)["constrained_columns"]) != wanted:
+                return True
+        return False
+
+    def apply(self, engine: Engine) -> None:
+        if not _is_postgres(engine):
+            return
+        existing = [
+            t.name for t in Base.metadata.sorted_tables if inspect(engine).has_table(t.name)
+        ]
+        _replace_primary_keys(engine, existing)
+
+    def verify(self, engine: Engine) -> None:
+        _verify_tenant_primary_keys(engine)
+
+
+def _literal(value: str):
+    """A bound-parameter literal for a SELECT list."""
+    from sqlalchemy import literal
+
+    return literal(value)
+
+
+def _replace_primary_keys(engine: Engine, names: list) -> None:
+    """Convert the named tables to the tenant composite primary key (PG).
+
+    The ALTER is emitted through SQLAlchemy's own DDL pipeline: a throwaway
+    ``MetaData`` carries the statement as an ``after_create`` hook, and
+    ``create_all(checkfirst=True)`` runs it (every real table already
+    exists, so only the hook fires).  The statement itself is compiled by
+    ``PrimaryKeySwap`` from the model's own table, so column and constraint
+    identifiers come from ``Base.metadata`` -- never from caller input or
+    from text read out of the database.
+
+    PostgreSQL only: a catalog ALTER builds the replacement index while the
+    old one still serves reads, so no table rewrite and no long exclusive
+    lock.  SQLite returns immediately and keeps its three fallback layers.
+    """
+    if not _is_postgres(engine):
+        return
+    insp = inspect(engine)
+    targets = []
+    for name in names:
+        wanted = [column.name for column in Base.metadata.tables[name].primary_key.columns]
+        if list(insp.get_pk_constraint(name)["constrained_columns"]) != wanted:
+            targets.append(name)
+    if not targets:
+        return
+    _emit_primary_key_swaps(engine, targets)
+
+
+def _emit_primary_key_swaps(engine: Engine, names: list) -> None:
+    """Run the conversion inside the migration's cross-tenant scope.
+
+    The DDL names no rows -- it is a catalog operation over a whole table --
+    so there is no tenant to scope it to; the explicit scope plus its
+    allowlist entry is how that is stated rather than implied.
+    """
+    plan = _SwapPlan(names)
+    with system_scope(reason=_MIGRATION_REASON):
+        plan.run(engine)
+
+
+class _SwapPlan:
+    """A metadata whose only job is to carry the ALTER statements.
+
+    ``create_all`` executes a metadata's DDL; attaching the swaps as
+    ``after_create`` hooks means SQLAlchemy's own execution path runs them,
+    and ``checkfirst`` keeps it from trying to create the tables.
+    """
+
+    def __init__(self, names: list) -> None:
+        self.names = names
+
+    def run(self, engine: Engine) -> None:
+        from sqlalchemy import event
+
+        metadata = MetaData()
+        for name in self.names:
+            event.listen(metadata, "after_create", PrimaryKeySwap(name))
+        metadata.create_all(engine, checkfirst=True)
+
+
+def _verify_tenant_primary_keys(engine: Engine) -> None:
+    """The composite key must be in place wherever the dialect can host it."""
+    if not _is_postgres(engine):
+        return
+    insp = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        if not insp.has_table(table.name):
+            continue
+        wanted = [column.name for column in table.primary_key.columns]
+        current = list(insp.get_pk_constraint(table.name)["constrained_columns"])
+        if current != wanted:
+            raise MigrationError(
+                "verification failed: primary key columns differ from the model"
+            )
+
+
+#: Ordered migration steps.  A database advances by running every step
+#: whose version exceeds its recorded version, so an older database (say,
+#: one already at version 1) picks up only what it is missing.
+DEFAULT_STEPS: list = [Step1Tenancy(), Step2TenantPrimaryKeys()]
 
 
 def upgrade_database(
