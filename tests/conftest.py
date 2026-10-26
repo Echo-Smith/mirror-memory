@@ -150,11 +150,144 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 def _pg_url() -> str | None:
-    """PostgreSQL URL for this test run (task 0), or None for SQLite."""
+    """PostgreSQL ADMIN URL for this test run (task 0), or None for SQLite.
+
+    This is the superuser / owner-side login: it creates schemas, applies
+    migrations and installs the RLS posture.  Tenant work in tests goes
+    through the APP role (``_pg_role_url("app")``) so that row-level
+    security actually applies -- a superuser bypasses every policy.
+    """
     import os
 
     url = os.environ.get("MM_DATABASE_URL", "")
     return url if url.startswith("postgres") else None
+
+
+#: Test-only credentials for the two login roles (created by
+#: ``_pg_rls_roles`` once per session; the owner role has no login).
+PG_TEST_ROLE_PASSWORDS = {"app": "mm_app_test", "maintenance": "mm_maintenance_test"}
+
+
+def _pg_role_url(kind: str) -> str | None:
+    """The admin URL re-pointed at the app / maintenance login."""
+    admin = _pg_url()
+    if admin is None:
+        return None
+    from sqlalchemy.engine import make_url
+
+    from mirror_memory.core import rls
+
+    role = rls.app_role() if kind == "app" else rls.maintenance_role()
+    return (
+        make_url(admin)
+        .set(username=role, password=PG_TEST_ROLE_PASSWORDS[kind])
+        .render_as_string(hide_password=False)
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _pg_rls_roles():
+    """PostgreSQL only: make sure the owner / app / maintenance roles exist
+    with the test credentials, and register the maintenance URL (M2
+    batch-2 task 1).
+
+    Roles are cluster-level and persist across tests; the per-test schema
+    rebuild (``db_session``) re-applies ownership, grants and policies.
+    """
+    import os
+
+    admin = _pg_url()
+    if admin is None:
+        yield
+        return
+    import psycopg
+    from psycopg import sql
+    from sqlalchemy.engine import make_url
+
+    from mirror_memory.core import rls
+
+    conninfo = make_url(admin).set(drivername="postgresql").render_as_string(hide_password=False)
+    roles = (
+        (rls.owner_role(), False, None),
+        (rls.app_role(), True, PG_TEST_ROLE_PASSWORDS["app"]),
+        (rls.maintenance_role(), True, PG_TEST_ROLE_PASSWORDS["maintenance"]),
+    )
+    with psycopg.connect(conninfo, autocommit=True) as conn:
+        for name, login, password in roles:
+            exists = conn.execute(
+                "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s", (name,)
+            ).fetchone()
+            if exists is None:
+                if login:
+                    conn.execute(
+                        sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                            sql.Identifier(name), sql.Literal(password)
+                        )
+                    )
+                else:
+                    conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(name)))
+            elif login:
+                conn.execute(
+                    sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {}").format(
+                        sql.Identifier(name), sql.Literal(password)
+                    )
+                )
+    maintenance_url = _pg_role_url("maintenance")
+    old = os.environ.get("MM_MAINTENANCE_DATABASE_URL")
+    os.environ["MM_MAINTENANCE_DATABASE_URL"] = maintenance_url
+    # Both the admin and the app database identities route system_scope
+    # sessions to the maintenance engine.
+    rls.register_maintenance_url(admin, maintenance_url)
+    rls.register_maintenance_url(_pg_role_url("app"), maintenance_url)
+    try:
+        yield
+    finally:
+        rls.clear_maintenance_registry()
+        if old is None:
+            os.environ.pop("MM_MAINTENANCE_DATABASE_URL", None)
+        else:
+            os.environ["MM_MAINTENANCE_DATABASE_URL"] = old
+
+
+def _pg_fresh_schema(admin_engine) -> None:
+    """Rebuild the schema from the model and install the RLS posture on it.
+
+    Every table ends up owned by the owner role with ENABLE + FORCE row
+    level security and both policies, exactly what step 3 of the migration
+    leaves behind; verification is skipped here (the dedicated RLS tests
+    verify it) to keep the per-test cost down.
+    """
+    from mirror_memory.core.schema_migration import install_row_level_security
+
+    Base.metadata.drop_all(admin_engine)  # clean slate (previous test leftovers)
+    Base.metadata.create_all(admin_engine)
+    install_row_level_security(admin_engine, verify=False)
+
+
+@pytest.fixture
+def pg_admin_engine():
+    """PostgreSQL only: a fresh RLS-protected schema; yields the admin
+    (owner-side) engine.  Skips on SQLite."""
+    pg = _pg_url()
+    if pg is None:
+        pytest.skip("needs MM_DATABASE_URL pointing at PostgreSQL")
+    engine = create_engine(pg, echo=False)
+    _pg_fresh_schema(engine)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def pg_app_url(pg_admin_engine):
+    """The app-role URL for the schema ``pg_admin_engine`` just built."""
+    return _pg_role_url("app")
+
+
+@pytest.fixture
+def pg_maintenance_url(pg_admin_engine):
+    return _pg_role_url("maintenance")
 
 
 @pytest.fixture(autouse=True)
@@ -222,13 +355,15 @@ def db_session():
 
     PostgreSQL (``MM_DATABASE_URL``): the test runs against the shared
     database with the schema rebuilt around it (``drop_all`` +
-    ``create_all`` from ``Base.metadata``).  Chosen over
-    transaction-rollback because much of the suite manages its own
-    transactions and opens several sessions per test -- a rollback
-    harness would fight both.  Chosen over schema/database-per-test
-    because it needs no identifier construction at all: everything goes
-    through metadata DDL, so there is no SQL-text assembly here.  Cost
-    measured locally: ~0.15 s per rebuild.
+    ``create_all`` from ``Base.metadata``) by the ADMIN login, the RLS
+    posture installed on it, and the session opened through the APP role
+    engine -- so the whole suite exercises row-level security as the
+    second defence (M2 batch-2 task 1), not just the dedicated RLS tests.
+    Rebuild chosen over transaction-rollback because much of the suite
+    manages its own transactions and opens several sessions per test -- a
+    rollback harness would fight both.  Chosen over schema/database-per-
+    test because it needs no identifier construction at all: everything
+    goes through metadata DDL, so there is no SQL-text assembly here.
     """
     pg = _pg_url()
     if pg is None:
@@ -242,9 +377,9 @@ def db_session():
         Base.metadata.drop_all(engine)
         engine.dispose()
         return
-    engine = create_engine(pg, echo=False)
-    Base.metadata.drop_all(engine)  # clean slate (previous test leftovers)
-    Base.metadata.create_all(engine)
+    admin_engine = create_engine(pg, echo=False)
+    _pg_fresh_schema(admin_engine)
+    engine = create_engine(_pg_role_url("app"), echo=False)
     SessionFactory = sessionmaker(bind=engine)
     session = SessionFactory()
     try:
@@ -253,6 +388,7 @@ def db_session():
         session.rollback()
         session.close()
         engine.dispose()
+        admin_engine.dispose()
 
 
 @pytest.fixture

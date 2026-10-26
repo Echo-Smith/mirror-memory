@@ -398,6 +398,15 @@ def create_app(
         )
 
         global _engine
+        from mirror_memory.core.tenancy import READ_FILTER_NONE, read_filter_mode
+
+        if read_filter_mode() == READ_FILTER_NONE:
+            # The unfiltered baseline exists for measurement only; a server
+            # must never answer requests without a tenant read filter.
+            raise RuntimeError(
+                "MM_TENANT_READ_FILTER=none is a measurement-only baseline; "
+                "the HTTP server refuses to start without a tenant read filter"
+            )
         _engine = MemoryEngine(
             config_path=config_path,
             config=config,

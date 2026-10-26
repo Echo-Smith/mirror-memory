@@ -74,8 +74,58 @@ _EXEMPT_PATTERNS = tuple(
         r"^\s*drop\s+table\s+(if\s+exists\s+)?[^;]*;?\s*$",
         # additive migration DDL (check_schema): no row access, one statement
         r"^\s*alter\s+table\s+[^;]*;?\s*$",
+        # Row-level-security posture DDL (M2 batch-2 task 1).  None of these
+        # can read or write a row: GRANT changes privileges, CREATE/DROP
+        # POLICY changes the catalog, CREATE ROLE creates a login.  Each is
+        # one statement (no separator) and anchored at both ends.  Note the
+        # role model, not the auditor, is what stops the app role from
+        # issuing them: they fail with "must be owner" at the database.
+        r"^\s*grant\s+[^;]*;?\s*$",
+        r"^\s*create\s+policy\s+[^;]*;?\s*$",
+        r"^\s*drop\s+policy\s+(if\s+exists\s+)?[^;]*;?\s*$",
+        r"^\s*create\s+role\s+[^;]*;?\s*$",
+        # The engine's own per-transaction tenant setting (core.rls), exactly
+        # as rendered -- both values are bound parameters.  Any OTHER
+        # statement touching the mm.* settings is a hard violation below.
+        r"^\s*select\s+set_config\('mm\.tenant_id',\s*%\(tenant_id\)s,\s*true\),\s*"
+        r"set_config\('mm\.app_id',\s*%\(app_id\)s,\s*true\)\s*;?\s*$",
     )
 )
+
+# ---------------------------------------------------------------------------
+# Hard violations (M2 batch-2 task 1): statements that would re-point or
+# switch off PostgreSQL row-level security from INSIDE an audited
+# connection.  Checked after the exact whitelist and before anything else;
+# a match anywhere in the text counts (``(^|;)`` catches a smuggled second
+# statement), and the verdict does not depend on parsing.
+#
+# - set_config('mm.*' ...) / SET [LOCAL|SESSION] mm.* : the tenant policy
+#   reads exactly these settings; re-pointing them is choosing another
+#   tenant's rows.  Only the engine's own statement above may set them.
+# - SET/RESET ROLE, SET SESSION AUTHORIZATION: switching to a role the
+#   maintenance policy admits.
+# - row_security: SET row_security=off makes a non-exempt role's queries
+#   error instead of bypassing, but it is never legitimate engine traffic.
+# ---------------------------------------------------------------------------
+
+_FORBIDDEN_PATTERNS = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bset_config\s*\(\s*'mm\.",
+        r"(?:^|;)\s*set\s+(?:local\s+|session\s+)?mm\.",
+        r"(?:^|;)\s*(?:set|reset)\s+(?:local\s+|session\s+)?role\b",
+        r"(?:^|;)\s*(?:set|reset)\s+session\s+authorization\b",
+        r"(?:^|;)\s*(?:set|reset)\s+(?:local\s+|session\s+)?row_security\b",
+        r"\bset_config\s*\(\s*'row_security'",
+    )
+)
+
+
+def _forbidden(sql: str) -> str | None:
+    for pat in _FORBIDDEN_PATTERNS:
+        if pat.search(sql):
+            return pat.pattern
+    return None
 
 # SQL text of every exempt statement, for reporting.
 _exemptions_seen: list[str] = []
@@ -234,6 +284,13 @@ def audit_sql(sql: str) -> None:
             _exemptions_seen.append(sql.strip()[:120])
         return
 
+    forbidden = _forbidden(sql)
+    if forbidden is not None:
+        raise AuditViolation(
+            "statement would re-point or switch off row-level security "
+            f"(matched {forbidden!r}): {sql[:200]!r}"
+        )
+
     # The verdict depends only on the statement text: the judge is
     # dialect-independent (the PK-addressing exemption is retired on every
     # dialect), bound parameters never affect the rules, and no context
@@ -263,16 +320,20 @@ _PG_PLACEHOLDER_RE = re.compile(
     #   %(name)s::TEXT[] (inside ARRAY[...]')  ->  ?
     # sqlglot cannot parse the psycopg placeholder form at all, and the
     # cast is irrelevant to the tenant rules (it only pins the bind value's
-    # type).  The cast tail is a sequence of type words (each optionally
-    # with a parenthesised length and/or an ``[]`` array suffix -- as ONE
-    # unit, so a word never swallows the ``]`` that closes an enclosing
-    # ARRAY[...] literal) and stops before any SQL keyword.
+    # type).  The cast tail is ONE type word (optionally with a
+    # parenthesised length and/or an ``[]`` array suffix, as one unit so a
+    # word never swallows the ``]`` closing an enclosing ARRAY[...])
+    # followed only by the continuation words multi-word PostgreSQL types
+    # are built from.  M2 batch-2: the tail used to be "any word not in a
+    # keyword stop-list", and ``%(c)s::VARCHAR LEFT OUTER JOIN
+    # pg_catalog.pg_class`` (SQLAlchemy's foreign-key reflection) lost its
+    # JOIN to the cast -- a parse failure, i.e. a false fail-closed verdict.
     r"%\([A-Za-z0-9_]+\)s"
     r"(?:::"
     r"[A-Za-z0-9_]+(?:\([0-9, ]+\))?(?:\[\])?"
-    r"(?:[ ](?!AND\b|OR\b|WHERE\b|FROM\b|GROUP\b|ORDER\b|LIMIT\b|RETURNING\b|VALUES\b|SET\b)"
-    r"[A-Za-z0-9_]+(?:\([0-9, ]+\))?(?:\[\])?)*"
-    r")?"
+    r"(?:[ ](?:WITHOUT|WITH|TIME|ZONE|PRECISION|VARYING)\b(?:\([0-9, ]+\))?(?:\[\])?)*"
+    r")?",
+    re.IGNORECASE,
 )
 
 

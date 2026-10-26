@@ -703,8 +703,10 @@ class InterventionEvent(TenantScoped, Base):
 
 
 # All tables are defined; install the authoring-time write guard for the
-# protected belief tables (see core.tenancy) and refuse table names the
-# SQL auditor would classify as catalog relations.
+# protected belief tables (see core.tenancy), refuse table names the SQL
+# auditor would classify as catalog relations, and attach the PostgreSQL
+# per-transaction tenant setting (see core.rls).
+from mirror_memory.core.rls import install_rls_hooks  # noqa: E402
 from mirror_memory.core.tenancy import (  # noqa: E402
     assert_tenant_table_names,
     install_write_guard,
@@ -712,3 +714,4 @@ from mirror_memory.core.tenancy import (  # noqa: E402
 
 install_write_guard()
 assert_tenant_table_names(Base.metadata.tables)
+install_rls_hooks()

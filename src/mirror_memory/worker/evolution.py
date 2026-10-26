@@ -156,10 +156,14 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
     """
     from mirror_memory.core.tenancy import system_scope
 
-    session = session_factory() if callable(session_factory) else session_factory
-
+    session = None
     try:
         with system_scope(reason="evolution worker: crash-recovery sweep and pending-job scan"):
+            # The scan session is created INSIDE the scope: on PostgreSQL with
+            # row-level security that binds it to the maintenance engine
+            # (core.tenancy routes system_scope sessions), where the
+            # cross-tenant scan can see every tenant's jobs.
+            session = session_factory() if callable(session_factory) else session_factory
             # Crash recovery: expire leases whose holder is gone.  The
             # lease_token is deliberately NOT reset -- it is the monotonic
             # fencing generation (I3).
@@ -184,7 +188,8 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
         for job in jobs:
             _claim_and_process(session_factory, job, config)
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 class LeaseLost(RuntimeError):

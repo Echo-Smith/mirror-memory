@@ -343,3 +343,51 @@ def test_live_metadata_passes_the_table_name_check():
 
     assert_tenant_table_names(Base.metadata.tables)
     assert not any(name.startswith("pg_") for name in Base.metadata.tables)
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2: the cast tail must stop before a JOIN (reflection shapes)
+# ---------------------------------------------------------------------------
+
+
+def test_cast_tail_stops_before_a_join_so_reflection_parses():
+    """SQLAlchemy's foreign-key reflection: ``%(c)s::VARCHAR LEFT OUTER JOIN
+    pg_catalog.pg_class`` -- the old keyword stop-list did not know JOIN,
+    swallowed the join into the cast, and the statement failed to parse
+    (a false fail-closed verdict on a catalog-only statement)."""
+    sql = (
+        "SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class "
+        "LEFT OUTER JOIN pg_catalog.pg_constraint ON pg_catalog.pg_class.oid = "
+        "pg_catalog.pg_constraint.conrelid AND pg_catalog.pg_constraint.contype = "
+        "%(contype_1)s::VARCHAR LEFT OUTER JOIN pg_catalog.pg_class AS cls_ref "
+        "ON cls_ref.oid = pg_catalog.pg_constraint.confrelid"
+    )
+    assert _audit_as(sql, "postgresql") is None
+    # The same shape over tenant tables keeps every table visible: the
+    # JOINed table without predicates is still a violation.
+    leaky = (
+        "SELECT b.id FROM mm_beliefs AS b LEFT OUTER JOIN mm_evidence AS e "
+        "ON b.id = e.belief_id AND e.kind = %(k)s::VARCHAR "
+        "WHERE b.tenant_id = %(t)s AND b.app_id = %(a)s"
+    )
+    assert _audit_as(leaky, "postgresql") is not None
+
+
+@pytest.mark.parametrize(
+    "cast",
+    [
+        "TIMESTAMP WITHOUT TIME ZONE",
+        "TIMESTAMP WITH TIME ZONE",
+        "DOUBLE PRECISION",
+        "CHARACTER VARYING(64)",
+        "VARCHAR(64)",
+        "TEXT[]",
+        "INTEGER",
+    ],
+)
+def test_multi_word_cast_types_still_normalise(cast):
+    sql = (
+        f"SELECT id FROM mm_beliefs WHERE created_at = %(c)s::{cast} "
+        "AND tenant_id = %(t)s AND app_id = %(a)s"
+    )
+    assert _audit_as(sql, "postgresql") is None

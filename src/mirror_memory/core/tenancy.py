@@ -402,6 +402,94 @@ def set_single_tenant_mode(enabled: bool) -> None:
     _single_tenant_mode.set(enabled)
 
 
+# ---------------------------------------------------------------------------
+# Read-filter mode (M2 batch-2 task 5 measurement modes)
+#
+#   app  -- application-layer injection filters reads (default; the only
+#           mode SQLite supports).  On PostgreSQL the row-level-security
+#           policies apply as well: this is perf mode A.
+#   rls  -- the per-statement injection is skipped and PostgreSQL row-level
+#           security alone filters reads; the write-side checks (before_flush,
+#           write guard, session.get/merge wrappers) stay on.  Perf mode B.
+#           Refused on any non-PostgreSQL bind: without RLS, skipping the
+#           injection would be a leak.
+#   none -- NO tenant read filter at all: the measurement-only baseline (perf
+#           mode C).  Requires MM_ALLOW_UNFILTERED_MEASUREMENT=1 as well, and
+#           the HTTP server refuses to start in it (see server.create_app).
+# ---------------------------------------------------------------------------
+
+READ_FILTER_APP = "app"
+READ_FILTER_RLS = "rls"
+READ_FILTER_NONE = "none"
+_READ_FILTER_MODES = (READ_FILTER_APP, READ_FILTER_RLS, READ_FILTER_NONE)
+
+_read_filter_override: ContextVar[str | None] = ContextVar("mm_read_filter", default=None)
+_read_filter_cached: str | None = None
+
+
+def read_filter_mode() -> str:
+    """The active read-filter mode (see the block comment above)."""
+    override = _read_filter_override.get()
+    if override is not None:
+        return override
+    global _read_filter_cached
+    if _read_filter_cached is None:
+        _read_filter_cached = _read_filter_from_env()
+    return _read_filter_cached
+
+
+def _read_filter_from_env() -> str:
+    import os
+
+    mode = os.environ.get("MM_TENANT_READ_FILTER", READ_FILTER_APP).strip().lower()
+    if mode not in _READ_FILTER_MODES:
+        raise TenantError(
+            f"MM_TENANT_READ_FILTER must be one of {_READ_FILTER_MODES}; got {mode!r}"
+        )
+    if mode == READ_FILTER_NONE and os.environ.get("MM_ALLOW_UNFILTERED_MEASUREMENT") != "1":
+        raise TenantError(
+            "MM_TENANT_READ_FILTER=none disables every tenant read filter; it is "
+            "a measurement-only baseline and additionally requires "
+            "MM_ALLOW_UNFILTERED_MEASUREMENT=1"
+        )
+    return mode
+
+
+def reset_read_filter_cache() -> None:
+    """Forget the environment-derived mode (tests that change the env)."""
+    global _read_filter_cached
+    _read_filter_cached = None
+
+
+@contextlib.contextmanager
+def read_filter_override(mode: str) -> Iterator[None]:
+    """Force a read-filter mode for the block (tests / measurement harness)."""
+    if mode not in _READ_FILTER_MODES:
+        raise TenantError(f"unknown read-filter mode {mode!r}")
+    token = _read_filter_override.set(mode)
+    try:
+        yield
+    finally:
+        _read_filter_override.reset(token)
+
+
+def _skip_read_injection(session: Session) -> bool:
+    """True when this statement must NOT get the loader criteria."""
+    if _single_tenant_mode.get():
+        return True
+    mode = read_filter_mode()
+    if mode == READ_FILTER_APP:
+        return False
+    if mode == READ_FILTER_RLS:
+        bind = session.bind if session is not None else None
+        if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
+            raise TenantError(
+                "MM_TENANT_READ_FILTER=rls needs PostgreSQL row-level security; "
+                "this session is bound to a database without it"
+            )
+    return True
+
+
 def _criteria_template(cls):
     return (cls.tenant_id == _tenant_bind) & (cls.app_id == _app_bind)
 
@@ -479,9 +567,10 @@ def _inject_tenant_criteria(state) -> None:
     tenant = _tenant_var.get()
     if tenant is not None:
         _check_session_tenant(state.session, tenant)
-        if _single_tenant_mode.get():
-            # Task 6: one fixed tenant on the device; the per-statement
-            # injection is the cloud multi-tenant cost and is skipped.
+        if _skip_read_injection(state.session):
+            # Single-tenant mode (one fixed tenant on the device) or a
+            # read-filter mode where PostgreSQL row-level security does the
+            # filtering (rls) / nothing does (none, measurement only).
             # Fail-closed / flush / guard layers remain active.
             return
         # Fast path: attach the shared tenant-agnostic criteria.  It only
@@ -630,11 +719,55 @@ _original_get = Session.get
 
 
 def _tenant_bound_session_init(self, *args: Any, **kwargs: Any) -> None:
+    if in_system_scope():
+        args, kwargs = _route_system_scope_bind(args, kwargs)
     _original_session_init(self, *args, **kwargs)
     # Bind the session to the tenant that was ambient at creation time.
     # A session created outside any scope is bound to None and may only be
     # used for non-tenant work or under system_scope.
     self.info[BOUND_TENANT_KEY] = _tenant_var.get()
+
+
+def _route_system_scope_bind(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """Sessions created inside ``system_scope`` on a PostgreSQL engine with
+    row-level security run on the MAINTENANCE engine (M2 batch-2 task 1).
+
+    The app role is admitted only by the tenant policy, and system work has
+    no tenant: a queue scan on the app engine would see 0 rows and report
+    an empty queue rather than fail.  Re-binding here keeps the seven
+    ``system_scope`` call sites unchanged (they still take the host's
+    session factory) and makes the routing a property of the scope itself.
+    SQLite and RLS-off engines are returned untouched; a missing
+    maintenance registration is a hard error (``system_engine_for``).
+    """
+    from sqlalchemy.engine import Connection, Engine
+
+    bind = kwargs.get("bind", args[0] if args else None)
+    if bind is None:
+        return args, kwargs
+    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    if dialect != "postgresql":
+        return args, kwargs
+    from mirror_memory.core.rls import RowSecurityError, rls_enabled, system_engine_for
+
+    if not rls_enabled():
+        return args, kwargs
+    if isinstance(bind, Connection):
+        raise RowSecurityError(
+            "a Session bound to a raw Connection cannot be re-routed to the "
+            "maintenance role inside system_scope; bind it to "
+            "system_engine_for(engine) instead"
+        )
+    if not isinstance(bind, Engine):
+        return args, kwargs
+    routed = system_engine_for(bind)
+    if routed is bind:
+        return args, kwargs
+    if "bind" in kwargs:
+        kwargs = dict(kwargs, bind=routed)
+    else:
+        args = (routed,) + tuple(args[1:])
+    return args, kwargs
 
 
 def _tenant_aware_get(self, entity, primary_key, *args, **kwargs):

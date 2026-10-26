@@ -347,7 +347,7 @@ def test_database_already_at_version_1_advances_to_step_2(base_db):
 
     # The full plan now runs only the steps above version 1.
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == 2
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     after = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
     if eng.dialect.name == "postgresql":
         assert after == ["tenant_id", "app_id", "id"], after

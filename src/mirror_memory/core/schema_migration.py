@@ -921,10 +921,97 @@ def _verify_tenant_primary_keys(engine: Engine) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Step 3: row-level security (M2 batch-2 task 1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Step3RowLevelSecurity:
+    """Install the PostgreSQL second defence: roles, ownership, grants,
+    ``ENABLE`` + ``FORCE ROW LEVEL SECURITY`` and the two policies on every
+    tenant table (see ``core.rls`` for the role model and why the
+    maintenance role is a policy rather than BYPASSRLS).
+
+    Re-entrant by construction: roles are created only when missing,
+    ownership transfers and GRANTs are idempotent, ENABLE/FORCE are
+    idempotent, and each policy is dropped-if-exists and recreated.  The
+    connected role must own the tables (or be superuser) and must hold
+    CREATEROLE if the roles do not exist yet; a privilege failure on role
+    creation aborts BEFORE any table is touched.
+
+    SQLite has no row-level security: nothing is altered and the version
+    still advances so both databases share one version sequence.
+    """
+
+    version: int = 3
+    name: str = "row-level security"
+
+    def needed(self, engine: Engine) -> bool:
+        if not _is_postgres(engine):
+            return False
+        from mirror_memory.core import rls
+
+        if rls.missing_roles(engine):
+            return True
+        try:
+            rls.verify_posture(engine)
+        except rls.RowSecurityError:
+            return True
+        return False
+
+    def apply(self, engine: Engine) -> None:
+        if not _is_postgres(engine):
+            return
+        install_row_level_security(engine, verify=False)
+
+    def verify(self, engine: Engine) -> None:
+        if not _is_postgres(engine):
+            return
+        from mirror_memory.core import rls
+
+        rls.verify_posture(engine)
+
+
+def install_row_level_security(engine: Engine, *, verify: bool = True) -> None:
+    """Bring a PostgreSQL database to the RLS posture (idempotent).
+
+    Roles first, so an insufficient-privilege failure leaves the tables
+    untouched; then the table plan in one transaction.  Hosts call this
+    through :func:`upgrade_database` (step 3); the test harness calls it
+    directly on each freshly created schema.
+    """
+    from sqlalchemy.exc import ProgrammingError
+
+    from mirror_memory.core import rls
+
+    if not _is_postgres(engine):
+        raise MigrationRefused("row-level security is PostgreSQL only")
+    missing = rls.missing_roles(engine)
+    if missing:
+        try:
+            _DDLPlan([rls.CreateRole(name, login) for name, login in missing]).run(engine)
+        except ProgrammingError as exc:
+            wanted = ", ".join(
+                "CREATE ROLE %s %s" % (name, "LOGIN" if login else "NOLOGIN")
+                for name, login in missing
+            )
+            raise MigrationRefused(
+                "the migration login may not create roles; create them first "
+                "(" + wanted + ") and set their credentials, then re-run"
+            ) from exc
+    _DDLPlan(rls.rls_plan(engine)).run(engine)
+    if verify:
+        rls.verify_posture(engine)
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
-DEFAULT_STEPS: list = [Step1Tenancy(), Step2TenantPrimaryKeys()]
+DEFAULT_STEPS: list = [Step1Tenancy(), Step2TenantPrimaryKeys(), Step3RowLevelSecurity()]
+
+#: The version a freshly upgraded database records.
+LATEST_VERSION: int = max(step.version for step in DEFAULT_STEPS)
 
 
 def upgrade_database(
