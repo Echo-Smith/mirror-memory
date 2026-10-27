@@ -58,7 +58,13 @@
 新租户包装的创建在缓存锁之外完成（锁内只放占位符），同一租户的并发首
 请求等待同一个结果，别的租户不被冷启动阻塞。SQLite 保持每租户一引擎。
 
-## 4. 备份
+## 4. 测量开关（生产不用）
+
+`MM_TENANT_READ_FILTER=rls|none`、`MM_PG_RLS=0`、`MM_ALLOW_UNFILTERED_MEASUREMENT=1`、
+`MM_LONGRUN_DATABASE_URL`（longrun 基准指向 PG）只服务 `.github/workflows/m2-rls-perf.yml`
+与 `tools/m2_mode_perf.py` 的三模式测量；server 在 `none` 下拒绝启动。
+
+## 5. 备份
 
 PostgreSQL 迁移前要求 `confirm_backup=True`；库不复制文件，缺参数时打印
 `pg_dump` 命令提示。

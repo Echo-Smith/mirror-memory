@@ -535,11 +535,23 @@ def test_auditor_still_rejects_smuggling_behind_posture_ddl():
     assert _audit_as('DROP POLICY "p" ON "mm_beliefs"; SELECT * FROM mm_beliefs') is not None
 
 
-def test_read_filter_rls_mode_is_refused_on_sqlite(db_session):
+def test_read_filter_rls_mode_keeps_injection_on_sqlite(db_session):
+    """RLS cannot carry the read filter on SQLite, so the rls mode falls back
+    to the application-layer injection there (the stronger filter), instead
+    of silently reading unfiltered or refusing to run."""
     if db_session.get_bind().dialect.name != "sqlite":
-        pytest.skip("the refusal is for binds without row-level security")
-    with read_filter_override("rls"), pytest.raises(TenantError, match="PostgreSQL"):
-        db_session.query(Belief).all()
+        pytest.skip("the fallback is for binds without row-level security")
+    with fixture_write_scope("rls fallback seed"):
+        db_session.add(Belief(user_id="u", dimension="d", key="mine", claim_text="default's", confidence=0.5))
+        db_session.commit()
+        with tenant_scope("tOther", "app"):
+            other = Session(db_session.get_bind())
+            other.add(Belief(user_id="u", dimension="d", key="theirs", claim_text="other's", confidence=0.5))
+            other.commit()
+            other.close()
+    with read_filter_override("rls"):
+        assert [b.key for b in db_session.query(Belief).all()] == ["mine"]
+        assert db_session.query(Belief).count() == 1
 
 
 def test_read_filter_none_is_measurement_only(monkeypatch):

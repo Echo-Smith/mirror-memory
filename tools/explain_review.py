@@ -330,6 +330,23 @@ def render(title: str, rows: list[tuple[str, str, dict]], counts: dict[str, int]
     return "\n".join(lines) + "\n"
 
 
+def bootstrap_app_login(admin_url: str, password: str) -> None:
+    """CI only: make sure the app role exists as a LOGIN with *password*
+    (psycopg identifier/literal composition -- no string assembly)."""
+    import psycopg
+    from psycopg import sql
+    from sqlalchemy.engine import make_url
+
+    from mirror_memory.core import rls
+
+    conninfo = make_url(admin_url).set(drivername="postgresql").render_as_string(hide_password=False)
+    name = rls.app_role()
+    with psycopg.connect(conninfo, autocommit=True) as conn:
+        exists = conn.execute("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s", (name,)).fetchone()
+        verb = "ALTER ROLE {} WITH LOGIN PASSWORD {}" if exists else "CREATE ROLE {} LOGIN PASSWORD {}"
+        conn.execute(sql.SQL(verb).format(sql.Identifier(name), sql.Literal(password)))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--admin-url", required=True)
@@ -338,9 +355,13 @@ def main() -> int:
     ap.add_argument("--beliefs-per-tenant", type=int, default=10_000)
     ap.add_argument("--users-per-tenant", type=int, default=100)
     ap.add_argument("--candidate-indexes", action="store_true")
+    ap.add_argument("--bootstrap-app-password", default="",
+                    help="create/alter the app login with this password first (CI: no prior role setup)")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
+    if args.bootstrap_app_password:
+        bootstrap_app_login(args.admin_url, args.bootstrap_app_password)
     admin = create_engine(args.admin_url)
     app = create_engine(args.app_url)
     t0 = time.monotonic()

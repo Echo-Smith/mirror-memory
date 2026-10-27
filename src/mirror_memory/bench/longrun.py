@@ -335,6 +335,7 @@ def run_longrun(
     user_id: str = "longrun-u1",
     seed: int = SEED,
     scenario_kwargs: dict | None = None,
+    database_url: str | None = None,
 ) -> LongRunReport:
     """Drive the engine through the scripted year and verify the outcome."""
     from sqlalchemy import select
@@ -359,7 +360,13 @@ def run_longrun(
     scenario = scenario or build_scenario(rng, **(scenario_kwargs or {}))
     report = LongRunReport()
 
-    engine = MemoryEngine(config=config, database_url="sqlite://")
+    # The bench runs in-memory by default; MM_LONGRUN_DATABASE_URL (or the
+    # argument) points it at a prepared PostgreSQL schema so the hosted
+    # shape can be measured (M2 batch-2 task 5).
+    import os
+
+    url = database_url or os.environ.get("MM_LONGRUN_DATABASE_URL") or "sqlite://"
+    engine = MemoryEngine(config=config, database_url=url)
     engine._ensure_db()
     start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -554,7 +561,19 @@ def run_longrun(
     with engine._session() as session:
         report.beliefs = session.query(Belief).filter_by(user_id=user_id).count()
         report.evidence_rows = session.query(Evidence).filter_by(user_id=user_id).count()
-        pages = session.execute(text("PRAGMA page_count")).scalar()
+        if session.get_bind().dialect.name == "postgresql":
+            # pages of the mm_* relations (heap + indexes + toast), in
+            # block_size units so the figure is comparable with SQLite's
+            pages = session.execute(text(
+                "SELECT COALESCE(SUM(pg_catalog.pg_total_relation_size(c.oid)), 0) "
+                "/ current_setting('block_size')::bigint "
+                "FROM pg_catalog.pg_class AS c "
+                "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+                "WHERE c.relkind = 'r' AND n.nspname = current_schema() "
+                "AND c.relname LIKE 'mm\\_%'"
+            )).scalar()
+        else:
+            pages = session.execute(text("PRAGMA page_count")).scalar()
         report.db_pages = int(pages or 0)
 
         # Semantic preservation: the canonical facts that must still be

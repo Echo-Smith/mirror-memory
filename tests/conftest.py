@@ -168,6 +168,16 @@ def _pg_url() -> str | None:
 PG_TEST_ROLE_PASSWORDS = {"app": "mm_app_test", "maintenance": "mm_maintenance_test"}
 
 
+def _pg_runtime_url() -> str | None:
+    """The URL tenant work runs on: the app role under RLS; the admin login
+    when RLS is switched off (``MM_PG_RLS=0``, the measurement-only
+    baseline C -- no policies, no per-transaction setting, superuser
+    connection)."""
+    from mirror_memory.core import rls
+
+    return _pg_role_url("app") if rls.rls_enabled() else _pg_url()
+
+
 def _pg_role_url(kind: str) -> str | None:
     """The admin URL re-pointed at the app / maintenance login."""
     admin = _pg_url()
@@ -303,7 +313,10 @@ def _pg_fresh_schema(admin_engine) -> None:
         )
         drop_bounded()
     Base.metadata.create_all(admin_engine)
-    install_row_level_security(admin_engine, verify=False)
+    from mirror_memory.core import rls
+
+    if rls.rls_enabled():
+        install_row_level_security(admin_engine, verify=False)
 
 
 @pytest.fixture
@@ -323,8 +336,9 @@ def pg_admin_engine():
 
 @pytest.fixture
 def pg_app_url(pg_admin_engine):
-    """The app-role URL for the schema ``pg_admin_engine`` just built."""
-    return _pg_role_url("app")
+    """The runtime URL for the schema ``pg_admin_engine`` just built: the
+    app role under RLS, the admin login when RLS is off (mode C)."""
+    return _pg_runtime_url()
 
 
 @pytest.fixture
@@ -421,7 +435,7 @@ def db_session():
         return
     admin_engine = create_engine(pg, echo=False)
     _pg_fresh_schema(admin_engine)
-    engine = create_engine(_pg_role_url("app"), echo=False)
+    engine = create_engine(_pg_runtime_url(), echo=False)
     SessionFactory = sessionmaker(bind=engine)
     session = SessionFactory()
     try:

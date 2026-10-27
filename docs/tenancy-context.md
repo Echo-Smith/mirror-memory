@@ -215,8 +215,8 @@ set_config('mm.app_id', %(app_id)s, true)`——两个值是绑定参数，
 超级用户会无声通过所有策略，让第二道防线看起来开着实际是空的。
 
 **读过滤模式** `MM_TENANT_READ_FILTER`（任务 5 的 A/B/C）：`app`（默认，
-应用层注入 + RLS）、`rls`（跳过注入，RLS 独自过滤读；非 PG bind 直接
-拒绝）、`none`（无任何读过滤，**仅测量**：还需
+应用层注入 + RLS）、`rls`（跳过注入，RLS 独自过滤读；非 PG bind 回退到注入——
+回退到更强的过滤是安全的）、`none`（无任何读过滤，**仅测量**：还需
 `MM_ALLOW_UNFILTERED_MEASUREMENT=1`，server 拒绝启动）。
 
 **审计器新规则**：引擎自己的那条 set_config 语句精确放行；其他任何设置

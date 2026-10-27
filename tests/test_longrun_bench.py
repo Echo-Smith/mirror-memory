@@ -31,6 +31,21 @@ def config():
 SMALL = dict(days=40, preferences=12, goals=5, corrections=6, conflicts=5, forgets=3)
 
 
+@pytest.fixture(autouse=True)
+def _bench_database(request, monkeypatch):
+    """Point the bench at the database under test: in-memory SQLite by
+    default; on the PostgreSQL leg a fresh RLS-protected schema and the
+    runtime login (M2 batch-2 task 5 measures the hosted shape)."""
+    import os
+
+    if os.environ.get("MM_DATABASE_URL", "").startswith("postgres"):
+        # pg_app_url builds the fresh schema and returns the runtime login
+        monkeypatch.setenv("MM_LONGRUN_DATABASE_URL", request.getfixturevalue("pg_app_url"))
+    else:
+        monkeypatch.delenv("MM_LONGRUN_DATABASE_URL", raising=False)
+    yield
+
+
 class TestScenarioGeneration:
     def test_small_scenario_is_bounded(self):
         scenario = build_scenario(random.Random(7), **SMALL)

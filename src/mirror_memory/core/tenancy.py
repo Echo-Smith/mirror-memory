@@ -411,8 +411,8 @@ def set_single_tenant_mode(enabled: bool) -> None:
 #   rls  -- the per-statement injection is skipped and PostgreSQL row-level
 #           security alone filters reads; the write-side checks (before_flush,
 #           write guard, session.get/merge wrappers) stay on.  Perf mode B.
-#           Refused on any non-PostgreSQL bind: without RLS, skipping the
-#           injection would be a leak.
+#           A non-PostgreSQL bind keeps the injection (RLS cannot carry the
+#           filter there; falling back to the stronger filter is safe).
 #   none -- NO tenant read filter at all: the measurement-only baseline (perf
 #           mode C).  Requires MM_ALLOW_UNFILTERED_MEASUREMENT=1 as well, and
 #           the HTTP server refuses to start in it (see server.create_app).
@@ -481,12 +481,13 @@ def _skip_read_injection(session: Session) -> bool:
     if mode == READ_FILTER_APP:
         return False
     if mode == READ_FILTER_RLS:
+        # RLS can only carry the read filter on a PostgreSQL bind.  Any other
+        # bind (an in-memory SQLite engine in the same process, say) keeps
+        # the application-layer injection: falling back to the STRONGER
+        # filter is safe; skipping it would be a leak.
         bind = session.bind if session is not None else None
         if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
-            raise TenantError(
-                "MM_TENANT_READ_FILTER=rls needs PostgreSQL row-level security; "
-                "this session is bound to a database without it"
-            )
+            return False
     return True
 
 

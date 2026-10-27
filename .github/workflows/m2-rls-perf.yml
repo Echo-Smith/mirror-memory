@@ -1,0 +1,128 @@
+name: m2-rls-perf
+
+# M2 batch-2 task 5: the multi-tenant performance final on PostgreSQL.
+#
+# Three modes of the SAME revision, interleaved x3 (full suite + longrun):
+#   C  measurement-only baseline -- no tenant read filter, no RLS, superuser
+#      connection (MM_TENANT_READ_FILTER=none + MM_ALLOW_UNFILTERED_MEASUREMENT=1
+#      + MM_PG_RLS=0); never shipped
+#   A  application-layer read injection + RLS (production today)
+#   B  RLS carries the read filter; the application keeps the write checks
+#
+# Methodology (tools/m2_mode_perf.py) = M1 task 0 / M2 batch-1 patch with
+# "mode" where they had "revision": the measured set is the ID INTERSECTION
+# of the tests passing in every mode's calibration run; every run writes
+# junit XML; a round is VALID only when all three modes pass exactly |ids|
+# tests with zero failures.  Auditor OFF in every leg (the M1 figure).
+#
+# Pre-agreed decision rule: B passes the task-1 isolation gate AND longrun
+# B/C <= 1.15 AND B at least 5 points below A on longrun -> recommend B as
+# the PostgreSQL default (SQLite keeps A); otherwise keep A.
+#
+# Trigger: a push to the dedicated branch (workflow_dispatch needs the file
+# on the default branch, which the M2 branch must not touch).
+
+on:
+  push:
+    branches: ["perf/m2-batch2"]
+  workflow_dispatch:
+
+env:
+  ADMIN_URL: postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+          pip install "sqlglot>=25.0"
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 60); do
+            if python -c "import psycopg; psycopg.connect('postgresql://postgres:mm@127.0.0.1:5432/mm_test').close()" 2>/dev/null; then
+              echo "postgres ready after attempt $i"; exit 0
+            fi
+            sleep 3
+          done
+          echo "postgres not ready"; exit 1
+      - name: Calibrate, measure (C/A/B x3, full + longrun), gate, decide
+        run: |
+          python tools/m2_mode_perf.py all --admin-url "$ADMIN_URL" \
+            --work /tmp/m2_mode_perf --rounds 3 --out /tmp/m2_mode_perf/report.json
+      - name: Upload raw outputs and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m2-rls-perf
+          path: /tmp/m2_mode_perf
+          if-no-files-found: warn
+
+  explain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 60); do
+            if python -c "import psycopg; psycopg.connect('postgresql://postgres:mm@127.0.0.1:5432/mm_test').close()" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
+          exit 1
+      - name: EXPLAIN review (100 tenants x 10k beliefs; C / A / B; candidate indexes)
+        run: |
+          python tools/explain_review.py --admin-url "$ADMIN_URL" \
+            --app-url "postgresql+psycopg://mm_app:ci-app@127.0.0.1:5432/mm_test" \
+            --bootstrap-app-password ci-app --candidate-indexes \
+            --out /tmp/explain_review_ci.md
+          cat /tmp/explain_review_ci.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m2-explain-review
+          path: /tmp/explain_review_ci.md
