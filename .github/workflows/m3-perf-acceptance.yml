@@ -57,6 +57,14 @@ jobs:
         run: |
           set -eu
           python tools/perf_ids.py collect 403f38d HEAD --out /tmp/ids.txt
+          # Mechanism tests that cannot run under the measurement口径
+          # (auditor off): the two auditor verdict-cache tests require the
+          # audit listener installed; the writer-caller scanner tests
+          # compare src against the repo-root yaml, which the revision
+          # checkout does not rewind.  They carry zero timing signal.
+          grep -v "test_sql_auditor.py::test_cache_context" /tmp/ids.txt \
+            | grep -v "tests/test_writer_callers.py" > /tmp/ids_filtered.txt || true
+          mv /tmp/ids_filtered.txt /tmp/ids.txt
           wc -l < /tmp/ids.txt | tee -a "$GITHUB_STEP_SUMMARY"
           test -s /tmp/ids.txt
           grep "test_longrun_bench" /tmp/ids.txt > /tmp/lr_ids.txt
