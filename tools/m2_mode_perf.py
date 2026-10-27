@@ -249,6 +249,37 @@ def cmd_gate(admin_url: str, work: Path, summary: Path | None) -> dict:
     return result
 
 
+def cmd_longrun_ac(admin_url: str, rounds: int, work: Path, summary: Path | None) -> dict:
+    """A-vs-C longrun only (M2 batch-2 patch acceptance): for when the
+    worker's transaction structure changed but everything else did not.
+    The longrun ids pass in every mode (both prior full finals), so the
+    set is simply tests/test_longrun_bench.py; three interleaved rounds,
+    validated the same way."""
+    ids = [i for i in collect_ids(mode_env("A", admin_url), ["tests/test_longrun_bench.py"])]
+    ids_file = work / "longrun_ac_ids.txt"
+    ids_file.write_text("\n".join(ids) + "\n", encoding="utf-8")
+    report: dict = {"ids": len(ids), "modes": ["C", "A"], "rounds": []}
+    _emit(summary, f"### longrun A vs C ({len(ids)} ids), interleaved x{rounds}, auditor off")
+    for r in range(1, rounds + 1):
+        row: dict = {}
+        for tag in ("C", "A"):
+            junit = work / f"ac_{tag}_{r}.xml"
+            secs = _run_ids(ids_file, mode_env(tag, admin_url), junit, work / (junit.stem + ".txt"))
+            counts = junit_counts(junit)
+            row[tag] = {"secs": round(secs, 1), **counts, "valid": counts["failed"] == 0 and counts["errors"] == 0 and counts["passed"] == len(ids)}
+        row["valid"] = all(row[t]["valid"] for t in ("C", "A"))
+        report["rounds"].append(row)
+        _emit(summary, f"round {r}: C {row['C']['secs']}s | A {row['A']['secs']}s | "
+                       f"{'VALID' if row['valid'] else 'INVALID'}")
+    valid = [r for r in report["rounds"] if r["valid"]]
+    if valid:
+        c = min(r["C"]["secs"] for r in valid); a = min(r["A"]["secs"] for r in valid)
+        report["ratios"] = {"A/C_min": round(a / c, 3), "rounds_valid": len(valid)}
+        _emit(summary, f"min ratio A/C = {a / c:.3f} over {len(valid)} valid round(s)")
+    (work / "longrun_ac.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 def cmd_decide(measure: dict, gate: dict, summary: Path | None) -> dict:
     """Pre-agreed rule: B passes the task-1 isolation gate, longrun B/C
     <= 1.15 and B at least 5 points below A on longrun -> recommend B for
@@ -280,7 +311,7 @@ def cmd_decide(measure: dict, gate: dict, summary: Path | None) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["calibrate", "measure", "gate", "decide", "all"])
+    ap.add_argument("command", choices=["calibrate", "measure", "gate", "decide", "all", "longrun-ac"])
     ap.add_argument("--admin-url", required=True)
     ap.add_argument("--work", default="/tmp/m2_mode_perf")
     ap.add_argument("--rounds", type=int, default=3)
@@ -303,6 +334,8 @@ def main() -> int:
         measure = json.loads((work / "measure.json").read_text(encoding="utf-8"))
         gate = json.loads((work / "gate.json").read_text(encoding="utf-8"))
         cmd_decide(measure, gate, summary)
+    elif args.command == "longrun-ac":
+        cmd_longrun_ac(args.admin_url, args.rounds, work, summary)
     else:
         calib = cmd_calibrate(args.admin_url, ids_file, work, args.files, summary)
         measure = cmd_measure(args.admin_url, ids_file, args.rounds, work, summary)
