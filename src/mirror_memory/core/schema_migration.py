@@ -1097,6 +1097,119 @@ class Step4PendingJobsIndex:
             )
 
 
+# ---------------------------------------------------------------------------
+# Step 5: (tenant_id, app_id, user_id) replaces the single-column user_id
+# indexes (M2 batch-2 patch task 3)
+# ---------------------------------------------------------------------------
+
+
+def _tenant_user_index_pair(table_name: str, concurrently: bool):
+    """(new composite index, legacy single-column index) for *table_name*,
+    both on a DETACHED copy of the table so neither touches Base.metadata
+    (the model already carries the composite one)."""
+    from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
+
+    table = Base.metadata.tables[table_name].to_metadata(MetaData())
+    for index in list(table.indexes):
+        if index.name in (tenant_user_index_name(table_name), legacy_user_index_name(table_name)):
+            table.indexes.discard(index)
+    new = Index(
+        tenant_user_index_name(table_name),
+        table.c.tenant_id, table.c.app_id, table.c.user_id,
+        postgresql_concurrently=concurrently,
+    )
+    old = Index(legacy_user_index_name(table_name), table.c.user_id, postgresql_concurrently=concurrently)
+    return new, old
+
+
+@dataclass
+class Step5TenantUserIndexes:
+    """Replace ``ix_<table>_user_id`` with ``ix_<table>_tenant_user`` on
+    ``(tenant_id, app_id, user_id)`` for every tenant table with a
+    ``user_id`` column -- a replacement, not an addition: the index count
+    per table does not grow.
+
+    Why: user ids repeat across tenants, so the bare ``user_id`` index
+    matches every tenant's rows for an id and the planner intersects it
+    with the primary key (EXPLAIN review, M2 batch-2 task 4: the delete-by-
+    user path was a BitmapAnd over 10k candidates at 100 tenants).  Every
+    by-user statement carries the tenant predicates, so the prefixed index
+    serves it exactly.  No ``system_scope`` (cross-tenant) query filters by
+    ``user_id`` -- the queue scan is by status / created_at -- so nothing
+    loses an index it relied on.
+
+    PostgreSQL per table: ``CREATE INDEX CONCURRENTLY`` the new index (an
+    INVALID leftover of a failed build is dropped first), then ``DROP INDEX
+    CONCURRENTLY`` the old one; both outside transactions, both
+    re-entrant.  SQLite: plain create / drop with ``checkfirst``.
+    """
+
+    version: int = 5
+    name: str = "tenant-prefixed user_id indexes"
+
+    def tables(self) -> list[str]:
+        from mirror_memory.core.models import TENANT_USER_INDEXED_TABLES
+
+        return list(TENANT_USER_INDEXED_TABLES)
+
+    def _states(self, engine: Engine, table_name: str):
+        from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
+
+        return (
+            _index_state(engine, table_name, tenant_user_index_name(table_name)),
+            _index_state(engine, table_name, legacy_user_index_name(table_name)),
+        )
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        for name in self.tables():
+            if not insp.has_table(name):
+                continue
+            new_state, old_state = self._states(engine, name)
+            if new_state != "valid" or old_state is not None:
+                return True
+        return False
+
+    def apply(self, engine: Engine) -> None:
+        insp = inspect(engine)
+        pg = _is_postgres(engine)
+        for name in self.tables():
+            if not insp.has_table(name):
+                continue
+            new_state, old_state = self._states(engine, name)
+            new, old = _tenant_user_index_pair(name, concurrently=pg)
+            if pg:
+                elements: list = [_lock_timeout_element()]
+                if new_state == "invalid":
+                    elements.append(DropIndex(new, if_exists=True))
+                if new_state != "valid":
+                    elements.append(CreateIndex(new))
+                if old_state is not None:
+                    elements.append(DropIndex(old, if_exists=True))
+                if len(elements) > 1:
+                    _DDLPlan(elements, autocommit=True).run(engine)
+                continue
+            if new_state != "valid":
+                new.create(engine, checkfirst=True)
+            if old_state is not None:
+                old.drop(engine, checkfirst=True)
+
+    def verify(self, engine: Engine) -> None:
+        insp = inspect(engine)
+        for name in self.tables():
+            if not insp.has_table(name):
+                continue
+            new_state, old_state = self._states(engine, name)
+            if new_state != "valid":
+                raise MigrationError(
+                    "verification failed: " + name + " lacks a valid (tenant_id, app_id, user_id) index"
+                )
+            if old_state is not None:
+                raise MigrationError(
+                    "verification failed: " + name + " still has its single-column user_id index"
+                )
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1105,6 +1218,7 @@ DEFAULT_STEPS: list = [
     Step2TenantPrimaryKeys(),
     Step3RowLevelSecurity(),
     Step4PendingJobsIndex(),
+    Step5TenantUserIndexes(),
 ]
 
 #: The version a freshly upgraded database records.

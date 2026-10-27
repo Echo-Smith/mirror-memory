@@ -45,7 +45,7 @@ import functools
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator
 
-from sqlalchemy import Column, PrimaryKeyConstraint, String, bindparam, event
+from sqlalchemy import Column, Index, PrimaryKeyConstraint, String, bindparam, event
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Mapped, Session, with_loader_criteria
 from sqlalchemy.orm.decl_api import declared_attr
@@ -322,6 +322,49 @@ def assert_tenant_table_names(names) -> None:
             "pg_* relations as PostgreSQL catalog metadata and would exempt "
             "statements on them from the tenant rules"
         )
+
+
+def tenant_user_index_name(table_name: str) -> str:
+    return f"ix_{table_name}_tenant_user"
+
+
+def legacy_user_index_name(table_name: str) -> str:
+    return f"ix_{table_name}_user_id"
+
+
+def install_tenant_user_indexes(metadata) -> list[str]:
+    """Replace every tenant table's single-column ``user_id`` index with
+    ``(tenant_id, app_id, user_id)`` (M2 batch-2 patch task 3).
+
+    User ids repeat across tenants (each app has its own namespace), so a
+    bare ``user_id`` index returns every tenant's rows for that id and the
+    planner has to intersect it with the primary key.  Every by-user query
+    the engine issues carries the tenant predicates -- injected by the
+    loader criteria, enforced by RLS -- so the tenant-prefixed index serves
+    them exactly.  Applied once after the models import; one rule for all
+    tables rather than fourteen declarations, so a new tenant table with a
+    ``user_id`` column gets the right index by construction.  Existing
+    databases are converted by migration step 5.  Returns the affected
+    table names.
+    """
+    affected: list[str] = []
+    for table in metadata.sorted_tables:
+        if not {"user_id", "tenant_id", "app_id"} <= set(table.c.keys()):
+            continue
+        legacy = [ix for ix in table.indexes if [c.name for c in ix.columns] == ["user_id"]]
+        if not legacy:
+            continue
+        for index in legacy:
+            table.indexes.discard(index)
+        if tenant_user_index_name(table.name) not in {ix.name for ix in table.indexes}:
+            Index(
+                tenant_user_index_name(table.name),
+                table.c.tenant_id,
+                table.c.app_id,
+                table.c.user_id,
+            )
+        affected.append(table.name)
+    return affected
 
 
 def is_tenant_primary_key(constraint) -> bool:

@@ -722,9 +722,13 @@ class InterventionEvent(TenantScoped, Base):
 from mirror_memory.core.rls import install_rls_hooks  # noqa: E402
 from mirror_memory.core.tenancy import (  # noqa: E402
     assert_tenant_table_names,
+    install_tenant_user_indexes,
     install_write_guard,
 )
 
 install_write_guard()
 assert_tenant_table_names(Base.metadata.tables)
+#: Tenant tables whose by-user index is (tenant_id, app_id, user_id);
+#: migration step 5 converts existing databases.
+TENANT_USER_INDEXED_TABLES: tuple[str, ...] = tuple(install_tenant_user_indexes(Base.metadata))
 install_rls_hooks()

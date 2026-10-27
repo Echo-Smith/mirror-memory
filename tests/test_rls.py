@@ -28,6 +28,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import create_engine, delete, func, insert, select, text, update
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.schema import CreateIndex, DropIndex
 from sqlalchemy.orm import Session, sessionmaker
 
 from mirror_memory.config.loader import load_config
@@ -679,3 +680,52 @@ def test_migration_runs_with_statement_timeout_zero_and_restores_it(pg_admin_eng
                 conn.execute(text("SELECT pg_sleep(1.3)"))
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2 patch task 3: step 5 swaps the user_id indexes CONCURRENTLY
+# ---------------------------------------------------------------------------
+
+
+def test_step5_swaps_user_indexes_concurrently_and_reentrantly(pg_admin_engine):
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.models import TENANT_USER_INDEXED_TABLES
+    from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
+
+    step = sm.Step5TenantUserIndexes()
+    assert not step.needed(pg_admin_engine)  # fresh schema already has the composite indexes
+    # an older database: single-column index present, composite missing
+    new, old = sm._tenant_user_index_pair("mm_belief_events", concurrently=False)
+    with pg_admin_engine.begin() as conn:
+        conn.execute(DropIndex(new, if_exists=True))
+        conn.execute(CreateIndex(old))
+    assert step.needed(pg_admin_engine)
+    with pytest.raises(sm.MigrationError, match="mm_belief_events"):
+        step.verify(pg_admin_engine)
+    step.apply(pg_admin_engine)
+    step.verify(pg_admin_engine)
+    assert sm._index_state(pg_admin_engine, "mm_belief_events", tenant_user_index_name("mm_belief_events")) == "valid"
+    assert sm._index_state(pg_admin_engine, "mm_belief_events", legacy_user_index_name("mm_belief_events")) is None
+    # an INVALID leftover of a failed CONCURRENTLY build is rebuilt
+    with pg_admin_engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE pg_catalog.pg_index SET indisvalid = false "
+            "WHERE indexrelid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = :name)"
+        ), {"name": tenant_user_index_name("mm_evidence")})
+    assert sm._index_state(pg_admin_engine, "mm_evidence", tenant_user_index_name("mm_evidence")) == "invalid"
+    assert step.needed(pg_admin_engine)
+    step.apply(pg_admin_engine)
+    step.verify(pg_admin_engine)
+    assert not step.needed(pg_admin_engine)
+    step.apply(pg_admin_engine)  # no-op repair
+    step.verify(pg_admin_engine)
+    # a replacement, not an addition: the composite index is there, the
+    # single-column one is gone, on every converted table
+    with pg_admin_engine.connect() as conn:
+        for name in TENANT_USER_INDEXED_TABLES:
+            rows = set(conn.execute(text(
+                "SELECT indexname FROM pg_catalog.pg_indexes WHERE schemaname = current_schema() "
+                "AND tablename = :t AND indexname LIKE 'ix\\_%user%'"
+            ), {"t": name}).scalars().all())
+            assert rows == {tenant_user_index_name(name)}, (name, rows)
+

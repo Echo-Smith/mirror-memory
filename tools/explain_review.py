@@ -53,7 +53,9 @@ from mirror_memory.core.models import (  # noqa: E402
     BeliefEvidenceLink,
     Evidence,
     EvolutionJob,
+    ExtractionStats,
     MemoryPreference,
+    Snapshot,
 )
 from mirror_memory.core.schema_migration import install_row_level_security  # noqa: E402
 from mirror_memory.core.tenancy import tenant_scope  # noqa: E402
@@ -172,6 +174,22 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
         counts["mm_evolution_jobs"] = conn.execute(
             _fill(EvolutionJob.__table__, jobs, {"id", "tenant_id", "app_id", "user_id", "idempotency_key", "status"})
         ).rowcount
+        s3 = _series(3, "s")
+        stats = select(
+            tenant_id.label("tenant_id"), literal(APP_ID).label("app_id"), user_id.label("user_id"),
+            literal("observe").label("trigger"), literal("fake").label("model"),
+            (func.now() - func.make_interval(0, 0, 0, 0, 0, 0, s3.c.n * 61)).label("created_at"),
+        ).select_from(t.join(u, true()).join(s3, true()))
+        counts["mm_extraction_stats"] = conn.execute(
+            _fill(ExtractionStats.__table__, stats, {"tenant_id", "app_id", "user_id", "trigger", "model", "created_at"})
+        ).rowcount
+        snapshots = select(
+            func.concat("snap-", tenant_id, "-", user_id).label("id"), tenant_id.label("tenant_id"),
+            literal(APP_ID).label("app_id"), user_id.label("user_id"), literal("active").label("status"),
+        ).select_from(t.join(u, true()))
+        counts["mm_snapshots"] = conn.execute(
+            _fill(Snapshot.__table__, snapshots, {"id", "tenant_id", "app_id", "user_id", "status"})
+        ).rowcount
     with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text("ANALYZE"))
     with admin.connect() as conn:
@@ -202,6 +220,7 @@ def _tenant(stmt, table, with_tenant: bool):
 def queries(belief_id: int, job_id: str) -> list[Q]:
     b, ev, e, l, j = (Belief.__table__, BeliefEvent.__table__, Evidence.__table__,
                       BeliefEvidenceLink.__table__, EvolutionJob.__table__)
+    xs, sn = ExtractionStats.__table__, Snapshot.__table__
     return [
         Q("recall: relevant slice (ILIKE, ORDER BY last_evidence_at LIMIT 150)",
           lambda wt: _tenant(
@@ -230,6 +249,18 @@ def queries(belief_id: int, job_id: str) -> list[Q]:
           lambda wt: _tenant(b.delete().where(b.c.user_id == U), b, wt)),
         Q("delete path: events by user",
           lambda wt: _tenant(ev.delete().where(ev.c.user_id == U), ev, wt)),
+        Q("delete path: evidence by user",
+          lambda wt: _tenant(e.delete().where(e.c.user_id == U), e, wt)),
+        Q("evidence re-find by (user, ref) (record_evidence)",
+          lambda wt: _tenant(select(e).where(e.c.user_id == U, e.c.ref == "ref-424203"), e, wt)),
+        Q("unlinked evidence ids by user",
+          lambda wt: _tenant(select(e.c.id).where(e.c.user_id == U), e, wt)),
+        Q("extraction stats by user (/stats: ORDER BY created_at DESC LIMIT 20)",
+          lambda wt: _tenant(select(xs).where(xs.c.user_id == U)
+                             .order_by(xs.c.created_at.desc()).limit(20), xs, wt)),
+        Q("snapshots by user (K3 summaries: status IN (...) ORDER BY created_at DESC LIMIT 5)",
+          lambda wt: _tenant(select(sn).where(sn.c.user_id == U, sn.c.status.in_(("active", "shadow")))
+                             .order_by(sn.c.created_at.desc()).limit(5), sn, wt)),
     ]
 
 
@@ -310,6 +341,23 @@ def candidate_indexes() -> list[Index]:
     ]
 
 
+def set_user_indexes(admin: Engine, legacy: bool) -> None:
+    """Swap every converted table between the legacy single-column
+    ``ix_<t>_user_id`` and the shipped ``ix_<t>_tenant_user`` (CONCURRENTLY,
+    outside transactions) -- the before/after of migration step 5."""
+    from sqlalchemy.schema import CreateIndex as _Create, DropIndex as _Drop
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.models import TENANT_USER_INDEXED_TABLES
+
+    for name in TENANT_USER_INDEXED_TABLES:
+        new, old = sm._tenant_user_index_pair(name, concurrently=True)
+        drop, create = (new, old) if legacy else (old, new)
+        sm._DDLPlan([_Drop(drop, if_exists=True), _Create(create, if_not_exists=True)], autocommit=True).run(admin)
+    with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("ANALYZE"))
+
+
 def create_candidates(admin: Engine) -> None:
     with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         for index in candidate_indexes():
@@ -355,6 +403,8 @@ def main() -> int:
     ap.add_argument("--beliefs-per-tenant", type=int, default=10_000)
     ap.add_argument("--users-per-tenant", type=int, default=100)
     ap.add_argument("--candidate-indexes", action="store_true")
+    ap.add_argument("--compare-user-index", action="store_true",
+                    help="run once with the legacy single-column user_id indexes, then with the shipped composites")
     ap.add_argument("--bootstrap-app-password", default="",
                     help="create/alter the app login with this password first (CI: no prior role setup)")
     ap.add_argument("--out", default="")
@@ -378,7 +428,21 @@ def main() -> int:
     pending_idx = 9 if args.users_per_tenant >= 10 else args.users_per_tenant - 1
     job_id = f"job-{T}-u{pending_idx:03d}"  # (idx+1) % 10 == 0 -> seeded as pending
     qs = queries(belief_id, job_id)
-    report = render("Baseline indexes (as shipped)", run_pass(admin, app, qs), counts, elapsed)
+    if args.compare_user_index:
+        t1 = time.monotonic()
+        set_user_indexes(admin, legacy=True)
+        report = render(
+            f"BEFORE step 5: legacy single-column user_id indexes ({time.monotonic() - t1:.1f}s to swap)",
+            run_pass(admin, app, qs), counts, elapsed,
+        )
+        t2 = time.monotonic()
+        set_user_indexes(admin, legacy=False)
+        report += "\n" + render(
+            f"AFTER step 5: (tenant_id, app_id, user_id) indexes as shipped ({time.monotonic() - t2:.1f}s to swap back)",
+            run_pass(admin, app, qs), counts, elapsed,
+        )
+    else:
+        report = render("Baseline indexes (as shipped)", run_pass(admin, app, qs), counts, elapsed)
     if args.candidate_indexes:
         t1 = time.monotonic()
         create_candidates(admin)

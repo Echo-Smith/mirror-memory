@@ -398,7 +398,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
 
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 4
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 5
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
     step = sm.Step4PendingJobsIndex()
@@ -406,3 +406,45 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
     step.apply(eng)
     step.verify(eng)
     eng.dispose()
+
+
+def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
+    """M2 batch-2 patch task 3: every tenant table with a user_id column
+    carries (tenant_id, app_id, user_id) and no bare user_id index, both
+    on a fresh schema and after the migration on an older database."""
+    from mirror_memory.core.models import TENANT_USER_INDEXED_TABLES
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
+
+    assert len(TENANT_USER_INDEXED_TABLES) == 14
+    eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
+    Base.metadata.create_all(eng)
+    insp = inspect(eng)
+    for name in TENANT_USER_INDEXED_TABLES:
+        names = {ix["name"] for ix in insp.get_indexes(name)}
+        assert tenant_user_index_name(name) in names, name
+        assert legacy_user_index_name(name) not in names, name
+    step = sm.Step5TenantUserIndexes()
+    assert not step.needed(eng)
+    step.verify(eng)
+    eng.dispose()
+
+    # an older database (single-column index, composite missing) migrates
+    eng2 = create_engine(f"sqlite:///{tmp_path}/old.db")
+    Base.metadata.create_all(eng2)
+    with eng2.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX ix_mm_beliefs_tenant_user")
+        conn.exec_driver_sql(
+            "CREATE INDEX ix_mm_beliefs_user_id ON mm_beliefs (user_id)"
+        )
+    step2 = sm.Step5TenantUserIndexes()
+    assert step2.needed(eng2)
+    with pytest.raises(sm.MigrationError):
+        step2.verify(eng2)
+    upgrade_database(eng2, default_tenant="t", default_app="a")
+    insp2 = inspect(eng2)
+    names = {ix["name"] for ix in insp2.get_indexes("mm_beliefs")}
+    assert tenant_user_index_name("mm_beliefs") in names
+    assert legacy_user_index_name("mm_beliefs") not in names
+    assert not step2.needed(eng2)
+    eng2.dispose()

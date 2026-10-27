@@ -48,3 +48,27 @@ A/B 与 C 的计划形状相同；B 模式（无应用谓词）同样命中租�
 `_pkey_build_index`（第一批）把主键构建索引挂在 `Base.metadata` 上：PG 上做过第 2 步主键
 换索引后，同进程再 `create_all` 会在事务内发 `CREATE UNIQUE INDEX CONCURRENTLY … __pkey_build`
 而失败。改为挂在分离的表副本上，加回归测试。
+
+## 补丁任务 3（2026-10-27 追加）：单列 `user_id` 索引替换为 `(tenant_id, app_id, user_id)`
+
+决定 3 中的"可选未采纳"项，用户评估后要求**替换**（不新增）。模型层用一条规则
+（`tenancy.install_tenant_user_indexes`）对全部 14 张带 `user_id` 的租户表统一生效，
+迁移**第 5 步**对存量 PG 库 `CREATE INDEX CONCURRENTLY` 新索引 → `DROP INDEX CONCURRENTLY`
+旧索引（INVALID 残留先删再建，可重入）。原始表格见 `user_index_before_after_local.md`
+（同一 500 万行数据集上先换回单列索引跑一遍，再换成复合索引跑一遍）。
+
+C 模式关键行（before → after）：
+
+| 查询 | before | after |
+|---|---|---|
+| 按用户删事件（200 万行表） | BitmapAnd `ix_*_user_id` ∧ 主键，8.4 ms，1036 次磁盘读 | `ix_*_tenant_user` 单索引，0.44 ms，0 读 |
+| 按用户删证据 | `uq_mm_evidence_user_ref` 1.74 ms，207 读 | 0.35 ms，0 读 |
+| /stats：extraction_stats 按用户 ORDER BY created_at LIMIT 20 | Index Scan on `user_id`，**过滤掉 297 行他租户** | 0 行过滤 |
+| K3 快照摘要按用户 | BitmapAnd `user_id` ∧ 主键，23 页 | Index Scan，9 页 |
+| 按用户删信念 | `uq_mm_beliefs_user_key`（本就带租户前缀） | 同级（0.53 → 0.11 ms，噪声量级） |
+| 证据按 (user, ref) 重查找 | `uq_mm_evidence_user_ref` | 不变（唯一约束已覆盖） |
+
+非租户查询是否依赖旧的 `user_id` 索引：**没有**。`system_scope` 内的三类调用点——队列扫描
+（按 status / created_at）、单租户启动探针（DISTINCT tenant_id, app_id）、迁移内部（按主键
+回填 / 全表计数）——都不按 `user_id` 过滤（grep 校验）；所有按用户的语句都在租户上下文内
+发出，带租户谓词，复合索引前缀精确匹配。
