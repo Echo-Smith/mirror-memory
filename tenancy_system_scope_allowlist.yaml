@@ -8,9 +8,10 @@
 # Entries that no longer have a matching call site fail the CI scan too --
 # an allowlist with ghosts hides real drift.
 #
-# Review status: entries marked "待评审" were added or rewritten by the M2
-# batch-1 agent (2026-10-26).  Review belongs to the user -- the agent does
-# not fill in its own reviewer or review date.
+# Review status: the five schema_migration entries were added by the M2
+# batch-1 agent (2026-10-26, marked 待评审) and reviewed by Echo-Smith
+# on 2026-10-27 (reason wording for _count_rows / _backfill_column
+# corrected in the same pass).
 
 - module: mirror_memory.worker.evolution
   function: process_pending
@@ -28,8 +29,8 @@
     Migration verification counts rows per table across tenants (row-count
     and NULL-tenant checks).  Called only from upgrade_database's verify
     path.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-27"
 
 - module: mirror_memory.core.schema_migration
   function: _backfill_column
@@ -37,16 +38,16 @@
     Batched backfill of tenant/other columns: selects primary keys across
     all tenants and updates them with the configured default.  Called only
     from migration steps.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-27"
 
 - module: mirror_memory.core.schema_migration
   function: _verify_column
   reason: >
     Step verification (row-count / NULL checks over the whole table) --
     same cross-tenant maintenance path as the backfill.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-27"
 
 - module: mirror_memory.core.schema_migration
   function: _verify_tenancy
@@ -55,8 +56,8 @@
     table carries both tenant columns and that no row has a NULL tenant
     value.  Reads whole tables across all tenants; reached only through
     upgrade_database.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-27"
 
 - module: mirror_memory.core.schema_migration
   function: _emit_primary_key_swaps
@@ -65,8 +66,8 @@
     is a catalog operation over the whole table, not a row-scoped query;
     there is no tenant to scope it to (the ALTER names no rows).  Reached
     only from Step2TenantPrimaryKeys inside upgrade_database.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-27"
 
 - module: mirror_memory.api
   function: _verify_single_tenant_startup
