@@ -37,23 +37,95 @@ class AuditViolation(AssertionError):
 
 # ---------------------------------------------------------------------------
 # Whitelist -- every entry documents why it is safe
+#
+# Shape rules (M2 patch, after the pg_catalog incident): a whitelist pattern
+# must describe the WHOLE statement.  A prefix anchor alone is a hole --
+# ``^\s*begin\b`` also matches ``BEGIN; SELECT * FROM mm_beliefs`` sent as
+# one query string (psycopg runs multi-statement queries), and
+# ``^\s*create\s+table\b`` also matched ``CREATE TABLE stolen AS SELECT *
+# FROM mm_beliefs``.  Every pattern therefore either anchors the end
+# (``;?\s*$``) or rejects statement separators, and DDL that can read rows
+# (CREATE TABLE ... AS SELECT) is explicitly excluded.
+#
+# PostgreSQL catalog introspection is NOT in this list any more: it used to
+# be three prefix regexes, and ``FROM pg_catalog.`` appearing anywhere in
+# the text whitelisted the whole statement -- including
+# ``SELECT * FROM mm_beliefs WHERE id IN (SELECT 1 FROM pg_catalog.pg_class)``.
+# Catalog statements are now recognised structurally after parsing (see
+# ``_is_catalog_only``), and mixed statements go through the normal rules.
 # ---------------------------------------------------------------------------
 
 _EXEMPT_PATTERNS = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"^\s*select\s+1\s*;?\s*$",  # health check: no tables
-        r"^\s*begin\b",              # transaction control, no tables
-        r"^\s*commit\b",
-        r"^\s*rollback\b",
-        r"^\s*savepoint\b",          # publisher savepoints, no tables
-        r"^\s*release\b",
-        r"^\s*pragma\b",             # sqlite introspection (table_info etc.)
-        r"^\s*create\s+(table|index|unique\s+index|savepoint)\b",  # DDL in create_all
-        r"^\s*drop\s+table\b",       # DDL in teardown
-        r"^\s*alter\s+table\b",      # additive migration DDL (check_schema), no row access
+        r"^\s*begin\s*(work|transaction)?\s*;?\s*$",  # transaction control
+        r"^\s*commit\s*(work|transaction)?\s*;?\s*$",
+        r'^\s*rollback\s*(work\s*|transaction\s*|to\s+savepoint\s+[a-z0-9_"]+\s*)?;?\s*$',
+        r'^\s*savepoint\s+[a-z0-9_"]+\s*;?\s*$',  # publisher savepoints
+        r'^\s*release\s*(savepoint\s*)?[a-z0-9_"]+\s*;?\s*$',
+        # sqlite introspection: single pragma, single statement
+        r"^\s*pragma\s+[a-z0-9_.]+\s*(\([^);]*\)|=\s*[^;]*)?\s*;?\s*$",
+        # DDL in create_all / teardown.  CTAS reads rows, so CREATE TABLE
+        # ... AS SELECT must NOT match (the negative lookahead rejects it).
+        r"^\s*create\s+(temp(?:orary)?\s+)?table\b(?![\s\S]*\bas\s+select\b)[^;]*;?\s*$",
+        r"^\s*create\s+(unique\s+)?index\b[^;]*;?\s*$",
+        r"^\s*create\s+savepoint\b[^;]*;?\s*$",
+        r"^\s*drop\s+table\s+(if\s+exists\s+)?[^;]*;?\s*$",
+        # additive migration DDL (check_schema): no row access, one statement
+        r"^\s*alter\s+table\s+[^;]*;?\s*$",
+        # Row-level-security posture DDL (M2 batch-2 task 1).  None of these
+        # can read or write a row: GRANT changes privileges, CREATE/DROP
+        # POLICY changes the catalog, CREATE ROLE creates a login.  Each is
+        # one statement (no separator) and anchored at both ends.  Note the
+        # role model, not the auditor, is what stops the app role from
+        # issuing them: they fail with "must be owner" at the database.
+        r"^\s*grant\s+[^;]*;?\s*$",
+        r"^\s*create\s+policy\s+[^;]*;?\s*$",
+        r"^\s*drop\s+policy\s+(if\s+exists\s+)?[^;]*;?\s*$",
+        r"^\s*create\s+role\s+[^;]*;?\s*$",
+        # The engine's own per-transaction tenant setting (core.rls), exactly
+        # as rendered -- both values are bound parameters.  Any OTHER
+        # statement touching the mm.* settings is a hard violation below.
+        r"^\s*select\s+set_config\('mm\.tenant_id',\s*%\(tenant_id\)s,\s*true\),\s*"
+        r"set_config\('mm\.app_id',\s*%\(app_id\)s,\s*true\)\s*;?\s*$",
     )
 )
+
+# ---------------------------------------------------------------------------
+# Hard violations (M2 batch-2 task 1): statements that would re-point or
+# switch off PostgreSQL row-level security from INSIDE an audited
+# connection.  Checked after the exact whitelist and before anything else;
+# a match anywhere in the text counts (``(^|;)`` catches a smuggled second
+# statement), and the verdict does not depend on parsing.
+#
+# - set_config('mm.*' ...) / SET [LOCAL|SESSION] mm.* : the tenant policy
+#   reads exactly these settings; re-pointing them is choosing another
+#   tenant's rows.  Only the engine's own statement above may set them.
+# - SET/RESET ROLE, SET SESSION AUTHORIZATION: switching to a role the
+#   maintenance policy admits.
+# - row_security: SET row_security=off makes a non-exempt role's queries
+#   error instead of bypassing, but it is never legitimate engine traffic.
+# ---------------------------------------------------------------------------
+
+_FORBIDDEN_PATTERNS = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bset_config\s*\(\s*'mm\.",
+        r"(?:^|;)\s*set\s+(?:local\s+|session\s+)?mm\.",
+        r"(?:^|;)\s*(?:set|reset)\s+(?:local\s+|session\s+)?role\b",
+        r"(?:^|;)\s*(?:set|reset)\s+session\s+authorization\b",
+        r"(?:^|;)\s*(?:set|reset)\s+(?:local\s+|session\s+)?row_security\b",
+        r"\bset_config\s*\(\s*'row_security'",
+    )
+)
+
+
+def _forbidden(sql: str) -> str | None:
+    for pat in _FORBIDDEN_PATTERNS:
+        if pat.search(sql):
+            return pat.pattern
+    return None
 
 # SQL text of every exempt statement, for reporting.
 _exemptions_seen: list[str] = []
@@ -101,7 +173,10 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
         return
 
     insert = stmt.find(exp.Insert)
-    if insert is not None and not stmt.find(exp.Select):
+    if insert is not None:
+        # Covers both INSERT ... VALUES and INSERT ... SELECT: the target
+        # column list is what matters (the PG dialect renders executemany
+        # inserts as INSERT ... SELECT CAST(...), same column list).
         target = insert.this  # a Schema(table, columns) for INSERT INTO t (...)
         table = target.this if isinstance(target, exp.Schema) else target
         real = table.name if isinstance(table, exp.Table) else None
@@ -119,28 +194,15 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
                 )
         return
 
-    # Identity-keyed exemption (documented limitation): ORM unit-of-work
-    # statements and expired-attribute refreshes address rows purely by
-    # primary key, and a session-scoped cache of "who authored this
-    # mutation" is unreliable (flushes are deferred).  Composite PKs that
-    # would put tenant_id into every UOW WHERE are not available on
-    # SQLite (CompileError: no autoincrement for composite PKs).  The
-    # PK-addressing surface is therefore closed by dedicated layers, each
-    # with its own tests (tests/test_pk_addressing.py): the whitelist
-    # write guard intercepts foreign-PK objects at construction, the
-    # merge wrapper refuses cross-tenant merges, and the flush checks
-    # refuse dirty/deleted rows from another tenant.
-    if len(touched) == 1 and _is_identity_keyed(stmt, touched, tenant_tables, exp):
-        return
-
-    # Collect the tenant columns constrained by bound equalities anywhere
-    # in the statement (WHERE, JOIN ON, subquery WHERE, HAVING).
-    # Note: there is NO identity-keyed exemption.  Every tenant table's
-    # primary key leads with (tenant_id, app_id), so ORM unit-of-work
-    # statements carry the tenant predicates natively; a PK-addressed
-    # statement without them (raw SQL, merge-by-id of another tenant) is a
-    # violation.  UOW statements' tenant safety additionally rests on
-    # load-time filtering and the authoring-time write guard.
+    # There is NO identity-keyed exemption (M2 task 3 retired it on
+    # PostgreSQL; the M2 patch then retired it on SQLite too, after the
+    # composite mapping proved every unit-of-work statement there carries
+    # the tenant columns as well).  Every tenant table's primary key leads
+    # with (tenant_id, app_id), so ORM unit-of-work statements carry the
+    # tenant predicates natively; a PK-addressed statement without them
+    # (raw SQL, merge-by-id of another tenant) is a violation.  Runtime
+    # safety additionally rests on load-time filtering, the authoring-time
+    # write guard, the merge wrapper and the flush checks -- all retained.
     covered: dict[str, set[str]] = {}
 
     def _attribute(table_ref: str) -> str | None:
@@ -171,65 +233,22 @@ def _analyse_statement(stmt, tenant_tables: set[str]) -> None:
             )
 
 
-def _is_identity_keyed(stmt, touched: dict[str, str], tenant_tables: set[str], exp) -> bool:
-    """True for a unit-of-work statement: one tenant table, WHERE is only
-    ``AND``-joined equalities between that table's PK columns and bound
-    parameters.
-
-    See the caller for why identity-keyed statements are exempt and which
-    layers close the residual surface instead.
-    """
-    if len(touched) != 1:
-        return False
-    real = next(iter(touched.values()))
-    pk_cols = set(tenant_pk_columns().get(real, ()))
-    if not pk_cols:
-        return False
-
-    where = stmt.args.get("where")
-    if where is None:
-        return False
-    condition = where.this
-
-    def _pk_chain(node) -> bool:
-        if isinstance(node, exp.And):
-            return _pk_chain(node.this) and _pk_chain(node.expression)
-        if isinstance(node, exp.EQ):
-            col, val = node.this, node.expression
-            if not (isinstance(col, exp.Column) and _is_bound(val)):
-                return False
-            if col.name in pk_cols and (not col.table or col.table in touched):
-                return True
-            return False
-        return False
-
-    return _pk_chain(condition)
-
-
-_pk_columns_cache: dict[str, set[str]] | None = None
-
-
-def tenant_pk_columns() -> dict[str, set[str]]:
-    """Primary-key column names per tenant table."""
-    global _pk_columns_cache
-    if _pk_columns_cache is None:
-        from mirror_memory.core.models import Base
-
-        _pk_columns_cache = {
-            name: {col.name for col in table.primary_key.columns}
-            for name, table in Base.metadata.tables.items()
-        }
-    return _pk_columns_cache
-
-
 _verdict_cache: dict[str, AuditViolation | None] = {}
 _VERDICT_CACHE_CAP = 100_000
 _cache_hits = 0
 _cache_misses = 0
 
+#: The dialect of the statement currently being audited.  Set by the
+#: execution listener right before :func:`audit_sql`.  The judge itself is
+#: dialect-independent (the PK-addressing exemption is retired on every
+#: dialect); tests use the same var to pin a dialect for statement probes.
+_dialect_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "mm_audit_dialect", default="sqlite"
+)
+
 
 def auditor_cache_stats() -> tuple[int, int, int]:
-    """(distinct texts, cache hits, misses) for the report."""
+    """(distinct entries, cache hits, misses) for the report."""
     return len(_verdict_cache), _cache_hits, _cache_misses
 
 
@@ -265,9 +284,22 @@ def audit_sql(sql: str) -> None:
             _exemptions_seen.append(sql.strip()[:120])
         return
 
-    if sql in _verdict_cache:
+    forbidden = _forbidden(sql)
+    if forbidden is not None:
+        raise AuditViolation(
+            "statement would re-point or switch off row-level security "
+            f"(matched {forbidden!r}): {sql[:200]!r}"
+        )
+
+    # The verdict depends only on the statement text: the judge is
+    # dialect-independent (the PK-addressing exemption is retired on every
+    # dialect), bound parameters never affect the rules, and no context
+    # reaches this function.
+    cache_key = sql
+
+    if cache_key in _verdict_cache:
         _cache_hits += 1
-        verdict = _verdict_cache[sql]
+        verdict = _verdict_cache[cache_key]
     else:
         _cache_misses += 1
         try:
@@ -276,27 +308,126 @@ def audit_sql(sql: str) -> None:
             verdict = exc
         if len(_verdict_cache) >= _VERDICT_CACHE_CAP:
             _verdict_cache.clear()
-        _verdict_cache[sql] = verdict
+        _verdict_cache[cache_key] = verdict
     if verdict is not None:
         raise verdict
+
+
+_PG_PLACEHOLDER_RE = re.compile(
+    # PostgreSQL driver placeholders, optionally with an explicit cast:
+    #   %(name)s::TIMESTAMP WITHOUT TIME ZONE  ->  ?
+    #   %(name)s::VARCHAR(64)                  ->  ?
+    #   %(name)s::TEXT[] (inside ARRAY[...]')  ->  ?
+    # sqlglot cannot parse the psycopg placeholder form at all, and the
+    # cast is irrelevant to the tenant rules (it only pins the bind value's
+    # type).  The cast tail is ONE type word (optionally with a
+    # parenthesised length and/or an ``[]`` array suffix, as one unit so a
+    # word never swallows the ``]`` closing an enclosing ARRAY[...])
+    # followed only by the continuation words multi-word PostgreSQL types
+    # are built from.  M2 batch-2: the tail used to be "any word not in a
+    # keyword stop-list", and ``%(c)s::VARCHAR LEFT OUTER JOIN
+    # pg_catalog.pg_class`` (SQLAlchemy's foreign-key reflection) lost its
+    # JOIN to the cast -- a parse failure, i.e. a false fail-closed verdict.
+    r"%\([A-Za-z0-9_]+\)s"
+    r"(?:::"
+    r"[A-Za-z0-9_]+(?:\([0-9, ]+\))?(?:\[\])?"
+    r"(?:[ ](?:WITHOUT|WITH|TIME|ZONE|PRECISION|VARYING)\b(?:\([0-9, ]+\))?(?:\[\])?)*"
+    r")?",
+    re.IGNORECASE,
+)
+
+
+_LIKE_ESCAPE_RE = re.compile(
+    # PostgreSQL renders the LIKE escape character as a bare inline literal
+    # right after the bind placeholder:   claim_text ILIKE ? '\'
+    # (there is no bind parameter for ESCAPE and this dialect omits the
+    # keyword).  sqlglot rejects that shape; the escape clause is
+    # irrelevant to the tenant rules, so it is dropped before parsing.
+    # The literal is: apostrophe, backslash, apostrophe.
+    r"(?<=\?)[ ]+(?:'\\\\'|'\\'|'')"
+)
+
+
+def _normalise_placeholders(sql: str) -> str:
+    """Rewrite driver placeholders / dialect-specific noise to one form."""
+    normalised = _PG_PLACEHOLDER_RE.sub("?", sql)
+    return _LIKE_ESCAPE_RE.sub("", normalised)
 
 
 def _judge(sql: str) -> AuditViolation | None:
     import sqlglot
 
-    try:
-        stmt = sqlglot.parse_one(sql, read="sqlite")
-    except Exception as exc:
+    normalised = _normalise_placeholders(sql)
+    # Dialect fallback: SQLite SQL (the default) and PostgreSQL SQL differ
+    # in ways sqlglot cares about -- ILIKE, ::casts, RETURNING placement.
+    # Parse with the matching dialect and fall back to the other one; the
+    # structural rules below are dialect-neutral.
+    stmt = None
+    last_exc: Exception | None = None
+    for dialect in ("sqlite", "postgres"):
+        try:
+            stmt = sqlglot.parse_one(normalised, read=dialect)
+            if stmt is not None:
+                break
+        except Exception as exc:  # noqa: BLE001 -- try the next dialect
+            last_exc = exc
+    if stmt is None:
         return AuditViolation(
-            f"SQL auditor could not parse statement (fail closed): {sql[:200]!r} ({exc})"
+            f"SQL auditor could not parse statement (fail closed): {sql[:200]!r} ({last_exc})"
         )
     if stmt is None:
         return AuditViolation(f"SQL auditor parsed an empty statement: {sql[:200]!r}")
     try:
+        if _is_catalog_only(stmt):
+            with _violations_lock:
+                _exemptions_seen.append(sql.strip()[:120])
+            return None
         _analyse_statement(stmt, _tenant_table_names())
         return None
     except AuditViolation as exc:
         return exc
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL catalog introspection (structural, M2 patch)
+#
+# The old text whitelist exempted any statement with ``FROM pg_catalog.``
+# anywhere in it, which also whitelisted
+# ``SELECT * FROM mm_beliefs WHERE id IN (SELECT 1 FROM pg_catalog.pg_class)``.
+# Catalog statements are now recognised from the parse tree instead: every
+# relation the statement touches (FROM, JOIN, subquery, UNION branch, CTE
+# body) must be a catalog relation.  Anything mixed with a real table falls
+# through to the normal tenant rules, and a statement that cannot be parsed
+# is still a violation (fail closed).
+# ---------------------------------------------------------------------------
+
+#: Schemas whose contents are engine metadata, never tenant data.
+_CATALOG_SCHEMAS = ("pg_catalog", "information_schema")
+
+
+def _is_catalog_relation(table) -> bool:
+    schema = (table.db or "").lower()
+    name = (table.name or "").lower()
+    if schema in _CATALOG_SCHEMAS:
+        return True
+    # unqualified system relations (search_path-resolved); PostgreSQL
+    # reserves the pg_ prefix, so a bare pg_* relation cannot be user data
+    return not schema and name.startswith("pg_")
+
+
+def _is_catalog_only(stmt) -> bool:
+    """True when every relation in the statement is a catalog relation.
+
+    A statement with no FROM at all (e.g. ``SELECT pg_catalog.version()``)
+    is handled by the caller: it references no table, so the tenant rules
+    pass it without a catalog exemption.
+    """
+    import sqlglot.expressions as exp
+
+    tables = list(stmt.find_all(exp.Table))
+    if not tables:
+        return False
+    return all(_is_catalog_relation(table) for table in tables)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +473,11 @@ def install_sql_auditor() -> None:
                 system_reason(), statement[:160],
             )
             return
-        audit_sql(statement)
+        token = _dialect_var.set(conn.dialect.name)
+        try:
+            audit_sql(statement)
+        finally:
+            _dialect_var.reset(token)
 
     event.listen(Engine, "before_cursor_execute", _audit)
     _installed = True

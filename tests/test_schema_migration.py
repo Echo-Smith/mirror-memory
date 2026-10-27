@@ -50,7 +50,9 @@ from sqlalchemy.orm import DeclarativeBase
 def main(db_path: str, models_dir: str) -> None:
     import importlib
     mod = importlib.import_module("base_models")
-    engine = create_engine(f"sqlite:///{db_path}")
+    from sqlalchemy.engine import URL
+
+    engine = create_engine(URL.create("sqlite", database=db_path))
     mod.Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     s = Session()
@@ -107,7 +109,9 @@ def base_db(tmp_path):
 
 
 def _engine(db_path):
-    return create_engine(f"sqlite:///{db_path}")
+    from sqlalchemy.engine import URL
+
+    return create_engine(URL.create("sqlite", database=str(db_path)))
 
 
 import contextlib  # noqa: E402
@@ -121,6 +125,15 @@ def downgrade_scope():
 
     with no_audit_scope():
         yield
+
+
+def _read_claims(engine) -> list[str]:
+    """Read belief claim_text from whatever schema is present (reflection)."""
+    from sqlalchemy import MetaData, select, Table
+
+    table = Table("mm_beliefs", MetaData(), autoload_with=engine)
+    with engine.connect() as conn:
+        return list(conn.execute(select(table.c.claim_text)).scalars())
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +166,7 @@ def test_upgrade_downgrade_upgrade_roundtrip(base_db):
         c["name"] for c in insp.get_columns("mm_beliefs")
     }
     with downgrade_scope():
-        with eng.connect() as conn:
-            claim = conn.execute(text("SELECT claim_text FROM mm_beliefs")).scalar_one()
-            assert claim == "User has trouble sleeping"
+        assert _read_claims(eng) == ["User has trouble sleeping"]
 
     # --- upgrade 2: same data again --------------------------------------
     counts2 = upgrade_database(eng, default_tenant="legacy", default_app="app")
@@ -221,22 +232,219 @@ def test_refuses_without_default_tenant(base_db):
 
 
 def test_mid_migration_failure_restores_backup(base_db, monkeypatch):
+    """A failing step leaves the database exactly as it was (SQLite: the
+    pre-migration file backup is restored)."""
     eng = _engine(base_db)
     from mirror_memory.core import schema_migration as sm
 
-    monkeypatch.setattr(sm, "_row_counts", lambda *a, **k: {"mm_beliefs": 999})
-    with pytest.raises(Exception):
+    def boom(engine):
+        raise sm.MigrationError("simulated verification failure")
+
+    monkeypatch.setattr(sm, "_verify_tenancy", boom)
+    with pytest.raises(sm.MigrationError):
         sm.upgrade_database(eng, default_tenant="legacy", default_app="app")
-    # backup restored: database is back to the base schema with data intact
+    # backup restored: base schema, data intact, version not advanced
     insp = inspect(eng)
     assert "tenant_id" not in {c["name"] for c in insp.get_columns("mm_beliefs")}
+    assert sm.current_version(eng) == 0
     with downgrade_scope():
-        with eng.connect() as conn:
-            claim = conn.execute(text("SELECT claim_text FROM mm_beliefs")).scalar_one()
-            assert claim == "User has trouble sleeping"
+        assert _read_claims(eng) == ["User has trouble sleeping"]
 
 
 def test_schema_parity_by_construction(base_db):
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
     assert verify_schema_parity(eng) == []
+
+
+def test_upgrade_installs_the_tenant_primary_key(base_db):
+    """M2 task 3: the migrated database exposes the composite tenant PK
+    wherever the dialect can host it.
+
+    PostgreSQL converts the constraint (catalog ALTER, no table rewrite).
+    SQLite keeps a single-column physical key -- a composite key over an
+    autoincrement column is a CompileError there -- and closes the
+    PK-addressing surface with the fallback layers instead.
+    """
+    import os  # noqa: F401 -- kept for the fixture's dialect note
+
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    insp = inspect(eng)
+    tenant_tables = [
+        t.name for t in Base.metadata.sorted_tables if insp.has_table(t.name)
+    ]
+    assert tenant_tables
+    # The legacy database this fixture builds is always SQLite (its base
+    # models come from a SQLite-seeded file), so the physical key stays
+    # single-column here on both matrix legs: the migration reads the
+    # target engine's dialect, and that engine is SQLite either way.
+    is_pg = eng.dialect.name == "postgresql"
+    for name in tenant_tables:
+        live = insp.get_pk_constraint(name)["constrained_columns"]
+        wanted = [c.name for c in Base.metadata.tables[name].primary_key.columns]
+        if is_pg:
+            assert live == wanted, (name, live, wanted)
+        else:
+            autoinc = Base.metadata.tables[name]._autoincrement_column
+            if autoinc is not None:
+                assert live == [autoinc.name], (name, live)
+            else:
+                assert live == wanted, (name, live, wanted)
+
+
+def test_upgrade_is_reentrant_on_the_primary_key_step(base_db):
+    """A second upgrade must not re-run the conversion or fail on it."""
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    before = {
+        t.name: inspect(eng).get_pk_constraint(t.name)["constrained_columns"]
+        for t in Base.metadata.sorted_tables
+        if inspect(eng).has_table(t.name)
+    }
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    after = {
+        t.name: inspect(eng).get_pk_constraint(t.name)["constrained_columns"]
+        for t in Base.metadata.sorted_tables
+        if inspect(eng).has_table(t.name)
+    }
+    assert after == before
+
+
+def test_primary_key_swap_is_postgres_only():
+    """The SQLite renderer refuses the catalog ALTER instead of silently
+    emitting something that would rebuild the table."""
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+
+    from mirror_memory.core.schema_migration import MigrationError, PrimaryKeySwap
+
+    with pytest.raises(MigrationError):
+        str(PrimaryKeySwap("mm_beliefs").compile(dialect=sqlite_dialect.dialect()))
+
+
+def test_database_already_at_version_1_advances_to_step_2(base_db):
+    """An M1-era database (tenant columns in place, version 1 recorded) must
+    be able to advance without re-running the tenancy step.
+
+    This is what makes the primary-key conversion a version step rather
+    than part of step 1: a database migrated by an earlier release already
+    has the tenant columns, so it can only pick up what it is missing.
+    """
+    from mirror_memory.core import schema_migration as sm
+
+    eng = _engine(base_db)
+    # Advance to version 1 only, the way the previous release left a
+    # database: tenant columns plus the version row, single-column key.
+    upgrade_database(
+        eng,
+        default_tenant="legacy",
+        default_app="app",
+        steps=[sm.Step1Tenancy()],
+    )
+    assert sm.current_version(eng) == 1
+    before = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
+    assert before[:2] != ["tenant_id", "app_id"], before
+
+    # The full plan now runs only the steps above version 1.
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION
+    after = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
+    if eng.dialect.name == "postgresql":
+        assert after == ["tenant_id", "app_id", "id"], after
+    else:
+        assert after == before, after  # SQLite keeps its physical key
+
+
+def test_primary_key_step_is_a_noop_when_already_applied():
+    """needed() must report False once the key matches, so a re-run neither
+    issues DDL nor advances the version twice."""
+    from mirror_memory.core import schema_migration as sm
+
+    step = sm.Step2TenantPrimaryKeys()
+    if not sm._is_postgres(create_engine("sqlite://")):
+        assert step.needed(create_engine("sqlite://")) is False
+
+
+def test_pkey_build_index_does_not_attach_to_the_model_metadata():
+    """M2 batch-2 finding: an Index built over the live table's columns joins
+    Base.metadata, and the next create_all in the process would emit the
+    CONCURRENTLY build inside a transaction.  The build index must live on
+    a detached copy."""
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.models import Base
+
+    build = sm._pkey_build_index("mm_beliefs")
+    assert build.name == "mm_beliefs" + sm._PKEY_BUILD_SUFFIX
+    assert build.table is not Base.metadata.tables["mm_beliefs"]
+    assert build.name not in {ix.name for ix in Base.metadata.tables["mm_beliefs"].indexes}
+
+
+def test_fresh_schema_declares_the_pending_jobs_partial_index(tmp_path):
+    """M2 batch-2 task 4: the maintenance queue scan's partial index is on
+    the model, so create_all ships it on both dialects."""
+    from mirror_memory.core import schema_migration as sm
+
+    eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
+    Base.metadata.create_all(eng)
+    assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
+    step = sm.Step4PendingJobsIndex()
+    assert not step.needed(eng)
+    step.verify(eng)
+    eng.dispose()
+
+
+def test_step4_adds_the_partial_index_to_an_older_database(base_db):
+    from mirror_memory.core import schema_migration as sm
+
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 5
+    assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
+    # re-entrant: a second apply is a no-op repair
+    step = sm.Step4PendingJobsIndex()
+    assert not step.needed(eng)
+    step.apply(eng)
+    step.verify(eng)
+    eng.dispose()
+
+
+def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
+    """M2 batch-2 patch task 3: every tenant table with a user_id column
+    carries (tenant_id, app_id, user_id) and no bare user_id index, both
+    on a fresh schema and after the migration on an older database."""
+    from mirror_memory.core.models import TENANT_USER_INDEXED_TABLES
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
+
+    assert len(TENANT_USER_INDEXED_TABLES) == 14
+    eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
+    Base.metadata.create_all(eng)
+    insp = inspect(eng)
+    for name in TENANT_USER_INDEXED_TABLES:
+        names = {ix["name"] for ix in insp.get_indexes(name)}
+        assert tenant_user_index_name(name) in names, name
+        assert legacy_user_index_name(name) not in names, name
+    step = sm.Step5TenantUserIndexes()
+    assert not step.needed(eng)
+    step.verify(eng)
+    eng.dispose()
+
+    # an older database (single-column index, composite missing) migrates
+    eng2 = create_engine(f"sqlite:///{tmp_path}/old.db")
+    Base.metadata.create_all(eng2)
+    with eng2.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX ix_mm_beliefs_tenant_user")
+        conn.exec_driver_sql(
+            "CREATE INDEX ix_mm_beliefs_user_id ON mm_beliefs (user_id)"
+        )
+    step2 = sm.Step5TenantUserIndexes()
+    assert step2.needed(eng2)
+    with pytest.raises(sm.MigrationError):
+        step2.verify(eng2)
+    upgrade_database(eng2, default_tenant="t", default_app="a")
+    insp2 = inspect(eng2)
+    names = {ix["name"] for ix in insp2.get_indexes("mm_beliefs")}
+    assert tenant_user_index_name("mm_beliefs") in names
+    assert legacy_user_index_name("mm_beliefs") not in names
+    assert not step2.needed(eng2)
+    eng2.dispose()

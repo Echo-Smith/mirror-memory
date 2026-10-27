@@ -82,7 +82,9 @@ class Synthesizer:
 
         Reads active beliefs, slice summaries, and check-in trends from
         *session*, then calls the LLM to produce a structured
-        understanding dict.
+        understanding dict.  Equivalent to ``produce(prepare(...))``; the
+        worker calls the two halves separately so that no database
+        transaction is held open while the model runs (M2 batch-2 patch).
 
         Parameters
         ----------
@@ -100,6 +102,20 @@ class Synthesizer:
             The structured understanding, or ``None`` if data is
             insufficient or the LLM call fails.  Persisting the result is
             the caller's responsibility.
+        """
+        return self.produce(self.prepare(session, user_id, config), config)
+
+    def prepare(
+        self,
+        session: object,
+        user_id: str,
+        config: MemoryConfig,
+    ) -> dict | None:
+        """The read half: everything the model call needs, as plain data.
+
+        Returns ``None`` when synthesis should be skipped (no LLM, no
+        prompt, fewer than two active beliefs); otherwise a dict holding
+        the system prompt and the payload text.  Issues no writes.
         """
         # Lazy imports to avoid circular dependencies.
         from mirror_memory.core.repository import list_active_beliefs
@@ -129,17 +145,26 @@ class Synthesizer:
         slice_summaries = _get_slice_summaries(session, user_id)
         current = _get_current_understanding(session, user_id)
 
-        user_content = _build_k3_payload(
-            beliefs_text, slice_summaries, "", current
-        )
+        return {
+            "user_id": user_id,
+            "system_prompt": system_prompt,
+            "payload_text": _build_k3_payload(beliefs_text, slice_summaries, "", current),
+        }
 
+    def produce(self, prepared: dict | None, config: MemoryConfig) -> dict | None:
+        """The model half: no session, no database access."""
+        if prepared is None:
+            return None
+        llm = config.llm_client
+        if llm is None:
+            return None
         try:
             raw = llm.generate(
-                system_prompt=system_prompt,
-                payload_text=user_content,
+                system_prompt=prepared["system_prompt"],
+                payload_text=prepared["payload_text"],
             )
         except Exception:
-            logger.warning("synthesis: LLM call failed for user %s", truncate_id(user_id))
+            logger.warning("synthesis: LLM call failed for user %s", truncate_id(prepared["user_id"]))
             return None
 
         return _parse_understanding(raw)

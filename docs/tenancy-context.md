@@ -124,11 +124,106 @@ Worker **不允许**继承调度方的上下文——租户的唯一来源是任
 Publisher——这是设计事实（证据是观察记录，不是状态变迁），已在收尾
 补丁中显式登记；其余 engine 表的状态变更全部经 Publisher。
 
+### 主键与审计豁免（M2 任务 3 + 补丁）
+
+每张租户表的主键在 ORM 层都是 `(tenant_id, app_id, ...)` 复合键，因此
+ORM 工作单元的 UPDATE / DELETE / 按 PK 刷新天然带租户谓词。据此，SQL
+审计器对「主键定位写语句」的豁免已在**两个方言上全部撤销**：一条不带
+租户谓词的 PK 语句（手写 SQL、对他租户行的 merge-by-id）现在是违规，
+而不再是豁免。SQLite 的物理主键仍为单列（自增限制，DDL 由编译钩子收
+窄），但映射与语句形态两库一致。
+
+仍然保留的运行时防线（与审计相互独立）：租户列构造期写守卫、
+`session.merge()` 跨租户拒绝、flush 期租户校验、读路径的
+`with_loader_criteria` 注入。
+
+### 调用方白名单（M2 任务 4）
+
+上表的"合法调用方"不是注释而是可执行的约束：`tenancy_writer_callers.yaml`
+按函数列出允许调用它的模块，`tools/check_writer_callers.py` 用 AST 扫描
+比对，CI 与本地均可运行：
+
+```
+python tools/check_writer_callers.py          # 双向检查，有漂移则非零退出
+python tools/check_writer_callers.py --list   # 打印当前调用方
+```
+
+两个方向都判失败：**未登记的调用方**（多出来的写路径）与**幽灵条目**
+（登记了但已不再调用）。后者同样致命——一份高于现实的清单不再是代码的
+描述。`@_sanctioned_writer` 是唯一能打开写入类作用域的装饰器，因此它的
+调用方就是能力的持有者；新增调用方必须与调用代码同一个提交里更新
+`tenancy_writer_callers.yaml`。
+
 测试侧：fixture **setup** 阶段默认在 `fixture_write_scope` 内（autouse
 hookwrapper）；**测试体**不再有全局豁免——直写表的测试体必须声明
 `@pytest.mark.fixture_writes(reason="...")`（reason 必填）。守卫的真实
 拦截力由金丝雀测试（`@pytest.mark.no_write_fixture_scope`）证明：逐类
 反例、跨树插件模块反例、映射完备性检查都在金丝雀套件中。
+
+### PostgreSQL 行级安全：第二道防线（M2 第二批任务 1）
+
+实现见 `src/mirror_memory/core/rls.py`，作为迁移**第 3 版本步骤**
+（`Step3RowLevelSecurity`，可重入）安装。SQLite 不受影响（无 RLS，
+版本号照常推进）。
+
+**角色**（名字可用 `MM_PG_OWNER_ROLE` / `MM_PG_APP_ROLE` /
+`MM_PG_MAINTENANCE_ROLE` 配置，默认如下）：
+
+| 角色 | 用途 | 关键属性 |
+|---|---|---|
+| `mm_owner` | 建表、迁移、DDL | 表 owner；`FORCE` 使其**同样受策略约束**，由维护策略放行 |
+| `mm_app` | 应用日常读写 | 不是 owner、无 `BYPASSRLS`、不能 `ALTER TABLE`；只被租户策略放行 |
+| `mm_maintenance` | 仅 `system_scope` 白名单调用点 | **独立引擎/连接池**；不是 `BYPASSRLS`，由命名策略放行 |
+
+维护角色选**专门策略而不是 BYPASSRLS**：策略是表级、可在 `pg_policies`
+里逐表看见和撤销的对象，角色本身仍是普通登录；`BYPASSRLS` 则会无声地
+绕过这个库里现在和将来每一张表的每一条策略。
+
+**策略**（每张租户表 `ENABLE` + `FORCE ROW LEVEL SECURITY`）：
+
+- `mm_tenant_rows` FOR ALL TO `mm_app`：`USING` 与 `WITH CHECK` 都是
+  `tenant_id = current_setting('mm.tenant_id', true) AND app_id =
+  current_setting('mm.app_id', true)`。未设置时 `current_setting(..., true)`
+  为 NULL，谓词为 NULL：**读到 0 行、写入报错**（fail-closed）。
+- `mm_maintenance_rows` FOR ALL TO `mm_maintenance`, `mm_owner`：
+  `USING (true) WITH CHECK (true)`。
+
+**租户设置**：每个事务一条参数化、事务级的 `set_config`。租户值的来源（补丁任务 4）：由 Session 发起的事务取 **Session 创建时绑定的租户**，并先与 ContextVar 比对——不一致（或 Session 未绑定）在发出任何 SQL 之前抛 `TenantMismatchError`；不经 Session 的裸连接（`engine.connect()` / Core）在首条语句前取 ContextVar。实现：`Engine` 类的 `begin` 事件只把新事务标记为「待设置」，Session 的 `after_begin` 与 Connection 的 `before_cursor_execute` 分别负责两条路径。原文描述的事务级语义不变——`Engine` 类上的 `begin` 事件在**每个事务开始**触发，由上述两处执行
+`SELECT set_config('mm.tenant_id', %(tenant_id)s, true),
+set_config('mm.app_id', %(app_id)s, true)`——两个值是绑定参数，
+`is_local = true` 为事务级：PostgreSQL 自己在 COMMIT / ROLLBACK 时丢弃，
+池里复用的物理连接不可能把上一个租户的设置带进下一个事务。SQLAlchemy 2.x
+对 autobegin 也会触发 `begin`，Session 与 `engine.connect()` 两条路径走
+同一个钩子，所以**不经过 Session 的 Core 语句同样被覆盖**；Session commit
+后继续查询会开新事务并再次触发。例外：`AUTOCOMMIT` 隔离级别的连接没有
+事务可挂设置，不得用于租户工作（策略会 fail-closed）。
+
+**`system_scope` 在 PG 上的路由**：在 `system_scope` 内创建的 Session，
+若其 bind 是 PG 引擎且 RLS 开启，会被重新绑定到注册的**维护引擎**
+（`register_maintenance_url` / 环境变量 `MM_MAINTENANCE_DATABASE_URL`，
+按"去掉口令的应用库 URL"为键）。未注册时是硬错误而不是静默看到 0 行
+（否则队列扫描会"看见空队列"）。不走 Session 的调用点
+（`api._verify_single_tenant_startup` 的裸连接）改用
+`rls.system_engine_for(engine)`；迁移内部的 5 个调用点以迁移登录
+（owner / 超级用户）运行——DDL 需要所有权，owner 由维护策略放行。
+`process_pending` 的扫描会话移到 `system_scope` 内创建。
+
+**运行期姿态校验**（`MemoryEngine._ensure_db`，PG 且 `MM_PG_RLS != 0`）：
+应用引擎不再 `create_all`；它要求 schema 已由 owner 侧
+`upgrade_database` 建好、每张租户表 ENABLE+FORCE 且两条策略在位、
+**当前登录不是超级用户、无 BYPASSRLS、不是表 owner、是 app 角色**——
+超级用户会无声通过所有策略，让第二道防线看起来开着实际是空的。
+
+**读过滤模式** `MM_TENANT_READ_FILTER`（任务 5 的 A/B/C）：`app`（默认，
+应用层注入 + RLS）、`rls`（跳过注入，RLS 独自过滤读；非 PG bind 回退到注入——
+回退到更强的过滤是安全的）、`none`（无任何读过滤，**仅测量**：还需
+`MM_ALLOW_UNFILTERED_MEASUREMENT=1`，server 拒绝启动）。
+
+**审计器新规则**：引擎自己的那条 set_config 语句精确放行；其他任何设置
+`mm.*` GUC、`SET/RESET ROLE`、`SET SESSION AUTHORIZATION`、`row_security`
+操作一律**硬性违规**（带内 RLS 绕过向量）；GRANT / CREATE|DROP POLICY /
+CREATE ROLE 单语句形态作为不读行的 DDL 放行（真正阻止 app 角色发出它们
+的是所有权——数据库报 `must be owner`）。
 
 ## 工具速查
 
@@ -141,6 +236,9 @@ hookwrapper）；**测试体**不再有全局豁免——直写表的测试体�
 | `engine_write_scope()` | 引擎认可写入口内部标记（Publisher、仓储认可 mutator）；**应用/插件代码不得使用** |
 | `fixture_write_scope(reason)` | 仅测试夹具：直接造信念数据时显式进入（reason 必填） |
 | `no_audit_scope()` | 仅测试：机制类测试里故意发原生 SQL 时使用 |
+| `rls.system_engine_for(engine)` | PG 上 `system_scope` 内不走 Session 的裸连接：取维护引擎 |
+| `rls.register_maintenance_url(app_url, maint_url)` | 宿主启动时注册维护登录（或设 `MM_MAINTENANCE_DATABASE_URL`） |
+| `read_filter_override(mode)` | 仅测试/测量：临时切换读过滤模式 |
 
 ## 错误类型
 
@@ -150,3 +248,5 @@ hookwrapper）；**测试体**不再有全局豁免——直写表的测试体�
 - `WriteGuardViolation`：信念类表被写在认可入口之外（白名单语义，
   **任何来源**的越界写都拦——包括未来的 server/脚本/插件）。
 - `AuditViolation`：SQL 审计器规则违规（测试期）。
+- `RowSecurityError`：PG 行级安全姿态缺失或错误（角色/策略/所有权、
+  运行登录为超级用户或 owner、`system_scope` 缺维护引擎）——全部 fail-closed。

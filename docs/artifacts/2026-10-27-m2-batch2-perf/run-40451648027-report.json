@@ -1,0 +1,395 @@
+{
+  "calibration": {
+    "collected": 1249,
+    "intersection": 1188,
+    "per_mode": {
+      "C": {
+        "secs": 415.2,
+        "tests": 1249,
+        "passed": 1188,
+        "failed": 46,
+        "errors": 7,
+        "skipped": 8
+      },
+      "A": {
+        "secs": 453.9,
+        "tests": 1249,
+        "passed": 1239,
+        "failed": 2,
+        "errors": 0,
+        "skipped": 8
+      },
+      "B": {
+        "secs": 441.0,
+        "tests": 1249,
+        "passed": 1239,
+        "failed": 2,
+        "errors": 0,
+        "skipped": 8
+      }
+    },
+    "dropped_by_file": {
+      "tests/test_api.py": {
+        "C": 9
+      },
+      "tests/test_concurrency_ported.py": {
+        "C,A,B": 4
+      },
+      "tests/test_lease_tokens.py": {
+        "C": 1
+      },
+      "tests/test_longmemeval_ingest.py": {
+        "C,A,B": 1
+      },
+      "tests/test_pg_pool.py": {
+        "C": 1
+      },
+      "tests/test_rls.py": {
+        "C": 12,
+        "C,A,B": 1
+      },
+      "tests/test_server_tenant.py": {
+        "C": 7
+      },
+      "tests/test_sql_auditor.py": {
+        "C,A,B": 3
+      },
+      "tests/test_tenancy_context.py": {
+        "C": 3
+      },
+      "tests/test_tenant_cache_security.py": {
+        "C": 9
+      },
+      "tests/test_tenant_isolation.py": {
+        "C": 8
+      },
+      "tests/test_tenant_pk.py": {
+        "C,A,B": 1,
+        "C": 1
+      }
+    }
+  },
+  "measure": {
+    "ids": 1188,
+    "longrun_ids": 18,
+    "rounds": [
+      {
+        "C": {
+          "secs": 379.5,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "A": {
+          "secs": 435.8,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "B": {
+          "secs": 411.2,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "valid": true
+      },
+      {
+        "C": {
+          "secs": 379.6,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "A": {
+          "secs": 427.6,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "B": {
+          "secs": 411.5,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "valid": true
+      },
+      {
+        "C": {
+          "secs": 385.2,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "A": {
+          "secs": 424.1,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "B": {
+          "secs": 413.3,
+          "tests": 1188,
+          "passed": 1188,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "valid": true
+      }
+    ],
+    "longrun_rounds": [
+      {
+        "C": {
+          "secs": 144.2,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "A": {
+          "secs": 159.6,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "B": {
+          "secs": 153.3,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "valid": true
+      },
+      {
+        "C": {
+          "secs": 145.5,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "A": {
+          "secs": 161.7,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "B": {
+          "secs": 152.5,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "valid": true
+      },
+      {
+        "C": {
+          "secs": 144.6,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "A": {
+          "secs": 161.4,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "B": {
+          "secs": 152.6,
+          "tests": 18,
+          "passed": 18,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "valid": true
+        },
+        "valid": true
+      }
+    ],
+    "stats": {
+      "rounds": {
+        "valid_rounds": 3,
+        "secs": {
+          "C": {
+            "min": 379.5,
+            "median": 379.6,
+            "all": [
+              379.5,
+              379.6,
+              385.2
+            ]
+          },
+          "A": {
+            "min": 424.1,
+            "median": 427.6,
+            "all": [
+              435.8,
+              427.6,
+              424.1
+            ]
+          },
+          "B": {
+            "min": 411.2,
+            "median": 411.5,
+            "all": [
+              411.2,
+              411.5,
+              413.3
+            ]
+          }
+        },
+        "ratios": {
+          "A/C": {
+            "min": 1.118,
+            "median": 1.126
+          },
+          "B/C": {
+            "min": 1.084,
+            "median": 1.084
+          },
+          "B/A": {
+            "min": 0.97,
+            "median": 0.962
+          }
+        }
+      },
+      "longrun_rounds": {
+        "valid_rounds": 3,
+        "secs": {
+          "C": {
+            "min": 144.2,
+            "median": 144.6,
+            "all": [
+              144.2,
+              145.5,
+              144.6
+            ]
+          },
+          "A": {
+            "min": 159.6,
+            "median": 161.4,
+            "all": [
+              159.6,
+              161.7,
+              161.4
+            ]
+          },
+          "B": {
+            "min": 152.5,
+            "median": 152.6,
+            "all": [
+              153.3,
+              152.5,
+              152.6
+            ]
+          }
+        },
+        "ratios": {
+          "A/C": {
+            "min": 1.107,
+            "median": 1.116
+          },
+          "B/C": {
+            "min": 1.058,
+            "median": 1.055
+          },
+          "B/A": {
+            "min": 0.956,
+            "median": 0.945
+          }
+        }
+      }
+    }
+  },
+  "gate": {
+    "secs": 20.5,
+    "tests": 60,
+    "passed": 55,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 5,
+    "ok": true,
+    "files": [
+      "tests/test_rls.py",
+      "tests/test_concurrency_ported.py"
+    ]
+  },
+  "decision": {
+    "recommend": "A",
+    "conditions": {
+      "gate_ok": true,
+      "longrun_B_over_C_le_1.15": true,
+      "B_at_least_5_points_below_A": false
+    },
+    "longrun_min_ratios": {
+      "A/C": 1.107,
+      "B/C": 1.058,
+      "A-B points": 4.9
+    },
+    "longrun_median_ratios": {
+      "A/C": 1.116,
+      "B/C": 1.055,
+      "B/A": 0.945
+    },
+    "full_min_ratios": {
+      "A/C": 1.118,
+      "B/C": 1.084,
+      "B/A": 0.97
+    },
+    "full_median_ratios": {
+      "A/C": 1.126,
+      "B/C": 1.084,
+      "B/A": 0.962
+    }
+  }
+}

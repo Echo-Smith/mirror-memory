@@ -156,10 +156,14 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
     """
     from mirror_memory.core.tenancy import system_scope
 
-    session = session_factory() if callable(session_factory) else session_factory
-
+    session = None
     try:
         with system_scope(reason="evolution worker: crash-recovery sweep and pending-job scan"):
+            # The scan session is created INSIDE the scope: on PostgreSQL with
+            # row-level security that binds it to the maintenance engine
+            # (core.tenancy routes system_scope sessions), where the
+            # cross-tenant scan can see every tenant's jobs.
+            session = session_factory() if callable(session_factory) else session_factory
             # Crash recovery: expire leases whose holder is gone.  The
             # lease_token is deliberately NOT reset -- it is the monotonic
             # fencing generation (I3).
@@ -184,7 +188,8 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
         for job in jobs:
             _claim_and_process(session_factory, job, config)
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 class LeaseLost(RuntimeError):
@@ -303,24 +308,38 @@ def _process_single_job(
     check sit immediately before the write, so any state change that happened
     during the compute aborts the publish and leaves the database untouched.
 
+    Transactions (M2 batch-2 patch): the snapshot is read in one
+    transaction which is then ENDED -- the connection goes back to the pool
+    -- before any model call; nothing is held "idle in transaction" while
+    the LLM thinks (PostgreSQL's ``idle_in_transaction_session_timeout``
+    would otherwise terminate the backend mid-compute).  The publish opens
+    a fresh transaction and re-reads: the Publisher's consent, revision and
+    authority checks were designed for a stale snapshot and are unchanged.
+
     Fencing (task 3): with *lease_token*, the completion/failure UPDATE only
     lands while this worker still holds the lease; on :class:`LeaseLost` the
     transaction (including the publish's memory writes) rolls back.
     """
     token = lease_token
+    # Plain copies of the job fields the phases below need: after the
+    # snapshot transaction ends the ORM row is not touched again until the
+    # publish transaction (see _end_snapshot_transaction).
+    job_id, user_id = job.id, job.user_id
+    attempt_count, watermark = job.attempt_count, job.evidence_watermark
     try:
         from mirror_memory.core.repository import get_state_revision, is_memory_enabled
 
-        # Renew the lease after the compute-heavy nodes: the publish below
+        # Renew the lease before the compute-heavy nodes: the publish below
         # must not race an expiry that happened while the LLM was thinking.
         if token is not None and not _renew_lease(
-            session, job.id, token, config.worker.job_lease_seconds
+            session, job_id, token, config.worker.job_lease_seconds
         ):
-            raise LeaseLost(f"job {job.id}: lease lost before publish")
+            raise LeaseLost(f"job {job_id}: lease lost before publish")
 
+        # -- snapshot transaction ------------------------------------------
         # Consent gate: a disabled user's beliefs must not even be read into
         # a compute payload, let alone published.
-        if not is_memory_enabled(session, job.user_id):
+        if not is_memory_enabled(session, user_id):
             _block_job(session, job, "memory_disabled", token)
             return
 
@@ -328,13 +347,27 @@ def _process_single_job(
         # enqueue time).  The revision may have been bumped by state mutations
         # between enqueue and compute, so we re-read the current value to
         # compare against the post-compute revision at Node 6.
-        expected_revision = get_state_revision(session, job.user_id)
+        expected_revision = get_state_revision(session, user_id)
 
-        # Node 1: load_evidence
-        evidence = _load_evidence(session, job.user_id)
+        # Node 1: load_evidence (plain data, no ORM instances retained)
+        evidence = _load_evidence(session, user_id)
+
+        # Node 5's read half (K3): the beliefs/summaries the synthesis prompt
+        # needs, taken in the same snapshot.  Fail-open like the node itself.
+        from mirror_memory.extraction.synthesis import Synthesizer
+
+        synthesizer = Synthesizer(config)
+        try:
+            k3_prepared = synthesizer.prepare(session, user_id, config)
+        except Exception:
+            logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job_id))
+            k3_prepared = None
+
+        _end_snapshot_transaction(session)
+        # -- no connection held from here until the publish -----------------
 
         # Node 2: formulate (LLM)
-        candidate = _formulate(session, job.user_id, evidence, config)
+        candidate = _formulate(session, user_id, evidence, config)
 
         # Node 3: validate
         validated = _validate(candidate, evidence, config)
@@ -345,17 +378,21 @@ def _process_single_job(
         # Node 5: synthesize (K3 -- pure Compute, fail-open, writes nothing)
         understanding = None
         try:
-            from mirror_memory.extraction.synthesis import Synthesizer
-
-            understanding = Synthesizer(config).synthesize(session, job.user_id, config)
+            understanding = synthesizer.produce(k3_prepared, config)
         except Exception:
-            logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job.id))
+            logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job_id))
 
         # The published content is the validated candidate, with K3's
         # understanding folded in when it produced one.
         content = dict(validated)
         if understanding is not None:
             content["understanding"] = understanding
+
+        # -- publish transaction -------------------------------------------
+        # Nothing read for the snapshot is trusted here: expire the identity
+        # map so the Publisher's consent / revision / authority re-checks
+        # read the database as it is now, in a fresh transaction.
+        session.expire_all()
 
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
@@ -367,13 +404,13 @@ def _process_single_job(
         is_shadow = evidence.get("distinct_sessions", 1) < 2
         proposal = StateTransitionProposal(
             transition=TRANSITION_SYNTHESIZE,
-            user_id=job.user_id,
+            user_id=user_id,
             session_id=None,
             expected_revision=expected_revision,
             payload={
                 "content": content,
                 "policy": policy,
-                "watermark": job.evidence_watermark,
+                "watermark": watermark,
                 "shadow": is_shadow,
             },
         )
@@ -381,17 +418,17 @@ def _process_single_job(
         if not decision.committed:
             logger.info(
                 "evolution: publish refused (job=%s reason=%s)",
-                truncate_id(job.id), decision.reason,
+                truncate_id(job_id), decision.reason,
             )
             _block_job(session, job, decision.reason, token)
             return
 
-        _set_job_state(session, job.id, token, {
+        _set_job_state(session, job_id, token, {
             "status": "completed",
             "completed_at": datetime.now(UTC),
             "error_code": "",
         })
-        logger.info("evolution: completed job=%s", truncate_id(job.id))
+        logger.info("evolution: completed job=%s", truncate_id(job_id))
 
     except LeaseLost:
         # Another worker re-claimed the job after our lease expired: every
@@ -400,23 +437,41 @@ def _process_single_job(
         session.rollback()
         logger.warning(
             "evolution: lease lost (job=%s); rolled back this worker's writes",
-            truncate_id(job.id),
+            truncate_id(job_id),
         )
     except Exception as exc:
         changes = {
-            "status": "failed" if job.attempt_count >= config.worker.max_attempts else "pending",
+            "status": "failed" if attempt_count >= config.worker.max_attempts else "pending",
             "error_code": type(exc).__name__,
         }
         try:
-            _set_job_state(session, job.id, token, changes)
+            _set_job_state(session, job_id, token, changes)
         except LeaseLost:
             session.rollback()
             logger.warning(
                 "evolution: lease lost while failing (job=%s); writes rolled back",
-                truncate_id(job.id),
+                truncate_id(job_id),
             )
             return
-        logger.warning("evolution: failed job=%s error=%s", truncate_id(job.id), type(exc).__name__)
+        logger.warning("evolution: failed job=%s error=%s", truncate_id(job_id), type(exc).__name__)
+
+
+def _end_snapshot_transaction(session: object) -> None:
+    """Close the snapshot's read transaction without expiring loaded state.
+
+    ``commit()`` rather than ``rollback()``: a rollback always expires every
+    instance in the session, and an expired attribute touched during the
+    compute would lazy-load -- i.e. quietly open a new transaction behind
+    the model call, which is exactly what this is avoiding.  Expiry on
+    commit is suspended for this one commit only; the publish phase expires
+    everything itself before it reads.
+    """
+    prior = session.expire_on_commit
+    session.expire_on_commit = False
+    try:
+        session.commit()
+    finally:
+        session.expire_on_commit = prior
 
 
 def _set_job_state(session: object, job_id: str, token: int | None, changes: dict) -> None:

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 server = ["fastapi>=0.115", "uvicorn>=0.30", "openai>=1.0,<2.0"]
+postgres = ["psycopg[binary]>=3.1"]
 llm = ["openai>=1.0,<2.0"]
 dev = ["pytest>=8.0", "ruff", "sqlglot>=25.0"]
 

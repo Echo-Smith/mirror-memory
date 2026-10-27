@@ -45,9 +45,11 @@ import functools
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator
 
-from sqlalchemy import Column, String, bindparam, event
+from sqlalchemy import Column, Index, PrimaryKeyConstraint, String, bindparam, event
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Mapped, Session, with_loader_criteria
 from sqlalchemy.orm.decl_api import declared_attr
+from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql import visitors
 
 
@@ -189,8 +191,10 @@ def system_reason() -> str | None:
 
 def in_sanctioned_write() -> bool:
     """True inside any sanctioned write scope (Publisher/claim mutators,
-    queue, consent, telemetry, fixture).  The SQL auditor uses this to
-    scope its identity-keyed exemption for UPDATE/DELETE."""
+    queue, consent, telemetry, fixture).  Reporting/diagnostic hook: the
+    write guard itself classifies by table, and the SQL auditor no longer
+    special-cases sanctioned scopes for UPDATE/DELETE (the identity-keyed
+    exemption was retired in M2)."""
     return _write_class_var.get() is not None
 
 
@@ -262,6 +266,26 @@ class TenantScoped:
     few (low cardinality), every tenant predicate pairs the two columns,
     and the composite unique/PK constraints that lead with them already
     serve point lookups.
+
+    Primary key (M2 task 3): every tenant table declares
+    ``PRIMARY KEY (tenant_id, app_id, id)`` -- or the tenant prefix plus
+    the table's own business key where one exists (``user_id``,
+    ``feature``).  Two consequences matter:
+
+    - The ORM's unit-of-work WHERE clause names the tenant columns, so
+      PostgreSQL (where the physical constraint is composite) can enforce
+      tenant predicates on PK-addressed writes without an exemption.
+    - ``session.get()`` needs the full key; the wrapper below supplies the
+      ambient tenant for legacy single-value lookups so the ~40 call sites
+      stay unchanged.
+
+    SQLite cannot host a composite primary key on an autoincrement column
+    (``CompileError: SQLite does not support autoincrement for composite
+    primary keys``), so its DDL is narrowed back to a single-column
+    ``PRIMARY KEY (id)`` by the compiler hook below.  The *mapping* stays
+    composite there too, which keeps ``session.get``/identity-map
+    behaviour identical across dialects; only the physical constraint
+    differs, and SQLite keeps the three-layer PK-addressing fallback.
     """
 
     @declared_attr
@@ -271,6 +295,135 @@ class TenantScoped:
     @declared_attr
     def app_id(cls) -> Mapped[str]:  # noqa: N805
         return Column(String(64), nullable=False, default="")
+
+
+#: How many leading primary-key columns are tenant columns.
+TENANT_PK_PREFIX = 2
+
+#: Table-name prefixes a tenant table must never use.  PostgreSQL reserves
+#: ``pg_`` for system relations, and the SQL auditor leans on that: an
+#: unqualified ``pg_*`` relation is classified as catalog metadata and the
+#: statement is exempted from the tenant rules.  A tenant table carrying
+#: the prefix would therefore be audited as if it held no tenant data.
+RESERVED_TABLE_PREFIXES = ("pg_",)
+
+
+def assert_tenant_table_names(names) -> None:
+    """Refuse tenant table names the auditor would mistake for catalog
+    relations (M2 batch-2 task 0).  Checked once after the models import."""
+    offending = sorted(
+        name for name in names
+        if str(name).lower().startswith(RESERVED_TABLE_PREFIXES)
+    )
+    if offending:
+        raise TenantError(
+            f"tenant table name(s) {offending} start with a reserved prefix "
+            f"{RESERVED_TABLE_PREFIXES}: the SQL auditor treats unqualified "
+            "pg_* relations as PostgreSQL catalog metadata and would exempt "
+            "statements on them from the tenant rules"
+        )
+
+
+def tenant_user_index_name(table_name: str) -> str:
+    return f"ix_{table_name}_tenant_user"
+
+
+def legacy_user_index_name(table_name: str) -> str:
+    return f"ix_{table_name}_user_id"
+
+
+def install_tenant_user_indexes(metadata) -> list[str]:
+    """Replace every tenant table's single-column ``user_id`` index with
+    ``(tenant_id, app_id, user_id)`` (M2 batch-2 patch task 3).
+
+    User ids repeat across tenants (each app has its own namespace), so a
+    bare ``user_id`` index returns every tenant's rows for that id and the
+    planner has to intersect it with the primary key.  Every by-user query
+    the engine issues carries the tenant predicates -- injected by the
+    loader criteria, enforced by RLS -- so the tenant-prefixed index serves
+    them exactly.  Applied once after the models import; one rule for all
+    tables rather than fourteen declarations, so a new tenant table with a
+    ``user_id`` column gets the right index by construction.  Existing
+    databases are converted by migration step 5.  Returns the affected
+    table names.
+    """
+    affected: list[str] = []
+    for table in metadata.sorted_tables:
+        if not {"user_id", "tenant_id", "app_id"} <= set(table.c.keys()):
+            continue
+        legacy = [ix for ix in table.indexes if [c.name for c in ix.columns] == ["user_id"]]
+        if not legacy:
+            continue
+        for index in legacy:
+            table.indexes.discard(index)
+        if tenant_user_index_name(table.name) not in {ix.name for ix in table.indexes}:
+            Index(
+                tenant_user_index_name(table.name),
+                table.c.tenant_id,
+                table.c.app_id,
+                table.c.user_id,
+            )
+        affected.append(table.name)
+    return affected
+
+
+def is_tenant_primary_key(constraint) -> bool:
+    """True for a PK shaped ``(tenant_id, app_id, ...)``."""
+    names = [c.name for c in constraint.columns]
+    return len(names) > TENANT_PK_PREFIX and names[:TENANT_PK_PREFIX] == [
+        "tenant_id",
+        "app_id",
+    ]
+
+
+@compiles(CreateColumn, "sqlite")
+def _relax_sqlite_composite_autoincrement(element, compiler, **kw):
+    """Drop ``autoincrement=True`` from a tenant table's id in SQLite DDL.
+
+    SQLAlchemy raises ``CompileError: SQLite does not support
+    autoincrement for composite primary keys`` while *rendering* the
+    column.  The flag is only consulted for the DDL here (the rowid alias
+    an ``INTEGER PRIMARY KEY`` gets is enough to generate values), so it is
+    relaxed for the duration of the render and restored immediately --
+    the in-memory mapping other dialects and the ORM's own insert logic
+    read stays untouched.
+    """
+    column = element.element
+    if (
+        column.autoincrement is True
+        and len(column.table.primary_key.columns) > 1
+        and is_tenant_primary_key(column.table.primary_key)
+    ):
+        column.autoincrement = "auto"
+        try:
+            return compiler.visit_create_column(element, **kw)
+        finally:
+            column.autoincrement = True
+    return compiler.visit_create_column(element, **kw)
+
+
+@compiles(PrimaryKeyConstraint, "sqlite")
+def _narrow_sqlite_tenant_pk(constraint, compiler, **kw):
+    """Render a tenant PK that includes an autoincrement column as the
+    single-column PK SQLite requires.
+
+    SQLite's ``AUTOINCREMENT`` (and the implicit rowid alias an
+    ``INTEGER PRIMARY KEY`` gets) only works for a single-column primary
+    key.  Only that shape is narrowed -- pure string keyed tables
+    (``mm_users``, ``mm_memory_preferences``, ``mm_consent_grants``,
+    ``mm_snapshots``, ``mm_evolution_jobs``) keep the full composite
+    constraint on SQLite and are row-unique per tenant there too.
+
+    The Python-side mapping stays composite on both dialects, so
+    ``session.get``, the identity map and the unit-of-work WHERE clauses
+    behave identically; the write-safety story for the narrowed tables on
+    SQLite comes from the fallback layers in
+    ``tests/test_pk_addressing.py``.
+    """
+    autoinc = [c for c in constraint.columns if c.autoincrement is True]
+    if is_tenant_primary_key(constraint) and len(autoinc) == 1:
+        return "PRIMARY KEY (%s)" % compiler.preparer.format_column(autoinc[0])
+    return compiler.visit_primary_key_constraint(constraint, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +443,95 @@ _single_tenant_mode: ContextVar[bool] = ContextVar("mm_single_tenant", default=F
 def set_single_tenant_mode(enabled: bool) -> None:
     """Enable end-side single-tenant mode for this context tree."""
     _single_tenant_mode.set(enabled)
+
+
+# ---------------------------------------------------------------------------
+# Read-filter mode (M2 batch-2 task 5 measurement modes)
+#
+#   app  -- application-layer injection filters reads (default; the only
+#           mode SQLite supports).  On PostgreSQL the row-level-security
+#           policies apply as well: this is perf mode A.
+#   rls  -- the per-statement injection is skipped and PostgreSQL row-level
+#           security alone filters reads; the write-side checks (before_flush,
+#           write guard, session.get/merge wrappers) stay on.  Perf mode B.
+#           A non-PostgreSQL bind keeps the injection (RLS cannot carry the
+#           filter there; falling back to the stronger filter is safe).
+#   none -- NO tenant read filter at all: the measurement-only baseline (perf
+#           mode C).  Requires MM_ALLOW_UNFILTERED_MEASUREMENT=1 as well, and
+#           the HTTP server refuses to start in it (see server.create_app).
+# ---------------------------------------------------------------------------
+
+READ_FILTER_APP = "app"
+READ_FILTER_RLS = "rls"
+READ_FILTER_NONE = "none"
+_READ_FILTER_MODES = (READ_FILTER_APP, READ_FILTER_RLS, READ_FILTER_NONE)
+
+_read_filter_override: ContextVar[str | None] = ContextVar("mm_read_filter", default=None)
+_read_filter_cached: str | None = None
+
+
+def read_filter_mode() -> str:
+    """The active read-filter mode (see the block comment above)."""
+    override = _read_filter_override.get()
+    if override is not None:
+        return override
+    global _read_filter_cached
+    if _read_filter_cached is None:
+        _read_filter_cached = _read_filter_from_env()
+    return _read_filter_cached
+
+
+def _read_filter_from_env() -> str:
+    import os
+
+    mode = os.environ.get("MM_TENANT_READ_FILTER", READ_FILTER_APP).strip().lower()
+    if mode not in _READ_FILTER_MODES:
+        raise TenantError(
+            f"MM_TENANT_READ_FILTER must be one of {_READ_FILTER_MODES}; got {mode!r}"
+        )
+    if mode == READ_FILTER_NONE and os.environ.get("MM_ALLOW_UNFILTERED_MEASUREMENT") != "1":
+        raise TenantError(
+            "MM_TENANT_READ_FILTER=none disables every tenant read filter; it is "
+            "a measurement-only baseline and additionally requires "
+            "MM_ALLOW_UNFILTERED_MEASUREMENT=1"
+        )
+    return mode
+
+
+def reset_read_filter_cache() -> None:
+    """Forget the environment-derived mode (tests that change the env)."""
+    global _read_filter_cached
+    _read_filter_cached = None
+
+
+@contextlib.contextmanager
+def read_filter_override(mode: str) -> Iterator[None]:
+    """Force a read-filter mode for the block (tests / measurement harness)."""
+    if mode not in _READ_FILTER_MODES:
+        raise TenantError(f"unknown read-filter mode {mode!r}")
+    token = _read_filter_override.set(mode)
+    try:
+        yield
+    finally:
+        _read_filter_override.reset(token)
+
+
+def _skip_read_injection(session: Session) -> bool:
+    """True when this statement must NOT get the loader criteria."""
+    if _single_tenant_mode.get():
+        return True
+    mode = read_filter_mode()
+    if mode == READ_FILTER_APP:
+        return False
+    if mode == READ_FILTER_RLS:
+        # RLS can only carry the read filter on a PostgreSQL bind.  Any other
+        # bind (an in-memory SQLite engine in the same process, say) keeps
+        # the application-layer injection: falling back to the STRONGER
+        # filter is safe; skipping it would be a leak.
+        bind = session.bind if session is not None else None
+        if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
+            return False
+    return True
 
 
 def _criteria_template(cls):
@@ -369,9 +611,10 @@ def _inject_tenant_criteria(state) -> None:
     tenant = _tenant_var.get()
     if tenant is not None:
         _check_session_tenant(state.session, tenant)
-        if _single_tenant_mode.get():
-            # Task 6: one fixed tenant on the device; the per-statement
-            # injection is the cloud multi-tenant cost and is skipped.
+        if _skip_read_injection(state.session):
+            # Single-tenant mode (one fixed tenant on the device) or a
+            # read-filter mode where PostgreSQL row-level security does the
+            # filtering (rls) / nothing does (none, measurement only).
             # Fail-closed / flush / guard layers remain active.
             return
         # Fast path: attach the shared tenant-agnostic criteria.  It only
@@ -520,11 +763,55 @@ _original_get = Session.get
 
 
 def _tenant_bound_session_init(self, *args: Any, **kwargs: Any) -> None:
+    if in_system_scope():
+        args, kwargs = _route_system_scope_bind(args, kwargs)
     _original_session_init(self, *args, **kwargs)
     # Bind the session to the tenant that was ambient at creation time.
     # A session created outside any scope is bound to None and may only be
     # used for non-tenant work or under system_scope.
     self.info[BOUND_TENANT_KEY] = _tenant_var.get()
+
+
+def _route_system_scope_bind(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """Sessions created inside ``system_scope`` on a PostgreSQL engine with
+    row-level security run on the MAINTENANCE engine (M2 batch-2 task 1).
+
+    The app role is admitted only by the tenant policy, and system work has
+    no tenant: a queue scan on the app engine would see 0 rows and report
+    an empty queue rather than fail.  Re-binding here keeps the seven
+    ``system_scope`` call sites unchanged (they still take the host's
+    session factory) and makes the routing a property of the scope itself.
+    SQLite and RLS-off engines are returned untouched; a missing
+    maintenance registration is a hard error (``system_engine_for``).
+    """
+    from sqlalchemy.engine import Connection, Engine
+
+    bind = kwargs.get("bind", args[0] if args else None)
+    if bind is None:
+        return args, kwargs
+    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    if dialect != "postgresql":
+        return args, kwargs
+    from mirror_memory.core.rls import RowSecurityError, rls_enabled, system_engine_for
+
+    if not rls_enabled():
+        return args, kwargs
+    if isinstance(bind, Connection):
+        raise RowSecurityError(
+            "a Session bound to a raw Connection cannot be re-routed to the "
+            "maintenance role inside system_scope; bind it to "
+            "system_engine_for(engine) instead"
+        )
+    if not isinstance(bind, Engine):
+        return args, kwargs
+    routed = system_engine_for(bind)
+    if routed is bind:
+        return args, kwargs
+    if "bind" in kwargs:
+        kwargs = dict(kwargs, bind=routed)
+    else:
+        args = (routed,) + tuple(args[1:])
+    return args, kwargs
 
 
 def _tenant_aware_get(self, entity, primary_key, *args, **kwargs):
@@ -544,10 +831,13 @@ def _tenant_aware_get(self, entity, primary_key, *args, **kwargs):
     pk_cols = mapper.primary_key
 
     pk = primary_key if isinstance(primary_key, tuple) else (primary_key,)
-    if len(pk_cols) - len(pk) == 2 and pk_cols[0].key == "tenant_id":
+    if len(pk_cols) - len(pk) == TENANT_PK_PREFIX and pk_cols[0].key == "tenant_id":
         # Legacy business key (pre-tenancy PK): the caller addresses a row
         # inside the ambient tenant, so the tenant prefix is supplied here
-        # rather than at each of the get() call sites.
+        # rather than at each get() call site.  The full key is
+        # ``(tenant_id, app_id, ...)`` for every tenant table, so a single
+        # value map to ``(tenant, app, value)`` and a two-value business
+        # key (``ConsentGrant``) to ``(tenant, app, k1, k2)``.
         pk = tenant + tuple(pk)
         primary_key = pk
 

@@ -1,0 +1,70 @@
+{
+  "collected": 1249,
+  "intersection": 1188,
+  "per_mode": {
+    "C": {
+      "secs": 415.2,
+      "tests": 1249,
+      "passed": 1188,
+      "failed": 46,
+      "errors": 7,
+      "skipped": 8
+    },
+    "A": {
+      "secs": 453.9,
+      "tests": 1249,
+      "passed": 1239,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 8
+    },
+    "B": {
+      "secs": 441.0,
+      "tests": 1249,
+      "passed": 1239,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 8
+    }
+  },
+  "dropped_by_file": {
+    "tests/test_api.py": {
+      "C": 9
+    },
+    "tests/test_concurrency_ported.py": {
+      "C,A,B": 4
+    },
+    "tests/test_lease_tokens.py": {
+      "C": 1
+    },
+    "tests/test_longmemeval_ingest.py": {
+      "C,A,B": 1
+    },
+    "tests/test_pg_pool.py": {
+      "C": 1
+    },
+    "tests/test_rls.py": {
+      "C": 12,
+      "C,A,B": 1
+    },
+    "tests/test_server_tenant.py": {
+      "C": 7
+    },
+    "tests/test_sql_auditor.py": {
+      "C,A,B": 3
+    },
+    "tests/test_tenancy_context.py": {
+      "C": 3
+    },
+    "tests/test_tenant_cache_security.py": {
+      "C": 9
+    },
+    "tests/test_tenant_isolation.py": {
+      "C": 8
+    },
+    "tests/test_tenant_pk.py": {
+      "C,A,B": 1,
+      "C": 1
+    }
+  }
+}

@@ -70,6 +70,8 @@ class MemoryEngine:
         tenant_id: str = "default",
         app_id: str = "default",
         single_tenant_mode: bool | None = None,
+        engine: Any | None = None,
+        schema_ready: bool = False,
     ) -> None:
         if config is not None:
             self._config = config
@@ -84,6 +86,14 @@ class MemoryEngine:
         # session it opens is created inside that scope and therefore bound
         # to it at creation time (see core.tenancy).
         self._tenant = (tenant_id, app_id)
+        # M2 batch-2 task 2: a pre-built SQLAlchemy engine may be shared
+        # between tenant wrappers (the server on PostgreSQL shares ONE pool
+        # across tenants).  A wrapper never disposes a pool it does not own,
+        # and ``schema_ready`` skips the schema/posture checks the owner of
+        # the shared engine already ran.
+        self._shared_engine = engine
+        self._owns_engine = engine is None
+        self._schema_ready = bool(schema_ready and engine is not None)
         # Task 6: end-side single-tenant mode (None -> env MM_SINGLE_TENANT).
         import os
 
@@ -105,16 +115,32 @@ class MemoryEngine:
         return OpenAILLM(api_key=api_key, model=model, base_url=base_url)
 
     def _ensure_db(self) -> None:
-        """Create tables on first use."""
+        """Create tables on first use (SQLite) or verify the owner-created
+        schema and the row-level-security posture (PostgreSQL)."""
         if self._initialized:
             return
-        from sqlalchemy import create_engine
-
         from mirror_memory.core.migrate import check_schema
         from mirror_memory.core.models import Base
+        from mirror_memory.core.pg_engine import build_engine
+        from mirror_memory.core.rls import is_postgres, prepare_runtime_engine, rls_enabled
 
-        self._engine = create_engine(self._database_url)
-        Base.metadata.create_all(self._engine)
+        if self._shared_engine is not None:
+            self._engine = self._shared_engine
+            if self._schema_ready:
+                # The owner of the shared engine ran the schema / posture /
+                # single-tenant checks once; a per-tenant wrapper only binds.
+                self._initialized = True
+                return
+        else:
+            self._engine = build_engine(self._database_url)
+        if is_postgres(self._engine) and rls_enabled():
+            # The app role never runs DDL: the owner-side upgrade_database
+            # created the schema, and the engine refuses to serve unless
+            # every tenant table is RLS-protected and this login is subject
+            # to the policies (core.rls).
+            prepare_runtime_engine(self._engine)
+        else:
+            Base.metadata.create_all(self._engine)
         # A database written by an older engine lacks the metabolism columns
         # the ORM now expects; fail with instructions instead of a mid-query
         # "no such column" error.
@@ -156,7 +182,12 @@ class MemoryEngine:
         except ImportError:
             pass
         with system_scope(reason="single-tenant startup: distinct-tenant check"):
-            with self._engine.connect() as conn:
+            # PostgreSQL with row-level security: the app role sees only its
+            # own tenant's rows, which would make this check vacuous -- the
+            # probe runs on the maintenance engine (core.rls).
+            from mirror_memory.core.rls import system_engine_for
+
+            with system_engine_for(self._engine).connect() as conn:
                 rows = conn.execute(
                     _text(
                         "SELECT DISTINCT tenant_id, app_id FROM mm_beliefs "

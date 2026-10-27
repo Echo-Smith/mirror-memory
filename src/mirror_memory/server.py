@@ -218,7 +218,10 @@ def _engine_cache_limit() -> int:
 
 
 def _release_engine(engine: "MemoryEngine") -> None:
-    """Dispose an evicted engine's connection pool."""
+    """Dispose an evicted engine's connection pool -- unless the pool is the
+    server's shared PostgreSQL engine, which the wrapper does not own."""
+    if not getattr(engine, "_owns_engine", True):
+        return
     pool = getattr(getattr(engine, "_engine", None), "pool", None)
     if pool is not None:
         try:
@@ -227,63 +230,102 @@ def _release_engine(engine: "MemoryEngine") -> None:
             logger.warning("tenant engine eviction: pool dispose failed", exc_info=True)
 
 
+class _Pending:
+    """Placeholder a creating thread parks in the cache while it builds the
+    engine OUTSIDE the lock; same-tenant requests wait on its future."""
+
+    __slots__ = ("future",)
+
+    def __init__(self) -> None:
+        import concurrent.futures
+
+        self.future: "concurrent.futures.Future[MemoryEngine]" = concurrent.futures.Future()
+
+
 class _TenantEngineCache:
     """Thread-safe bounded LRU cache (insertion order = recency order).
 
-    get/insert/evict run under one lock.  Engine CREATION is also
-    serialised by the caller holding the same lock across
-    miss -> create -> insert (the task's option 1), which guarantees at
-    most one engine is ever created per tenant even under a thundering
-    herd; the cost is that one tenant's first request waits behind
-    another tenant's engine creation (a metadata create_all, a few ms).
-    Evicted engines are collected in the lock and returned to the CALLER
-    -- pool.dispose happens outside, so a slow dispose never blocks other
-    tenants' requests.
+    M2 batch-2 task 2: engine CREATION happens outside the lock.  A miss
+    parks a :class:`_Pending` placeholder under the lock and releases it;
+    the creating thread builds the engine, then re-takes the lock to swap
+    the placeholder for the engine and evict.  Other requests for the same
+    tenant find the placeholder and wait on its future, so a tenant still
+    gets exactly one engine -- but a cold start for one tenant no longer
+    holds the lock other tenants' lookups need.  Placeholders are never
+    counted or evicted.  Evicted engines are returned to the CALLER, whose
+    dispose happens outside the lock as before.
     """
 
     def __init__(self):
-        self._data: dict[tuple[str, str], MemoryEngine] = {}
+        self._data: dict[tuple[str, str], object] = {}
         self._lock = threading.Lock()
+
+    def _real_count(self) -> int:
+        return sum(1 for v in self._data.values() if not isinstance(v, _Pending))
 
     def get(self, key):
         """Return the cached engine (marking it recently used) or None."""
         with self._lock:
-            engine = self._data.get(key)
-            if engine is not None:
-                del self._data[key]
-                self._data[key] = engine
-            return engine
+            entry = self._data.get(key)
+            if entry is None or isinstance(entry, _Pending):
+                return None
+            del self._data[key]
+            self._data[key] = entry
+            return entry
 
     def get_or_create(self, key, create) -> tuple[MemoryEngine, list]:
         """Return the engine for *key*, creating it via *create()* when
         absent.  Returns (engine, evicted_engines) -- dispose the evicted
         list OUTSIDE the lock."""
         with self._lock:
-            engine = self._data.get(key)
-            if engine is not None:
+            entry = self._data.get(key)
+            if entry is not None and not isinstance(entry, _Pending):
                 del self._data[key]
-                self._data[key] = engine
-                return engine, []
+                self._data[key] = entry
+                return entry, []
+            creator = entry is None
+            if creator:
+                entry = _Pending()
+                self._data[key] = entry
+            future = entry.future
+        if not creator:
+            # Same result -- or the same exception -- as the creating thread.
+            return future.result(), []
+        try:
             engine = create()
+        except BaseException as exc:
+            with self._lock:
+                if self._data.get(key) is entry:
+                    del self._data[key]
+            future.set_exception(exc)
+            raise
+        with self._lock:
+            if self._data.get(key) is entry:
+                del self._data[key]
             self._data[key] = engine
             evicted = []
-            while len(self._data) > _engine_cache_limit():
-                oldest = next(iter(self._data))
+            limit = _engine_cache_limit()
+            while self._real_count() > limit:
+                oldest = next(k for k, v in self._data.items() if not isinstance(v, _Pending))
                 evicted.append(self._data.pop(oldest))
-            return engine, evicted
+        future.set_result(engine)
+        return engine, evicted
 
     def __len__(self) -> int:
-        return len(self._data)
+        with self._lock:
+            return self._real_count()
 
     def items(self):
         with self._lock:
-            return list(self._data.items())
+            return [(k, v) for k, v in self._data.items() if not isinstance(v, _Pending)]
 
     def clear(self) -> list:
-        """Drop everything; returns the engines for outside-lock disposal."""
+        """Drop every engine; returns them for outside-lock disposal.
+        In-flight placeholders stay so their creators can still land."""
         with self._lock:
-            dropped = list(self._data.values())
-            self._data.clear()
+            dropped = [v for v in self._data.values() if not isinstance(v, _Pending)]
+            for k in [k for k, v in self._data.items() if not isinstance(v, _Pending)]:
+                del self._data[k]
             return dropped
 
 
@@ -336,17 +378,26 @@ def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
     each engine binds its own sessions inside its tenant scope (engines
     are single-tenant by construction).
 
-    Concurrency: miss -> create -> insert is one critical section
-    (get_or_create), so concurrent first requests for a tenant share ONE
-    engine; evictions are disposed outside the lock."""
+    PostgreSQL (M2 batch-2 task 2): every tenant wrapper shares the ONE
+    SQLAlchemy engine / pool the lifespan engine opened (tenants are told
+    apart by the per-transaction setting and the loader criteria, not by
+    pools), so the cache bounds wrappers, not connections, and eviction
+    never disposes the shared pool.  SQLite keeps one engine per tenant.
+
+    Concurrency: creation runs outside the cache lock behind a
+    placeholder; concurrent first requests for a tenant share ONE engine
+    and other tenants are not blocked while it is built."""
 
     def _create() -> MemoryEngine:
+        shared = _app_state.get("sa_engine")
         engine = MemoryEngine(
             config=_app_state["config"],
             database_url=_app_state["database_url"],
             llm_client=_app_state["llm_client"],
             tenant_id=tenant[0],
             app_id=tenant[1],
+            engine=shared,
+            schema_ready=shared is not None,
         )
         engine._ensure_db()
         return engine
@@ -398,6 +449,15 @@ def create_app(
         )
 
         global _engine
+        from mirror_memory.core.tenancy import READ_FILTER_NONE, read_filter_mode
+
+        if read_filter_mode() == READ_FILTER_NONE:
+            # The unfiltered baseline exists for measurement only; a server
+            # must never answer requests without a tenant read filter.
+            raise RuntimeError(
+                "MM_TENANT_READ_FILTER=none is a measurement-only baseline; "
+                "the HTTP server refuses to start without a tenant read filter"
+            )
         _engine = MemoryEngine(
             config_path=config_path,
             config=config,
@@ -408,12 +468,17 @@ def create_app(
             llm_base_url=llm_base_url or os.environ.get("MM_LLM_BASE_URL"),
         )
         _engine._ensure_db()
-        # Task 5: per-tenant engine factory state + optional key file
+        # Task 5: per-tenant engine factory state + optional key file.
+        # PostgreSQL: the lifespan engine's SQLAlchemy engine is THE shared
+        # pool every tenant wrapper binds to (M2 batch-2 task 2).
+        from mirror_memory.core.rls import is_postgres
+
         _app_state.clear()
         _app_state.update(
             config=_engine._config,
             database_url=_engine._database_url,
             llm_client=_engine._llm_client,
+            sa_engine=_engine._engine if is_postgres(_engine._engine) else None,
         )
         if getattr(_engine, "_single_tenant", False) and _tenant_key_registry:
             raise RuntimeError(
@@ -426,9 +491,14 @@ def create_app(
             logger.info("tenant auth enabled: %d key(s) registered", len(_tenant_key_registry))
         logger.info("mirror-memory engine initialized")
         yield
+        primary = _engine
         _engine = None
         for dropped in _tenant_engines.clear():
             _release_engine(dropped)
+        # The shared pool belongs to the lifespan engine; wrappers never
+        # disposed it, so it goes last.
+        if primary is not None and getattr(primary, "_engine", None) is not None:
+            primary._engine.dispose()
 
     app = FastAPI(
         title="mirror-memory",

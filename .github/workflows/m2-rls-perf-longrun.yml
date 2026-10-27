@@ -1,0 +1,57 @@
+name: m2-rls-perf-longrun
+
+# Patch acceptance only (M2 batch-2 patch task 1): the worker's transaction
+# structure changed, so the A-vs-C longrun is re-measured once -- the full
+# C/A/B final from m2-rls-perf.yml is NOT re-run.
+
+on:
+  push:
+    branches: ["perf/m2-batch2-longrun"]
+  workflow_dispatch:
+
+jobs:
+  longrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+          pip install "sqlglot>=25.0"
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 60); do
+            if python -c "import psycopg; psycopg.connect('postgresql://postgres:mm@127.0.0.1:5432/mm_test').close()" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
+          exit 1
+      - name: Longrun A vs C, interleaved x3
+        run: |
+          python tools/m2_mode_perf.py longrun-ac \
+            --admin-url "postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test" \
+            --work /tmp/m2_longrun_ac --rounds 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m2-longrun-ac
+          path: /tmp/m2_longrun_ac

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from mirror_memory.core.sql_audit import AuditViolation, audit_sql
+from mirror_memory.core.sql_audit import AuditViolation, _dialect_var, audit_sql
 
 
 def test_select_with_both_predicates_passes():
@@ -217,3 +217,177 @@ def test_audit_sql_refuses_to_run_inside_context_pass():
     with system_scope(reason="task-1a invariant guard"):
         with pytest.raises(RuntimeError):
             audit_sql(LEAK_SQL)
+
+
+# ---------------------------------------------------------------------------
+# M2 patch: the catalog whitelist is structural, not textual
+#
+# The old text patterns exempted any statement containing ``FROM
+# pg_catalog.`` ANYWHERE -- which whitelisted tenant reads wrapped in a
+# catalog subquery -- and ``SELECT pg_catalog.`` as a prefix, which
+# whitelisted ``SELECT pg_catalog.version() FROM mm_beliefs``.  Catalog
+# statements are now recognised from the parse tree (every relation must
+# be pg_catalog / information_schema); a mixed statement falls through to
+# the normal tenant rules.  The other whitelist patterns were tightened
+# the same way: a prefix anchor alone is a hole, because psycopg runs
+# multi-statement query strings (``BEGIN; SELECT ...``).
+# ---------------------------------------------------------------------------
+
+
+def _audit_as(sql: str, dialect: str):
+    token = _dialect_var.set(dialect)
+    try:
+        audit_sql(sql)
+        return None
+    except AuditViolation as exc:
+        return exc
+
+
+@pytest.mark.parametrize(
+    "label, sql",
+    [
+        ("catalog subquery", "SELECT * FROM mm_beliefs WHERE id IN (SELECT 1 FROM pg_catalog.pg_class)"),
+        ("catalog join", "SELECT c.relname FROM pg_catalog.pg_class c JOIN mm_beliefs b ON b.key = c.relname"),
+        ("catalog union", "SELECT id FROM mm_beliefs UNION SELECT 1 FROM pg_catalog.pg_class"),
+        ("catalog cte", "WITH c AS (SELECT 1 FROM pg_catalog.pg_class) SELECT * FROM mm_beliefs, c"),
+        ("catalog function + tenant FROM", "SELECT pg_catalog.version() FROM mm_beliefs"),
+        ("bare pg_ prefix mix", "SELECT * FROM mm_beliefs WHERE EXISTS (SELECT 1 FROM pg_tables)"),
+    ],
+)
+@pytest.mark.parametrize("dialect", ["postgresql", "sqlite"])
+def test_counterexample_catalog_mix_is_a_violation(label, sql, dialect):
+    assert _audit_as(sql, dialect) is not None, (label, dialect)
+
+
+@pytest.mark.parametrize(
+    "label, sql",
+    [
+        ("reflection join", "SELECT c.relname FROM pg_catalog.pg_class c "
+                            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid"),
+        ("catalog function only", "SELECT pg_catalog.version()"),
+        ("information_schema columns", "SELECT column_name FROM information_schema.columns "
+                                       "WHERE table_name = 'mm_beliefs'"),
+        ("bare pg_ relation", "SELECT relname FROM pg_class ORDER BY relname LIMIT 1"),
+    ],
+)
+def test_catalog_only_statements_pass(label, sql):
+    """SQLAlchemy's own create_all / reflection statements: every relation
+    is a catalog relation, so they carry no tenant data and stay exempt."""
+    assert _audit_as(sql, "postgresql") is None
+
+
+@pytest.mark.parametrize(
+    "label, sql",
+    [
+        ("BEGIN smuggle", "BEGIN; SELECT * FROM mm_beliefs"),
+        ("COMMIT smuggle", "COMMIT; SELECT * FROM mm_beliefs"),
+        ("SAVEPOINT smuggle", "SAVEPOINT sa_1; SELECT * FROM mm_beliefs"),
+        ("PRAGMA smuggle", "PRAGMA table_info(mm_beliefs); SELECT * FROM mm_beliefs"),
+        ("CREATE TABLE smuggle", "CREATE TABLE mm_tmp (id int); SELECT * FROM mm_beliefs"),
+        ("DROP TABLE smuggle", "DROP TABLE IF EXISTS mm_tmp; SELECT * FROM mm_beliefs"),
+        ("ALTER TABLE smuggle", "ALTER TABLE mm_tmp ADD COLUMN c int; SELECT * FROM mm_beliefs"),
+    ],
+)
+def test_counterexample_multi_statement_smuggle_is_a_violation(label, sql):
+    """A whitelist prefix must not whitewash the rest of a multi-statement
+    query string (psycopg executes them all)."""
+    assert _audit_as(sql, "postgresql") is not None
+
+
+def test_counterexample_create_table_as_select_is_a_violation():
+    """CTAS reads every row of the source table and parks them in a new
+    one -- the old ``create table`` prefix exempted it wholesale."""
+    assert _audit_as("CREATE TABLE stolen AS SELECT * FROM mm_beliefs", "postgresql") is not None
+
+
+def test_single_statement_ddl_still_exempt():
+    assert _audit_as("CREATE TABLE mm_tmp (id int)", "postgresql") is None
+    assert _audit_as("DROP TABLE IF EXISTS mm_tmp", "postgresql") is None
+    assert _audit_as("ALTER TABLE mm_tmp ADD COLUMN c VARCHAR(64)", "postgresql") is None
+    assert _audit_as("SAVEPOINT sa_1", "postgresql") is None
+    assert _audit_as("ROLLBACK TO SAVEPOINT sa_1", "postgresql") is None
+    assert _audit_as("RELEASE SAVEPOINT sa_1", "postgresql") is None
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2 task 0: tenant table names must not look like catalog relations
+# ---------------------------------------------------------------------------
+
+
+def test_counterexample_pg_prefixed_tenant_table_would_escape_the_audit(monkeypatch):
+    """The hazard the metadata check exists for: an unqualified ``pg_*``
+    relation is classified as PostgreSQL catalog metadata, so a tenant
+    table with that prefix would be read without any tenant predicate and
+    the auditor would wave the statement through."""
+    import mirror_memory.core.sql_audit as audit
+
+    monkeypatch.setattr(audit, "_tenant_table_names", lambda: {"pg_beliefs_t0", "mm_beliefs"})
+    # same shape against a real tenant table is a violation ...
+    assert _audit_as("SELECT * FROM mm_beliefs WHERE user_id = ?", "postgresql") is not None
+    # ... but the reserved prefix makes the identical statement pass
+    assert _audit_as("SELECT * FROM pg_beliefs_t0 WHERE user_id = ?", "postgresql") is None
+
+
+def test_counterexample_pg_prefixed_tenant_table_name_is_refused():
+    from mirror_memory.core.tenancy import TenantError, assert_tenant_table_names
+
+    with pytest.raises(TenantError, match="pg_beliefs"):
+        assert_tenant_table_names(["mm_beliefs", "pg_beliefs"])
+    with pytest.raises(TenantError):
+        assert_tenant_table_names(["PG_Shadow"])  # case-insensitive, like the auditor
+
+
+def test_live_metadata_passes_the_table_name_check():
+    from mirror_memory.core.models import Base
+    from mirror_memory.core.tenancy import assert_tenant_table_names
+
+    assert_tenant_table_names(Base.metadata.tables)
+    assert not any(name.startswith("pg_") for name in Base.metadata.tables)
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2: the cast tail must stop before a JOIN (reflection shapes)
+# ---------------------------------------------------------------------------
+
+
+def test_cast_tail_stops_before_a_join_so_reflection_parses():
+    """SQLAlchemy's foreign-key reflection: ``%(c)s::VARCHAR LEFT OUTER JOIN
+    pg_catalog.pg_class`` -- the old keyword stop-list did not know JOIN,
+    swallowed the join into the cast, and the statement failed to parse
+    (a false fail-closed verdict on a catalog-only statement)."""
+    sql = (
+        "SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class "
+        "LEFT OUTER JOIN pg_catalog.pg_constraint ON pg_catalog.pg_class.oid = "
+        "pg_catalog.pg_constraint.conrelid AND pg_catalog.pg_constraint.contype = "
+        "%(contype_1)s::VARCHAR LEFT OUTER JOIN pg_catalog.pg_class AS cls_ref "
+        "ON cls_ref.oid = pg_catalog.pg_constraint.confrelid"
+    )
+    assert _audit_as(sql, "postgresql") is None
+    # The same shape over tenant tables keeps every table visible: the
+    # JOINed table without predicates is still a violation.
+    leaky = (
+        "SELECT b.id FROM mm_beliefs AS b LEFT OUTER JOIN mm_evidence AS e "
+        "ON b.id = e.belief_id AND e.kind = %(k)s::VARCHAR "
+        "WHERE b.tenant_id = %(t)s AND b.app_id = %(a)s"
+    )
+    assert _audit_as(leaky, "postgresql") is not None
+
+
+@pytest.mark.parametrize(
+    "cast",
+    [
+        "TIMESTAMP WITHOUT TIME ZONE",
+        "TIMESTAMP WITH TIME ZONE",
+        "DOUBLE PRECISION",
+        "CHARACTER VARYING(64)",
+        "VARCHAR(64)",
+        "TEXT[]",
+        "INTEGER",
+    ],
+)
+def test_multi_word_cast_types_still_normalise(cast):
+    sql = (
+        f"SELECT id FROM mm_beliefs WHERE created_at = %(c)s::{cast} "
+        "AND tenant_id = %(t)s AND app_id = %(a)s"
+    )
+    assert _audit_as(sql, "postgresql") is None
