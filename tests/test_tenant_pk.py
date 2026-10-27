@@ -37,10 +37,17 @@ IS_PG = PG_URL.startswith("postgres")
 
 def _engine():
     if IS_PG:
-        eng = create_engine(PG_URL)
-        Base.metadata.drop_all(eng)
-        Base.metadata.create_all(eng)
-        return eng
+        # Fresh schema with the RLS posture (admin side), then the RUNTIME
+        # login: under RLS that is the app role, so these counterexamples
+        # exercise the same connection the engine uses -- a superuser
+        # connection would bypass every policy and only ever test the
+        # application-layer injection.
+        from tests.conftest import _pg_fresh_schema, _pg_runtime_url
+
+        admin = create_engine(PG_URL)
+        _pg_fresh_schema(admin)
+        admin.dispose()
+        return create_engine(_pg_runtime_url())
     eng = create_engine("sqlite://")
     Base.metadata.create_all(eng)
     return eng

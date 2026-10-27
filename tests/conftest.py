@@ -285,9 +285,17 @@ def _pg_fresh_schema(admin_engine) -> None:
     from mirror_memory.core.schema_migration import install_row_level_security
 
     def drop_bounded() -> None:
+        from sqlalchemy import MetaData
+
+        from mirror_memory.core.schema_migration import _version_table
+
         with admin_engine.connect() as conn:
             conn.execute(text("SET LOCAL lock_timeout = '2s'"))
             Base.metadata.drop_all(conn)  # clean slate (previous test leftovers)
+            # the version table is not in Base.metadata; a fresh schema has
+            # no migration history either (a leftover row would make the
+            # next upgrade_database skip every step)
+            _version_table(MetaData()).drop(conn, checkfirst=True)
             conn.commit()
 
     try:
