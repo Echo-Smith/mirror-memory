@@ -329,12 +329,16 @@ def _process_single_job(
     try:
         from mirror_memory.core.repository import get_state_revision, is_memory_enabled
 
-        # Renew the lease before the compute-heavy nodes: the publish below
-        # must not race an expiry that happened while the LLM was thinking.
+        # Renew the lease before the compute-heavy nodes: the pre-compute
+        # renewal must find the token still held; a lost lease aborts before
+        # any compute.  A second renewal happens at the publish transaction
+        # (below), so the publish itself never runs on an expired lease
+        # either -- the lease only has to be held at two instants, not
+        # across the whole compute.
         if token is not None and not _renew_lease(
             session, job_id, token, config.worker.job_lease_seconds
         ):
-            raise LeaseLost(f"job {job_id}: lease lost before publish")
+            raise LeaseLost(f"job {job_id}: lease lost before compute")
 
         # -- snapshot transaction ------------------------------------------
         # Consent gate: a disabled user's beliefs must not even be read into
@@ -393,6 +397,17 @@ def _process_single_job(
         # map so the Publisher's consent / revision / authority re-checks
         # read the database as it is now, in a fresh transaction.
         session.expire_all()
+
+        # Renew once more now that the compute is done (M3 batch-1 task 0):
+        # a compute longer than the lease must not publish on an expired
+        # one.  The renewal is fenced on the token -- if another worker
+        # re-claimed during the compute, this fails and nothing of ours is
+        # written.  _renew_lease commits, so the publish's own statements
+        # open the fresh transaction after it.
+        if token is not None and not _renew_lease(
+            session, job_id, token, config.worker.job_lease_seconds
+        ):
+            raise LeaseLost(f"job {job_id}: lease lost before publish")
 
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
