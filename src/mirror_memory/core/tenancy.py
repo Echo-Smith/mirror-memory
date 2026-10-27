@@ -927,6 +927,8 @@ TABLE_WRITE_CLASSES: dict[str, str] = {
     "mm_memory_preferences": "consent",
     "mm_consent_grants": "consent",
     "mm_users": "consent",
+    "mm_purpose_grants": "consent",
+    "mm_purpose_grant_events": "consent",
     # telemetry: append-only operational records with named writer entries
     "mm_extraction_stats": "telemetry",
     "mm_session_summaries": "telemetry",

@@ -117,6 +117,18 @@ def _scope_strict():
 
 
 @pytest.fixture(autouse=True)
+def _test_autogrant(monkeypatch):
+    """M3: the purpose authorization layer is on for every engine call in
+    the suite.  Instead of seeding a grant per (user, purpose) pair in
+    every test, the test harness enables the authorization module's
+    explicit autogrant (a REAL grant row with a REAL audit event, issued
+    by "test-autogrant"); the purpose-gate tests turn it off locally.
+    Production never sets MM_TEST_AUTOGRANT."""
+    monkeypatch.setenv("MM_TEST_AUTOGRANT", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _sql_auditor():
     """M1: the SQL auditor is always on during tests (MM_SQL_AUDIT=0 to
     disable for performance measurement runs)."""

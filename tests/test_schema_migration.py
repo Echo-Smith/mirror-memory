@@ -398,7 +398,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
 
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 5
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 6
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
     step = sm.Step4PendingJobsIndex()
@@ -416,7 +416,7 @@ def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
     from mirror_memory.core import schema_migration as sm
     from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
 
-    assert len(TENANT_USER_INDEXED_TABLES) == 14
+    assert len(TENANT_USER_INDEXED_TABLES) == 15
     eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
     Base.metadata.create_all(eng)
     insp = inspect(eng)

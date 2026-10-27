@@ -1210,6 +1210,84 @@ class Step5TenantUserIndexes:
                 )
 
 
+# ---------------------------------------------------------------------------
+# Step 6: purpose authorization tables (M3 batch-1 task 1)
+# ---------------------------------------------------------------------------
+
+PURPOSE_TABLES = ("mm_purpose_grants", "mm_purpose_grant_events")
+
+
+@dataclass
+class Step6PurposeAuthorization:
+    """Create the purpose-authorization tables and add ``mm_evolution_jobs
+    .purpose``.
+
+    Fresh databases get everything from ``create_all``; this step brings
+    databases already at version 5 up.  Re-entrant: tables are created
+    with ``checkfirst``, the column addition resumes its backfill, and the
+    RLS plan is idempotent.
+
+    - The two tables are created FROM THE MODEL METADATA, so every dialect
+      gets the same shape ``create_all`` would have made (the composite
+      tenant primary key included -- both their keys are all-string and
+      need no SQLite narrowing).
+    - ``mm_evolution_jobs.purpose``: ``ADD COLUMN`` (nullable) -> batched
+      backfill to ``''`` -> non-blocking ``SET NOT NULL`` (the same
+      ``NOT VALID`` CHECK / ``VALIDATE`` / ``SET NOT NULL`` recipe as
+      step 1).  The empty purpose marks pre-M3 jobs; the worker refuses
+      them with ``missing_purpose`` instead of running them ungated.
+    - PostgreSQL: the RLS posture is applied to the two new tables (the
+      databases this step runs on already have step 3's roles and the
+      tenant tables protected; a fresh database gets everything at once
+      from ``install_row_level_security``).
+    """
+
+    version: int = 6
+    name: str = "purpose authorization tables"
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        if any(not insp.has_table(name) for name in PURPOSE_TABLES):
+            return True
+        return "purpose" not in _table_columns(engine, "mm_evolution_jobs")
+
+    def apply(self, engine: Engine) -> None:
+        for name in PURPOSE_TABLES:
+            Base.metadata.tables[name].create(engine, checkfirst=True)
+        if "purpose" not in _table_columns(engine, "mm_evolution_jobs"):
+            if _is_postgres(engine):
+                _DDLPlan([AddColumn("mm_evolution_jobs", "purpose", "VARCHAR(64)")]).run(engine)
+                _backfill_column(
+                    engine, "mm_evolution_jobs", {"purpose": ""}, ["purpose"],
+                    DEFAULT_BACKFILL_BATCH,
+                )
+                notnull = [_lock_timeout_element()]
+                check = AddNotNullCheck("mm_evolution_jobs", "purpose")
+                notnull.append(check)
+                notnull.append(ValidateConstraint("mm_evolution_jobs", check.constraint_name))
+                notnull.append(AlterColumnClause("mm_evolution_jobs", "purpose", "SET NOT NULL"))
+                notnull.append(AlterColumnClause("mm_evolution_jobs", "purpose", "SET DEFAULT ''"))
+                notnull.append(DropConstraintByName("mm_evolution_jobs", check.constraint_name))
+                _DDLPlan(notnull).run(engine)
+            else:
+                # SQLite allows ADD COLUMN with a NOT NULL constant default
+                _DDLPlan([AddColumn(
+                    "mm_evolution_jobs", "purpose", "VARCHAR(64) NOT NULL DEFAULT ''",
+                )]).run(engine)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=list(PURPOSE_TABLES))).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        if "purpose" not in _table_columns(engine, "mm_evolution_jobs"):
+            raise MigrationError("verification failed: mm_evolution_jobs.purpose missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=list(PURPOSE_TABLES))
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1219,6 +1297,7 @@ DEFAULT_STEPS: list = [
     Step3RowLevelSecurity(),
     Step4PendingJobsIndex(),
     Step5TenantUserIndexes(),
+    Step6PurposeAuthorization(),
 ]
 
 #: The version a freshly upgraded database records.

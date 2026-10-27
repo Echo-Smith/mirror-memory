@@ -645,6 +645,7 @@ class EvolutionJob(TenantScoped, Base):
 
     id: Mapped[str] = mapped_column(String(64))
     user_id: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
     idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
@@ -712,6 +713,64 @@ class InterventionEvent(TenantScoped, Base):
     session_id: Mapped[str] = mapped_column(String(128))
     kind: Mapped[str] = mapped_column(String(32))  # "question_injected" / "question_answered"
     detail_json: Mapped[str] = mapped_column(Text, default="{}")  # belief_label, belief_key, verdict
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Purpose authorization (M3 batch 1)
+# ---------------------------------------------------------------------------
+
+
+class PurposeGrant(TenantScoped, Base):
+    """One purpose's authorization for one user (M3 batch 1 task 1).
+
+    ``purpose`` is the caller's declared reason for touching memory
+    (``"api"``, ``"worker"``, ``"benchmark"``, ...); ``allowed_operations``
+    is a JSON array over the fixed operation vocabulary
+    (``core.authorization.OPERATIONS``).  ``version`` is a monotonically
+    increasing optimistic-locking counter: every change is a
+    compare-and-swap on it, so concurrent issuers cannot clobber each
+    other, and a worker that recorded a version can detect any later
+    change.  ``revoked_at`` set means refused everywhere, immediately
+    (``authorize`` never caches -- it re-reads this row on every call).
+    """
+
+    __tablename__ = "mm_purpose_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "user_id", "purpose"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(64))
+    purpose: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    allowed_operations: Mapped[str] = mapped_column(Text, default="[]")  # JSON array
+    issued_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    issuer: Mapped[str] = mapped_column(String(64), default="")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PurposeGrantEvent(TenantScoped, Base):
+    """Append-only audit trail of purpose-grant changes (M3 batch 1 task 1).
+
+    One row per issuance, update, or revocation: the version transition,
+    who did it, when, and why.  Never updated or deleted; the grant row's
+    current state is stored denormalized on mm_purpose_grants for the hot
+    authorize() path, and this table is what makes every authorization
+    change reviewable after the fact.
+    """
+
+    __tablename__ = "mm_purpose_grant_events"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16))  # "granted" / "updated" / "revoked"
+    old_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), default="")
+    reason: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

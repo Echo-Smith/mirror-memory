@@ -634,6 +634,72 @@ class MemoryEngine:
             set_memory_enabled(session, user_id, enabled)
             session.commit()
 
+    def grant_purpose(
+        self,
+        *,
+        user_id: str,
+        purpose: str,
+        operations: list[str],
+        issuer: str,
+        expires_at: Any | None = None,
+        expected_version: int | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Issue or update one purpose authorization (M3 batch 1 task 1).
+
+        First issuance takes no ``expected_version``; updating an existing
+        grant requires it (the optimistic lock -- a stale issuer is
+        refused, concurrent issuers cannot clobber each other).  Every
+        accepted change appends a row to ``mm_purpose_grant_events``.
+        """
+        self._ensure_db()
+        from mirror_memory.core import authorization
+
+        with self._session() as session:
+            grant = authorization.grant_purpose(
+                session, user_id, purpose,
+                operations=operations, issuer=issuer, expires_at=expires_at,
+                expected_version=expected_version, reason=reason,
+            )
+            session.commit()
+            return {
+                "user_id": grant.user_id,
+                "purpose": grant.purpose,
+                "version": grant.version,
+                "allowed_operations": grant.allowed_operations,
+                "revoked": grant.revoked_at is not None,
+            }
+
+    def revoke_purpose(
+        self,
+        *,
+        user_id: str,
+        purpose: str,
+        actor: str,
+        reason: str = "",
+        expected_version: int | None = None,
+    ) -> dict:
+        """Revoke one purpose authorization (immediate: the next
+        ``authorize`` re-reads the row).  Idempotent."""
+        self._ensure_db()
+        from mirror_memory.core import authorization
+
+        with self._session() as session:
+            grant = authorization.revoke_purpose(
+                session, user_id, purpose, actor=actor, reason=reason,
+                expected_version=expected_version,
+            )
+            session.commit()
+            if grant is None:
+                return {"user_id": user_id, "purpose": purpose, "revoked": False, "existed": False}
+            return {
+                "user_id": grant.user_id,
+                "purpose": grant.purpose,
+                "version": grant.version,
+                "revoked": grant.revoked_at is not None,
+                "existed": True,
+            }
+
     def set_consent(self, *, user_id: str, feature: str, granted: bool) -> None:
         """Set feature-level consent for a user.
 
