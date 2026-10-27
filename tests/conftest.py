@@ -256,10 +256,52 @@ def _pg_fresh_schema(admin_engine) -> None:
     level security and both policies, exactly what step 3 of the migration
     leaves behind; verification is skipped here (the dedicated RLS tests
     verify it) to keep the per-test cost down.
+
+    Leaked sessions: a test that fails while a Session still holds an
+    open transaction keeps that connection alive (the failing frame
+    references it, and ``Engine.dispose`` cannot close a checked-out
+    connection), and the next test's ``DROP TABLE`` would then wait on
+    its locks forever.  The drop runs under a 2 s transaction-local
+    ``lock_timeout``; on timeout the harness terminates every other
+    backend on this test database, warns loudly (so the leaking test is
+    visible), and retries.  The run keeps going; the failure that caused
+    the leak is still reported as such.
     """
+    import warnings
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
     from mirror_memory.core.schema_migration import install_row_level_security
 
-    Base.metadata.drop_all(admin_engine)  # clean slate (previous test leftovers)
+    def drop_bounded() -> None:
+        with admin_engine.connect() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '2s'"))
+            Base.metadata.drop_all(conn)  # clean slate (previous test leftovers)
+            conn.commit()
+
+    try:
+        drop_bounded()
+    except OperationalError as exc:
+        if "55P03" not in str(exc) and "lock timeout" not in str(exc).lower():
+            raise
+        with admin_engine.connect() as conn:
+            conn.rollback()
+            leaked = conn.execute(text(
+                "SELECT pid, state, left(query, 120) FROM pg_catalog.pg_stat_activity "
+                "WHERE datname = current_database() AND pid <> pg_catalog.pg_backend_pid() "
+                "AND backend_type = 'client backend'"
+            )).all()
+            for pid, _state, _query in leaked:
+                conn.execute(text("SELECT pg_catalog.pg_terminate_backend(:pid)"), {"pid": pid})
+            conn.commit()
+        warnings.warn(
+            "pg harness: schema rebuild waited >2s for locks held by leaked "
+            f"session(s); terminated {len(leaked)} backend(s): "
+            + "; ".join(f"pid={p} {s}: {q!r}" for p, s, q in leaked),
+            stacklevel=2,
+        )
+        drop_bounded()
     Base.metadata.create_all(admin_engine)
     install_row_level_security(admin_engine, verify=False)
 
