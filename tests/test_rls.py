@@ -620,3 +620,62 @@ def test_step4_builds_the_pending_index_concurrently_and_reentrantly(pg_admin_en
             "JOIN pg_catalog.pg_class AS c ON c.oid = i.indexrelid WHERE c.relname = :name"
         ), {"name": sm.PENDING_JOBS_INDEX}).scalar_one()
     assert "WHERE" in definition and "pending" in definition and "created_at" in definition
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2 patch task 2: the migration is not bound by statement_timeout
+# ---------------------------------------------------------------------------
+
+
+def test_migration_runs_with_statement_timeout_zero_and_restores_it(pg_admin_engine, monkeypatch):
+    """The owner-side engine carries the application's statement_timeout
+    (1 s here, via build_engine).  Inside upgrade_database every connection
+    the migration checks out runs with statement_timeout = 0 -- session
+    level, so CONCURRENTLY builds outside a transaction are covered -- and
+    the setting is reset when the connection returns to the pool."""
+    from mirror_memory.core.pg_engine import build_engine
+    from mirror_memory.core.schema_migration import upgrade_database
+
+    monkeypatch.setenv("MM_PG_STATEMENT_TIMEOUT_MS", "1000")
+    engine = build_engine(pg_admin_engine.url.render_as_string(hide_password=False))
+    seen: dict[str, str] = {}
+
+    class ProbeStep:
+        version = 99
+        name = "probe: statement_timeout inside the migration"
+
+        def needed(self, eng):
+            return True
+
+        def apply(self, eng):
+            with eng.connect() as conn:
+                seen["during"] = conn.execute(text("SHOW statement_timeout")).scalar()
+                # longer than the application's 1 s limit: must not be cancelled
+                conn.execute(text("SELECT pg_sleep(1.3)"))
+            # the CONCURRENTLY path runs on an autocommit connection
+            with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                seen["autocommit"] = conn.execute(text("SHOW statement_timeout")).scalar()
+                seen["lock_timeout_default"] = conn.execute(text("SHOW lock_timeout")).scalar()
+
+        def verify(self, eng):
+            pass
+
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(text("SHOW statement_timeout")).scalar() == "1s"
+        upgrade_database(
+            engine, default_tenant="t", default_app="a", confirm_backup=True, steps=[ProbeStep()]
+        )
+        assert seen["during"] == "0" and seen["autocommit"] == "0", seen
+        # lock_timeout stays whatever the migration's own DDL sets; the
+        # session default (5 s from build_engine) is untouched here
+        assert seen["lock_timeout_default"] == "5s", seen
+        # every connection the migration used is back in the pool with the
+        # application's timeout restored
+        with engine.connect() as conn:
+            assert conn.execute(text("SHOW statement_timeout")).scalar() == "1s"
+        with pytest.raises(DBAPIError, match="statement timeout"):
+            with engine.connect() as conn:
+                conn.execute(text("SELECT pg_sleep(1.3)"))
+    finally:
+        engine.dispose()

@@ -35,6 +35,7 @@ run without ``confirm_backup=True`` and prints a ready ``pg_dump`` command.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -1139,35 +1140,96 @@ def upgrade_database(
 
     plan = steps if steps is not None else DEFAULT_STEPS
     backup = None if _is_postgres(engine) else _backup_sqlite(engine)
-    _ensure_version_table(engine)
-    start_version = current_version(engine)
+    with _unbounded_statement_timeout(engine):
+        _ensure_version_table(engine)
+        start_version = current_version(engine)
 
-    tables = [t.name for t in Base.metadata.sorted_tables]
-    before = _row_counts(engine, tables)
+        tables = [t.name for t in Base.metadata.sorted_tables]
+        before = _row_counts(engine, tables)
 
-    try:
-        for step in plan:
-            if step.version <= start_version:
-                continue
-            if hasattr(step, "default_tenant"):
-                step.default_tenant = (default_tenant, default_app)
-            if step.needed(engine):
-                logger.info("migration: applying step %d (%s)", step.version, step.name)
-                if isinstance(step, StepAddColumnBackfill):
-                    step.apply(engine, batch=batch)
-                else:
-                    step.apply(engine)
-            step.verify(engine)
-            _record_version(engine, step.version, step.name)
-    except Exception as exc:
-        _restore_sqlite(engine, backup)
-        if isinstance(exc, MigrationError):
-            raise
-        raise MigrationError(
-            "migration step failed (" + type(exc).__name__ + ": " + str(exc) + ")"
-        ) from exc
+        try:
+            for step in plan:
+                if step.version <= start_version:
+                    continue
+                if hasattr(step, "default_tenant"):
+                    step.default_tenant = (default_tenant, default_app)
+                if step.needed(engine):
+                    logger.info("migration: applying step %d (%s)", step.version, step.name)
+                    if isinstance(step, StepAddColumnBackfill):
+                        step.apply(engine, batch=batch)
+                    else:
+                        step.apply(engine)
+                step.verify(engine)
+                _record_version(engine, step.version, step.name)
+        except Exception as exc:
+            _restore_sqlite(engine, backup)
+            if isinstance(exc, MigrationError):
+                raise
+            raise MigrationError(
+                "migration step failed (" + type(exc).__name__ + ": " + str(exc) + ")"
+            ) from exc
 
     return before
+
+
+@contextlib.contextmanager
+def _unbounded_statement_timeout(engine: Engine):
+    """PostgreSQL: the migration's own connections run without the
+    application's ``statement_timeout`` (M2 batch-2 patch task 2).
+
+    The owner-side engine is normally built by ``pg_engine.build_engine``,
+    which pins ``statement_timeout`` for request traffic (30 s default);
+    ``VALIDATE CONSTRAINT``, backfills and ``CREATE INDEX CONCURRENTLY`` on
+    a large table legitimately run longer.  While the migration is active
+    every connection it checks out gets ``SET statement_timeout = 0`` --
+    session level, because CONCURRENTLY runs outside any transaction, so a
+    ``SET LOCAL`` could not cover it -- and ``RESET statement_timeout`` on
+    the way back into the pool restores the session default, i.e. the value
+    the connect-time libpq options established.  Both run on the fresh /
+    returned DBAPI connection and are committed at once, so the connection
+    is idle (not in a transaction) when SQLAlchemy takes it over or an
+    autocommit isolation level is applied.  ``lock_timeout`` is deliberately
+    NOT touched: the migration sets its own (``SetLockTimeout``) and must
+    keep failing fast rather than queueing behind readers.
+
+    Backfill batches never idle inside a transaction: each batch is one
+    UPDATE in its own ``engine.begin()`` block, and the Python loop runs
+    BETWEEN transactions, so ``idle_in_transaction_session_timeout`` cannot
+    fire during a backfill.
+    """
+    if not _is_postgres(engine):
+        yield
+        return
+    from sqlalchemy import event
+
+    def _checkout(dbapi_connection, connection_record, connection_proxy):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET statement_timeout = 0")
+        finally:
+            cursor.close()
+        dbapi_connection.commit()
+
+    def _checkin(dbapi_connection, connection_record):
+        if dbapi_connection is None:
+            return  # the pool discarded a broken connection
+        try:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("RESET statement_timeout")
+            finally:
+                cursor.close()
+            dbapi_connection.commit()
+        except Exception:  # noqa: BLE001 -- a dead connection is the pool's to drop
+            logger.debug("migration: could not reset statement_timeout on checkin", exc_info=True)
+
+    event.listen(engine, "checkout", _checkout)
+    event.listen(engine, "checkin", _checkin)
+    try:
+        yield
+    finally:
+        event.remove(engine, "checkout", _checkout)
+        event.remove(engine, "checkin", _checkin)
 
 
 def downgrade_database(engine: Engine) -> bool:

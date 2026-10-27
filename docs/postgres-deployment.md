@@ -22,6 +22,14 @@
    default_tenant=..., default_app=..., confirm_backup=True)`）。它建表、
    补租户列、改复合主键，并在第 3 步安装 RLS（所有权转给 `mm_owner`、
    GRANT、`ENABLE`+`FORCE ROW LEVEL SECURITY`、两条策略）。每一步可重入。
+   **迁移不受应用超时约束**：迁移期间它借出的每个连接都设为会话级
+   `statement_timeout = 0`（会话级而非 `SET LOCAL`，因为 `CREATE INDEX
+   CONCURRENTLY` 在事务外执行），连接归还连接池时 `RESET` 回建连时的应用
+   默认值；`lock_timeout` 不动——迁移沿用自己的 `MM_MIGRATION_LOCK_TIMEOUT`
+   （默认 3 s）并失败重试，而不是排队堵住后面的读者。分批回填的每一批是
+   独立事务里的一条 UPDATE，Python 循环在事务**之间**运行，所以
+   `idle_in_transaction_session_timeout` 不会在回填期间触发。建议迁移用
+   专用的 owner 引擎，不与请求流量共享连接池（监听器作用于整个引擎）。
 2. **应用进程用 app 登录**：`MM_DATABASE_URL=postgresql+psycopg://mm_app:...@host/db`。
    引擎启动时校验：schema 已建好、每张租户表 RLS 在位、当前登录不是
    超级用户 / owner / BYPASSRLS——任一不满足即拒绝启动（fail-closed）。
@@ -45,7 +53,7 @@
 | `MM_PG_POOL_RECYCLE` | 1800 s | 低于常见 NAT / 代理空闲上限；服务端角色或参数变更无需重启即可到达连接池 |
 | `MM_PG_STATEMENT_TIMEOUT_MS` | 30000 | observe/recall 的语句是毫秒级；跑到 30 s 的语句是失控查询或等不到的锁，池只有 ≤15 条连接，几条被钉住就是整体不可用 |
 | `MM_PG_LOCK_TIMEOUT_MS` | 5000 | claim/publish 的行锁争用毫秒级即可解决；5 s 兜住排在卡死写者后面的情况。迁移另有 `MM_MIGRATION_LOCK_TIMEOUT` |
-| `MM_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS` | 60000 | 空闲的开放事务持锁并阻塞 VACUUM；引擎会话是请求级的，60 s 远超任何合法请求，又能在泄漏会话伤到集群前释放 |
+| `MM_PG_IDLE_IN_TRANSACTION_TIMEOUT_MS` | 60000 | 空闲的开放事务持锁并阻塞 VACUUM；引擎会话是请求级的，60 s 远超任何合法请求，又能在泄漏会话伤到集群前释放。worker 在模型调用期间**不持有事务**（快照事务先结束、发布前再开新事务），所以这个上限对计算时长没有约束 |
 | `MM_PG_MAINTENANCE_POOL_SIZE` | 2 | 维护流量只有队列扫描与启动探针 |
 
 三个超时通过 libpq `options`（`-c statement_timeout=...`）在**建连时**设置，
