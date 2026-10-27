@@ -7,7 +7,7 @@ name: dual-db
 
 on:
   push:
-    branches: [main, "feat/m2-postgres"]
+    branches: [main, "feat/m2-postgres", "feat/m3-purpose"]
   pull_request:
   workflow_dispatch:
 
