@@ -729,3 +729,91 @@ def test_step5_swaps_user_indexes_concurrently_and_reentrantly(pg_admin_engine):
             ), {"t": name}).scalars().all())
             assert rows == {tenant_user_index_name(name)}, (name, rows)
 
+
+
+# ---------------------------------------------------------------------------
+# M2 batch-2 patch task 4: the tenant setting follows the Session's binding
+# ---------------------------------------------------------------------------
+
+
+def _recording_engine(url):
+    from sqlalchemy import event
+
+    engine = create_engine(url)
+    recorded: list[tuple[str, object]] = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _rec(conn, cursor, statement, parameters, context, executemany):
+        recorded.append((statement, parameters))
+
+    return engine, recorded
+
+
+def _tenant_settings(recorded) -> list[str]:
+    return [
+        p["tenant_id"] for s, p in recorded
+        if "set_config('mm.tenant_id'" in s and isinstance(p, dict) and "tenant_id" in p
+    ]
+
+
+def test_session_bound_to_a_refuses_to_run_under_b_without_any_sql(two_tenants):
+    """A Session bound to tenant A, driven inside a tenant-B context: every
+    way of starting a transaction on it must raise, and no statement may
+    run with B's tenant setting -- not the ORM query (already covered by
+    the binding check), and not raw text or an explicit connection()."""
+    from mirror_memory.core.tenancy import TenantMismatchError
+
+    engine, recorded = _recording_engine(two_tenants)
+    try:
+        with tenant_scope("tA", "app"):
+            session = Session(engine)  # bound to tA at creation
+        with tenant_scope("tB", "app"):
+            with pytest.raises(TenantMismatchError):
+                session.execute(text("select 1"))
+            session.rollback()
+            with pytest.raises(TenantMismatchError):
+                session.connection()
+            session.rollback()
+            with pytest.raises(TenantMismatchError):
+                session.query(Belief).all()
+            session.rollback()
+        session.close()
+        assert "tB" not in _tenant_settings(recorded), _tenant_settings(recorded)
+        # and under its own tenant the same session works, with A's setting
+        with tenant_scope("tA", "app"):
+            assert session.execute(text("select 1")).scalar() == 1
+            assert session.query(Belief).count() == 1
+            session.close()
+        assert _tenant_settings(recorded) and set(_tenant_settings(recorded)) == {"tA"}
+    finally:
+        engine.dispose()
+
+
+def test_unbound_session_under_a_tenant_refuses_raw_sql_too(two_tenants):
+    from mirror_memory.core.tenancy import TenantMismatchError
+
+    engine, recorded = _recording_engine(two_tenants)
+    try:
+        with no_tenant_scope():
+            session = Session(engine)  # bound to None
+        with tenant_scope("tB", "app"):
+            with pytest.raises(TenantMismatchError, match="no bound tenant"):
+                session.execute(text("select 1"))
+            session.rollback()
+        session.close()
+        assert _tenant_settings(recorded) == []
+    finally:
+        engine.dispose()
+
+
+def test_raw_connection_still_takes_the_ambient_tenant(two_tenants):
+    """engine.connect() has no Session binding: the ContextVar is the only
+    source, as before."""
+    engine, recorded = _recording_engine(two_tenants)
+    try:
+        with tenant_scope("tB", "app"), no_audit_scope():
+            with engine.connect() as conn:
+                assert _count_all(conn) == 1
+        assert _tenant_settings(recorded) == ["tB"]
+    finally:
+        engine.dispose()

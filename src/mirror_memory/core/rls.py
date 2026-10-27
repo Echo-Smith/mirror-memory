@@ -149,23 +149,75 @@ SET_TENANT_SQL = (
 _hooks_installed = False
 
 
-def _set_tenant_on_begin(conn) -> None:
+def _applies(conn) -> bool:
     if not is_postgres(conn) or not rls_enabled():
-        return
-    if conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT":
-        return
-    tenant = peek_tenant()
-    if tenant is None:
-        return  # no tenant -> no setting -> the policies see nothing
+        return False
+    return conn.get_execution_options().get("isolation_level") != "AUTOCOMMIT"
+
+
+def _set_tenant(conn, tenant: tuple[str, str]) -> None:
+    conn._mm_tenant_pending = False  # before executing: the nested execute must not recurse
     conn.exec_driver_sql(SET_TENANT_SQL, {"tenant_id": tenant[0], "app_id": tenant[1]})
 
 
+def _mark_pending_on_begin(conn) -> None:
+    """Connection ``begin`` (fires for autobegin too): the new transaction has
+    no tenant setting yet.  Nothing is executed here -- which source the
+    tenant comes from is decided by whoever starts the first statement
+    (M2 batch-2 patch task 4)."""
+    conn._mm_tenant_pending = _applies(conn)
+
+
+def _set_tenant_for_session(session, transaction, connection) -> None:
+    """Session ``after_begin``: the tenant comes from the SESSION'S BINDING,
+    checked against the ambient context first.
+
+    A Session is bound to a tenant at creation; a mismatch between that
+    binding and the ambient ``tenant_scope`` is a programming error that
+    the ORM path already refuses (``_check_session_tenant``).  Raw text and
+    an explicit ``session.connection()`` do not pass through the ORM hook,
+    so the same check runs here -- BEFORE any statement, so a transaction
+    begun under the wrong tenant never carries the wrong setting.
+    """
+    if not getattr(connection, "_mm_tenant_pending", False):
+        return
+    from mirror_memory.core.tenancy import _check_session_tenant, in_system_scope
+
+    ambient = peek_tenant()
+    if ambient is None:
+        # No tenant context: fail closed -- no setting, the policies admit
+        # nothing; the ORM layer raises TenantContextMissing on its own.
+        connection._mm_tenant_pending = False
+        return
+    if not in_system_scope():
+        _check_session_tenant(session, ambient)  # raises on bound != ambient / unbound
+    _set_tenant(connection, ambient)
+
+
+def _set_tenant_before_first_statement(conn, cursor, statement, parameters, context, executemany) -> None:
+    """Connection ``before_cursor_execute``: a connection no Session claimed
+    (``engine.connect()`` / Core) takes the ambient tenant at its first
+    statement of the transaction."""
+    if not getattr(conn, "_mm_tenant_pending", False):
+        return
+    tenant = peek_tenant()
+    if tenant is None:
+        conn._mm_tenant_pending = False
+        return  # no tenant -> no setting -> the policies see nothing
+    _set_tenant(conn, tenant)
+
+
 def install_rls_hooks() -> None:
-    """Idempotently attach the per-transaction tenant setting to every Engine."""
+    """Idempotently attach the per-transaction tenant setting to every Engine
+    and Session."""
     global _hooks_installed
     if _hooks_installed:
         return
-    event.listen(Engine, "begin", _set_tenant_on_begin)
+    from sqlalchemy.orm import Session
+
+    event.listen(Engine, "begin", _mark_pending_on_begin)
+    event.listen(Engine, "before_cursor_execute", _set_tenant_before_first_statement)
+    event.listen(Session, "after_begin", _set_tenant_for_session)
     _hooks_installed = True
 
 

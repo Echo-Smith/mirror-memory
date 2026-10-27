@@ -188,7 +188,7 @@ hookwrapper）；**测试体**不再有全局豁免——直写表的测试体�
 - `mm_maintenance_rows` FOR ALL TO `mm_maintenance`, `mm_owner`：
   `USING (true) WITH CHECK (true)`。
 
-**租户设置**：`Engine` 类上的 `begin` 事件监听器在**每个事务开始**执行
+**租户设置**：每个事务一条参数化、事务级的 `set_config`。租户值的来源（补丁任务 4）：由 Session 发起的事务取 **Session 创建时绑定的租户**，并先与 ContextVar 比对——不一致（或 Session 未绑定）在发出任何 SQL 之前抛 `TenantMismatchError`；不经 Session 的裸连接（`engine.connect()` / Core）在首条语句前取 ContextVar。实现：`Engine` 类的 `begin` 事件只把新事务标记为「待设置」，Session 的 `after_begin` 与 Connection 的 `before_cursor_execute` 分别负责两条路径。原文描述的事务级语义不变——`Engine` 类上的 `begin` 事件在**每个事务开始**触发，由上述两处执行
 `SELECT set_config('mm.tenant_id', %(tenant_id)s, true),
 set_config('mm.app_id', %(app_id)s, true)`——两个值是绑定参数，
 `is_local = true` 为事务级：PostgreSQL 自己在 COMMIT / ROLLBACK 时丢弃，
