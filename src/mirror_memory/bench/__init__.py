@@ -64,3 +64,16 @@ __all__ = [
     "StateCaseV11",
     "load_statebench_v1_1",
 ]
+
+
+def grant_bench_purpose(engine, user_ids, purpose: str = "benchmark") -> None:
+    """Idempotently authorize the benchmark purpose for the users a bench
+    run will touch (M3: the benches are engine callers like any other
+    host).  Commits once; safe to call repeatedly."""
+    from mirror_memory.core.authorization import ensure_purpose_grant
+
+    engine._ensure_db()
+    with engine._session() as session:
+        for user_id in user_ids:
+            ensure_purpose_grant(session, user_id, purpose, issuer="bench-harness")
+        session.commit()

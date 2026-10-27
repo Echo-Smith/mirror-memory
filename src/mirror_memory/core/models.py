@@ -766,9 +766,13 @@ class PurposeGrantEvent(TenantScoped, Base):
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     purpose: Mapped[str] = mapped_column(String(64))
-    action: Mapped[str] = mapped_column(String(16))  # "granted" / "updated" / "revoked"
+    action: Mapped[str] = mapped_column(String(16))  # "granted" / "updated" / "revoked" / "invoked"
+    # For grant-change events both are empty; a forget invocation records
+    # operation="forget", decision="allowed_regardless" (M3 batch-1 task 3).
+    operation: Mapped[str] = mapped_column(String(16), default="")
+    decision: Mapped[str] = mapped_column(String(32), default="")
     old_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    new_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actor: Mapped[str] = mapped_column(String(64), default="")
     reason: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

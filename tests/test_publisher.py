@@ -407,7 +407,7 @@ class TestWorkerPublishesThroughPublisher:
 
         config.llm_client = FakeLLM()
 
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
         _process_single_job(db_session, job, config)
 
         assert job.status == "completed"
@@ -430,7 +430,7 @@ class TestWorkerPublishesThroughPublisher:
                 return '{"patterns": [], "support_policy": {}}'
 
         config.llm_client = FakeLLM()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
 
         def _formulate_with_concurrent_write(session, user_id, evidence, cfg):
             touch_memory_state(session, user_id)

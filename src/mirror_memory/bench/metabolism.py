@@ -299,7 +299,11 @@ def run_case(
         config=_benchmark_config(config, llm_client),
         database_url="sqlite://",
         llm_client=llm_client,
+        default_purpose="benchmark",
     )
+    from mirror_memory.bench import grant_bench_purpose
+
+    grant_bench_purpose(engine, [user_id])
     clock = datetime.now(UTC)
     # Each observe is a distinct turn: the pipeline keys fallback evidence on
     # ``session:turn``, so re-using one index would collapse repeated

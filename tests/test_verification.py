@@ -345,10 +345,17 @@ class TestMemoryEngineVerification:
         assert engine.get_verification_candidates(user_id="u1") == []
 
     def test_engine_disabled_loop(self, engine):
+        """With the feature switch off, the purpose layer refuses with
+        feature_disabled (the two-layer truth table) -- it no longer
+        silently returns empty, which would mask the authorization state."""
         self._seed(engine)
         engine.set_enabled(user_id="u1", enabled=False)
-        assert engine.get_verification_candidates(user_id="u1") == []
-        assert engine.run_verification(user_id="u1", session_id="s3", user_text="yes") is False
+        from mirror_memory.core.authorization import PurposeDenied
+
+        with pytest.raises(PurposeDenied, match="feature_disabled"):
+            engine.get_verification_candidates(user_id="u1")
+        with pytest.raises(PurposeDenied, match="feature_disabled"):
+            engine.run_verification(user_id="u1", session_id="s3", user_text="yes")
 
     def test_delete_cascades_intervention_events(self, engine):
         self._seed(engine)

@@ -331,7 +331,11 @@ def _run_case(
         config=config,
         database_url=database_url,
         llm_client=llm_client,
+        default_purpose="benchmark",
     )
+    from mirror_memory.bench import grant_bench_purpose
+
+    grant_bench_purpose(engine, [case.case_id])
     extracted = [
         engine.observe(
             user_id=case.case_id,

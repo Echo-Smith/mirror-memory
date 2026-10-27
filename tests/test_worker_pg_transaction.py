@@ -74,8 +74,7 @@ def _seed(session, job_id: str) -> None:
     with queue_write_scope():
         session.add(EvolutionJob(
             id=job_id, user_id=USER, evidence_watermark="{}",
-            idempotency_key=f"{job_id}:ik", status="pending",
-        ))
+            idempotency_key=f"{job_id}:ik", status="pending", purpose="test"))
     session.commit()
 
 

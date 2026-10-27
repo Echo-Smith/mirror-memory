@@ -27,6 +27,15 @@ writers:
       # the test-only autogrant path (MM_TEST_AUTOGRANT=1, conftest only)
       - mirror_memory.core.authorization
 
+  record_purpose_invocation:
+    reason: >
+      Appends a mm_purpose_grant_events row for an operation that ran
+      WITHOUT a grant decision: the forget path, which is admitted
+      regardless of authorization state (a revoked user can still have
+      their data erased) but must carry a purpose and is audited.
+    callers:
+      - mirror_memory.api
+
   revoke_purpose:
     reason: >
       Revokes one purpose grant (sets revoked_at, bumps the version,

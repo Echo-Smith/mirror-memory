@@ -156,8 +156,7 @@ def test_worker_uses_job_tenant_not_scheduler_context(tmp_path):
         s.add(EvolutionJob(
             id=job_id, user_id="u1",
             evidence_watermark="{}", idempotency_key="tA:u1:v1",
-            status="pending", tenant_id="tA", app_id="app",
-        ))
+            status="pending", tenant_id="tA", app_id="app", purpose="test"))
         s.commit()
         s.close()
 

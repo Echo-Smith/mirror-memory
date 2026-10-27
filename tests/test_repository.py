@@ -598,8 +598,7 @@ class TestForgetInvalidatesDerived:
         job = EvolutionJob(
             id="test-job-1", user_id="u_job",
             evidence_watermark="{}", prompt_version="v1",
-            idempotency_key="u_job:none:v1", status="pending",
-        )
+            idempotency_key="u_job:none:v1", status="pending", purpose="test")
         db_session.add(job)
         db_session.commit()
 

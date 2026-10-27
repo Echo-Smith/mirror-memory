@@ -72,6 +72,7 @@ class MemoryEngine:
         single_tenant_mode: bool | None = None,
         engine: Any | None = None,
         schema_ready: bool = False,
+        default_purpose: str | None = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -94,6 +95,10 @@ class MemoryEngine:
         self._shared_engine = engine
         self._owns_engine = engine is None
         self._schema_ready = bool(schema_ready and engine is not None)
+        # M3: an explicit engine-level default purpose (an end-side
+        # single-tenant host sets it once).  None means NO default: callers
+        # must pass a purpose; there is no implicit one.
+        self._default_purpose = default_purpose
         # Task 6: end-side single-tenant mode (None -> env MM_SINGLE_TENANT).
         import os
 
@@ -233,6 +238,41 @@ class MemoryEngine:
             self._pipeline = ExtractionPipeline(config=self._config, llm_client=self._llm_client)
         return self._pipeline
 
+    # -- purpose authorization (M3 batch-1 tasks 2/3) ------------------------
+
+    def _purpose_or_default(self, purpose: str | None) -> str:
+        """The effective purpose: the call's argument or the engine-level
+        default.  Neither present -> PurposeDenied(missing_purpose); there
+        is no implicit default."""
+        from mirror_memory.core.authorization import Decision, PurposeDenied
+
+        resolved = purpose if purpose is not None else self._default_purpose
+        if not resolved or not str(resolved).strip():
+            raise PurposeDenied(Decision(False, "missing_purpose", None, ""), "unresolved")
+        return str(resolved).strip()
+
+    def _authorize(self, session, user_id: str, purpose: str | None, operation: str) -> str:
+        """Authorize *operation* in the CURRENT transaction, before any
+        business statement; raises PurposeDenied on refusal."""
+        from mirror_memory.core import authorization
+
+        resolved = self._purpose_or_default(purpose)
+        authorization.authorize_or_raise(session, user_id, resolved, operation)
+        return resolved
+
+    def _record_forget_invocation(self, session, user_id: str, purpose: str | None) -> str:
+        """The forget paths run regardless of authorization state (a revoked
+        user can still have their data erased) but must carry a purpose, and
+        every invocation is written to the authorization audit trail."""
+        from mirror_memory.core import authorization
+
+        resolved = self._purpose_or_default(purpose)
+        authorization.record_purpose_invocation(
+            session, user_id, resolved,
+            operation="forget", decision="allowed_regardless", actor="engine",
+        )
+        return resolved
+
     def observe(
         self,
         *,
@@ -240,6 +280,7 @@ class MemoryEngine:
         session_id: str,
         text: str,
         turn_count: int = 1,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> int:
         """Process a single conversation turn — extract and store beliefs.
@@ -270,6 +311,7 @@ class MemoryEngine:
         pipeline = self._get_pipeline()
         started = time.monotonic()
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "observe")
             claims = pipeline.observe(
                 session,
                 user_id=user_id,
@@ -295,6 +337,7 @@ class MemoryEngine:
         tail_load: int = 0,
         trace_hook: Any | None = None,
         now: Any | None = None,
+        purpose: str | None = None,
     ) -> str | None:
         """Retrieve a rendered memory block for prompt injection.
 
@@ -338,6 +381,7 @@ class MemoryEngine:
 
         started = time.monotonic()
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "recall")
             result = render_memory_block(
                 session,
                 user_id,
@@ -364,7 +408,9 @@ class MemoryEngine:
         )
         return result
 
-    def run_metabolism(self, *, user_id: str, dry_run: bool = False, now: Any | None = None) -> dict:
+    def run_metabolism(
+        self, *, user_id: str, dry_run: bool = False, now: Any | None = None, purpose: str | None = None,
+    ) -> dict:
         """Run one memory-metabolism cycle for a user.
 
         Scans the user's beliefs, scores heat, applies protection, and
@@ -404,6 +450,7 @@ class MemoryEngine:
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "extract")
             report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)
             session.commit()
             return report.as_dict()
@@ -413,6 +460,7 @@ class MemoryEngine:
         *,
         user_id: str,
         language: str = "en",
+        purpose: str | None = None,
     ) -> PanelData:
         """Build a structured panel of the user's memory for frontend display.
 
@@ -435,6 +483,7 @@ class MemoryEngine:
         from mirror_memory.render.panel import build_panel
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "recall")
             raw = build_panel(session, user_id, config=self._config, language=language)
             return PanelData(
                 memory=raw.get("memory", {}),
@@ -448,6 +497,7 @@ class MemoryEngine:
         user_id: str,
         dimensions: list[str] | None = None,
         limit: int = 50,
+        purpose: str | None = None,
     ) -> list[BeliefInfo]:
         """List active beliefs for a user.
 
@@ -470,6 +520,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import list_active_beliefs
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "explain")
             beliefs = list_active_beliefs(session, user_id, dimensions=dimensions, limit=limit)
             return [
                 BeliefInfo(
@@ -490,7 +541,9 @@ class MemoryEngine:
                 for b in beliefs
             ]
 
-    def get_verification_candidates(self, *, user_id: str, limit: int = 1, session_id: str = "") -> list[dict]:
+    def get_verification_candidates(
+        self, *, user_id: str, limit: int = 1, session_id: str = "", purpose: str | None = None,
+    ) -> list[dict]:
         """Get beliefs eligible for verification questioning.
 
         Selects L4 beliefs (confidence >= question threshold, cross-session
@@ -539,6 +592,7 @@ class MemoryEngine:
         )
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "explain")
             try:
                 beliefs = get_question_candidates(session, user_id, self._config, limit=limit)
                 results: list[dict] = []
@@ -570,7 +624,9 @@ class MemoryEngine:
                 session.rollback()
                 return []
 
-    def run_verification(self, *, user_id: str, session_id: str, user_text: str) -> bool:
+    def run_verification(
+        self, *, user_id: str, session_id: str, user_text: str, purpose: str | None = None,
+    ) -> bool:
         """Run verification judgment for this turn. Returns True if turn consumed.
 
         Judges the user's reply against the pending verification question
@@ -596,6 +652,7 @@ class MemoryEngine:
         from mirror_memory.extraction.verification import run_verification_judgment
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "correct")
             try:
                 consumed = run_verification_judgment(
                     session,
@@ -729,7 +786,7 @@ class MemoryEngine:
             set_feature_consent(session, user_id, feature.strip(), granted)
             session.commit()
 
-    def delete_memories(self, *, user_id: str) -> DeleteResult:
+    def delete_memories(self, *, user_id: str, purpose: str | None = None) -> DeleteResult:
         """Delete all memory data for a user.
 
         Returns
@@ -749,11 +806,12 @@ class MemoryEngine:
         from mirror_memory.core.repository import delete_user_memories
 
         with self._session() as session:
+            self._record_forget_invocation(session, user_id, purpose)
             counts = delete_user_memories(session, user_id)
             session.commit()
             return DeleteResult(**counts)
 
-    def forget_belief(self, *, user_id: str, belief_id: int) -> bool:
+    def forget_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Targeted forget: delete a single belief and everything derived from it.
 
         The deletion is one transaction — belief, events, evidence links,
@@ -783,6 +841,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
+            self._record_forget_invocation(session, user_id, purpose)
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_FORGET,
@@ -794,7 +853,7 @@ class MemoryEngine:
             session.commit()
             return decision.committed
 
-    def restore_belief(self, *, user_id: str, belief_id: int) -> bool:
+    def restore_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Restore an archived belief into the default retrieval scan.
 
         Archiving is reversible by design: an archived belief has left the
@@ -823,6 +882,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "correct")
             belief = session.get(Belief, belief_id)
             if belief is None or belief.user_id != user_id:
                 return False
@@ -844,7 +904,7 @@ class MemoryEngine:
             session.commit()
             return decision.committed
 
-    def forget_session(self, *, user_id: str, session_id: str) -> bool:
+    def forget_session(self, *, user_id: str, session_id: str, purpose: str | None = None) -> bool:
         """Targeted forget: delete a session summary by session_id.
 
         Returns ``True`` if the summary was found and deleted.
@@ -863,6 +923,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import forget_session_summary
 
         with self._session() as session:
+            self._record_forget_invocation(session, user_id, purpose)
             result = forget_session_summary(session, user_id, session_id)
             session.commit()
             return result
@@ -877,6 +938,7 @@ class MemoryEngine:
         new_predicate: str | None = None,
         new_object: str | None = None,
         new_value: dict | None = None,
+        purpose: str | None = None,
     ) -> dict | None:
         """User-initiated correction: supersede a belief with corrected text.
 
@@ -905,6 +967,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "correct")
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_CORRECT,
@@ -939,7 +1002,7 @@ class MemoryEngine:
                 "confidence": row.confidence,
             }
 
-    def belief_history(self, *, user_id: str, belief_id: int) -> list[dict]:
+    def belief_history(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> list[dict]:
         """Return the version chain behind a belief, oldest first.
 
         The versioned ledger is the authoritative history: one identity per
@@ -963,9 +1026,10 @@ class MemoryEngine:
         from mirror_memory.core.repository import belief_history
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "explain")
             return belief_history(session, user_id, belief_id)
 
-    def explain(self, *, user_id: str, belief_id: int) -> dict | None:
+    def explain(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> dict | None:
         """Return the provenance chain for a belief.
 
         Returns a dict with belief state, event history, evidence sources,
@@ -983,4 +1047,5 @@ class MemoryEngine:
         from mirror_memory.core.repository import explain_belief
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "explain")
             return explain_belief(session, user_id, belief_id)

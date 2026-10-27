@@ -205,13 +205,19 @@ class TestServerEndpoints:
         finally:
             del os.environ["MM_API_KEY"]
 
-    def test_auth_with_valid_key(self):
-        """With correct API key, requests should succeed."""
+    def test_auth_with_valid_key(self, tmp_path):
+        """With correct API key, requests should succeed.
+
+        A FILE-backed database: the in-memory ``sqlite://`` is per-thread
+        (SingletonThreadPool), and the M3 purpose check is the first
+        request-side statement -- pre-M3 this test passed only because a
+        no-LLM observe never touched the database at all (a latent gap,
+        see the M3 batch-1 report)."""
         os.environ["MM_API_KEY"] = "test-secret"
         try:
             from mirror_memory.server import create_app
             from fastapi.testclient import TestClient
-            app = create_app(config_path="config/", database_url="sqlite://")
+            app = create_app(config_path="config/", database_url=f"sqlite:///{tmp_path}/auth.db")
             with TestClient(app) as client:
                 r = client.post("/observe", json={
                     "user_id": "u1", "session_id": "s1", "text": "hello"

@@ -99,7 +99,11 @@ def _run_mirror(
         config=config,
         database_url=database_url,
         llm_client=llm_client,
+        default_purpose="benchmark",
     )
+    from mirror_memory.bench import grant_bench_purpose
+
+    grant_bench_purpose(engine, [case.case_id])
     for index, turn in enumerate(case.turns):
         engine.observe(
             user_id=case.case_id,

@@ -150,7 +150,9 @@ def _load_grant(session, user_id: str, purpose: str, *, lock: bool = False):
         PurposeGrant.purpose == purpose,
     )
     if lock and session.get_bind().dialect.name == "postgresql":
-        query = query.with_for_share()
+        # SQLAlchemy 2.x: read=True renders FOR SHARE (the 1.x-era
+        # with_for_share name no longer exists on Query)
+        query = query.with_for_update(read=True)
     return query.first()
 
 
@@ -187,7 +189,16 @@ def authorize(
     grant = _load_grant(session, user_id, purpose, lock=lock)
     if grant is None:
         if _autogrant_enabled():
-            grant = _autogrant(session, user_id, purpose)
+            # Concurrent first requests can both reach the autogrant; the
+            # CAS makes exactly one the issuer, and the loser re-reads the
+            # winner's grant instead of refusing (test scaffolding only).
+            try:
+                grant = _autogrant(session, user_id, purpose)
+            except StaleGrantVersion:
+                session.rollback()
+                grant = _load_grant(session, user_id, purpose, lock=lock)
+                if grant is None:
+                    raise
         else:
             return Decision(False, REASON_NO_GRANT, None, purpose)
     assert grant is not None
@@ -424,3 +435,152 @@ def ensure_purpose_grant(session, user_id: str, purpose: str, *, issuer: str, op
         operations=list(operations or OPERATIONS), issuer=issuer,
         reason="ensure_purpose_grant (idempotent host-side issuance)",
     )
+
+
+@_sanctioned_writer("consent")
+def record_purpose_invocation(
+    session,
+    user_id: str,
+    purpose: str,
+    *,
+    operation: str,
+    decision: str,
+    actor: str,
+    reason: str = "",
+) -> None:
+    """Append an authorization-audit row for an operation that ran WITHOUT
+    a grant decision -- the forget path (M3 batch-1 task 3): deletion is
+    allowed regardless of authorization state, but every invocation is
+    recorded with its purpose and the decision that admitted it."""
+    from mirror_memory.core.models import PurposeGrantEvent
+
+    if operation not in OPERATIONS:
+        raise UnknownOperation(operation)
+    session.add(PurposeGrantEvent(
+        user_id=user_id,
+        purpose=str(purpose or "").strip(),
+        action="invoked",
+        operation=operation,
+        decision=decision,
+        old_version=None,
+        new_version=None,
+        actor=actor,
+        reason=reason[:200],
+    ))
+    session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Entry-point inventory (M3 batch-1 task 3)
+#
+# Every public entry that can read or write memory must be registered here
+# with the operation it exercises and where its purpose comes from.  The
+# test suite discovers the actual surface (MemoryEngine public methods,
+# server routes) and fails when an entry is missing from this registry --
+# the same mechanism as the system_scope allowlist.  A new memory-touching
+# entry without a registered authorization point is a leak by construction.
+#
+# ``engine`` documents which engine the authorization query runs on: the
+# tenant (app) engine in every case -- never the maintenance engine, which
+# authorize() refuses (a cross-tenant grant could satisfy the check).
+# ---------------------------------------------------------------------------
+
+ENTRY_REGISTRY: dict[str, dict] = {
+    # ---- library API (MemoryEngine) ---------------------------------------
+    "mirror_memory.api.MemoryEngine.observe": {
+        "operation": "observe", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.recall": {
+        "operation": "recall", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.panel": {
+        "operation": "recall", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.get_beliefs": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.get_verification_candidates": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.run_verification": {
+        "operation": "correct", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.belief_history": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.explain": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.correct": {
+        "operation": "correct", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.restore_belief": {
+        "operation": "correct", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    "mirror_memory.api.MemoryEngine.forget_belief": {
+        "operation": "forget (allowed_regardless)", "engine": "tenant(app)",
+        "purpose_source": "parameter or engine default; invocation audited",
+    },
+    "mirror_memory.api.MemoryEngine.forget_session": {
+        "operation": "forget (allowed_regardless)", "engine": "tenant(app)",
+        "purpose_source": "parameter or engine default; invocation audited",
+    },
+    "mirror_memory.api.MemoryEngine.delete_memories": {
+        "operation": "forget (allowed_regardless)", "engine": "tenant(app)",
+        "purpose_source": "parameter or engine default; invocation audited",
+    },
+    "mirror_memory.api.MemoryEngine.run_metabolism": {
+        "operation": "extract", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
+    },
+    # ---- HTTP server (routes call the engine entries above) ---------------
+    "mirror_memory.server.observe": {
+        "operation": "observe", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.recall": {
+        "operation": "recall", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.panel": {
+        "operation": "recall", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.beliefs": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.belief_by_id": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.stats": {
+        "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.delete_memories": {
+        "operation": "forget (allowed_regardless)", "engine": "tenant(app)",
+        "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL); invocation audited",
+    },
+    # ---- background worker ------------------------------------------------
+    "mirror_memory.worker.evolution._process_single_job": {
+        "operation": "extract", "engine": "tenant(app) for the job's tenant; maintenance engine only for the queue scan",
+        "purpose_source": "the job's purpose column, recorded from the triggering observe at enqueue",
+    },
+    "mirror_memory.worker.evolution.process_pending": {
+        "operation": "extract", "engine": "maintenance engine (scan) -> tenant(app) per job",
+        "purpose_source": "each job's purpose column; the scan itself reads only the queue",
+    },
+    # ---- benchmark harness (host-side, explicit bench purpose) ------------
+    "mirror_memory.bench.longrun.run_longrun": {
+        "operation": "observe/recall/extract via the engine entries",
+        "engine": "tenant(app)", "purpose_source": "default_purpose='benchmark', granted at setup",
+    },
+    "mirror_memory.bench.runner.run_cases": {
+        "operation": "observe/recall via the engine entries",
+        "engine": "tenant(app)", "purpose_source": "default_purpose='benchmark', granted at setup",
+    },
+}
+
+#: Engine methods that are deliberately NOT purpose-gated, with the reason.
+#: Anything not listed here and not in ENTRY_REGISTRY fails the discovery
+#: test.
+UNGATED_ENGINE_METHODS: dict[str, str] = {
+    "set_enabled": "authorization administration (the feature switch itself)",
+    "set_consent": "authorization administration (feature consent)",
+    "grant_purpose": "authorization administration (issuance)",
+    "revoke_purpose": "authorization administration (revocation)",
+}

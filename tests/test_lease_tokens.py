@@ -69,8 +69,7 @@ def seed_job(factory, tenant=("default", "default"), job_id="job-1"):
         job = ev.EvolutionJob(
             id=job_id, user_id="u1",
             evidence_watermark="{}", idempotency_key=f"{job_id}:ik",
-            status="pending", tenant_id=tenant[0], app_id=tenant[1],
-        )
+            status="pending", tenant_id=tenant[0], app_id=tenant[1], purpose="test")
         from mirror_memory.core.tenancy import queue_write_scope
 
         with queue_write_scope():
@@ -91,7 +90,7 @@ def test_expired_lease_old_holder_commit_rolls_back(tmp_path):
         from mirror_memory.core.tenancy import queue_write_scope
 
         with queue_write_scope():
-            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik1", status="pending"))
+            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik1", status="pending", purpose="test"))
         s.commit()
         token_a = _claim_job(s, "j1", lease_seconds=1)
         assert token_a == 1
@@ -144,7 +143,7 @@ def test_concurrent_claim_single_winner(tmp_path):
         from mirror_memory.core.tenancy import queue_write_scope
 
         with queue_write_scope():
-            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2", status="pending"))
+            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2", status="pending", purpose="test"))
         s.commit()
         s.close()
 
@@ -184,7 +183,7 @@ def test_failed_renewal_then_commit_lease_lost(tmp_path):
         from mirror_memory.core.tenancy import queue_write_scope
 
         with queue_write_scope():
-            s.add(EvolutionJob(id="j3", user_id="u1", idempotency_key="ik3", status="pending"))
+            s.add(EvolutionJob(id="j3", user_id="u1", idempotency_key="ik3", status="pending", purpose="test"))
         s.commit()
         token = _claim_job(s, "j3", lease_seconds=60)
         assert token == 1
@@ -217,7 +216,7 @@ def test_lease_token_monotonic(tmp_path):
         from mirror_memory.core.tenancy import queue_write_scope
 
         with queue_write_scope():
-            s.add(EvolutionJob(id="j4", user_id="u1", idempotency_key="ik4", status="pending"))
+            s.add(EvolutionJob(id="j4", user_id="u1", idempotency_key="ik4", status="pending", purpose="test"))
         s.commit()
         seen = []
         for cycle in range(4):
@@ -249,8 +248,7 @@ def test_token_and_tenant_both_enforced(tmp_path):
         with queue_write_scope():
             s.add(EvolutionJob(
                 id="jA", user_id="u1", idempotency_key="ikA",
-                status="pending", tenant_id="tA", app_id="app",
-            ))
+                status="pending", tenant_id="tA", app_id="app", purpose="test"))
         s.commit()
         token_a = _claim_job(s, "jA", lease_seconds=60)
         assert token_a == 1

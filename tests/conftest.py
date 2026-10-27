@@ -117,6 +117,25 @@ def _scope_strict():
 
 
 @pytest.fixture(autouse=True)
+def _default_test_purpose(monkeypatch):
+    """M3: every MemoryEngine the tests build gets the explicit default
+    purpose "test" (the engine parameter is the sanctioned way to default
+    a purpose; nothing implicit in engine code).  A test that needs an
+    engine WITHOUT a default (the purpose-gate tests) passes
+    default_purpose=None explicitly, which setdefault respects."""
+    from mirror_memory.api import MemoryEngine
+
+    original = MemoryEngine.__init__
+
+    def with_default_purpose(self, *args, **kwargs):
+        kwargs.setdefault("default_purpose", "test")
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryEngine, "__init__", with_default_purpose)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _test_autogrant(monkeypatch):
     """M3: the purpose authorization layer is on for every engine call in
     the suite.  Instead of seeding a grant per (user, purpose) pair in
@@ -313,7 +332,9 @@ def _pg_fresh_schema(admin_engine) -> None:
     try:
         drop_bounded()
     except OperationalError as exc:
-        if "55P03" not in str(exc) and "lock timeout" not in str(exc).lower():
+        # 55P03 lock timeout and 40P01 deadlock both mean someone else's
+        # locks are in the way -- the self-healing below applies to both
+        if "55P03" not in str(exc) and "40P01" not in str(exc) and "lock timeout" not in str(exc).lower() and "deadlock" not in str(exc).lower():
             raise
         with admin_engine.connect() as conn:
             conn.rollback()

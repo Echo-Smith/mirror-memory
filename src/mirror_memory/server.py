@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from mirror_memory import __version__
+from mirror_memory.core.authorization import PurposeDenied
 from mirror_memory.api import MemoryEngine
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
@@ -71,8 +72,9 @@ class TenantAuthMiddleware:
         auth = headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             presented = auth[7:].strip()
+        purpose = (headers.get("x-mm-purpose") or "").strip() or None
         try:
-            tenant = _resolve_tenant(presented)
+            tenant = _resolve_tenant(presented, purpose)
         except HTTPException as exc:
             response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
             await response(scope, receive, send)
@@ -81,6 +83,7 @@ class TenantAuthMiddleware:
         from mirror_memory.core.tenancy import tenant_scope
 
         scope.setdefault("state", {})["mm_tenant"] = tenant
+        scope["state"]["mm_purpose"] = purpose
         with tenant_scope(*tenant):
             await self.app(scope, receive, send)
 
@@ -106,6 +109,14 @@ def _verify_api_key(
     ):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return None
+
+
+def _request_purpose(request: Request) -> str | None:
+    """The request's purpose (middleware-validated against the key's set in
+    tenant mode; taken from the header as-is in legacy MM_API_KEY mode,
+    where the engine's authorization layer enforces it)."""
+    value = request.headers.get("x-mm-purpose", "").strip()
+    return value or None
 
 
 def _get_engine(tenant: tuple[str, str] | None = None) -> MemoryEngine:
@@ -201,8 +212,11 @@ import hashlib  # noqa: E402
 import hmac  # noqa: E402
 import threading  # noqa: E402
 
-#: sha256(key) -> (tenant_id, app_id).  Raw keys never live here.
-_tenant_key_registry: dict[str, tuple[str, str]] = {}
+#: sha256(key) -> (tenant_id, app_id, frozenset(purposes)).  Raw keys never
+#: live here.  The purpose set is what the key may declare in the
+#: X-MM-Purpose header (M3 batch-1 task 2); anything else is 403 before any
+#: SQL, the same layer as the 401.
+_tenant_key_registry: dict[str, tuple[str, str, frozenset]] = {}
 #: Bounded LRU cache of per-tenant engines (closeout task 3): an unbounded
 #: dict would leak one engine (and its connection pool) per tenant forever.
 #: Bound is MM_TENANT_ENGINE_CACHE (default 32); evicted engines get their
@@ -337,13 +351,22 @@ def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
-def register_tenant_key(api_key: str, tenant_id: str, app_id: str) -> None:
+def register_tenant_key(api_key: str, tenant_id: str, app_id: str, *, purposes) -> None:
     """Register an API key mapping (call before/after create_app).
 
-    Only the SHA-256 digest is kept.  Comparison at request time is
-    constant-time over digests.
+    *purposes* is the set of purposes this key may declare per request
+    (the X-MM-Purpose header value must be one of them).  Required and
+    fail-closed: a key without purposes cannot use purpose-gated endpoints
+    at all.  Only the SHA-256 digest is kept; comparison at request time
+    is constant-time over digests.
     """
-    _tenant_key_registry[_hash_key(api_key)] = (tenant_id, app_id)
+    purpose_set = frozenset(purposes or ())
+    if not purpose_set:
+        raise ValueError(
+            "register_tenant_key requires a non-empty purposes set: a key "
+            "without allowed purposes cannot call purpose-gated endpoints"
+        )
+    _tenant_key_registry[_hash_key(api_key)] = (tenant_id, app_id, purpose_set)
 
 
 def load_tenant_keys_file(path: str | Path) -> None:
@@ -354,22 +377,37 @@ def load_tenant_keys_file(path: str | Path) -> None:
     import json
 
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    for digest, pair in data["keys"].items():
-        _tenant_key_registry[digest] = (str(pair[0]), str(pair[1]))
+    for digest, entry in data["keys"].items():
+        if len(entry) < 3 or not entry[2]:
+            raise ValueError(
+                f"tenant keys file: digest {digest[:8]}... has no purpose set; "
+                "entries are [tenant_id, app_id, [purposes]] -- fail-closed, "
+                "a key without purposes is refused"
+            )
+        _tenant_key_registry[digest] = (str(entry[0]), str(entry[1]), frozenset(entry[2]))
 
 
-def _resolve_tenant(presented: str | None) -> tuple[str, str]:
-    """Constant-time key check -> tenant, or raise 401.
-
-    Raises before any database work: an unauthenticated request must not
-    cause a single SQL statement.
+def _resolve_tenant(presented: str | None, purpose: str | None) -> tuple[str, str]:
+    """Constant-time key check -> tenant, with the purpose checked against
+    the key's registered set (403).  Both raise before any database work:
+    an unauthenticated or unauthorized request must not cause a single SQL
+    statement.
     """
     if presented is None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     digest = _hash_key(presented)
-    for stored, tenant in _tenant_key_registry.items():
+    for stored, entry in _tenant_key_registry.items():
         if hmac.compare_digest(stored, digest):
-            return tenant
+            tenant_id, app_id, purposes = entry
+            if purpose is None or purpose not in purposes:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"Purpose {purpose!r} is not allowed for this key "
+                        f"(allowed: {sorted(purposes)}); set the X-MM-Purpose header"
+                    ),
+                )
+            return (tenant_id, app_id)
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -537,7 +575,11 @@ def create_app(
         )
 
     @app.post("/observe", response_model=ObserveResponse)
-    def observe(req: ObserveRequest, tenant: tuple[str, str] | None = Depends(_verify_api_key)):
+    def observe(
+        req: ObserveRequest,
+        tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
+    ):
         """Ingest a single conversation turn into memory."""
         engine = _get_engine(tenant)
         try:
@@ -546,8 +588,11 @@ def create_app(
                 session_id=req.session_id,
                 text=req.text,
                 turn_count=req.turn_count,
+                purpose=purpose,
             )
             return ObserveResponse(status="ok", claims_extracted=count)
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
@@ -557,7 +602,11 @@ def create_app(
             raise HTTPException(status_code=500, detail="Internal error")
 
     @app.post("/recall", response_model=RecallResponse)
-    def recall(req: RecallRequest, tenant: tuple[str, str] | None = Depends(_verify_api_key)):
+    def recall(
+        req: RecallRequest,
+        tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
+    ):
         """Retrieve memory context for a query."""
         engine = _get_engine(tenant)
         try:
@@ -565,12 +614,15 @@ def create_app(
                 user_id=req.user_id,
                 query=req.query,
                 language=req.language,
+                purpose=purpose,
             )
             return RecallResponse(
                 user_id=req.user_id,
                 context=ctx,
                 char_count=len(ctx or ""),
             )
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
@@ -584,15 +636,18 @@ def create_app(
         user_id: str = Query(..., min_length=1),
         language: str = Query("en", pattern="^(zh|en)$"),
         tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
     ):
         """Get structured panel data for frontend display."""
         engine = _get_engine(tenant)
         try:
-            data = engine.panel(user_id=user_id, language=language)
+            data = engine.panel(user_id=user_id, language=language, purpose=purpose)
             return PanelResponse(
                 user_id=user_id,
                 panel={"memory": data.memory, "sections": data.sections, "avatar": data.avatar},
             )
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
@@ -606,11 +661,12 @@ def create_app(
         user_id: str = Query(..., min_length=1),
         limit: int = Query(50, ge=1, le=200),
         tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
     ):
         """List active beliefs for a user."""
         engine = _get_engine(tenant)
         try:
-            raw = engine.get_beliefs(user_id=user_id, limit=limit)
+            raw = engine.get_beliefs(user_id=user_id, limit=limit, purpose=purpose)
             items = [
                 BeliefItem(
                     dimension=b.dimension, key=b.key, claim_text=b.claim_text,
@@ -620,6 +676,8 @@ def create_app(
                 for b in raw
             ]
             return BeliefsResponse(user_id=user_id, beliefs=items, total=len(items))
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
@@ -629,12 +687,18 @@ def create_app(
             raise HTTPException(status_code=500, detail="Internal error")
 
     @app.post("/delete", response_model=DeleteResponse)
-    def delete_memories(req: DeleteRequest, tenant: tuple[str, str] | None = Depends(_verify_api_key)):
+    def delete_memories(
+        req: DeleteRequest,
+        tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
+    ):
         """Delete all memory data for a user."""
         engine = _get_engine(tenant)
         try:
-            result = engine.delete_memories(user_id=req.user_id)
+            result = engine.delete_memories(user_id=req.user_id, purpose=purpose)
             return DeleteResponse(status="deleted", counts=result.as_dict())
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
@@ -648,6 +712,7 @@ def create_app(
         belief_id: int,
         user_id: str = Query(..., min_length=1),
         tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
     ):
         """Fetch one belief by id.
 
@@ -658,6 +723,7 @@ def create_app(
         engine = _get_engine(tenant)
         try:
             with engine._session() as session:
+                engine._authorize(session, user_id, purpose, "explain")
                 from mirror_memory.core.models import Belief
 
                 row = session.get(Belief, belief_id)
@@ -673,6 +739,8 @@ def create_app(
                 }
         except HTTPException:
             raise
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except Exception as e:
             logger.warning("belief fetch failed: %s", e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -682,11 +750,13 @@ def create_app(
         user_id: str = Query(..., min_length=1),
         limit: int = Query(20, ge=1, le=100),
         tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
     ):
         """Get extraction statistics for a user."""
         engine = _get_engine(tenant)
         try:
             with engine._session() as session:
+                engine._authorize(session, user_id, purpose, "explain")
                 from mirror_memory.core.models import ExtractionStats
 
                 rows = (
@@ -711,6 +781,8 @@ def create_app(
                         for r in rows
                     ],
                 }
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except Exception as e:
             logger.warning("stats failed for user %s: %s", user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")

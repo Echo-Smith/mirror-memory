@@ -22,6 +22,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
 from mirror_memory.config.schema import MemoryConfig
+from mirror_memory.core.authorization import Decision, PurposeDenied
 from mirror_memory.core.constants import (
     FORMULATE_MIN_CONFIDENCE,
     JOB_BATCH_LIMIT,
@@ -39,15 +40,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> EvolutionJob | None:
+def enqueue_job(
+    session: object,
+    user_id: str,
+    config: MemoryConfig,
+    *,
+    purpose: str,
+) -> EvolutionJob | None:
     """Write or merge an evolution job for *user_id*.
 
     Idempotent: same user + same evidence watermark produces at most
     one pending job.  Returns the job row, or ``None`` if the user
     has no active beliefs.
+
+    ``purpose`` is REQUIRED (M3 batch-1 task 2): the job carries the
+    purpose of the observe that triggered it, and the worker re-checks
+    the authorization with it (operation ``extract``) before compute and
+    again before publish.  There is no default.
     """
     from mirror_memory.core.repository import is_memory_enabled
 
+    if not purpose or not str(purpose).strip():
+        raise PurposeDenied(
+            Decision(False, "missing_purpose", None, ""), "enqueue"
+        )
+    purpose = str(purpose).strip()
     if not is_memory_enabled(session, user_id):
         return None
 
@@ -118,6 +135,7 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         job = EvolutionJob(
             id=uuid.uuid4().hex[:16],
             user_id=user_id,
+            purpose=purpose,
             evidence_watermark=json.dumps({"latest_update": watermark}),
             prompt_version=config.worker.prompt_version,
             idempotency_key=idempotency_key,
@@ -327,6 +345,7 @@ def _process_single_job(
     job_id, user_id = job.id, job.user_id
     attempt_count, watermark = job.attempt_count, job.evidence_watermark
     try:
+        from mirror_memory.core.authorization import authorize_or_raise
         from mirror_memory.core.repository import get_state_revision, is_memory_enabled
 
         # Renew the lease before the compute-heavy nodes: the pre-compute
@@ -341,10 +360,27 @@ def _process_single_job(
             raise LeaseLost(f"job {job_id}: lease lost before compute")
 
         # -- snapshot transaction ------------------------------------------
-        # Consent gate: a disabled user's beliefs must not even be read into
-        # a compute payload, let alone published.
+        # Consent gate first (its reason is the long-standing one): a
+        # disabled user's beliefs must not even be read into a compute
+        # payload, let alone published.
         if not is_memory_enabled(session, user_id):
             _block_job(session, job, "memory_disabled", token)
+            return
+
+        # Authorization gate (M3 batch-1 task 2): the job carries the
+        # purpose of the observe that enqueued it; the worker re-checks it
+        # for the extract operation.  A pre-M3 job (empty purpose) is
+        # cancelled, never run ungated; a refusal cancels the job with the
+        # decision's reason.
+        if not (job.purpose or "").strip():
+            _block_job(session, job, "missing_purpose", token)
+            return
+        try:
+            grant_version = authorize_or_raise(
+                session, user_id, job.purpose, "extract"
+            ).grant_version
+        except PurposeDenied as exc:
+            _block_job(session, job, exc.decision.reason, token)
             return
 
         # We intentionally ignore job.claimed_revision here (a snapshot from
@@ -409,6 +445,33 @@ def _process_single_job(
         ):
             raise LeaseLost(f"job {job_id}: lease lost before publish")
 
+        # Consent gate again (pre-existing semantics: its reason wins)
+        if not is_memory_enabled(session, user_id):
+            _block_job(session, job, "memory_disabled", token)
+            return
+
+        # Authorization re-check (M3 batch-1 task 4): the snapshot's grant
+        # may have been revoked or re-versioned during the compute.
+        # authorize(lock=True) takes FOR SHARE on the grant row (PostgreSQL):
+        # a concurrent revocation's UPDATE blocks until this transaction
+        # ends, so a committed revocation can never slip between this check
+        # and the publish's commit.  SQLite serializes writers by itself.
+        # Any refusal here -- and any version change -- cancels the job as
+        # authorization_revoked; the refusal happens before the Publisher
+        # writes, so nothing lands.
+        from mirror_memory.core.authorization import authorize_or_raise
+
+        try:
+            publish_grant_version = authorize_or_raise(
+                session, user_id, job.purpose, "extract", lock=True
+            ).grant_version
+        except PurposeDenied:
+            _block_job(session, job, "authorization_revoked", token)
+            return
+        if publish_grant_version != grant_version:
+            _block_job(session, job, "authorization_revoked", token)
+            return
+
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
         # authority itself -- so a change that landed during the compute is
@@ -455,6 +518,11 @@ def _process_single_job(
             truncate_id(job_id),
         )
     except Exception as exc:
+        # A failure surfaced OUTSIDE the publish's savepoint (e.g. the
+        # authorization re-check) leaves the transaction aborted on
+        # PostgreSQL: roll it back before any bookkeeping.  The fenced
+        # completion UPDATE still guards the bookkeeping itself.
+        session.rollback()
         changes = {
             "status": "failed" if attempt_count >= config.worker.max_attempts else "pending",
             "error_code": type(exc).__name__,

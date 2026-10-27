@@ -364,7 +364,7 @@ def test_background_tasks_do_not_cross_tenants(raw_session_factory):
         with tenant_scope(*tenant):
             s = raw_session_factory()
             try:
-                assert enqueue_job(s, USER, cfg) is not None
+                assert enqueue_job(s, USER, cfg, purpose="test") is not None
                 s.commit()
             finally:
                 s.close()

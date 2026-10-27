@@ -92,9 +92,9 @@ def test_queue_class_wrong_scope_refused(tmp_path):
     with tenant_scope("default", "default"):
         s = factory()
         with pytest.raises(WriteGuardViolation):
-            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik"))
+            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik", purpose="test"))
         with queue_write_scope():
-            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2"))
+            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2", purpose="test"))
         s.rollback()
         s.close()
 
