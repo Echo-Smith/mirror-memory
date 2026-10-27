@@ -14,11 +14,13 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    Index,
     Integer,
     PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -627,6 +629,17 @@ class EvolutionJob(TenantScoped, Base):
         UniqueConstraint(
             "tenant_id", "app_id", "idempotency_key",
             name="uq_mm_evolution_jobs_idempotency",
+        ),
+        # M2 batch-2 task 4 (EXPLAIN review): the maintenance scan
+        # ``status = 'pending' ORDER BY created_at LIMIT n`` is cross-tenant
+        # by design, so no tenant-prefixed index can serve it; without this
+        # it is a sequential scan of the whole queue on every poll.  A
+        # partial index over the pending rows only is tiny and exact.
+        Index(
+            "ix_mm_evolution_jobs_pending",
+            "created_at",
+            postgresql_where=text("status = 'pending'"),
+            sqlite_where=text("status = 'pending'"),
         ),
     )
 

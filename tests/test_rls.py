@@ -577,3 +577,34 @@ def test_server_refuses_to_start_without_a_tenant_read_filter(tmp_path):
     with read_filter_override("none"), pytest.raises(RuntimeError, match="measurement"):
         with TestClient(app):
             pass
+
+
+# ---------------------------------------------------------------------------
+# Migration step 4 on PostgreSQL: CONCURRENTLY build, re-entrant
+# ---------------------------------------------------------------------------
+
+
+def test_step4_builds_the_pending_index_concurrently_and_reentrantly(pg_admin_engine):
+    from sqlalchemy.schema import DropIndex
+
+    from mirror_memory.core import schema_migration as sm
+
+    step = sm.Step4PendingJobsIndex()
+    assert sm._index_state(pg_admin_engine, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
+    assert not step.needed(pg_admin_engine)
+    # a database from before the index: drop it, the step restores it
+    with pg_admin_engine.begin() as conn:
+        conn.execute(DropIndex(sm._pending_jobs_index(concurrently=False), if_exists=True))
+    assert sm._index_state(pg_admin_engine, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) is None
+    assert step.needed(pg_admin_engine)
+    step.apply(pg_admin_engine)
+    step.verify(pg_admin_engine)
+    assert not step.needed(pg_admin_engine)
+    step.apply(pg_admin_engine)  # second run: no-op repair, still valid
+    step.verify(pg_admin_engine)
+    with pg_admin_engine.connect() as conn:
+        definition = conn.execute(text(
+            "SELECT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index AS i "
+            "JOIN pg_catalog.pg_class AS c ON c.oid = i.indexrelid WHERE c.relname = :name"
+        ), {"name": sm.PENDING_JOBS_INDEX}).scalar_one()
+    assert "WHERE" in definition and "pending" in definition and "created_at" in definition

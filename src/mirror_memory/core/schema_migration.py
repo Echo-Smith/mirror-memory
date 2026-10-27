@@ -54,6 +54,7 @@ from sqlalchemy import (
     func,
     inspect,
     select,
+    text,
     update,
 )
 from sqlalchemy.engine import Engine
@@ -791,7 +792,11 @@ def _pkey_build_index(name: str) -> Index:
     build name differs from the final constraint name because ``PRIMARY KEY
     USING INDEX`` renames the adopted index.
     """
-    table = Base.metadata.tables[name]
+    # Built on a detached copy of the table: an Index over the LIVE table's
+    # columns attaches itself to Base.metadata, and every later create_all
+    # in the process would then emit "CREATE UNIQUE INDEX CONCURRENTLY ...
+    # __pkey_build" inside its transaction and fail (M2 batch-2 finding).
+    table = Base.metadata.tables[name].to_metadata(MetaData())
     return Index(
         name + _PKEY_BUILD_SUFFIX,
         *[table.c[column.name] for column in table.primary_key.columns],
@@ -1005,10 +1010,101 @@ def install_row_level_security(engine: Engine, *, verify: bool = True) -> None:
         rls.verify_posture(engine)
 
 
+# ---------------------------------------------------------------------------
+# Step 4: partial index for the maintenance queue scan (M2 batch-2 task 4)
+# ---------------------------------------------------------------------------
+
+#: Declared on the model (fresh databases get it from create_all); this
+#: step adds it to databases created before it existed.
+PENDING_JOBS_INDEX = "ix_mm_evolution_jobs_pending"
+
+_INDEX_VALIDITY = text(
+    "SELECT i.indisvalid FROM pg_catalog.pg_index AS i "
+    "JOIN pg_catalog.pg_class AS c ON c.oid = i.indexrelid "
+    "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+    "WHERE c.relname = :name AND n.nspname = current_schema()"
+)
+
+
+def _index_state(engine: Engine, table: str, name: str) -> str | None:
+    """None (absent), "valid" or "invalid" (a failed CONCURRENTLY build)."""
+    if _is_postgres(engine):
+        with engine.connect() as conn:
+            row = conn.execute(_INDEX_VALIDITY, {"name": name}).first()
+        if row is None:
+            return None
+        return "valid" if row[0] else "invalid"
+    insp = inspect(engine)
+    if not insp.has_table(table):
+        return None
+    return "valid" if any(ix.get("name") == name for ix in insp.get_indexes(table)) else None
+
+
+def _pending_jobs_index(concurrently: bool) -> Index:
+    """The model's partial index, rebuilt on a DETACHED table copy (an Index
+    on the live table would join Base.metadata) with the CONCURRENTLY flag
+    the migration needs and ``create_all`` must not use."""
+    table = Base.metadata.tables["mm_evolution_jobs"].to_metadata(MetaData())
+    declared = next(ix for ix in table.indexes if ix.name == PENDING_JOBS_INDEX)
+    table.indexes.discard(declared)
+    return Index(
+        PENDING_JOBS_INDEX,
+        table.c.created_at,
+        postgresql_where=declared.dialect_options["postgresql"]["where"],
+        sqlite_where=declared.dialect_options["sqlite"]["where"],
+        postgresql_concurrently=concurrently,
+    )
+
+
+@dataclass
+class Step4PendingJobsIndex:
+    """Add ``ix_mm_evolution_jobs_pending`` to databases that predate it.
+
+    Why: the EXPLAIN review (100 tenants x 10k beliefs, 10k jobs) showed
+    every other key query already served by the composite primary keys and
+    unique constraints, and exactly one sequential scan -- the maintenance
+    role's ``status = 'pending' ORDER BY created_at LIMIT n`` queue scan,
+    which has no tenant to index by.  A partial index over the pending rows
+    is tiny and turns it into an index scan with nothing filtered.
+
+    PostgreSQL: ``CREATE INDEX CONCURRENTLY`` outside any transaction, so
+    the queue stays readable and writable while it builds; a failed build
+    leaves an INVALID index behind, so the step drops any leftover first
+    (re-entrant).  SQLite: a plain ``CREATE INDEX`` (``checkfirst``).
+    """
+
+    version: int = 4
+    name: str = "pending-jobs partial index"
+
+    def needed(self, engine: Engine) -> bool:
+        return _index_state(engine, "mm_evolution_jobs", PENDING_JOBS_INDEX) != "valid"
+
+    def apply(self, engine: Engine) -> None:
+        if _is_postgres(engine):
+            build = _pending_jobs_index(concurrently=True)
+            _DDLPlan(
+                [_lock_timeout_element(), DropIndex(build, if_exists=True), CreateIndex(build)],
+                autocommit=True,
+            ).run(engine)
+            return
+        _pending_jobs_index(concurrently=False).create(engine, checkfirst=True)
+
+    def verify(self, engine: Engine) -> None:
+        if _index_state(engine, "mm_evolution_jobs", PENDING_JOBS_INDEX) != "valid":
+            raise MigrationError(
+                "verification failed: " + PENDING_JOBS_INDEX + " is missing or invalid"
+            )
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
-DEFAULT_STEPS: list = [Step1Tenancy(), Step2TenantPrimaryKeys(), Step3RowLevelSecurity()]
+DEFAULT_STEPS: list = [
+    Step1Tenancy(),
+    Step2TenantPrimaryKeys(),
+    Step3RowLevelSecurity(),
+    Step4PendingJobsIndex(),
+]
 
 #: The version a freshly upgraded database records.
 LATEST_VERSION: int = max(step.version for step in DEFAULT_STEPS)

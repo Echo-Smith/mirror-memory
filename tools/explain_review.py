@@ -23,9 +23,10 @@ Usage::
     python tools/explain_review.py ... --tenants 5 --beliefs-per-tenant 500   # smoke
 
 The optional ``--candidate-indexes`` flag creates the composite indexes
-proposed in the report (CONCURRENTLY, outside any transaction) after the
+the review considered (CONCURRENTLY, outside any transaction) after the
 first pass and re-explains every query, so the before/after plans sit side
-by side.  Timings are indicative (plan shape is the decision input);
+by side; the one index the review adopted (the pending-jobs partial index)
+ships on the model and is present in the baseline pass.  Timings are indicative (plan shape is the decision input);
 the harness-wide performance numbers come from CI.
 """
 
@@ -35,13 +36,15 @@ import argparse
 import json
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 
-from sqlalchemy import Index, create_engine, func, literal, select, text
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, case, cast, create_engine, func, literal, select, text, true
 from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateIndex
 
 sys.path.insert(0, "src")
+warnings.filterwarnings("ignore", message=".*cartesian product.*")  # the generators cross-join on purpose
 
 from mirror_memory.core.models import (  # noqa: E402
     Base,
@@ -63,8 +66,9 @@ APP_ID = "app"
 # ---------------------------------------------------------------------------
 
 
-def _series(n: int):
-    return func.generate_series(1, n).table_valued("n")
+def _series(n: int, name: str):
+    """generate_series(1, n) AS <name>(n)"""
+    return func.generate_series(1, n).table_valued("n").render_derived(name=name)
 
 
 def _fill(table, select_stmt, provided: set[str]):
@@ -73,43 +77,45 @@ def _fill(table, select_stmt, provided: set[str]):
     Columns the caller did not provide get the model's scalar default, a
     neutral literal of the right type, or ``now()`` -- Python-side defaults
     do not apply to INSERT ... SELECT, so this is what ``create_all`` + the
-    ORM would have written.
+    ORM would have written.  Column names follow the SELECT list order.
     """
-    cols = []
-    exprs = list(select_stmt.selected_columns)
+    names = [c.key for c in select_stmt.selected_columns]
+    assert set(names) == provided, (sorted(names), sorted(provided))
+    exprs = []  # extra columns appended to the caller's SELECT (its FROM is kept)
     for col in table.columns:
-        if col.name in provided or col.nullable:
-            continue
+        if col.name in provided or col.nullable or col.autoincrement is True:
+            continue  # serial ids come from the sequence
         default = getattr(col.default, "arg", None)
+        names.append(col.name)
         if default is not None and not callable(default):
-            cols.append(col.name)
             exprs.append(literal(default))
-        elif callable(default):
-            cols.append(col.name)
+        elif isinstance(col.type, DateTime) or callable(default):
             exprs.append(func.now())
+        elif isinstance(col.type, Boolean):
+            exprs.append(literal(False))
+        elif isinstance(col.type, Integer):
+            exprs.append(literal(0))
+        elif isinstance(col.type, Float):
+            exprs.append(literal(0.0))
         else:
-            py = col.type.python_type
-            cols.append(col.name)
-            exprs.append(literal({str: "", int: 0, float: 0.0, bool: False}.get(py, "")))
-    stmt = select(*exprs)
-    names = list(provided) + cols
-    return table.insert().from_select(names, stmt)
+            exprs.append(literal(""))
+    return table.insert().from_select(names, select_stmt.add_columns(*exprs))
 
 
 def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per_tenant: int) -> dict[str, int]:
     per_user = beliefs_per_tenant // users_per_tenant
-    t = _series(tenants).alias("t")
-    u = _series(users_per_tenant).alias("u")
-    b = _series(per_user).alias("b")
-    tenant_id = func.format("t%03s", t.c.n - 1)
-    user_id = func.format("u%03s", u.c.n - 1)
+    t = _series(tenants, "t")
+    u = _series(users_per_tenant, "u")
+    b = _series(per_user, "b")
+    tenant_id = func.concat("t", func.lpad(cast(t.c.n - 1, String), 3, "0"))
+    user_id = func.concat("u", func.lpad(cast(u.c.n - 1, String), 3, "0"))
     belief_id = (t.c.n - 1) * beliefs_per_tenant + (u.c.n - 1) * per_user + b.c.n
     counts = {}
     with admin.begin() as conn:
         prefs = select(
             tenant_id.label("tenant_id"), literal(APP_ID).label("app_id"), user_id.label("user_id"),
             literal(True).label("enabled"), literal(1).label("state_revision"),
-        ).select_from(t, u)
+        ).select_from(t.join(u, true()))
         counts["mm_memory_preferences"] = conn.execute(
             _fill(MemoryPreference.__table__, prefs, {"tenant_id", "app_id", "user_id", "enabled", "state_revision"})
         ).rowcount
@@ -121,7 +127,7 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
             literal("active").label("status"), literal(0.7).label("confidence"),
             literal("hot").label("memory_tier"),
             (func.now() - func.make_interval(0, 0, 0, 0, 0, 0, b.c.n * 37)).label("last_evidence_at"),
-        ).select_from(t, u, b)
+        ).select_from(t.join(u, true()).join(b, true()))
         counts["mm_beliefs"] = conn.execute(
             _fill(Belief.__table__, beliefs, {
                 "id", "tenant_id", "app_id", "user_id", "dimension", "key", "claim_text",
@@ -131,11 +137,11 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
         conn.execute(text(
             "SELECT setval(pg_get_serial_sequence('mm_beliefs', 'id'), (SELECT max(id) FROM mm_beliefs))"
         ))
-        e2 = _series(2).alias("e")
+        e2 = _series(2, "e")
         events = select(
             tenant_id.label("tenant_id"), literal(APP_ID).label("app_id"), belief_id.label("belief_id"),
             user_id.label("user_id"), literal("support").label("event_type"),
-        ).select_from(t, u, b, e2)
+        ).select_from(t.join(u, true()).join(b, true()).join(e2, true()))
         counts["mm_belief_events"] = conn.execute(
             _fill(BeliefEvent.__table__, events, {"tenant_id", "app_id", "belief_id", "user_id", "event_type"})
         ).rowcount
@@ -143,7 +149,7 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
             belief_id.label("id"), tenant_id.label("tenant_id"), literal(APP_ID).label("app_id"),
             user_id.label("user_id"), func.format("s%s", b.c.n % 7).label("session_id"),
             func.format("ref-%s", belief_id).label("ref"), literal("message").label("source_type"),
-        ).select_from(t, u, b)
+        ).select_from(t.join(u, true()).join(b, true()))
         counts["mm_evidence"] = conn.execute(
             _fill(Evidence.__table__, evidence, {"id", "tenant_id", "app_id", "user_id", "session_id", "ref", "source_type"})
         ).rowcount
@@ -153,7 +159,7 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
         links = select(
             tenant_id.label("tenant_id"), literal(APP_ID).label("app_id"), belief_id.label("belief_id"),
             belief_id.label("evidence_id"), literal("supports").label("relation"),
-        ).select_from(t, u, b)
+        ).select_from(t.join(u, true()).join(b, true()))
         counts["mm_belief_evidence_links"] = conn.execute(
             _fill(BeliefEvidenceLink.__table__, links, {"tenant_id", "app_id", "belief_id", "evidence_id", "relation"})
         ).rowcount
@@ -161,13 +167,18 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
             func.format("job-%s-%s", tenant_id, user_id).label("id"), tenant_id.label("tenant_id"),
             literal(APP_ID).label("app_id"), user_id.label("user_id"),
             func.format("%s:%s:v1", user_id, u.c.n).label("idempotency_key"),
-            func.case((u.c.n % 10 == 0, literal("pending")), else_=literal("completed")).label("status"),
-        ).select_from(t, u)
+            case((u.c.n % 10 == 0, literal("pending")), else_=literal("completed")).label("status"),
+        ).select_from(t.join(u, true()))
         counts["mm_evolution_jobs"] = conn.execute(
             _fill(EvolutionJob.__table__, jobs, {"id", "tenant_id", "app_id", "user_id", "idempotency_key", "status"})
         ).rowcount
     with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text("ANALYZE"))
+    with admin.connect() as conn:
+        for name in list(counts):
+            counts[name] = conn.execute(
+                select(func.count()).select_from(Base.metadata.tables[name])
+            ).scalar_one()
     return counts
 
 
@@ -175,7 +186,7 @@ def load_dataset(admin: Engine, tenants: int, beliefs_per_tenant: int, users_per
 # Key queries (Core mirrors of the ORM shapes; tenant predicates optional)
 # ---------------------------------------------------------------------------
 
-T, A, U, BID = "t042", APP_ID, "u017", None
+T, A, U = "t042", APP_ID, "u017"  # re-pointed by main() for small datasets
 
 
 @dataclass
@@ -262,33 +273,46 @@ def run_pass(admin: Engine, app: Engine, qs: list[Q]) -> list[tuple[str, str, di
     out = []
     for q in qs:
         # C: app predicates, superuser (RLS bypassed)
-        with admin.begin() as conn:
+        with admin.connect() as conn:
             out.append((q.name, "C", summarize(_explain(conn, _compile(q.build(True), admin)))))
             conn.rollback()
         # A: app predicates + RLS; B: RLS alone (same transaction setting)
         with tenant_scope(T, A):
             for mode, with_tenant in (("A", True), ("B", False)):
-                with app.begin() as conn:
+                with app.connect() as conn:
                     out.append((q.name, mode, summarize(_explain(conn, _compile(q.build(with_tenant), app)))))
                     conn.rollback()
     return out
 
 
-CANDIDATE_INDEXES = [
-    Index("ix_mm_beliefs_tenant_user_recent", Belief.__table__.c.tenant_id, Belief.__table__.c.app_id,
-          Belief.__table__.c.user_id, Belief.__table__.c.last_evidence_at.desc(), postgresql_concurrently=True),
-    Index("ix_mm_belief_events_tenant_belief", BeliefEvent.__table__.c.tenant_id, BeliefEvent.__table__.c.app_id,
-          BeliefEvent.__table__.c.belief_id, postgresql_concurrently=True),
-    Index("ix_mm_belief_evidence_links_tenant_belief", BeliefEvidenceLink.__table__.c.tenant_id,
-          BeliefEvidenceLink.__table__.c.app_id, BeliefEvidenceLink.__table__.c.belief_id, postgresql_concurrently=True),
-    Index("ix_mm_evolution_jobs_pending", EvolutionJob.__table__.c.created_at,
-          postgresql_where=text("status = 'pending'"), postgresql_concurrently=True),
-]
+def _detached(name: str):
+    """A copy of the model table on a throwaway MetaData: an Index built on
+    the live table's columns would attach itself to Base.metadata and make
+    every later create_all emit it (CONCURRENTLY, inside a transaction)."""
+    from sqlalchemy import MetaData
+
+    return Base.metadata.tables[name].to_metadata(MetaData())
+
+
+def candidate_indexes() -> list[Index]:
+    """Composite indexes considered and NOT adopted (the before/after plans
+    in the report are the evidence).  The pending-jobs partial index that
+    the review did adopt now ships on the model (migration step 4)."""
+    b, ev, l = (_detached("mm_beliefs"), _detached("mm_belief_events"),
+                _detached("mm_belief_evidence_links"))
+    return [
+        Index("ix_mm_beliefs_tenant_user_recent", b.c.tenant_id, b.c.app_id, b.c.user_id,
+              b.c.last_evidence_at.desc(), postgresql_concurrently=True),
+        Index("ix_mm_belief_events_tenant_user", ev.c.tenant_id, ev.c.app_id, ev.c.user_id,
+              postgresql_concurrently=True),
+        Index("ix_mm_belief_evidence_links_tenant_belief", l.c.tenant_id, l.c.app_id, l.c.belief_id,
+              postgresql_concurrently=True),
+    ]
 
 
 def create_candidates(admin: Engine) -> None:
     with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        for index in CANDIDATE_INDEXES:
+        for index in candidate_indexes():
             conn.execute(CreateIndex(index, if_not_exists=True))
         conn.execute(text("ANALYZE"))
 
@@ -325,8 +349,13 @@ def main() -> int:
     install_row_level_security(admin)
     counts = load_dataset(admin, args.tenants, args.beliefs_per_tenant, args.users_per_tenant)
     elapsed = time.monotonic() - t0
-    belief_id = 42 * args.beliefs_per_tenant + 17 * (args.beliefs_per_tenant // args.users_per_tenant) + 3
-    job_id = f"job-{T}-u019"  # u019 -> n=20 -> pending (n % 10 == 0)
+    global T, U
+    per_user = args.beliefs_per_tenant // args.users_per_tenant
+    t_idx, u_idx = min(42, args.tenants - 1), min(17, args.users_per_tenant - 1)
+    T, U = f"t{t_idx:03d}", f"u{u_idx:03d}"
+    belief_id = t_idx * args.beliefs_per_tenant + u_idx * per_user + 3
+    pending_idx = 9 if args.users_per_tenant >= 10 else args.users_per_tenant - 1
+    job_id = f"job-{T}-u{pending_idx:03d}"  # (idx+1) % 10 == 0 -> seeded as pending
     qs = queries(belief_id, job_id)
     report = render("Baseline indexes (as shipped)", run_pass(admin, app, qs), counts, elapsed)
     if args.candidate_indexes:

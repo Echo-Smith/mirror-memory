@@ -363,3 +363,46 @@ def test_primary_key_step_is_a_noop_when_already_applied():
     step = sm.Step2TenantPrimaryKeys()
     if not sm._is_postgres(create_engine("sqlite://")):
         assert step.needed(create_engine("sqlite://")) is False
+
+
+def test_pkey_build_index_does_not_attach_to_the_model_metadata():
+    """M2 batch-2 finding: an Index built over the live table's columns joins
+    Base.metadata, and the next create_all in the process would emit the
+    CONCURRENTLY build inside a transaction.  The build index must live on
+    a detached copy."""
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.models import Base
+
+    build = sm._pkey_build_index("mm_beliefs")
+    assert build.name == "mm_beliefs" + sm._PKEY_BUILD_SUFFIX
+    assert build.table is not Base.metadata.tables["mm_beliefs"]
+    assert build.name not in {ix.name for ix in Base.metadata.tables["mm_beliefs"].indexes}
+
+
+def test_fresh_schema_declares_the_pending_jobs_partial_index(tmp_path):
+    """M2 batch-2 task 4: the maintenance queue scan's partial index is on
+    the model, so create_all ships it on both dialects."""
+    from mirror_memory.core import schema_migration as sm
+
+    eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
+    Base.metadata.create_all(eng)
+    assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
+    step = sm.Step4PendingJobsIndex()
+    assert not step.needed(eng)
+    step.verify(eng)
+    eng.dispose()
+
+
+def test_step4_adds_the_partial_index_to_an_older_database(base_db):
+    from mirror_memory.core import schema_migration as sm
+
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 4
+    assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
+    # re-entrant: a second apply is a no-op repair
+    step = sm.Step4PendingJobsIndex()
+    assert not step.needed(eng)
+    step.apply(eng)
+    step.verify(eng)
+    eng.dispose()
