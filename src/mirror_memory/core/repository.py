@@ -418,7 +418,7 @@ def evidence_for_belief(
 
 def evidence_summary(
     session: Session, user_id: str, belief_id: int,
-    *, visibility: "VisibilityRule | None" = None,
+    *, visibility: "VisibilityRule | None" = None, pairs: list | None = None,
 ) -> dict:
     """Explainability view of a belief's evidence, grouped by relation.
 
@@ -428,13 +428,14 @@ def evidence_summary(
     compacted, the digest carries the folded bulk's aggregate (totals stay
     whole; only the row-by-row listing is the live sample).
     """
-    pairs = evidence_for_belief(session, belief_id)
+    if pairs is None:
+        pairs = evidence_for_belief(session, belief_id)
     # Only visible provenance is listed; and the compaction digest -- whose
     # summary may fold text from ANY linked evidence -- is included only
     # when every linked evidence is visible.
     if visibility is not None:
+        all_visible = all(visibility.purpose_visible(e.source_purpose) for e, _r in pairs)
         pairs = [(e, r) for e, r in pairs if visibility.purpose_visible(e.source_purpose)]
-        all_visible = not _belief_has_invisible_evidence(session, user_id, belief_id, visibility)
     else:
         all_visible = True
     grouped: dict[str, list[dict]] = {}
@@ -2859,14 +2860,6 @@ def correct_belief(
     return corrected
 
 
-def _belief_has_invisible_evidence(
-    session: Session, user_id: str, belief_id: int, visibility: "VisibilityRule",
-) -> bool:
-    """Any linked evidence whose source purpose the rule refuses?"""
-    pairs = evidence_for_belief(session, belief_id)
-    return any(not visibility.purpose_visible(e.source_purpose) for e, _r in pairs)
-
-
 def explain_belief(
     session: Session, user_id: str, belief_id: int,
     *, visibility: "VisibilityRule | None" = None,
@@ -2893,13 +2886,12 @@ def explain_belief(
         return None
 
     events = get_belief_events(session, user_id, belief_id)
+    pairs = None
     if visibility is not None:
-        # only visible provenance: evidence ids/graph from visible evidence,
-        # events recorded under visible purposes
-        visible_pairs = [
-            (e, r) for e, r in evidence_for_belief(session, belief_id)
-            if visibility.purpose_visible(e.source_purpose)
-        ]
+        # one fetch of the evidence pairs feeds the visibility check, the id
+        # list, the source purposes and the graph (no repeated queries)
+        pairs = evidence_for_belief(session, belief_id)
+        visible_pairs = [(e, r) for e, r in pairs if visibility.purpose_visible(e.source_purpose)]
         evidence_ids = [e.id for e, _r in visible_pairs]
         source_purposes = sorted({e.source_purpose for e, _r in visible_pairs})
         events = [e for e in events if visibility.purpose_visible(e.source_purpose)]
@@ -2924,7 +2916,9 @@ def explain_belief(
         "protected_reason": getattr(belief, "protected_reason", ""),
         "access_count": getattr(belief, "access_count", 0),
         "evidence_ids": evidence_ids,
-        "evidence_graph": evidence_summary(session, user_id, belief_id, visibility=visibility),
+        "evidence_graph": evidence_summary(
+            session, user_id, belief_id, visibility=visibility, pairs=pairs,
+        ),
         "source_purposes": source_purposes,
         "superseded_by": belief.superseded_by,
         "first_seen_at": belief.first_seen_at.isoformat() if belief.first_seen_at else None,
