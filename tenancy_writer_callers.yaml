@@ -40,6 +40,23 @@ wrappers:
     callers: []
 
 writers:
+  # ---- audit class: the access audit (M3 batch-2 task 2, reviewer 待评审) ----
+  record_access:
+    reason: >
+      Appends one access-audit row per memory read (or refused read) in the
+      same transaction as the read; fail-closed -- the entry returns
+      nothing if the row cannot be written.  Written only through the
+      engine (MemoryEngine._authorize / _audit); the server routes that
+      read through their own session call those engine helpers.
+    callers:
+      - mirror_memory.api
+  purge_access_audit:
+    reason: >
+      The one sanctioned deletion on the append-only audit table: the
+      tenant-scoped retention purge behind MemoryEngine.purge_access_audit.
+    callers:
+      - mirror_memory.api
+
   # ---- consent class: purpose authorization (M3 batch 1, reviewer 待评审) ----
   grant_purpose:
     reason: >

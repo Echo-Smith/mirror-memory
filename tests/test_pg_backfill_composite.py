@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlalchemy import MetaData, inspect, text
+from sqlalchemy import MetaData, create_engine, inspect, text
 
 from mirror_memory.core import schema_migration as sm
 from mirror_memory.core.sql_audit import no_audit_scope
@@ -155,3 +155,47 @@ def test_step7_runs_against_a_version6_postgres_database(pg_admin_engine):
         )).all()
     assert rows == [("snap1", "legacy-app"), ("snap2", "")]
     assert not step.needed(pg_admin_engine)
+
+
+def test_step8_creates_the_audit_table_with_rls_on_postgres(pg_admin_engine):
+    """M3 batch-2 task 2: the new table gets the composite key and the RLS
+    posture (ENABLE + FORCE, both policies), and the app role sees only
+    its tenant's rows."""
+    from sqlalchemy.orm import Session
+
+    from mirror_memory.core import rls
+    from mirror_memory.core.models import AccessAudit
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+    from tests.conftest import _pg_runtime_url
+
+    with no_audit_scope(), pg_admin_engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE mm_access_audit")
+    sm._ensure_version_table(pg_admin_engine)
+    with no_audit_scope(), pg_admin_engine.begin() as conn:
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=7, note="simulated v7"))
+    step = sm.Step8AccessAudit()
+    assert step.needed(pg_admin_engine)
+    step.apply(pg_admin_engine)
+    step.verify(pg_admin_engine)
+    rls.verify_posture(pg_admin_engine, tables=["mm_access_audit"])
+    live = sm._live_table(pg_admin_engine, "mm_access_audit")
+    assert [c.name for c in live.primary_key.columns] == ["tenant_id", "app_id", "id"]
+
+    runtime = create_engine(_pg_runtime_url())
+    try:
+        for tenant in (("tA", "app"), ("tB", "app")):
+            with tenant_scope(*tenant), fixture_write_scope("seed audit rows"):
+                s = Session(runtime)
+                s.add(AccessAudit(user_id="u1", purpose="p", operation="recall",
+                                  entry="e", decision="allowed"))
+                s.commit()
+                s.close()
+        with tenant_scope("tA", "app"):
+            s = Session(runtime)
+            rows = s.query(AccessAudit).all()
+            assert [(r.tenant_id, r.app_id) for r in rows] == [("tA", "app")]
+            s.close()
+    finally:
+        runtime.dispose()

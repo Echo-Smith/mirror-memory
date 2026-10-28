@@ -86,6 +86,7 @@ def _sanctioned_writer(write_class: str):
     import functools
 
     from mirror_memory.core.tenancy import (
+        audit_write_scope,
         consent_write_scope,
         engine_write_scope,
         telemetry_write_scope,
@@ -95,6 +96,7 @@ def _sanctioned_writer(write_class: str):
         "engine": engine_write_scope,
         "consent": consent_write_scope,
         "telemetry": telemetry_write_scope,
+        "audit": audit_write_scope,
     }
     scope = scopes[write_class]
 

@@ -398,7 +398,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
 
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 7
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 8
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
     step = sm.Step4PendingJobsIndex()
@@ -416,7 +416,7 @@ def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
     from mirror_memory.core import schema_migration as sm
     from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
 
-    assert len(TENANT_USER_INDEXED_TABLES) == 15
+    assert len(TENANT_USER_INDEXED_TABLES) == 16
     eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
     Base.metadata.create_all(eng)
     insp = inspect(eng)
@@ -662,7 +662,7 @@ def test_step7_adds_source_purpose_to_a_version6_database(tmp_path):
     assert step.needed(eng)
 
     counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == 7
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     assert "legacy_jobs_to_cancel" not in counts, "step 6 did not run: no stale count"
     insp = inspect(eng)
     for table in sm.SOURCE_PURPOSE_TABLES:
@@ -731,4 +731,40 @@ def test_upgrade_database_returns_the_step6_cancel_count(base_db):
     eng = _engine(base_db)
     counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
     assert isinstance(counts.get("legacy_jobs_to_cancel"), int)
+    eng.dispose()
+
+
+def test_step8_creates_the_access_audit_table_on_a_version7_database(tmp_path):
+    """M3 batch-2 task 2: a version-7 database gains mm_access_audit with
+    the model's shape (composite tenant key, tenant-prefixed indexes);
+    re-entrant."""
+    from sqlalchemy import MetaData
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.tenancy import tenant_user_index_name
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'v7.db'}")
+    Base.metadata.create_all(eng)
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE mm_access_audit")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=7, note="simulated v7"))
+    step = sm.Step8AccessAudit()
+    assert step.needed(eng)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 8
+    insp = inspect(eng)
+    assert insp.has_table("mm_access_audit")
+    names = {ix["name"] for ix in insp.get_indexes("mm_access_audit")}
+    assert tenant_user_index_name("mm_access_audit") in names
+    assert "ix_mm_access_audit_tenant_created" in names
+    cols = {c["name"] for c in insp.get_columns("mm_access_audit")}
+    assert {"tenant_id", "app_id", "id", "user_id", "purpose", "operation", "entry",
+            "decision", "reason", "grant_version", "memory_count", "memory_ids_json",
+            "truncated", "created_at"} <= cols
+    assert not step.needed(eng)
+    step.apply(eng)  # re-entry is a no-op
+    step.verify(eng)
     eng.dispose()

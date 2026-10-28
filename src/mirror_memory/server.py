@@ -28,6 +28,7 @@ from sqlalchemy import text
 
 from mirror_memory import __version__
 from mirror_memory.core.authorization import PurposeDenied
+from mirror_memory.core import access_audit
 from mirror_memory.api import MemoryEngine
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
@@ -610,12 +611,13 @@ def create_app(
         """Retrieve memory context for a query."""
         engine = _get_engine(tenant)
         try:
-            ctx = engine.recall(
-                user_id=req.user_id,
-                query=req.query,
-                language=req.language,
-                purpose=purpose,
-            )
+            with access_audit.entry_label("mirror_memory.server.recall"):
+                ctx = engine.recall(
+                    user_id=req.user_id,
+                    query=req.query,
+                    language=req.language,
+                    purpose=purpose,
+                )
             return RecallResponse(
                 user_id=req.user_id,
                 context=ctx,
@@ -641,7 +643,8 @@ def create_app(
         """Get structured panel data for frontend display."""
         engine = _get_engine(tenant)
         try:
-            data = engine.panel(user_id=user_id, language=language, purpose=purpose)
+            with access_audit.entry_label("mirror_memory.server.panel"):
+                data = engine.panel(user_id=user_id, language=language, purpose=purpose)
             return PanelResponse(
                 user_id=user_id,
                 panel={"memory": data.memory, "sections": data.sections, "avatar": data.avatar},
@@ -666,7 +669,8 @@ def create_app(
         """List active beliefs for a user."""
         engine = _get_engine(tenant)
         try:
-            raw = engine.get_beliefs(user_id=user_id, limit=limit, purpose=purpose)
+            with access_audit.entry_label("mirror_memory.server.beliefs"):
+                raw = engine.get_beliefs(user_id=user_id, limit=limit, purpose=purpose)
             items = [
                 BeliefItem(
                     dimension=b.dimension, key=b.key, claim_text=b.claim_text,
@@ -723,11 +727,22 @@ def create_app(
         engine = _get_engine(tenant)
         try:
             with engine._session() as session:
-                engine._authorize(session, user_id, purpose, "explain")
+                authorized = engine._authorize(
+                    session, user_id, purpose, "explain",
+                    audit_entry="mirror_memory.server.belief_by_id",
+                )
                 from mirror_memory.core.models import Belief
 
                 row = session.get(Belief, belief_id)
-                if row is None or row.user_id != user_id:
+                found = row is not None and row.user_id == user_id
+                # the audit row rides the same transaction as the read and
+                # is committed before anything is returned -- a miss is an
+                # access attempt too
+                engine._audit(session, authorized, user_id=user_id, operation="explain",
+                              entry="mirror_memory.server.belief_by_id",
+                              memory_ids=[row.id] if found else [])
+                session.commit()
+                if not found:
                     raise HTTPException(status_code=404, detail="Not found")
                 return {
                     "belief_id": row.id,
@@ -756,7 +771,9 @@ def create_app(
         engine = _get_engine(tenant)
         try:
             with engine._session() as session:
-                engine._authorize(session, user_id, purpose, "explain")
+                authorized = engine._authorize(
+                    session, user_id, purpose, "explain", audit_entry="mirror_memory.server.stats",
+                )
                 from mirror_memory.core.models import ExtractionStats
 
                 rows = (
@@ -766,6 +783,11 @@ def create_app(
                     .limit(limit)
                     .all()
                 )
+                # extraction stats are telemetry, not memory items: the
+                # access is recorded with no memory ids
+                engine._audit(session, authorized, user_id=user_id, operation="explain",
+                              entry="mirror_memory.server.stats", memory_ids=[])
+                session.commit()
                 return {
                     "user_id": user_id,
                     "stats": [

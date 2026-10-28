@@ -933,6 +933,10 @@ TABLE_WRITE_CLASSES: dict[str, str] = {
     "mm_extraction_stats": "telemetry",
     "mm_session_summaries": "telemetry",
     "mm_intervention_events": "telemetry",
+    # audit: the access audit (M3 batch-2 task 2) -- append-only, written
+    # by the entries in the same transaction as the read; its only deletion
+    # is the retention purge
+    "mm_access_audit": "audit",
 }
 
 _WRITE_SCOPE_CLASS: dict[str, str] = {
@@ -940,6 +944,7 @@ _WRITE_SCOPE_CLASS: dict[str, str] = {
     "queue": "queue",
     "consent": "consent",
     "telemetry": "telemetry",
+    "audit": "audit",
     "fixture": "fixture",  # test seeding: matches every class
 }
 
@@ -987,6 +992,12 @@ def telemetry_write_scope() -> contextlib.AbstractContextManager[None]:
     """Sanctioned *telemetry* writer scope (extraction stats, session
     summaries, intervention events)."""
     return _class_write_scope("telemetry")
+
+
+def audit_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *access-audit* writer scope (core.access_audit: the
+    per-read record and the retention purge)."""
+    return _class_write_scope("audit")
 
 
 def fixture_write_scope(reason: str) -> contextlib.AbstractContextManager[None]:
@@ -1049,6 +1060,7 @@ def install_write_guard() -> None:
                 "queue": "queue_write_scope (worker / enqueue)",
                 "consent": "consent_write_scope (preference/consent setters)",
                 "telemetry": "telemetry_write_scope (stats/summary/intervention recorders)",
+                "audit": "audit_write_scope (core.access_audit record/purge)",
             }.get(required, "an unclassified table -- add it to TABLE_WRITE_CLASSES")
             raise WriteGuardViolation(
                 f"{type(target).__name__}.{initiator.key} (table "

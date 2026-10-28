@@ -378,6 +378,30 @@ class MetabolismConfig(BaseModel):
         return v
 
 
+class AccessAuditConfig(BaseModel):
+    """Access audit (M3 batch-2 task 2)."""
+
+    max_ids: int = Field(
+        default=100, ge=1, le=5000,
+        description=(
+            "Memory ids kept per audit row; beyond it the list is cut and the row "
+            "marked truncated (the count stays exact).  100 covers any single "
+            "prompt injection -- recall renders a few dozen beliefs at most -- "
+            "and keeps a row under ~1 KB."
+        ),
+    )
+    retention_days: int = Field(
+        default=90, ge=1,
+        description=(
+            "How long audit rows are kept before the explicit purge may remove "
+            "them.  90 days is the common floor for access-log retention in "
+            "security baselines and long enough to investigate a complaint "
+            "about a purpose's reads a quarter later; rows are ids only, so "
+            "growth is bounded by read volume, not content."
+        ),
+    )
+
+
 class MemoryConfig(BaseModel):
     """Root configuration object assembled from multiple YAML files.
 
@@ -396,6 +420,7 @@ class MemoryConfig(BaseModel):
     blocked_key_prefixes: list[str] = Field(default_factory=list)
     render: RenderConfig = Field(default_factory=RenderConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    access_audit: AccessAuditConfig = Field(default_factory=AccessAuditConfig)
     question_value_tiers: dict[str, int] = Field(
         default_factory=dict,
         description="Dimension -> priority tier for verification question candidates "

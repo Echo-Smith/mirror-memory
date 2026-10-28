@@ -251,6 +251,10 @@ def test_refused_recall_issues_only_authorization_queries(pg_app_url):
         seen_tables = {t for t in (
             "mm_purpose_grants", "mm_memory_preferences", "mm_consent_grants") if t in " ".join(statements)}
         assert seen_tables, statements
+        # M3 batch-2 task 2: the refusal itself is the one write -- a
+        # committed denied row in the access audit
+        audit_writes = [s for s in statements if "mm_access_audit" in s]
+        assert len(audit_writes) == 1 and audit_writes[0].upper().startswith("INSERT"), audit_writes
     finally:
         engine.dispose()
 

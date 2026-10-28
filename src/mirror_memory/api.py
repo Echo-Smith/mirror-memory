@@ -22,7 +22,7 @@ import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import NamedTuple, Any
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
@@ -30,6 +30,25 @@ from mirror_memory.exceptions import ValidationError
 from mirror_memory.models import BeliefInfo, DeleteResult, PanelData
 
 logger = logging.getLogger(__name__)
+
+
+#: ENTRY_REGISTRY keys of the memory-reading library entries (the audit
+#: rows name them; the server relabels with its own route key).
+ENTRY_RECALL = "mirror_memory.api.MemoryEngine.recall"
+ENTRY_PANEL = "mirror_memory.api.MemoryEngine.panel"
+ENTRY_GET_BELIEFS = "mirror_memory.api.MemoryEngine.get_beliefs"
+ENTRY_VERIFICATION_CANDIDATES = "mirror_memory.api.MemoryEngine.get_verification_candidates"
+ENTRY_BELIEF_HISTORY = "mirror_memory.api.MemoryEngine.belief_history"
+ENTRY_EXPLAIN = "mirror_memory.api.MemoryEngine.explain"
+
+
+class Authorized(NamedTuple):
+    """What an entry knows after its authorization passed: the resolved
+    purpose and the grant version that allowed it (both go into the
+    access audit row)."""
+
+    purpose: str
+    grant_version: int | None
 
 
 class MemoryEngine:
@@ -251,16 +270,57 @@ class MemoryEngine:
             raise PurposeDenied(Decision(False, "missing_purpose", None, ""), "unresolved")
         return str(resolved).strip()
 
-    def _authorize(self, session, user_id: str, purpose: str | None, operation: str) -> str:
+    def _authorize(
+        self, session, user_id: str, purpose: str | None, operation: str,
+        *, audit_entry: str | None = None,
+    ) -> "Authorized":
         """Authorize *operation* in the CURRENT transaction, before any
-        business statement; raises PurposeDenied on refusal."""
-        from mirror_memory.core import authorization, provenance
+        business statement; raises PurposeDenied on refusal.
+
+        With *audit_entry* (the ENTRY_REGISTRY key of a memory-reading
+        entry) a refusal is written to the access audit -- decision
+        ``denied`` with the reason -- and COMMITTED before the exception
+        propagates: nothing else is pending this early in the transaction,
+        and a probing caller must leave a trace.  The one refusal that is
+        NOT audited is ``missing_purpose``: it is decided in Python before
+        any SQL (batch-1 invariant) and has nothing to attribute -- no
+        purpose, possibly no real user.  The audit INSERT on the allowed
+        path is the entry's own job (:meth:`_audit`)."""
+        from mirror_memory.core import access_audit, authorization, provenance
 
         resolved = self._purpose_or_default(purpose)
-        authorization.authorize_or_raise(session, user_id, resolved, operation)
+        try:
+            decision = authorization.authorize_or_raise(session, user_id, resolved, operation)
+        except authorization.PurposeDenied as exc:
+            if audit_entry is not None:
+                access_audit.record_access(
+                    session, user_id=user_id, purpose=resolved,
+                    operation=operation, entry=audit_entry, decision=access_audit.DENIED,
+                    reason=exc.decision.reason, grant_version=exc.decision.grant_version,
+                    max_ids=self._config.access_audit.max_ids,
+                )
+                session.commit()
+            raise
         # everything this transaction writes is collected under `resolved`
         provenance.bind(session, resolved)
-        return resolved
+        return Authorized(resolved, decision.grant_version)
+
+    def _audit(
+        self, session, authorized: "Authorized", *, user_id: str, operation: str,
+        entry: str, memory_ids: list[int],
+    ) -> None:
+        """Append the allowed-access audit row for a read entry.  Same
+        transaction as the read; the caller commits -- and a failure of
+        either the INSERT or that commit propagates, so the entry returns
+        nothing (fail-closed: memory never leaves unrecorded)."""
+        from mirror_memory.core import access_audit
+
+        access_audit.record_access(
+            session, user_id=user_id, purpose=authorized.purpose, operation=operation,
+            entry=entry, decision=access_audit.ALLOWED,
+            grant_version=authorized.grant_version, memory_ids=memory_ids,
+            max_ids=self._config.access_audit.max_ids,
+        )
 
     def _record_forget_invocation(self, session, user_id: str, purpose: str | None) -> str:
         """The forget paths run regardless of authorization state (a revoked
@@ -380,12 +440,12 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.render.renderer import render_memory_block
+        from mirror_memory.render.renderer import render_memory_block_with_ids
 
         started = time.monotonic()
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "recall")
-            result = render_memory_block(
+            authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
+            result, rendered_ids = render_memory_block_with_ids(
                 session,
                 user_id,
                 config=self._config,
@@ -395,15 +455,14 @@ class MemoryEngine:
                 trace_hook=trace_hook,
                 now=now,
             )
-            # Recall records access telemetry (which beliefs reached the
-            # prompt — the reheat signal for memory metabolism).  The
-            # telemetry must never break recall, so a failed commit just
-            # discards it and returns the already-rendered block.
-            try:
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.warning("recall: access telemetry commit failed; discarded")
+            # The access audit row (M3 batch-2 task 2) rides the same
+            # transaction as the read, together with the access telemetry
+            # (which beliefs reached the prompt -- the reheat signal).  The
+            # commit is mandatory: if the audit cannot be written the block
+            # is NOT returned (fail-closed).
+            self._audit(session, authorized, user_id=user_id, operation="recall",
+                        entry=ENTRY_RECALL, memory_ids=rendered_ids)
+            session.commit()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "recall: user=%s chars=%d latency=%dms",
@@ -486,8 +545,11 @@ class MemoryEngine:
         from mirror_memory.render.panel import build_panel
 
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "recall")
+            authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_PANEL)
             raw = build_panel(session, user_id, config=self._config, language=language)
+            self._audit(session, authorized, user_id=user_id, operation="recall",
+                        entry=ENTRY_PANEL, memory_ids=list(raw.get("belief_ids", [])))
+            session.commit()
             return PanelData(
                 memory=raw.get("memory", {}),
                 sections=raw.get("sections", []),
@@ -523,8 +585,11 @@ class MemoryEngine:
         from mirror_memory.core.repository import list_active_beliefs
 
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "explain")
+            authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_GET_BELIEFS)
             beliefs = list_active_beliefs(session, user_id, dimensions=dimensions, limit=limit)
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_GET_BELIEFS, memory_ids=[b.id for b in beliefs])
+            session.commit()
             return [
                 BeliefInfo(
                     dimension=b.dimension,
@@ -595,10 +660,12 @@ class MemoryEngine:
         )
 
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "explain")
+            authorized = self._authorize(
+                session, user_id, purpose, "explain", audit_entry=ENTRY_VERIFICATION_CANDIDATES,
+            )
+            results: list[dict] = []
             try:
                 beliefs = get_question_candidates(session, user_id, self._config, limit=limit)
-                results: list[dict] = []
                 injected = False
                 for belief in beliefs:
                     recorded = False
@@ -620,12 +687,17 @@ class MemoryEngine:
                             "injected": recorded,
                         }
                     )
-                session.commit()
-                return results
             except Exception:
+                # the candidate selection is fail-open (an empty list, never
+                # an error for the caller) -- the audit below is not
                 logger.warning("get_verification_candidates failed; returning []", exc_info=True)
                 session.rollback()
-                return []
+                results = []
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_VERIFICATION_CANDIDATES,
+                        memory_ids=[r["belief_id"] for r in results])
+            session.commit()
+            return results
 
     def run_verification(
         self, *, user_id: str, session_id: str, user_text: str, purpose: str | None = None,
@@ -788,6 +860,24 @@ class MemoryEngine:
         with self._session() as session:
             set_feature_consent(session, user_id, feature.strip(), granted)
             session.commit()
+
+    def purge_access_audit(self, *, older_than: Any | None = None) -> int:
+        """Maintenance: delete this tenant's access-audit rows that are out
+        of retention (``config.access_audit.retention_days``, or an explicit
+        *older_than* instant).  Returns the number removed.  Not purpose
+        gated: it reads no memory and is the operator's retention duty, run
+        per tenant by the host.  Never automatic."""
+        from mirror_memory.core import access_audit
+
+        self._ensure_db()
+        cutoff = older_than if older_than is not None else access_audit.retention_cutoff(
+            self._config.access_audit.retention_days,
+        )
+        with self._session() as session:
+            removed = access_audit.purge_access_audit(session, older_than=cutoff)
+            session.commit()
+        logger.info("access audit: purged %d row(s) older than %s", removed, cutoff)
+        return removed
 
     def delete_memories(self, *, user_id: str, purpose: str | None = None) -> DeleteResult:
         """Delete all memory data for a user.
@@ -1029,8 +1119,12 @@ class MemoryEngine:
         from mirror_memory.core.repository import belief_history
 
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "explain")
-            return belief_history(session, user_id, belief_id)
+            authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_BELIEF_HISTORY)
+            history = belief_history(session, user_id, belief_id)
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_BELIEF_HISTORY, memory_ids=[belief_id] if history else [])
+            session.commit()
+            return history
 
     def explain(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> dict | None:
         """Return the provenance chain for a belief.
@@ -1050,5 +1144,9 @@ class MemoryEngine:
         from mirror_memory.core.repository import explain_belief
 
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "explain")
-            return explain_belief(session, user_id, belief_id)
+            authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_EXPLAIN)
+            explained = explain_belief(session, user_id, belief_id)
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_EXPLAIN, memory_ids=[belief_id] if explained is not None else [])
+            session.commit()
+            return explained

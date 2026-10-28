@@ -462,24 +462,30 @@ ENTRY_REGISTRY: dict[str, dict] = {
         "operation": "observe", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.recall": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "recall", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.panel": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "recall", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.get_beliefs": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.get_verification_candidates": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.run_verification": {
         "operation": "correct", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.belief_history": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.explain": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
     "mirror_memory.api.MemoryEngine.correct": {
@@ -508,18 +514,23 @@ ENTRY_REGISTRY: dict[str, dict] = {
         "operation": "observe", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
     },
     "mirror_memory.server.recall": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "recall", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
     },
     "mirror_memory.server.panel": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "recall", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
     },
     "mirror_memory.server.beliefs": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
     },
     "mirror_memory.server.belief_by_id": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
     },
     "mirror_memory.server.stats": {
+        "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
     },
     "mirror_memory.server.delete_memories": {
@@ -554,4 +565,5 @@ UNGATED_ENGINE_METHODS: dict[str, str] = {
     "set_consent": "authorization administration (feature consent)",
     "grant_purpose": "authorization administration (issuance)",
     "revoke_purpose": "authorization administration (revocation)",
+    "purge_access_audit": "maintenance: access-audit retention purge (reads no memory; ids only)",
 }

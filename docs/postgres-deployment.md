@@ -38,6 +38,16 @@
    / `MM_LEGACY_JOB_PURPOSE` 时，存量行改打该 purpose——一个选择同时标注
    存量任务与存量记忆。列的服务端默认值始终是 `''`，legacy purpose 只标注
    已存在的行，不会泄漏到之后写入的行上。本批只记录、不按它过滤召回。
+   **第 8 步**建访问审计表 `mm_access_audit`（租户表：复合主键、RLS、
+   写入守卫类别 `audit`）：每次读取记忆的入口（recall / panel / beliefs /
+   belief_by_id / stats / explain / belief_history / 验证候选）在**同一事务**
+   里追加一行——user_id、purpose、授权版本、入口名、返回的记忆数量与 id
+   列表（只存 id，超过 `access_audit.max_ids` 截断并标记）；被拒绝的读取
+   也记一行（decision=denied + reason；缺 purpose 的拒绝仍在 Python 层零 SQL
+   拒绝，不记）。审计写不进去则读取失败、不返回数据。`delete_memories`
+   不删审计。保留期 `access_audit.retention_days`（默认 90 天）只由显式的
+   `MemoryEngine.purge_access_audit()` 按租户清理，宿主对每个租户各跑一次；
+   引擎不会替宿主枚举租户。
    **迁移不受应用超时约束**：迁移期间它借出的每个连接都设为会话级
    `statement_timeout = 0`（会话级而非 `SET LOCAL`，因为 `CREATE INDEX
    CONCURRENTLY` 在事务外执行），连接归还连接池时 `RESET` 回建连时的应用

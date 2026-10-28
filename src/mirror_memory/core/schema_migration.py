@@ -1469,6 +1469,45 @@ class Step7SourcePurpose:
                 raise MigrationError(f"verification failed: {table}.source_purpose is nullable")
 
 
+#: The access audit table (M3 batch-2 task 2).
+ACCESS_AUDIT_TABLE = "mm_access_audit"
+
+
+@dataclass
+class Step8AccessAudit:
+    """Create ``mm_access_audit`` (M3 batch-2 task 2).
+
+    Fresh databases get it from ``create_all``; this step brings version-7
+    databases up.  Created FROM THE MODEL METADATA with ``checkfirst`` (so
+    every dialect gets the composite tenant primary key and the two
+    tenant-prefixed indexes ``create_all`` would make), then on PostgreSQL
+    the RLS posture is applied to the new table.  Re-entrant: the create is
+    skipped when the table exists and the RLS plan is idempotent.  Nothing
+    to backfill -- the table starts empty.
+    """
+
+    version: int = 8
+    name: str = "access audit table"
+
+    def needed(self, engine: Engine) -> bool:
+        return not inspect(engine).has_table(ACCESS_AUDIT_TABLE)
+
+    def apply(self, engine: Engine) -> None:
+        Base.metadata.tables[ACCESS_AUDIT_TABLE].create(engine, checkfirst=True)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=[ACCESS_AUDIT_TABLE])).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        if not inspect(engine).has_table(ACCESS_AUDIT_TABLE):
+            raise MigrationError("verification failed: mm_access_audit missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=[ACCESS_AUDIT_TABLE])
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1480,6 +1519,7 @@ DEFAULT_STEPS: list = [
     Step5TenantUserIndexes(),
     Step6PurposeAuthorization(),
     Step7SourcePurpose(),
+    Step8AccessAudit(),
 ]
 
 #: The version a freshly upgraded database records.

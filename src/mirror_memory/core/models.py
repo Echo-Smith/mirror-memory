@@ -735,6 +735,41 @@ class InterventionEvent(TenantScoped, Base):
 
 
 # ---------------------------------------------------------------------------
+# Access audit (M3 batch-2 task 2): append-only record of every memory read
+# ---------------------------------------------------------------------------
+
+
+class AccessAudit(TenantScoped, Base):
+    """One row per read of memory (or refused read): who, under which
+    purpose and grant version, through which entry, how many memories and
+    which ids.  Ids only, never content, so it survives delete_memories.
+    Append-only; the one sanctioned deletion is the tenant-scoped retention
+    purge (core.access_audit.purge_access_audit)."""
+
+    __tablename__ = "mm_access_audit"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
+        # the retention purge scans by age inside one tenant
+        Index("ix_mm_access_audit_tenant_created", "tenant_id", "app_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(64), default="")
+    operation: Mapped[str] = mapped_column(String(16))
+    #: the ENTRY_REGISTRY key of the outermost entry (server route or
+    #: library method)
+    entry: Mapped[str] = mapped_column(String(96))
+    decision: Mapped[str] = mapped_column(String(8))  # "allowed" / "denied"
+    reason: Mapped[str] = mapped_column(String(32), default="")
+    grant_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    memory_count: Mapped[int] = mapped_column(Integer, default=0)
+    memory_ids_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of ids
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
 # Purpose authorization (M3 batch 1)
 # ---------------------------------------------------------------------------
 

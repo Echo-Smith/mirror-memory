@@ -179,6 +179,27 @@ def render_memory_block(
     trace_hook: object | None = None,
     now: datetime | None = None,
 ) -> str | None:
+    """Render a memory block for prompt injection (see
+    :func:`render_memory_block_with_ids`, which also returns the ids of
+    the beliefs that reached the block -- the access audit needs them)."""
+    block, _ids = render_memory_block_with_ids(
+        session, user_id, config, user_message=user_message, language=language,
+        tail_load=tail_load, trace_hook=trace_hook, now=now,
+    )
+    return block
+
+
+def render_memory_block_with_ids(
+    session: object,
+    user_id: str,
+    config: MemoryConfig,
+    *,
+    user_message: str = "",
+    language: str = "zh",
+    tail_load: int = 0,
+    trace_hook: object | None = None,
+    now: datetime | None = None,
+) -> tuple[str | None, list[int]]:
     """Render a memory block for prompt injection.
 
     Parameters
@@ -209,9 +230,9 @@ def render_memory_block(
 
     Returns
     -------
-    str or None
-        The rendered memory block, or ``None`` if there is nothing to
-        render.
+    (block, belief_ids)
+        The rendered memory block (``None`` if there is nothing to render)
+        and the ids of the beliefs that reached it, in render order.
     """
     def _trace(stage: str, **fields: object) -> None:
         if trace_hook is None:
@@ -425,7 +446,7 @@ def render_memory_block(
         budget=budget,
         used_snippet_fallback=bool(user_message and config.session_summary_enabled and "[context]" in (block or "")),
     )
-    return block or None
+    return (block or None), list(accessed_ids)
 
 
 def _retrieve_session_snippets(
