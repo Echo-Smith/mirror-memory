@@ -1,6 +1,7 @@
 name: m3-perf-acceptance
 
-# M3 batch-1 acceptance: the authorization layer's overhead, measured with
+# M3 acceptance (batch 1: the authorization layer; batch 2: provenance +
+# access audit + export on top): the overhead, measured with
 # the M1/M2 methodology (auditor OFF -- the guards stay on; ID intersection
 # between the two revisions; junit-verified rounds; same-run interleaved
 # x3):
@@ -11,7 +12,7 @@ name: m3-perf-acceptance
 
 on:
   push:
-    branches: ["perf/m3-batch1"]
+    branches: ["perf/m3-batch1", "perf/m3-batch2"]
   workflow_dispatch:
 
 jobs:
