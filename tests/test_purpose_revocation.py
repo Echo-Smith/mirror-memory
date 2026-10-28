@@ -42,7 +42,7 @@ from sqlalchemy.orm import sessionmaker
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.authorization import grant_purpose, revoke_purpose
-from mirror_memory.core.models import Belief, EvolutionJob
+from mirror_memory.core.models import Belief, EvolutionJob, PurposeGrantEvent, PurposeGrant
 from mirror_memory.core.repository import record_claim, set_memory_enabled
 from mirror_memory.core.tenancy import queue_write_scope, tenant_scope
 from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqueue_job
@@ -167,7 +167,9 @@ def test_revoke_during_compute_cancels_the_publish(factory):
             s = factory()
             row = s.get(EvolutionJob, (*TENANT, job_id))
             assert row.status == "cancelled", (round_no, row.status, row.error_code)
-            assert row.error_code == "authorization_revoked", (round_no, row.error_code)
+            # the hook fires inside formulate, i.e. after the snapshot
+            # authorize: the publish re-check refuses with "revoked"
+            assert row.error_code == "revoked", (round_no, row.error_code)
             s.close()
         # the seed belief is all that exists; nothing published after revoke
         assert _belief_count(factory) == round_no + 1, (round_no, _belief_count(factory))
@@ -269,3 +271,111 @@ def row_status_is(factory, job_id, error_code) -> bool:
         ok = row.error_code == error_code
         s.close()
     return ok
+
+
+# ---------------------------------------------------------------------------
+# Patch task 3: the publish re-check is CURRENT-ALLOWED only
+# ---------------------------------------------------------------------------
+
+
+def test_renewal_between_claim_and_publish_still_publishes(factory):
+    """A renewal (or an added operation) during the compute is fine: the
+    version moved but extract is still allowed -- the publish lands, and
+    the audit trail records both versions."""
+    _seed_user(factory)
+    with tenant_scope(*TENANT):
+        s = factory()
+        grant_purpose(s, "u1", PURPOSE, operations=["extract"], issuer="reviewer")
+        s.commit()
+        record_claim(s, "u1", dimension="topic", key="k0",
+                     claim_text="seed", confidence=0.8, session_id="s1")
+        s.commit()
+        job = enqueue_job(s, "u1", _config(), purpose=PURPOSE)
+        job_id = job.id
+        s.close()
+    with tenant_scope(*TENANT):
+        s = factory()
+        token = _claim_job(s, job_id, lease_seconds=60)
+        s.close()
+
+    from mirror_memory.core.models import PurposeGrantEvent
+
+    renewed: list[int] = []
+    cfg = _config(hook=lambda: (
+        (lambda: (
+            (lambda s: (
+                grant_purpose(s, "u1", PURPOSE,
+                              operations=["extract", "recall"], issuer="reviewer",
+                              expected_version=renewed[0] if renewed else 1),
+                s.commit(),
+                renewed.append(1),
+            ))(factory()),
+        ))() if not renewed else None,
+    ))
+
+    with tenant_scope(*TENANT):
+        s = factory()
+        job_row = s.get(EvolutionJob, (*TENANT, job_id))
+        _process_single_job(s, job_row, cfg, lease_token=token)
+        s.close()
+
+    with tenant_scope(*TENANT):
+        s = factory()
+        row = s.get(EvolutionJob, (*TENANT, job_id))
+        assert (row.status, row.error_code) == ("completed", ""), (row.status, row.error_code)
+        grants = s.query(PurposeGrant).filter_by(user_id="u1", purpose=PURPOSE).first()
+        snapshot_or_publish = s.query(PurposeGrantEvent).filter_by(
+            user_id="u1", purpose=PURPOSE, action="invoked",
+            operation="extract", decision="published",
+        ).all()
+        assert snapshot_or_publish, "the publish invocation was not audited"
+        event = snapshot_or_publish[-1]
+        assert event.reason.startswith("snapshot_version=1 publish_version="), event.reason
+        assert grants.version >= 2  # renewed mid-compute
+        s.close()
+
+
+def test_extract_removed_between_claim_and_publish_cancels(factory):
+    """The operation (not the whole grant) is removed mid-compute: the
+    publish re-check refuses with the decision's reason and nothing lands."""
+    _seed_user(factory)
+    with tenant_scope(*TENANT):
+        s = factory()
+        grant_purpose(s, "u1", PURPOSE, operations=["extract", "recall"], issuer="reviewer")
+        s.commit()
+        record_claim(s, "u1", dimension="topic", key="k0",
+                     claim_text="seed", confidence=0.8, session_id="s1")
+        s.commit()
+        job = enqueue_job(s, "u1", _config(), purpose=PURPOSE)
+        job_id = job.id
+        s.close()
+    with tenant_scope(*TENANT):
+        s = factory()
+        token = _claim_job(s, job_id, lease_seconds=60)
+        s.close()
+
+    removed: list[bool] = []
+    cfg = _config(hook=lambda: (
+        (lambda: (
+            (lambda s: (
+                grant_purpose(s, "u1", PURPOSE, operations=["recall"],
+                              issuer="reviewer", expected_version=1),
+                s.commit(),
+                removed.append(True),
+            ))(factory()),
+        ))() if not removed else None,
+    ))
+
+    with tenant_scope(*TENANT):
+        s = factory()
+        job_row = s.get(EvolutionJob, (*TENANT, job_id))
+        _process_single_job(s, job_row, cfg, lease_token=token)
+        s.close()
+
+    with tenant_scope(*TENANT):
+        s = factory()
+        row = s.get(EvolutionJob, (*TENANT, job_id))
+        assert (row.status, row.error_code) == ("cancelled", "operation_not_allowed"), (
+            row.status, row.error_code
+        )
+        s.close()

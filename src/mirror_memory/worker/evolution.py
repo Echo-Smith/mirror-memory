@@ -450,27 +450,35 @@ def _process_single_job(
             _block_job(session, job, "memory_disabled", token)
             return
 
-        # Authorization re-check (M3 batch-1 task 4): the snapshot's grant
-        # may have been revoked or re-versioned during the compute.
-        # authorize(lock=True) takes FOR SHARE on the grant row (PostgreSQL):
-        # a concurrent revocation's UPDATE blocks until this transaction
-        # ends, so a committed revocation can never slip between this check
-        # and the publish's commit.  SQLite serializes writers by itself.
-        # Any refusal here -- and any version change -- cancels the job as
-        # authorization_revoked; the refusal happens before the Publisher
-        # writes, so nothing lands.
-        from mirror_memory.core.authorization import authorize_or_raise
+        # Authorization re-check (M3 batch-1 task 4, patch task 3): only
+        # "is extract still allowed right now" matters.  The version is
+        # recorded, not compared -- a renewal or an added operation during
+        # the compute publishes normally; a revocation, an expiry, or the
+        # operation being removed cancels.  authorize(lock=True) takes FOR
+        # SHARE on the grant row (PostgreSQL): a concurrent revocation's
+        # UPDATE blocks until this transaction ends, so a committed
+        # revocation can never slip between this check and the publish's
+        # commit.  SQLite serializes writers by itself.  The refusal (or a
+        # lost authorization) cancels the job with the decision's reason
+        # before the Publisher writes, so nothing lands.  Both versions --
+        # the snapshot's and the publish-time's -- go to the authorization
+        # audit trail and the log.
+        from mirror_memory.core.authorization import authorize_or_raise, record_purpose_invocation
 
         try:
-            publish_grant_version = authorize_or_raise(
+            decision = authorize_or_raise(
                 session, user_id, job.purpose, "extract", lock=True
-            ).grant_version
-        except PurposeDenied:
-            _block_job(session, job, "authorization_revoked", token)
+            )
+        except PurposeDenied as exc:
+            _block_job(session, job, exc.decision.reason, token)
             return
-        if publish_grant_version != grant_version:
-            _block_job(session, job, "authorization_revoked", token)
-            return
+        publish_grant_version = decision.grant_version
+        record_purpose_invocation(
+            session, user_id, job.purpose,
+            operation="extract", decision="published",
+            actor="worker",
+            reason=f"snapshot_version={grant_version} publish_version={publish_grant_version}",
+        )
 
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
