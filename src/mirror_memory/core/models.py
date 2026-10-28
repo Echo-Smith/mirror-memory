@@ -333,7 +333,10 @@ class BeliefEvidenceLink(TenantScoped, Base):
     __tablename__ = "mm_belief_evidence_links"
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
-    belief_id: Mapped[int] = mapped_column(Integer, index=True)
+    # the per-belief lookups (visibility filter, evidence graph) always run
+    # inside one tenant, so the index is tenant-prefixed (M3 batch-3 step 9;
+    # the bare belief_id index it replaces matched every tenant's rows)
+    belief_id: Mapped[int] = mapped_column(Integer)
     evidence_id: Mapped[int] = mapped_column(Integer, index=True)
     relation: Mapped[str] = mapped_column(String(16), default="support")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -342,6 +345,8 @@ class BeliefEvidenceLink(TenantScoped, Base):
         PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint("belief_id", "evidence_id", "relation",
                          name="uq_mm_belief_evidence_link"),
+        Index("ix_mm_belief_evidence_links_tenant_belief",
+              "tenant_id", "app_id", "belief_id"),
     )
 
 
@@ -358,10 +363,16 @@ class BeliefEvent(TenantScoped, Base):
     """
 
     __tablename__ = "mm_belief_events"
-    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
+        Index("ix_mm_belief_events_tenant_belief",
+              "tenant_id", "app_id", "belief_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
-    belief_id: Mapped[int] = mapped_column(Integer, index=True)
+    # tenant-prefixed (M3 batch-3 step 9): the visibility filter's
+    # provenance-events probe is per-belief and per-tenant
+    belief_id: Mapped[int] = mapped_column(Integer)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     event_type: Mapped[str] = mapped_column(String(32))
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -705,6 +716,13 @@ class SessionSummary(TenantScoped, Base):
     session_id: Mapped[str] = mapped_column(String(128), index=True)
     summary_text: Mapped[str] = mapped_column(Text, default="")
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    # The purpose the observe that stored this snippet was authorized for
+    # (M3 batch-3 step 9) -- recall's session-summary fallback returns raw
+    # message text, so it is provenance like evidence; "" = not recorded.
+    # First collection wins: appends to an existing row keep its purpose.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

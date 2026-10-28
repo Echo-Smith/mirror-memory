@@ -2981,6 +2981,7 @@ def store_session_summary(
             session_id=session_id,
             summary_text=snippet,
             turn_count=turn_count,
+            source_purpose=provenance.current(session),
         ))
     session.flush()
 

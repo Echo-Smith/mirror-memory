@@ -427,7 +427,9 @@ def render_memory_block_with_ids(
         # Check if key query terms appear in the block.
         matched = sum(1 for w in query_nouns if w in block_lower)
         if query_nouns and matched < len(query_nouns) * QUERY_NOUN_MATCH_THRESHOLD:
-            snippets = _retrieve_session_snippets(session, user_id, user_message, limit=3)
+            snippets = _retrieve_session_snippets(
+                session, user_id, user_message, limit=3, visibility=visibility,
+            )
             if snippets:
                 snippet_text = " | ".join(snippets)
                 # Allow 2x budget for snippet overflow.
@@ -457,11 +459,17 @@ def _retrieve_session_snippets(
     user_id: str,
     query: str,
     limit: int = 3,
+    *,
+    visibility: "VisibilityRule | None" = None,
 ) -> list[str]:
     """Search session summaries for snippets matching query keywords.
 
     Returns the most relevant snippets (by keyword hit count), preserving
     specific details like dates, names, and numbers.
+
+    With a visibility rule, summaries collected under purposes the rule
+    refuses are withheld: the fallback returns raw message text, so a
+    summary is provenance exactly like evidence (M3 batch 3).
     """
     from mirror_memory.core.models import SessionSummary
 
@@ -469,9 +477,11 @@ def _retrieve_session_snippets(
         session.query(SessionSummary)
         .filter(SessionSummary.user_id == user_id)
         .order_by(SessionSummary.created_at.desc())
-        .limit(20)
+        .limit(60 if visibility else 20)
         .all()
     )
+    if visibility is not None:
+        summaries = [r for r in summaries if visibility.purpose_visible(r.source_purpose)][:20]
     if not summaries or not query:
         return []
 

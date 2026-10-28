@@ -552,3 +552,35 @@ def test_revocation_vs_visibility_50_rounds_sqlite(tmp_path):
             _visibility_race_round(db, eng, round_no)
     finally:
         db.dispose()
+
+
+def test_session_summary_fallback_is_visibility_filtered(db):
+    """recall's snippet fallback returns raw message text: summaries are
+    provenance like evidence, so P's snippets vanish from Q once P is
+    revoked (session summaries need session_summary_enabled)."""
+    cfg = load_config("config/")
+    cfg.session_summary_enabled = True
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+    eng = MemoryEngine(config=cfg, database_url=str(db.url),
+                       tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM())
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I keep a journal about {SENTINEL} in the attic.", P, "s1")
+    _observe(eng, "I keep a journal about gardening in the shed.", Q, "s2")
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+    # both snippets exist, but only Q's may surface
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            summaries = s.execute(select(__import__("mirror_memory.core.models", fromlist=["SessionSummary"]).SessionSummary)).scalars().all()
+        finally:
+            s.close()
+    assert len(summaries) == 2
+    block = eng.recall(user_id=USER, query="journal attic", purpose=Q) or ""
+    assert SENTINEL not in block
+    assert "gardening" in block or "shed" in block

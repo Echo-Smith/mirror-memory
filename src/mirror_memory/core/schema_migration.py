@@ -1508,6 +1508,143 @@ class Step8AccessAudit:
             rls.verify_posture(engine, tables=[ACCESS_AUDIT_TABLE])
 
 
+#: The bare ``belief_id`` indexes step 9 replaces (SQLAlchemy's default
+#: names for ``index=True`` on those columns).
+LEGACY_BELIEF_INDEXES: dict[str, str] = {
+    "mm_belief_evidence_links": "ix_mm_belief_evidence_links_belief_id",
+    "mm_belief_events": "ix_mm_belief_events_belief_id",
+}
+
+#: The tenant-prefixed replacements (the model declares them for fresh
+#: databases).
+TENANT_BELIEF_INDEXES: dict[str, str] = {
+    "mm_belief_evidence_links": "ix_mm_belief_evidence_links_tenant_belief",
+    "mm_belief_events": "ix_mm_belief_events_tenant_belief",
+}
+
+
+def _belief_index_pair(table_name: str, concurrently: bool):
+    """(new tenant-prefixed index, legacy single-column index) on a DETACHED
+    copy of the model table -- the model already declares the composite one,
+    and the legacy name is not in the metadata any more."""
+    table = Base.metadata.tables[table_name].to_metadata(MetaData())
+    for index in list(table.indexes):
+        if index.name in (TENANT_BELIEF_INDEXES[table_name], LEGACY_BELIEF_INDEXES[table_name]):
+            table.indexes.discard(index)
+    new = Index(
+        TENANT_BELIEF_INDEXES[table_name],
+        table.c.tenant_id, table.c.app_id, table.c.belief_id,
+        postgresql_concurrently=concurrently,
+    )
+    old = Index(LEGACY_BELIEF_INDEXES[table_name], table.c.belief_id,
+                postgresql_concurrently=concurrently)
+    return new, old
+
+
+@dataclass
+class Step9RecallVisibility:
+    """Recall-visibility support (M3 batch 3): tenant-prefixed belief_id
+    indexes and provenance on the session summaries.
+
+    - ``mm_belief_evidence_links`` / ``mm_belief_events``: the bare
+      ``belief_id`` index is REPLACED by ``(tenant_id, app_id, belief_id)``
+      -- the visibility filter's probes (and every other per-belief lookup)
+      always carry the tenant predicates, so the bare index matched every
+      tenant's rows for an id and was intersected with the primary key.
+      Replacement, not addition: the index count per table does not grow.
+      PostgreSQL: ``CREATE INDEX CONCURRENTLY`` the new index (an INVALID
+      leftover of a failed build is dropped and rebuilt), then
+      ``DROP INDEX CONCURRENTLY`` the old one -- both outside transactions,
+      both re-entrant.  SQLite: plain create/drop.
+    - ``mm_session_summaries.source_purpose``: recall's session-summary
+      fallback returns raw message text, so the summaries are provenance
+      like evidence.  The same NOT NULL VARCHAR(64) / server default ''
+      recipe as step 7; existing rows carry the empty marker unless the
+      OPTIONAL ``legacy_job_purpose`` (shared with steps 6 and 7) labels
+      them.  Re-entrant per artifact.
+    """
+
+    version: int = 9
+    name: str = "recall visibility: tenant belief indexes + summary provenance"
+    legacy_job_purpose: str | None = None
+
+    def _legacy_purpose(self) -> str:
+        return _legacy_purpose_value(self.legacy_job_purpose)
+
+    def needed(self, engine: Engine) -> bool:
+        if "source_purpose" not in _table_columns(engine, "mm_session_summaries"):
+            return True
+        states = {
+            name: _index_state(engine, table, TENANT_BELIEF_INDEXES[table])
+            for table, name in TENANT_BELIEF_INDEXES.items()
+        }
+        return any(state != "valid" for state in states.values())
+
+    def apply(self, engine: Engine) -> None:
+        pg = _is_postgres(engine)
+        legacy = self._legacy_purpose()
+        for table in TENANT_BELIEF_INDEXES:
+            new, old = _belief_index_pair(table, concurrently=pg)
+            elements = []
+            if pg:
+                if _index_state(engine, table, new.name) == "invalid":
+                    elements.append(DropIndex(new, if_exists=True))
+                if _index_state(engine, table, new.name) != "valid":
+                    elements.append(CreateIndex(new))
+                if _index_state(engine, table, old.name) is not None:
+                    elements.append(DropIndex(old, if_exists=True))
+                if elements:
+                    _DDLPlan(elements, autocommit=True).run(engine)
+            else:
+                new.create(engine, checkfirst=True)
+                old.drop(engine, checkfirst=True)
+        if "source_purpose" not in _table_columns(engine, "mm_session_summaries"):
+            if pg:
+                _DDLPlan([AddColumn("mm_session_summaries", "source_purpose", "VARCHAR(64)")]).run(engine)
+                _backfill_column(
+                    engine, "mm_session_summaries", {"source_purpose": legacy},
+                    ["source_purpose"], DEFAULT_BACKFILL_BATCH,
+                )
+                check = AddNotNullCheck("mm_session_summaries", "source_purpose")
+                _DDLPlan([
+                    _lock_timeout_element(),
+                    check,
+                    ValidateConstraint("mm_session_summaries", check.constraint_name),
+                    AlterColumnClause("mm_session_summaries", "source_purpose", "SET NOT NULL"),
+                    AlterColumnClause("mm_session_summaries", "source_purpose", "SET DEFAULT ''"),
+                    DropConstraintByName("mm_session_summaries", check.constraint_name),
+                ]).run(engine)
+            else:
+                _DDLPlan([AddColumn(
+                    "mm_session_summaries", "source_purpose",
+                    "VARCHAR(64) NOT NULL DEFAULT ''",
+                )]).run(engine)
+        if legacy:
+            # label the rows still carrying the empty marker -- the just-added
+            # column's rows and any a previous run left unlabelled alike
+            _backfill_column(
+                engine, "mm_session_summaries", {"source_purpose": legacy},
+                ["source_purpose"], DEFAULT_BACKFILL_BATCH, marker="",
+            )
+
+    def verify(self, engine: Engine) -> None:
+        cols = {c["name"] for c in inspect(engine).get_columns("mm_session_summaries")}
+        if "source_purpose" not in cols:
+            raise MigrationError("verification failed: mm_session_summaries.source_purpose missing")
+        for table, index_name in TENANT_BELIEF_INDEXES.items():
+            state = _index_state(engine, table, index_name)
+            if state != "valid":
+                raise MigrationError(
+                    f"verification failed: {table} lacks a valid {index_name}"
+                )
+            if LEGACY_BELIEF_INDEXES[table] in {
+                ix["name"] for ix in inspect(engine).get_indexes(table)
+            }:
+                raise MigrationError(
+                    f"verification failed: {table} still carries {LEGACY_BELIEF_INDEXES[table]}"
+                )
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1520,6 +1657,7 @@ DEFAULT_STEPS: list = [
     Step6PurposeAuthorization(),
     Step7SourcePurpose(),
     Step8AccessAudit(),
+    Step9RecallVisibility(),
 ]
 
 #: The version a freshly upgraded database records.

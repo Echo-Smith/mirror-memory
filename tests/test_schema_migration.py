@@ -398,7 +398,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
 
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 8
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
     step = sm.Step4PendingJobsIndex()
@@ -754,7 +754,7 @@ def test_step8_creates_the_access_audit_table_on_a_version7_database(tmp_path):
     step = sm.Step8AccessAudit()
     assert step.needed(eng)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 8
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     insp = inspect(eng)
     assert insp.has_table("mm_access_audit")
     names = {ix["name"] for ix in insp.get_indexes("mm_access_audit")}
@@ -767,4 +767,64 @@ def test_step8_creates_the_access_audit_table_on_a_version7_database(tmp_path):
     assert not step.needed(eng)
     step.apply(eng)  # re-entry is a no-op
     step.verify(eng)
+    eng.dispose()
+
+
+def test_step9_swaps_belief_indexes_and_stamps_summaries(tmp_path):
+    """M3 batch 3 step 9: the bare belief_id indexes are REPLACED by
+    tenant-prefixed composites and mm_session_summaries gains
+    source_purpose (existing rows carry the empty marker unless the legacy
+    purpose labels them); re-entrant per artifact."""
+    from sqlalchemy import MetaData, text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'v8.db'}")
+    Base.metadata.create_all(eng)
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        # simulate v8: legacy single-column belief indexes, no summary column
+        for table, legacy in sm.LEGACY_BELIEF_INDEXES.items():
+            conn.exec_driver_sql(f"DROP INDEX {sm.TENANT_BELIEF_INDEXES[table]}")
+            conn.exec_driver_sql(
+                f"CREATE INDEX {legacy} ON {table} (belief_id)")
+        conn.exec_driver_sql("ALTER TABLE mm_session_summaries DROP COLUMN source_purpose")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=8, note="simulated v8"))
+        conn.execute(_text(
+            "INSERT INTO mm_session_summaries (user_id, session_id, summary_text, "
+            "turn_count, created_at, tenant_id, app_id) VALUES ('u1', 's1', 'c', 1, "
+            "CURRENT_TIMESTAMP, 't', 'a')"
+        ))
+    step = sm.Step9RecallVisibility(legacy_job_purpose="legacy-app")
+    assert step.needed(eng)
+    upgrade_database(eng, default_tenant="legacy", default_app="app",
+                     steps=[step])
+    assert sm.current_version(eng) == sm.LATEST_VERSION
+    insp = inspect(eng)
+    for table, composite in sm.TENANT_BELIEF_INDEXES.items():
+        names = {ix["name"] for ix in insp.get_indexes(table)}
+        assert composite in names, (table, names)
+        assert sm.LEGACY_BELIEF_INDEXES[table] not in names, table
+    with no_audit_scope(), eng.connect() as conn:
+        purpose = conn.execute(_text(
+            "SELECT source_purpose FROM mm_session_summaries")).scalar_one()
+    assert purpose == "legacy-app"
+    # a summary written after the migration carries the marker default
+    with no_audit_scope(), eng.begin() as conn:
+        conn.execute(_text(
+            "INSERT INTO mm_session_summaries (user_id, session_id, summary_text, "
+            "turn_count, created_at, tenant_id, app_id) VALUES ('u1', 's2', 'c2', 1, "
+            "CURRENT_TIMESTAMP, 't', 'a')"
+        ))
+    with no_audit_scope(), eng.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT session_id, source_purpose FROM mm_session_summaries ORDER BY session_id")).all()
+    assert rows == [("s1", "legacy-app"), ("s2", "")]
+    step2 = sm.Step9RecallVisibility()
+    assert not step2.needed(eng)
+    step2.apply(eng)  # re-entry: no-op
+    step2.verify(eng)
     eng.dispose()
