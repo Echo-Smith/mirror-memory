@@ -24,9 +24,11 @@ Classification (task requirement; one row per v2 test):
 | 14 | BG test_evidence_deleted_between_claim_and_publish| 按 v1 语义改写 | v2 forget(evidence_ids) -> v1 evidence rows deleted; the Publisher's authority gate refuses (`evidence_missing`) |
 | 15 | BG test_no_memory_with_revocation_does_not_mark_ready | 按 v1 语义改写 | the revoke half is M3; the v1 core -- a refused publish leaves the job cancelled, never completed -- is kept via the consent gate |
 
-v1 addition required by the task: the version CAS under REAL thread
-concurrency (``test_cas_real_concurrency_only_one_side_wins``, 8 threads,
-50 rounds).
+The v1 addition the M2 task asked for -- a version CAS under REAL thread
+concurrency -- moved to tests/test_purpose_authorization.py in M3 batch 1
+(``test_cas_first_issuance_exactly_one_winner`` /
+``test_cas_update_exactly_one_winner``, 50 rounds) when the CAS under
+test became the purpose-grant version.
 
 Race tests loop 50x so a pass is not luck.  Threads do not inherit
 ContextVars: every thread body opens its own ``tenant_scope`` (the RLS
