@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+
+from sqlalchemy.exc import OperationalError
 
 from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.core.authorization import Decision, PurposeDenied
@@ -531,10 +534,39 @@ def _process_single_job(
         # PostgreSQL: roll it back before any bookkeeping.  The fenced
         # completion UPDATE still guards the bookkeeping itself.
         session.rollback()
+        busy = _is_sqlite_busy(exc)
         changes = {
-            "status": "failed" if attempt_count >= config.worker.max_attempts else "pending",
-            "error_code": type(exc).__name__,
+            # A SQLite lock collision (database is locked / BUSY) is
+            # TRANSIENT: it must not burn an attempt -- the job goes back to
+            # pending with its attempt count restored, deferred to the end
+            # of the queue (M3 patch task 0)
+            "status": "pending" if busy else (
+                "failed" if attempt_count >= config.worker.max_attempts else "pending"
+            ),
+            "error_code": type(exc).__name__ if not busy else "database_is_locked",
         }
+        if busy:
+            changes["attempt_count"] = max(0, attempt_count - 1)
+            changes["created_at"] = datetime.now(UTC)  # defer: end of the queue
+            # the contending writer may still hold the lock while this
+            # bookkeeping runs: retry the fenced bookkeeping under a
+            # bounded deadline (the sweep's next pass would only hit the
+            # same lock).  PG failures never take this path (the text
+            # check is SQLite-specific).
+            deadline = time.monotonic() + _BUSY_BOOKKEEPING_TIMEOUT
+            while True:
+                try:
+                    _set_job_state(session, job_id, token, changes)
+                    logger.info(
+                        "evolution: job=%s deferred (sqlite busy); attempt "
+                        "count restored", truncate_id(job_id),
+                    )
+                    return
+                except OperationalError as busy_exc:
+                    if not _is_sqlite_busy(busy_exc) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.4)
+            # unreachable: the loop returns or raises
         try:
             _set_job_state(session, job_id, token, changes)
         except LeaseLost:
@@ -545,6 +577,19 @@ def _process_single_job(
             )
             return
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job_id), type(exc).__name__)
+
+
+#: How long the BUSY bookkeeping keeps retrying the fenced pending-update
+#: before giving up and surfacing the lock error (the sweep retries anyway).
+_BUSY_BOOKKEEPING_TIMEOUT = 6.0
+
+
+def _is_sqlite_busy(exc: BaseException) -> bool:
+    """True for a SQLite lock collision: the error text carries
+    'database is locked' / 'database table is locked' (pysqlite raises
+    OperationalError with those messages; there is no distinct SQLSTATE)."""
+    text = str(exc)
+    return "database is locked" in text or "database table is locked" in text
 
 
 def _end_snapshot_transaction(session: object) -> None:
