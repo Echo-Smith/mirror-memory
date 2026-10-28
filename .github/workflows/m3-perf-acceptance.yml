@@ -83,6 +83,10 @@ jobs:
               grep -qx "$f" /tmp/keep.txt || rm -f "$f"
             done
             git checkout -f -q "$rev" -- src tests pyproject.toml
+            # the allowlist yaml files and the scanners are part of the
+            # measured surface: without rewinding them the base revision
+            # sees the HEAD yaml and its scope/writer scans report ghosts
+            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
             export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
             local start end
             start=$(python -c 'import time; print(time.monotonic())')
@@ -112,6 +116,10 @@ jobs:
               grep -qx "$f" /tmp/keep.txt || rm -f "$f"
             done
             git checkout -f -q "$rev" -- src tests pyproject.toml
+          }
+          use_rev() {
+            local rev="$1"
+            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
           }
           measure() {
             local rev="$1" round="$2" tag="$3"
