@@ -30,11 +30,12 @@ writers:
   record_purpose_invocation:
     reason: >
       Appends a mm_purpose_grant_events row for an operation that ran
-      WITHOUT a grant decision: the forget path, which is admitted
-      regardless of authorization state (a revoked user can still have
-      their data erased) but must carry a purpose and is audited.
+      without/around a grant decision: the forget path (admitted
+      regardless of authorization state, but audited) and the worker's
+      publish-time authorization record (snapshot/publish versions).
     callers:
       - mirror_memory.api
+      - mirror_memory.worker.evolution
 
   revoke_purpose:
     reason: >
