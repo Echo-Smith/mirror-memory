@@ -34,6 +34,15 @@ DENYLIST = re.compile(r"autogrant", re.IGNORECASE)
 #: The hook's name is banned as an identifier or literal anywhere in src.
 BANNED_TOKEN = re.compile(r"autogrant", re.IGNORECASE)
 
+#: The test harness's grant plumbing (M3 batch-3 task 4): the conftest
+#: wrapper issues real grants through a dedicated ADMIN ENGINE so src never
+#: has to.  If src references any of this, production code is reaching for
+#: test-side authorization -- the autogrant hole wearing a different coat.
+HARNESS_TOKENS = re.compile(
+    r"tests\.conftest|from tests import|_grant_on_authorize|_grant_now"
+    r"|_grant_in_savepoint|sqlite_granted|_test_grants_active|refusing_authz"
+)
+
 
 def env_keys_read(tree: ast.AST) -> list[str]:
     """Environment-key string literals read via os.environ[...],
@@ -73,6 +82,10 @@ def violations(src_dir: Path) -> list[str]:
         if hit:
             found.append(f"{rel}: contains banned token {hit.group(0)!r}")
             continue  # one line per file is enough
+        hit = HARNESS_TOKENS.search(text)
+        if hit:
+            found.append(f"{rel}: references the test grant harness {hit.group(0)!r}")
+            continue
         try:
             tree = ast.parse(text)
         except SyntaxError as exc:
@@ -109,7 +122,26 @@ def selftest() -> int:
         if violations(root / "src"):
             print("SELFTEST FAIL: a clean env read was flagged:", violations(root / "src"))
             return 1
-    print("selftest ok: counterexample caught, clean env read passes")
+        # the batch-3 rule: src must not reach for the test grant harness
+        harness = root / "src" / "harness_ref.py"
+        harness.write_text(
+            "from tests.conftest import refusing_authz\n\n\ndef check():\n    return 1\n",
+            encoding="utf-8",
+        )
+        found = violations(root / "src")
+        if not any("test grant harness" in f for f in found):
+            print("SELFTEST FAIL: the harness reference was not caught:", found)
+            return 1
+        clean = root / "src" / "harness_ref.py"
+        clean.write_text(
+            '# the word "conftest" alone in a comment is not a reference\nX = 1\n',
+            encoding="utf-8",
+        )
+        found = violations(root / "src")
+        if any("test grant harness" in f for f in found):
+            print("SELFTEST FAIL: a benign file was flagged as harness use:", found)
+            return 1
+    print("selftest ok: counterexamples caught, clean files pass")
     return 0
 
 

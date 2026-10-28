@@ -53,9 +53,11 @@ writers:
   purge_access_audit:
     reason: >
       The one sanctioned deletion on the append-only audit table: the
-      tenant-scoped retention purge behind MemoryEngine.purge_access_audit.
+      tenant-scoped retention purge behind MemoryEngine.purge_access_audit
+      and the worker's batched maintenance pass.
     callers:
       - mirror_memory.api
+      - mirror_memory.worker.maintenance
 
   # ---- consent class: purpose authorization (M3 batch 1, reviewer 待评审) ----
   grant_purpose:

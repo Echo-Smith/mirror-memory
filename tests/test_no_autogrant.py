@@ -60,3 +60,23 @@ def test_benign_env_read_is_not_flagged(tmp_path):
     )
     result = _run_checker("--src", str(src))
     assert result.returncode == 0, result.stdout
+
+
+def test_src_may_not_reference_the_test_grant_harness(tmp_path):
+    """M3 batch-3 task 4: the harness's admin-engine granting is TEST-side
+    machinery.  A src module importing tests.conftest (or naming its
+    fixtures) is production code reaching for test-side authorization --
+    the autogrant hole in a different coat -- and must fail the scan."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "hole.py").write_text(
+        "from tests.conftest import refusing_authz\n\n\ndef check():\n    return 1\n",
+        encoding="utf-8",
+    )
+    r = _run_checker("--src", str(src))
+    assert r.returncode != 0, r.stdout
+    assert "test grant harness" in r.stdout, r.stdout
+    # the live src tree is clean of harness references
+    r = _run_checker()
+    assert r.returncode == 0, r.stdout
+    assert "test grant harness" not in r.stdout

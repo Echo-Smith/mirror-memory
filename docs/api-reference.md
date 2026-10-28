@@ -226,6 +226,33 @@ result = engine.run_verification(
 
 **Raises**: `ValidationError` if user_id, session_id, or user_text is empty.
 
+### export_page() / export()
+
+```python
+page = engine.export_page(user_id="u1", purpose="analytics", cursor=None, page_size=500)
+for page in engine.export(user_id="u1", purpose="analytics", page_size=500):
+    ...
+```
+
+**Parameters**:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `user_id` | `str` | — | User identifier |
+| `purpose` | `str` | engine default | Must carry the `export` operation in its grant; re-authorized on EVERY page |
+| `cursor` | `str` | `None` | The previous page's `next_cursor` (`"<section>:<last_id>"`); `None` starts the export |
+| `page_size` | `int` | `500` | Rows fetched per page (1..5000) |
+
+**Returns**: `ExportPage` — `{schema_version: "mm-export/1", user_id, section, items, next_cursor, revision, exported_at, authorization}`. Sections run in a fixed order (`beliefs` → `evidence` → `events`); `next_cursor` is `None` after the last page. Beliefs carry `source_purposes` (the distinct source purposes of their linked evidence); evidence and events carry `source_purpose`.
+
+**Cross-purpose visibility**: pages only return memory whose provenance is visible under the reading purpose — evidence/events under a revoked purpose, and beliefs supported only by such provenance, are withheld (they count against the cursor, so pages may be smaller than `page_size` or empty).
+
+**Pagination is NOT one consistent snapshot.** Each page is its own short transaction, re-authorized and audited independently; memory can change between pages (a concurrent observe, a metabolism cycle, a revocation). Consumers that need consistency must compare the `revision` field (the memory state revision at each page's read time): if it moves between pages, restart the export. The re-authorization per page is the point — a grant revoked mid-export refuses the next page, so no stream can outlive its grant.
+
+**Raises**: `PurposeDenied` if the purpose lacks the `export` operation (or the grant is revoked/expired — including between pages); `InvalidCursor`/`ValidationError` for a malformed cursor or out-of-range `page_size`.
+
+**Server**: `GET /export?user_id=&cursor=&page_size=` — one page per request with the same semantics (the `X-MM-Purpose` header supplies the purpose; re-authorized per request).
+
 ## OpenAILLM
 
 ```python
