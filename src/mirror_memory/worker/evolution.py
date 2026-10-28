@@ -377,6 +377,9 @@ def _process_single_job(
         # cancelled, never run ungated; a refusal cancels the job with the
         # decision's reason.
         if not (job.purpose or "").strip():
+            from mirror_memory.core import metrics
+
+            metrics.inc(metrics.MISSING_PURPOSE)
             _block_job(session, job, "missing_purpose", token)
             return
         try:
@@ -887,11 +890,19 @@ async def evolution_worker(
     """
     session_factory = config.session_factory
     poll_interval = config.worker.poll_interval_seconds
+    # audit-retention maintenance runs on its own (much longer) cadence
+    maintenance_state: dict[str, float] = {}
+    from mirror_memory.worker.maintenance import next_due, purge_expired_audit
 
     while not stop.is_set():
         try:
             await asyncio.to_thread(process_pending, session_factory, config)
         except Exception:
             logger.warning("evolution: worker will retry on next tick", exc_info=True)
+        if next_due(maintenance_state, config):
+            try:
+                await asyncio.to_thread(purge_expired_audit, session_factory, config)
+            except Exception:
+                logger.warning("audit maintenance: will retry next interval", exc_info=True)
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_interval)

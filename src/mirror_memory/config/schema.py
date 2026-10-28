@@ -400,6 +400,23 @@ class AccessAuditConfig(BaseModel):
             "growth is bounded by read volume, not content."
         ),
     )
+    purge_interval_seconds: int = Field(
+        default=3600, ge=1,
+        description=(
+            "How often the background worker's maintenance pass runs the "
+            "retention purge (per tenant, in batches).  Hourly: a backlog "
+            "older than the retention window is bounded by an hour of reads, "
+            "and the pass itself is a no-op when nothing is expired."
+        ),
+    )
+    purge_batch_size: int = Field(
+        default=500, ge=1,
+        description=(
+            "Audit rows deleted per batch inside the maintenance pass, so a "
+            "large backlog drains in short transactions instead of one long "
+            "one (each batch commits before the next)."
+        ),
+    )
 
 
 class MemoryConfig(BaseModel):

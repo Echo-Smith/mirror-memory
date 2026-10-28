@@ -269,10 +269,14 @@ class MemoryEngine:
         """The effective purpose: the call's argument or the engine-level
         default.  Neither present -> PurposeDenied(missing_purpose); there
         is no implicit default."""
+        from mirror_memory.core import metrics
         from mirror_memory.core.authorization import Decision, PurposeDenied
 
         resolved = purpose if purpose is not None else self._default_purpose
         if not resolved or not str(resolved).strip():
+            # decided in Python before any SQL (batch-1 invariant): the
+            # count is in-process, never a query
+            metrics.inc(metrics.MISSING_PURPOSE)
             raise PurposeDenied(Decision(False, "missing_purpose", None, ""), "unresolved")
         return str(resolved).strip()
 

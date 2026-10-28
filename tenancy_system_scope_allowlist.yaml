@@ -87,3 +87,15 @@
     configuration.  Runs a single bounded query at engine construction.
   reviewer: Echo-Smith
   reviewed_at: "2026-10-25"
+
+- module: mirror_memory.worker.maintenance
+  function: purge_expired_audit
+  reason: >
+    Audit-retention maintenance (M3 batch 3): enumerates the DISTINCT
+    tenants holding access-audit rows once (a read of the audit table's
+    tenant columns) so each tenant's retention purge can then run inside
+    its own tenant_scope through the sanctioned writer.  The enumeration
+    is the only cross-tenant statement; the deletions are per-tenant and
+    batched.  Reached from the worker loop's periodic maintenance pass.
+  reviewer: 待评审
+  reviewed_at: ""

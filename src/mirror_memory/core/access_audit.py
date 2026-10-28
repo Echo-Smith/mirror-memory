@@ -111,16 +111,26 @@ def retention_cutoff(retention_days: int, *, now: datetime | None = None) -> dat
 
 
 @_sanctioned_writer("audit")
-def purge_access_audit(session: Session, *, older_than: datetime) -> int:
+def purge_access_audit(session: Session, *, older_than: datetime, limit: int | None = None) -> int:
     """Delete this tenant's audit rows created before *older_than*; returns
     the number removed.  The ONE sanctioned deletion on the append-only
     table: an explicit maintenance call under the caller's tenant scope.
     A host with many tenants runs it per tenant -- the engine never
-    enumerates tenants on a host's behalf."""
+    enumerates tenants on a host's behalf.  *limit* caps the deletion to
+    one batch (the worker's maintenance loop chunks with it, committing
+    between batches so a large backlog never holds one long transaction)."""
     if older_than.tzinfo is not None:
         older_than = older_than.astimezone(UTC).replace(tzinfo=None)
-    return int(
-        session.query(AccessAudit)
-        .filter(AccessAudit.created_at < older_than)
-        .delete(synchronize_session=False)
-    )
+    query = session.query(AccessAudit).filter(AccessAudit.created_at < older_than)
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        ids = [row.id for row in query.with_entities(AccessAudit.id).limit(limit)]
+        if not ids:
+            return 0
+        return int(
+            session.query(AccessAudit)
+            .filter(AccessAudit.id.in_(ids))
+            .delete(synchronize_session=False)
+        )
+    return int(query.delete(synchronize_session=False))
