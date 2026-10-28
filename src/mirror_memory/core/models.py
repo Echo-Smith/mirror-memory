@@ -236,6 +236,14 @@ class Evidence(TenantScoped, Base):
     # Who the statement is attributable to: "user" / "assistant" / "system" /
     # "derived".  Drives how much weight the evidence can carry.
     authority: Mapped[str] = mapped_column(String(32), default="user")
+    # The purpose the entry that collected this row was authorized for
+    # (M3 batch-2 task 1): observe's purpose, the worker's job purpose.
+    # "" = source not recorded (pre-M3 rows, direct repository use).  Set
+    # from the session's bound provenance, never by the caller; see
+    # core.provenance.  Recorded only -- not yet filtered on.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     # Memory metabolism (PR3).  ``hot`` rows are live provenance;
@@ -359,6 +367,11 @@ class BeliefEvent(TenantScoped, Base):
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
     detail_json: Mapped[str] = mapped_column(Text, default="{}")
     origin_stats_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The purpose the entry that caused this event was authorized for
+    # (M3 batch-2 task 1); "" = not recorded.  See core.provenance.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -612,6 +625,11 @@ class Snapshot(TenantScoped, Base):
     support_policy_json: Mapped[str] = mapped_column(Text, default="{}")
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
+    # The purpose of the job that synthesised this snapshot (M3 batch-2
+    # task 1) -- the worker's provenance row; "" = not recorded.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

@@ -41,6 +41,7 @@ from mirror_memory.core.constants import (
     QUESTION_TIER_WEIGHT_MIN,
     SUPPORT_GAIN,
 )
+from mirror_memory.core import provenance
 from mirror_memory.core.models import (
     Belief,
     BeliefEvent,
@@ -318,6 +319,12 @@ def record_evidence(
             existing.authority = authority
         if observed_at is not None:
             existing.observed_at = observed_at
+        # Provenance is the purpose of the FIRST collection; a re-observation
+        # under another purpose does not relabel it.  A row whose source was
+        # never recorded (pre-M3, direct repository use) takes the purpose
+        # now known.
+        if not existing.source_purpose:
+            existing.source_purpose = provenance.current(session)
         # Re-observing a message whose evidence was folded is the
         # evidence-level reheat signal: the row goes live again (its group
         # link stays on the digest for audit).
@@ -335,6 +342,7 @@ def record_evidence(
         source_type=source_type,
         extraction_method=extraction_method,
         authority=authority,
+        source_purpose=provenance.current(session),
         observed_at=observed_at or utcnow(),
     )
     session.add(row)
@@ -1051,6 +1059,7 @@ def _append_event(
             evidence_json=json.dumps(evidence),
             detail_json=json.dumps(detail or {}, ensure_ascii=False),
             origin_stats_id=stats_id,
+            source_purpose=provenance.current(session),
         )
     )
 

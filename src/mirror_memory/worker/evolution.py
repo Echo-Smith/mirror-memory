@@ -31,6 +31,7 @@ from mirror_memory.core.constants import (
     JOB_BATCH_LIMIT,
     LOAD_EVIDENCE_LIMIT,
 )
+from mirror_memory.core import provenance
 from mirror_memory.core.models import Belief, EvolutionJob
 from mirror_memory.core.utils import truncate_id
 from mirror_memory.worker.snapshot import promote_shadow_if_ready
@@ -385,6 +386,9 @@ def _process_single_job(
         except PurposeDenied as exc:
             _block_job(session, job, exc.decision.reason, token)
             return
+        # The rows the publish writes (ledger events) are collected under
+        # the job's purpose -- the purpose of the observe that enqueued it.
+        provenance.bind(session, job.purpose)
 
         # We intentionally ignore job.claimed_revision here (a snapshot from
         # enqueue time).  The revision may have been bumped by state mutations
@@ -577,6 +581,10 @@ def _process_single_job(
             )
             return
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job_id), type(exc).__name__)
+    finally:
+        # a session reused across jobs must not carry this job's purpose
+        # into the next one
+        provenance.unbind(session)
 
 
 #: How long the BUSY bookkeeping keeps retrying the fenced pending-update

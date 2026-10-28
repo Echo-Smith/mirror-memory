@@ -9,6 +9,7 @@ import json
 import logging
 import uuid
 
+from mirror_memory.core import provenance
 from mirror_memory.core.models import Belief, Snapshot
 from mirror_memory.core.utils import truncate_id
 
@@ -79,6 +80,7 @@ def persist_snapshot(
             support_policy_json=json.dumps(policy, ensure_ascii=False),
             evidence_watermark=watermark,
             prompt_version="v1",
+            source_purpose=provenance.current(session),
         )
         session.add(snapshot)
         session.flush()

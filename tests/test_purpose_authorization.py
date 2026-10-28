@@ -354,7 +354,7 @@ def test_step6_creates_tables_column_and_records_version(tmp_path):
         conn.execute(vt.delete())
         conn.execute(vt.insert().values(version=5, note="simulated v5"))
     sm.upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == 6
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     step = sm.Step6PurposeAuthorization()
     insp = inspect(eng)
     assert {"mm_purpose_grants", "mm_purpose_grant_events"} <= set(insp.get_table_names())

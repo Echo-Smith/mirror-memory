@@ -254,23 +254,26 @@ class MemoryEngine:
     def _authorize(self, session, user_id: str, purpose: str | None, operation: str) -> str:
         """Authorize *operation* in the CURRENT transaction, before any
         business statement; raises PurposeDenied on refusal."""
-        from mirror_memory.core import authorization
+        from mirror_memory.core import authorization, provenance
 
         resolved = self._purpose_or_default(purpose)
         authorization.authorize_or_raise(session, user_id, resolved, operation)
+        # everything this transaction writes is collected under `resolved`
+        provenance.bind(session, resolved)
         return resolved
 
     def _record_forget_invocation(self, session, user_id: str, purpose: str | None) -> str:
         """The forget paths run regardless of authorization state (a revoked
         user can still have their data erased) but must carry a purpose, and
         every invocation is written to the authorization audit trail."""
-        from mirror_memory.core import authorization
+        from mirror_memory.core import authorization, provenance
 
         resolved = self._purpose_or_default(purpose)
         authorization.record_purpose_invocation(
             session, user_id, resolved,
             operation="forget", decision="allowed_regardless", actor="engine",
         )
+        provenance.bind(session, resolved)
         return resolved
 
     def observe(

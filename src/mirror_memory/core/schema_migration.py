@@ -1248,6 +1248,22 @@ def _count_legacy_jobs(engine: Engine) -> int:
             )
 
 
+def _legacy_purpose_value(explicit: str | None) -> str:
+    """The operator's purpose for pre-M3 rows: the explicit dataclass
+    argument, else ``MM_LEGACY_JOB_PURPOSE``; "" means "keep the empty
+    marker".  Shared by steps 6 (jobs) and 7 (provenance rows) so one
+    choice labels both."""
+    import os
+
+    value = explicit
+    if value is None:
+        value = os.environ.get("MM_LEGACY_JOB_PURPOSE", "") or ""
+    value = value.strip()
+    if value and any(c.isspace() for c in value):
+        raise MigrationError("legacy_job_purpose must not contain whitespace")
+    return value
+
+
 @dataclass
 class Step6PurposeAuthorization:
     """Create the purpose-authorization tables and add ``mm_evolution_jobs
@@ -1284,17 +1300,7 @@ class Step6PurposeAuthorization:
     legacy_job_purpose: str | None = None
 
     def _legacy_purpose(self) -> str:
-        import os
-
-        value = self.legacy_job_purpose
-        if value is None:
-            value = os.environ.get("MM_LEGACY_JOB_PURPOSE", "") or ""
-        value = value.strip()
-        if value and any(c.isspace() for c in value):
-            raise MigrationError(
-                "legacy_job_purpose must not contain whitespace"
-            )
-        return value
+        return _legacy_purpose_value(self.legacy_job_purpose)
 
     def needed(self, engine: Engine) -> bool:
         insp = inspect(engine)
@@ -1368,6 +1374,101 @@ class Step6PurposeAuthorization:
             rls.verify_posture(engine, tables=list(PURPOSE_TABLES))
 
 
+#: Tables that record where memory came from and therefore carry the
+#: purpose it was collected under (M3 batch-2 task 1).
+SOURCE_PURPOSE_TABLES: tuple[str, ...] = ("mm_evidence", "mm_belief_events", "mm_snapshots")
+
+
+@dataclass
+class Step7SourcePurpose:
+    """Add ``source_purpose`` to the provenance tables.
+
+    ``mm_evidence``, ``mm_belief_events`` and ``mm_snapshots`` gain a NOT
+    NULL ``VARCHAR(64)`` whose value is the purpose the writing entry was
+    authorized for -- observe's purpose on evidence and ledger events, the
+    job's purpose on the snapshot the worker synthesises (see
+    ``core.provenance``).  Fresh databases get the column from
+    ``create_all`` (``server_default=''``); this step brings version-6
+    databases up.  Re-entrant: a table that already has the column is
+    skipped (or, with a legacy purpose, only re-stamped).
+
+    - Existing rows are backfilled with the EMPTY MARKER ``''`` -- "source
+      not recorded" -- unless the OPTIONAL ``legacy_job_purpose`` (the same
+      dataclass argument / ``MM_LEGACY_JOB_PURPOSE`` step 6 uses) is given,
+      in which case pre-M3 rows are labelled with it: one operator choice
+      labels the pre-M3 jobs and the pre-M3 memory alike.  Re-entering
+      with a legacy purpose chosen between runs stamps it onto the rows
+      still carrying ``''``.
+    - The column's server default is always ``''``: the legacy purpose
+      labels what exists, it must never leak onto rows written later.
+    - PostgreSQL: ``ADD COLUMN`` (nullable) -> batched backfill -> the
+      non-blocking ``NOT VALID`` CHECK / ``VALIDATE`` / ``SET NOT NULL``
+      recipe -> ``SET DEFAULT ''``.  SQLite: ``ADD COLUMN ... NOT NULL
+      DEFAULT ''`` then the batched backfill for the legacy purpose.
+    - No new table, so the RLS posture and the write-guard classes are
+      unchanged; the only system_scope use is the reviewed
+      ``_backfill_column``.
+    """
+
+    version: int = 7
+    name: str = "source purpose on evidence, belief events and snapshots"
+    legacy_job_purpose: str | None = None
+
+    def _legacy_purpose(self) -> str:
+        return _legacy_purpose_value(self.legacy_job_purpose)
+
+    def needed(self, engine: Engine) -> bool:
+        return any(
+            "source_purpose" not in _table_columns(engine, table)
+            for table in SOURCE_PURPOSE_TABLES
+        )
+
+    def apply(self, engine: Engine) -> None:
+        legacy = self._legacy_purpose()
+        self.rows_labelled: dict[str, int] = {}
+        for table in SOURCE_PURPOSE_TABLES:
+            if "source_purpose" not in _table_columns(engine, table):
+                if _is_postgres(engine):
+                    _DDLPlan([AddColumn(table, "source_purpose", "VARCHAR(64)")]).run(engine)
+                    filled = _backfill_column(
+                        engine, table, {"source_purpose": legacy}, ["source_purpose"],
+                        DEFAULT_BACKFILL_BATCH,
+                    )
+                    check = AddNotNullCheck(table, "source_purpose")
+                    _DDLPlan([
+                        _lock_timeout_element(),
+                        check,
+                        ValidateConstraint(table, check.constraint_name),
+                        AlterColumnClause(table, "source_purpose", "SET NOT NULL"),
+                        AlterColumnClause(table, "source_purpose", "SET DEFAULT ''"),
+                        DropConstraintByName(table, check.constraint_name),
+                    ]).run(engine)
+                    self.rows_labelled[table] = filled if legacy else 0
+                    continue
+                _DDLPlan([AddColumn(
+                    table, "source_purpose", "VARCHAR(64) NOT NULL DEFAULT ''",
+                )]).run(engine)
+            if legacy:
+                self.rows_labelled[table] = _backfill_column(
+                    engine, table, {"source_purpose": legacy}, ["source_purpose"],
+                    DEFAULT_BACKFILL_BATCH, marker="",
+                )
+        if legacy:
+            logger.info(
+                "migration: source_purpose labelled with %r on %s",
+                legacy,
+                ", ".join(f"{t}={n}" for t, n in self.rows_labelled.items()),
+            )
+
+    def verify(self, engine: Engine) -> None:
+        for table in SOURCE_PURPOSE_TABLES:
+            cols = {c["name"]: c for c in inspect(engine).get_columns(table)}
+            if "source_purpose" not in cols:
+                raise MigrationError(f"verification failed: {table}.source_purpose missing")
+            if cols["source_purpose"].get("nullable", True):
+                raise MigrationError(f"verification failed: {table}.source_purpose is nullable")
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1378,6 +1479,7 @@ DEFAULT_STEPS: list = [
     Step4PendingJobsIndex(),
     Step5TenantUserIndexes(),
     Step6PurposeAuthorization(),
+    Step7SourcePurpose(),
 ]
 
 #: The version a freshly upgraded database records.
@@ -1426,7 +1528,8 @@ def upgrade_database(
                     continue
                 if hasattr(step, "default_tenant"):
                     step.default_tenant = (default_tenant, default_app)
-                if step.needed(engine):
+                applied = step.needed(engine)
+                if applied:
                     logger.info("migration: applying step %d (%s)", step.version, step.name)
                     if isinstance(step, StepAddColumnBackfill):
                         step.apply(engine, batch=batch)
@@ -1434,6 +1537,10 @@ def upgrade_database(
                         step.apply(engine)
                 step.verify(engine)
                 _record_version(engine, step.version, step.name)
+                if applied and hasattr(step, "legacy_jobs_to_cancel"):
+                    # the operator's cancel count (step 6 docstring): logged
+                    # by the step, surfaced here as promised
+                    before["legacy_jobs_to_cancel"] = int(step.legacy_jobs_to_cancel)
         except Exception as exc:
             _restore_sqlite(engine, backup)
             if isinstance(exc, MigrationError):

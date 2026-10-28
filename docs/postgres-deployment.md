@@ -31,6 +31,13 @@
    purpose——它们仍只在存在该 purpose 的有效授权时运行。若要「升级后
    继续跑存量任务」，升级前先 `grant_purpose(purpose=<legacy>, ...,
    operations=["extract", ...])`。
+   **第 7 步（M3 第二批）**给 `mm_evidence`、`mm_belief_events`、
+   `mm_snapshots` 加 `source_purpose` 列——该行是在哪个 purpose 的授权下
+   收集的（observe 写当前 purpose，worker 写任务的 purpose）。存量行回填
+   为空标记 `''`（含义：来源未记录）；提供**同一个** `legacy_job_purpose`
+   / `MM_LEGACY_JOB_PURPOSE` 时，存量行改打该 purpose——一个选择同时标注
+   存量任务与存量记忆。列的服务端默认值始终是 `''`，legacy purpose 只标注
+   已存在的行，不会泄漏到之后写入的行上。本批只记录、不按它过滤召回。
    **迁移不受应用超时约束**：迁移期间它借出的每个连接都设为会话级
    `statement_timeout = 0`（会话级而非 `SET LOCAL`，因为 `CREATE INDEX
    CONCURRENTLY` 在事务外执行），连接归还连接池时 `RESET` 回建连时的应用
