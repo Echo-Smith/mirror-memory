@@ -506,3 +506,87 @@ def test_step6_legacy_job_purpose_backfills_and_counts(base_db, tmp_path):
     with pytest.raises(sm.MigrationError):
         sm.Step6PurposeAuthorization(legacy_job_purpose="legacy app")._legacy_purpose()
     eng2.dispose()
+
+
+def _insert_job(conn, job_id: str, purpose: str, tenant: str = "t", app: str = "a") -> None:
+    from sqlalchemy import text as _text
+
+    conn.execute(
+        _text(
+            "INSERT INTO mm_evolution_jobs (id, user_id, evidence_watermark, "
+            "idempotency_key, status, purpose, tenant_id, app_id, lease_token, "
+            "prompt_version, attempt_count, error_code, claimed_revision, "
+            "created_at) VALUES (:id, 'u1', '{}', :ik, 'pending', :purpose, "
+            ":tenant, :app, 0, '', 0, '', 0, CURRENT_TIMESTAMP)"
+        ),
+        {"id": job_id, "ik": "ik-" + job_id, "purpose": purpose, "tenant": tenant, "app": app},
+    )
+
+
+def test_backfill_column_handles_composite_pk_and_empty_marker(tmp_path):
+    """M3 batch-2 task 1 finding: ``_backfill_column`` refused every table
+    with a composite primary key (all tenant tables after step 2 -- on
+    PostgreSQL that is every table step 6 touches, so step 6 could not run
+    on a real v5 database), and it only matched NULL, so the documented
+    re-entry 'stamp rows still carrying the empty marker' matched nothing.
+    Composite keys are now matched as a row value and ``marker`` widens the
+    predicate to the empty marker."""
+    from sqlalchemy import text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'composite.db'}")
+    Base.metadata.create_all(eng)
+    live = sm._live_table(eng, "mm_evolution_jobs")
+    assert [c.name for c in live.primary_key.columns] == ["tenant_id", "app_id", "id"]
+    with eng.begin() as conn:
+        _insert_job(conn, "j0", "")
+        _insert_job(conn, "j1", "", tenant="t2")
+        _insert_job(conn, "j2", "keep")
+    with no_audit_scope():
+        # batch of 1 forces several rounds through the row-value IN
+        stamped = sm._backfill_column(
+            eng, "mm_evolution_jobs", {"purpose": "legacy-app"}, ["purpose"], 1, marker="",
+        )
+        rows = eng.connect().execute(
+            _text("SELECT id, purpose FROM mm_evolution_jobs ORDER BY id")
+        ).all()
+    assert stamped == 2
+    assert rows == [("j0", "legacy-app"), ("j1", "legacy-app"), ("j2", "keep")]
+    with no_audit_scope():
+        # without the marker only NULL rows qualify: nothing left to do
+        assert sm._backfill_column(
+            eng, "mm_evolution_jobs", {"purpose": "x"}, ["purpose"], 10,
+        ) == 0
+    eng.dispose()
+
+
+def test_step6_reentry_stamps_empty_marker_jobs(tmp_path):
+    """Re-entering step 6 with a legacy purpose chosen between runs must
+    label the jobs that the first run left with the empty marker."""
+    from sqlalchemy import MetaData, text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'reentry.db'}")
+    Base.metadata.create_all(eng)
+    with eng.begin() as conn:
+        _insert_job(conn, "j0", "")
+        _insert_job(conn, "j1", "already")
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=5, note="simulated v5 after a run without legacy purpose"))
+    step = sm.Step6PurposeAuthorization(legacy_job_purpose="legacy-app")
+    step.apply(eng)  # column already present -> re-entry branch
+    step.verify(eng)
+    with no_audit_scope():
+        rows = eng.connect().execute(
+            _text("SELECT id, purpose FROM mm_evolution_jobs ORDER BY id")
+        ).all()
+    assert rows == [("j0", "legacy-app"), ("j1", "already")]
+    assert step.legacy_jobs_to_cancel == 0
+    eng.dispose()

@@ -56,6 +56,7 @@ from sqlalchemy import (
     inspect,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.engine import Engine
@@ -439,36 +440,40 @@ def _backfill_column(
     assignments: dict[str, str],
     null_predicate_names: list[str],
     batch: int,
+    *,
+    marker: str | None = None,
 ) -> int:
     """Batched, re-entrant backfill of *assignments* on rows where any of
-    *null_predicate_names* is NULL.
+    *null_predicate_names* is NULL -- or, with *marker*, equals that marker
+    (the empty-string "unknown" marker steps 6 and 7 leave behind, so a
+    re-entry can stamp a value chosen between runs onto them).
 
     Expressed with SQLAlchemy constructs: the batch subquery selects primary
     keys, the outer statement updates only those rows, every assigned value
-    is a bound parameter.
+    is a bound parameter.  Composite primary keys (every tenant table after
+    step 2) are matched as a row value, ``(tenant_id, app_id, id) IN
+    (SELECT ...)``; a single-column key degenerates to the plain ``IN``.
     """
     table = _live_table(engine, name)
     if table is None:
         return 0
     pk = list(table.primary_key.columns)
-    if len(pk) != 1:
-        raise MigrationError(
-            "batched backfill needs a single-column primary key on " + name
-        )
-    pk_col = pk[0]
+    if not pk:
+        raise MigrationError("batched backfill needs a primary key on " + name)
     null_filter = None
     for col_name in null_predicate_names:
         condition = table.c[col_name].is_(None)
+        if marker is not None:
+            condition = condition | (table.c[col_name] == marker)
         null_filter = condition if null_filter is None else (null_filter | condition)
 
+    key = pk[0] if len(pk) == 1 else tuple_(*pk)
     total = 0
     while True:
-        batch_ids = (
-            select(pk_col).where(null_filter).limit(batch).scalar_subquery()
-        )
+        batch_keys = select(*pk).where(null_filter).limit(batch)
         stmt = (
             update(table)
-            .where(pk_col.in_(batch_ids))
+            .where(key.in_(batch_keys))
             .values(assignments)
         )
         with system_scope(reason=_MIGRATION_REASON):
@@ -1336,7 +1341,7 @@ class Step6PurposeAuthorization:
             # stamp it onto rows still carrying the empty marker
             _backfill_column(
                 engine, "mm_evolution_jobs", {"purpose": backfill_value},
-                ["purpose"], DEFAULT_BACKFILL_BATCH,
+                ["purpose"], DEFAULT_BACKFILL_BATCH, marker="",
             )
         if _is_postgres(engine):
             from mirror_memory.core import rls
