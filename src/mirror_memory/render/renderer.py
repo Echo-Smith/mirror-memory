@@ -178,13 +178,14 @@ def render_memory_block(
     tail_load: int = 0,
     trace_hook: object | None = None,
     now: datetime | None = None,
+    visibility: "VisibilityRule | None" = None,
 ) -> str | None:
     """Render a memory block for prompt injection (see
     :func:`render_memory_block_with_ids`, which also returns the ids of
     the beliefs that reached the block -- the access audit needs them)."""
     block, _ids = render_memory_block_with_ids(
         session, user_id, config, user_message=user_message, language=language,
-        tail_load=tail_load, trace_hook=trace_hook, now=now,
+        tail_load=tail_load, trace_hook=trace_hook, now=now, visibility=visibility,
     )
     return block
 
@@ -199,6 +200,7 @@ def render_memory_block_with_ids(
     tail_load: int = 0,
     trace_hook: object | None = None,
     now: datetime | None = None,
+    visibility: "VisibilityRule | None" = None,
 ) -> tuple[str | None, list[int]]:
     """Render a memory block for prompt injection.
 
@@ -305,6 +307,7 @@ def render_memory_block_with_ids(
     all_beliefs = recall_candidates(
         session, user_id, query=user_message,
         temporal_mode=_detect_temporal_mode(user_message),
+        visibility=visibility,
     )
     now = now or datetime.now(UTC)
     # Evidence is a first-class entity now, so the multi-evidence bonus counts

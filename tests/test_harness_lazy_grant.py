@@ -147,7 +147,9 @@ def test_second_read_only_call_emits_no_harness_statements(sqlite_engine):
     grant_statements = [s for s in statements if "mm_purpose_grants" in s]
     assert not [s for s in grant_statements if s.upper().startswith("INSERT")], grant_statements
     assert not [s for s in statements if "SAVEPOINT" in s.upper()], statements
-    assert len([s for s in grant_statements if s.upper().startswith("SELECT")]) == 1, grant_statements
+    # batch 3: the two product SELECTs are authorize + the visibility rule's
+    # live-purpose read -- the harness adds none
+    assert len([s for s in grant_statements if s.upper().startswith("SELECT")]) == 2, grant_statements
 
 
 def test_memo_is_tenant_scoped_like_the_grant_rows(sqlite_engine):

@@ -416,7 +416,10 @@ def evidence_for_belief(
     return [(row[0], row[1]) for row in session.execute(stmt).all()]
 
 
-def evidence_summary(session: Session, user_id: str, belief_id: int) -> dict:
+def evidence_summary(
+    session: Session, user_id: str, belief_id: int,
+    *, visibility: "VisibilityRule | None" = None,
+) -> dict:
     """Explainability view of a belief's evidence, grouped by relation.
 
     Returns counts per relation plus the supporting evidence's provenance, so
@@ -426,6 +429,14 @@ def evidence_summary(session: Session, user_id: str, belief_id: int) -> dict:
     whole; only the row-by-row listing is the live sample).
     """
     pairs = evidence_for_belief(session, belief_id)
+    # Only visible provenance is listed; and the compaction digest -- whose
+    # summary may fold text from ANY linked evidence -- is included only
+    # when every linked evidence is visible.
+    if visibility is not None:
+        pairs = [(e, r) for e, r in pairs if visibility.purpose_visible(e.source_purpose)]
+        all_visible = not _belief_has_invisible_evidence(session, user_id, belief_id, visibility)
+    else:
+        all_visible = True
     grouped: dict[str, list[dict]] = {}
     for evidence, relation in pairs:
         grouped.setdefault(relation, []).append(
@@ -445,7 +456,7 @@ def evidence_summary(session: Session, user_id: str, belief_id: int) -> dict:
         "counts": {relation: len(items) for relation, items in grouped.items()},
         "by_relation": grouped,
     }
-    digest = _digest_for_belief(session, belief_id)
+    digest = _digest_for_belief(session, belief_id) if all_visible else None
     if digest is not None:
         summary["digest"] = {
             "support_count": digest.support_count,
@@ -1005,7 +1016,8 @@ def belief_versions_for_identity(
 
 
 def belief_history(
-    session: Session, user_id: str, belief_id: int
+    session: Session, user_id: str, belief_id: int,
+    *, visibility: "VisibilityRule | None" = None,
 ) -> list[dict]:
     """The version chain behind one read-model belief, oldest first.
 
@@ -1016,6 +1028,8 @@ def belief_history(
     """
     belief = session.get(Belief, belief_id)
     if belief is None or belief.user_id != user_id:
+        return []
+    if visibility is not None and not provenance.belief_is_visible(session, user_id, visibility, belief_id):
         return []
     versions = belief_versions_for_identity(
         session, user_id, slot_key=_slot_key_for(belief)
@@ -1090,6 +1104,7 @@ def list_active_beliefs(
     dimensions: tuple[str, ...] | None = None,
     limit: int = 50,
     temporal_mode: str = "all",
+    visibility: "VisibilityRule | None" = None,
 ) -> list[Belief]:
     """Active beliefs, ordered by most-recent evidence.  Returns [] if memory
     is disabled for the user.
@@ -1125,7 +1140,12 @@ def list_active_beliefs(
     results = list(session.scalars(stmt))
     # Filter out expired life events.
     results = [b for b in results if not _is_expired(b)]
-    return _filter_by_temporal_mode(results, temporal_mode)
+    results = _filter_by_temporal_mode(results, temporal_mode)
+    # Cross-purpose visibility (M3 batch 3): with a rule, only beliefs whose
+    # provenance passes it come back.  None = unfiltered (bench/tests).
+    if visibility is not None:
+        results = provenance.beliefs_visible(session, user_id, visibility, results)
+    return results
 
 
 def _filter_by_temporal_mode(beliefs: list[Belief], temporal_mode: str) -> list[Belief]:
@@ -1169,6 +1189,7 @@ def recall_candidates(
     temporal_mode: str = "all",
     relevant_limit: int = 150,
     recent_limit: int = 25,
+    visibility: "VisibilityRule | None" = None,
 ) -> list[Belief]:
     """Query-aware admission: which beliefs could matter for *query*?
 
@@ -1243,6 +1264,10 @@ def recall_candidates(
 
     merged = [b for b in merged if not _is_expired(b)]
     merged = _filter_by_temporal_mode(merged, temporal_mode)
+    # Cross-purpose visibility BEFORE the slot logic: an invisible belief
+    # must not suppress an older visible one in its single-value slot.
+    if visibility is not None:
+        merged = provenance.beliefs_visible(session, user_id, visibility, merged)
     merged = _keep_newest_per_single_slot(merged, temporal_mode, _SINGLE_VALUED_PREDICATES)
     return _filter_withdrawn(merged, temporal_mode)
 
@@ -2834,7 +2859,18 @@ def correct_belief(
     return corrected
 
 
-def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | None:
+def _belief_has_invisible_evidence(
+    session: Session, user_id: str, belief_id: int, visibility: "VisibilityRule",
+) -> bool:
+    """Any linked evidence whose source purpose the rule refuses?"""
+    pairs = evidence_for_belief(session, belief_id)
+    return any(not visibility.purpose_visible(e.source_purpose) for e, _r in pairs)
+
+
+def explain_belief(
+    session: Session, user_id: str, belief_id: int,
+    *, visibility: "VisibilityRule | None" = None,
+) -> dict | None:
     """Return the provenance chain for a belief.
 
     Returns a dict with:
@@ -2850,8 +2886,26 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
     belief = session.get(Belief, belief_id)
     if belief is None or belief.user_id != user_id:
         return None
+    # An invisible belief is "not found" under this rule: returning it would
+    # leak the claim text (and the mere existence of P-collected memory)
+    # through a purpose that may not see it.
+    if visibility is not None and not provenance.belief_is_visible(session, user_id, visibility, belief_id):
+        return None
 
     events = get_belief_events(session, user_id, belief_id)
+    if visibility is not None:
+        # only visible provenance: evidence ids/graph from visible evidence,
+        # events recorded under visible purposes
+        visible_pairs = [
+            (e, r) for e, r in evidence_for_belief(session, belief_id)
+            if visibility.purpose_visible(e.source_purpose)
+        ]
+        evidence_ids = [e.id for e, _r in visible_pairs]
+        source_purposes = sorted({e.source_purpose for e, _r in visible_pairs})
+        events = [e for e in events if visibility.purpose_visible(e.source_purpose)]
+    else:
+        evidence_ids = belief_evidence_ids(belief)
+        source_purposes = None
     return {
         "belief_id": belief.id,
         "dimension": belief.dimension,
@@ -2869,8 +2923,9 @@ def explain_belief(session: Session, user_id: str, belief_id: int) -> dict | Non
         "metabolism_state": getattr(belief, "metabolism_state", ""),
         "protected_reason": getattr(belief, "protected_reason", ""),
         "access_count": getattr(belief, "access_count", 0),
-        "evidence_ids": belief_evidence_ids(belief),
-        "evidence_graph": evidence_summary(session, user_id, belief_id),
+        "evidence_ids": evidence_ids,
+        "evidence_graph": evidence_summary(session, user_id, belief_id, visibility=visibility),
+        "source_purposes": source_purposes,
         "superseded_by": belief.superseded_by,
         "first_seen_at": belief.first_seen_at.isoformat() if belief.first_seen_at else None,
         "last_evidence_at": belief.last_evidence_at.isoformat() if belief.last_evidence_at else None,

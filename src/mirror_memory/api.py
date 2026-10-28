@@ -44,6 +44,7 @@ ENTRY_EXPORT_PAGE = "mirror_memory.api.MemoryEngine.export_page"
 ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
 
 
+from mirror_memory.core import provenance
 from mirror_memory.core.export import ExportPage  # re-exported for hosts
 
 
@@ -450,6 +451,7 @@ class MemoryEngine:
         started = time.monotonic()
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
             result, rendered_ids = render_memory_block_with_ids(
                 session,
                 user_id,
@@ -459,6 +461,7 @@ class MemoryEngine:
                 tail_load=tail_load,
                 trace_hook=trace_hook,
                 now=now,
+                visibility=rule,
             )
             # The access audit row (M3 batch-2 task 2) rides the same
             # transaction as the read, together with the access telemetry
@@ -551,7 +554,8 @@ class MemoryEngine:
 
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_PANEL)
-            raw = build_panel(session, user_id, config=self._config, language=language)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            raw = build_panel(session, user_id, config=self._config, language=language, visibility=rule)
             self._audit(session, authorized, user_id=user_id, operation="recall",
                         entry=ENTRY_PANEL, memory_ids=list(raw.get("belief_ids", [])))
             session.commit()
@@ -591,7 +595,10 @@ class MemoryEngine:
 
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_GET_BELIEFS)
-            beliefs = list_active_beliefs(session, user_id, dimensions=dimensions, limit=limit)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            beliefs = list_active_beliefs(
+                session, user_id, dimensions=dimensions, limit=limit, visibility=rule,
+            )
             self._audit(session, authorized, user_id=user_id, operation="explain",
                         entry=ENTRY_GET_BELIEFS, memory_ids=[b.id for b in beliefs])
             session.commit()
@@ -668,9 +675,12 @@ class MemoryEngine:
             authorized = self._authorize(
                 session, user_id, purpose, "explain", audit_entry=ENTRY_VERIFICATION_CANDIDATES,
             )
+            rule = provenance.visibility(session, user_id, authorized.purpose)
             results: list[dict] = []
             try:
-                beliefs = get_question_candidates(session, user_id, self._config, limit=limit)
+                beliefs = get_question_candidates(
+                    session, user_id, self._config, limit=limit, visibility=rule,
+                )
                 injected = False
                 for belief in beliefs:
                     recorded = False
@@ -1128,8 +1138,9 @@ class MemoryEngine:
         self._ensure_db()
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "export", audit_entry=ENTRY_EXPORT_PAGE)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
             section, items, ids, next_cursor = read_page(
-                session, user_id, cursor=cursor, page_size=page_size,
+                session, user_id, cursor=cursor, page_size=page_size, visibility=rule,
             )
             revision = get_state_revision(session, user_id)
             self._audit(session, authorized, user_id=user_id, operation="export",
@@ -1188,7 +1199,8 @@ class MemoryEngine:
 
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_BELIEF_HISTORY)
-            history = belief_history(session, user_id, belief_id)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            history = belief_history(session, user_id, belief_id, visibility=rule)
             self._audit(session, authorized, user_id=user_id, operation="explain",
                         entry=ENTRY_BELIEF_HISTORY, memory_ids=[belief_id] if history else [])
             session.commit()
@@ -1213,7 +1225,8 @@ class MemoryEngine:
 
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_EXPLAIN)
-            explained = explain_belief(session, user_id, belief_id)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            explained = explain_belief(session, user_id, belief_id, visibility=rule)
             if explained is not None:
                 from mirror_memory.core.export import source_purposes_for_beliefs
 

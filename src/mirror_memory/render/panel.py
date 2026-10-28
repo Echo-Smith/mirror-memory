@@ -21,6 +21,7 @@ def build_panel(
     config: MemoryConfig,
     *,
     language: str = "zh",
+    visibility: "VisibilityRule | None" = None,
 ) -> dict:
     """Build panel data for the user's memory profile.
 
@@ -71,7 +72,9 @@ def build_panel(
         header = display.dimension_header(dim_id, language)
         items: list[dict] = []
 
-        beliefs = list_active_beliefs(session, user_id, dimensions=(dim_id,), limit=10)
+        beliefs = list_active_beliefs(
+            session, user_id, dimensions=(dim_id,), limit=10, visibility=visibility,
+        )
         for belief in beliefs:
             item = _item_for(belief, display, language)
             if item:

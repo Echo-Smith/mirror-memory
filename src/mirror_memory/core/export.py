@@ -38,7 +38,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from mirror_memory.core.models import Belief, BeliefEvent, BeliefEvidenceLink, Evidence
+from mirror_memory.core import provenance
+from mirror_memory.core.models import Belief, BeliefEvent, Evidence
 
 SCHEMA_VERSION = "mm-export/1"
 SECTIONS: tuple[str, ...] = ("beliefs", "evidence", "events")
@@ -166,57 +167,74 @@ def source_purposes_for_beliefs(
     session: Session, user_id: str, belief_ids: list[int],
 ) -> dict[int, list[str]]:
     """``belief id -> sorted distinct source purposes of its linked
-    evidence``; beliefs with no linked evidence map to ``[]``."""
-    out: dict[int, set[str]] = {bid: set() for bid in belief_ids}
-    if not belief_ids:
-        return {}
-    rows = session.execute(
-        select(BeliefEvidenceLink.belief_id, Evidence.source_purpose)
-        .join(Evidence, Evidence.id == BeliefEvidenceLink.evidence_id)
-        .where(
-            BeliefEvidenceLink.belief_id.in_(belief_ids),
-            Evidence.user_id == user_id,
-        )
-    ).all()
-    for belief_id, purpose in rows:
-        out.setdefault(belief_id, set()).add(purpose or "")
-    return {bid: sorted(values) for bid, values in out.items()}
+    evidence``; beliefs with no linked evidence map to ``[]``.
+
+    Delegates to the batched provenance query (which joins on the full
+    composite key -- evidence ids are only unique per tenant, so a bare-id
+    join could pair a belief with another tenant's row of the same number;
+    batch-3 finding, fixed here)."""
+    from mirror_memory.core import provenance
+
+    links, _events = provenance.provenance_purposes(session, user_id, belief_ids)
+    return {bid: sorted(links.get(bid) or ()) for bid in belief_ids}
 
 
 def read_page(
     session: Session, user_id: str, *, cursor: str | None, page_size: int,
+    visibility: "VisibilityRule | None" = None,
 ) -> tuple[str, list[dict[str, Any]], list[int], str | None]:
     """One page of the export: ``(section, items, item ids, next cursor)``.
 
     Walks the current section by ascending id from the cursor; when a
     section is exhausted the cursor moves to the start of the next one
     (an empty section yields one empty page so the consumer still sees
-    it).  ``next_cursor`` is ``None`` only after the last section."""
+    it).  ``next_cursor`` is ``None`` only after the last section.
+
+    With a visibility rule only visible rows are RETURNED: beliefs by the
+    A2 provenance rule, evidence and events by their own source purpose.
+    The cursor always advances by the FETCHED rows -- a page may carry
+    fewer items than *page_size* (even zero) because invisible rows were
+    withheld, never because rows were skipped in the keyset."""
     if page_size < 1 or page_size > MAX_PAGE_SIZE:
         raise ValueError(f"page_size must be in 1..{MAX_PAGE_SIZE}")
     section, last_id = parse_cursor(cursor)
+    fetched_last = 0
     if section == "beliefs":
         rows = session.execute(
             select(Belief).where(Belief.user_id == user_id, Belief.id > last_id)
             .order_by(Belief.id).limit(page_size)
         ).scalars().all()
-        purposes = source_purposes_for_beliefs(session, user_id, [b.id for b in rows])
-        items = [_belief_item(b, purposes.get(b.id, [])) for b in rows]
+        fetched_last = int(rows[-1].id) if rows else last_id
+        if visibility is not None:
+            kept = provenance.beliefs_visible(session, user_id, visibility, list(rows))
+        else:
+            kept = list(rows)
+        purposes = source_purposes_for_beliefs(session, user_id, [b.id for b in kept])
+        items = [_belief_item(b, purposes.get(b.id, [])) for b in kept]
     elif section == "evidence":
         rows = session.execute(
             select(Evidence).where(Evidence.user_id == user_id, Evidence.id > last_id)
             .order_by(Evidence.id).limit(page_size)
         ).scalars().all()
+        fetched_last = int(rows[-1].id) if rows else last_id
+        if visibility is not None:
+            rows = [r for r in rows if visibility.purpose_visible(r.source_purpose)]
         items = [_evidence_item(r) for r in rows]
     else:
         rows = session.execute(
             select(BeliefEvent).where(BeliefEvent.user_id == user_id, BeliefEvent.id > last_id)
             .order_by(BeliefEvent.id).limit(page_size)
         ).scalars().all()
+        fetched_last = int(rows[-1].id) if rows else last_id
+        if visibility is not None:
+            rows = [r for r in rows if visibility.purpose_visible(r.source_purpose)]
         items = [_event_item(r) for r in rows]
     ids = [int(r.id) for r in rows]
-    if len(rows) == page_size:
-        next_cursor: str | None = f"{section}:{ids[-1]}"
+    if len(ids) == page_size:
+        # advanced by the FETCHED keyset even when invisible rows shrank the
+        # returned items (ids here are the visible ones; recompute the
+        # fetched tail id for the cursor)
+        next_cursor: str | None = f"{section}:{fetched_last}"
     else:
         index = SECTIONS.index(section)
         next_cursor = f"{SECTIONS[index + 1]}:0" if index + 1 < len(SECTIONS) else None

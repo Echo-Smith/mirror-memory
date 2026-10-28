@@ -731,10 +731,16 @@ def create_app(
                     session, user_id, purpose, "explain",
                     audit_entry="mirror_memory.server.belief_by_id",
                 )
+                from mirror_memory.core import provenance
                 from mirror_memory.core.models import Belief
 
                 row = session.get(Belief, belief_id)
                 found = row is not None and row.user_id == user_id
+                if found:
+                    # cross-purpose visibility: an invisible belief is a 404
+                    # here, exactly like a cross-tenant one
+                    rule = provenance.visibility(session, user_id, authorized.purpose)
+                    found = provenance.belief_is_visible(session, user_id, rule, belief_id)
                 # the audit row rides the same transaction as the read and
                 # is committed before anything is returned -- a miss is an
                 # access attempt too

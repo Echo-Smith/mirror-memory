@@ -389,6 +389,12 @@ def _process_single_job(
         # The rows the publish writes (ledger events) are collected under
         # the job's purpose -- the purpose of the observe that enqueued it.
         provenance.bind(session, job.purpose)
+        # Cross-purpose visibility (M3 batch 3): the job may only READ
+        # memory collected under purposes that are still live (the A2
+        # rule) -- a job under Q must not synthesize from P-only evidence
+        # after P was revoked.  One rule per job, computed inside this
+        # transaction.
+        visibility_rule = provenance.visibility(session, user_id)
 
         # We intentionally ignore job.claimed_revision here (a snapshot from
         # enqueue time).  The revision may have been bumped by state mutations
@@ -396,8 +402,9 @@ def _process_single_job(
         # compare against the post-compute revision at Node 6.
         expected_revision = get_state_revision(session, user_id)
 
-        # Node 1: load_evidence (plain data, no ORM instances retained)
-        evidence = _load_evidence(session, user_id)
+        # Node 1: load_evidence (plain data, no ORM instances retained),
+        # filtered to memory the job's purpose may see
+        evidence = _load_evidence(session, user_id, visibility=visibility_rule)
 
         # Node 5's read half (K3): the beliefs/summaries the synthesis prompt
         # needs, taken in the same snapshot.  Fail-open like the node itself.
@@ -405,7 +412,7 @@ def _process_single_job(
 
         synthesizer = Synthesizer(config)
         try:
-            k3_prepared = synthesizer.prepare(session, user_id, config)
+            k3_prepared = synthesizer.prepare(session, user_id, config, visibility=visibility_rule)
         except Exception:
             logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job_id))
             k3_prepared = None
@@ -688,8 +695,16 @@ def _current_watermark(session: object, user_id: str) -> str:
     return latest.isoformat() if latest else "none"
 
 
-def _load_evidence(session: object, user_id: str) -> dict:
-    """Node 1: Read active beliefs, background, and session count."""
+def _load_evidence(
+    session: object, user_id: str, *, visibility: "VisibilityRule | None" = None,
+) -> dict:
+    """Node 1: Read active beliefs, background, and session count.
+
+    With a visibility rule only beliefs whose provenance passes it feed the
+    synthesis -- and ``distinct_sessions`` counts the VISIBLE page only
+    (the shadow gate asks whether the job's purpose has seen the user in
+    more than one session, which is a question about what this job may
+    use)."""
     beliefs = (
         session.query(Belief)
         .filter(Belief.user_id == user_id, Belief.status == "active")
@@ -697,6 +712,8 @@ def _load_evidence(session: object, user_id: str) -> dict:
         .limit(LOAD_EVIDENCE_LIMIT)
         .all()
     )
+    if visibility is not None:
+        beliefs = provenance.beliefs_visible(session, user_id, visibility, beliefs)
     belief_data = []
     for b in beliefs:
         belief_data.append({
@@ -708,12 +725,9 @@ def _load_evidence(session: object, user_id: str) -> dict:
             "value": b.value_json,
         })
 
-    distinct_sessions = (
-        session.query(Belief.origin_session_id)
-        .filter(Belief.user_id == user_id, Belief.status == "active")
-        .distinct()
-        .count()
-    )
+    distinct_sessions = len({
+        b.origin_session_id for b in beliefs if b.origin_session_id
+    })
 
     return {
         "beliefs": belief_data,
