@@ -158,10 +158,6 @@ def _grant_on_authorize(monkeypatch):
     caller's locks could interleave with the grant write.  Refusal tests
     opt out with the ``refusing_authz`` fixture.  src contains no trace of
     this: tools/check_no_autogrant.py keeps it that way."""
-    import contextvars as _cv
-
-    from sqlalchemy.orm import Session as _Session
-
     from mirror_memory.core import authorization as _authorization
 
     original = _authorization.authorize_or_raise
@@ -171,19 +167,27 @@ def _grant_on_authorize(monkeypatch):
             return original(session, user_id, purpose, operation, lock=lock)
         resolved = (purpose or "").strip()
         if resolved:
-            bind = session.get_bind()
-            grant_session = _Session(bind=bind)
+            # The grant is issued through the CALLER's session inside a
+            # SAVEPOINT that is committed immediately (released).  An
+            # independent session here would check out a SECOND connection
+            # while the caller holds one -- under a small pool with more
+            # in-flight requests than connections that is a circular wait:
+            # every held connection waits for another one for its grant
+            # (observed as 500s in the 50-tenant storm).  A savepoint keeps
+            # the same connection; its rollback discards only the grant
+            # attempt, never the caller's transaction.  Read-only engine
+            # paths never commit, so their grants are re-issued per call --
+            # correct, just not durable.
+            nested = session.begin_nested()
             try:
                 _authorization.ensure_purpose_grant(
-                    grant_session, user_id, resolved,
+                    session, user_id, resolved,
                     issuer="test-harness", operations=list(_authorization.OPERATIONS),
                 )
-                grant_session.commit()
+                nested.commit()
             except Exception:
-                grant_session.rollback()
+                nested.rollback()
                 raise
-            finally:
-                grant_session.close()
         return original(session, user_id, purpose, operation, lock=lock)
 
     monkeypatch.setattr(_authorization, "authorize_or_raise", granting)
