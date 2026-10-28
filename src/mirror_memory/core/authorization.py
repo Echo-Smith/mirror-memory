@@ -488,6 +488,16 @@ ENTRY_REGISTRY: dict[str, dict] = {
         "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
+    "mirror_memory.api.MemoryEngine.export_page": {
+        "reads_memory": True,  # writes an access-audit row per page (M3 batch-2 task 3)
+        "operation": "export", "engine": "tenant(app)",
+        "purpose_source": "parameter or engine default; re-authorized on EVERY page",
+    },
+    "mirror_memory.api.MemoryEngine.export": {
+        "reads_memory": True,  # a stream of export_page calls, labelled as this entry
+        "operation": "export", "engine": "tenant(app)",
+        "purpose_source": "parameter or engine default; re-authorized on EVERY page",
+    },
     "mirror_memory.api.MemoryEngine.correct": {
         "operation": "correct", "engine": "tenant(app)", "purpose_source": "parameter or engine default",
     },
@@ -532,6 +542,11 @@ ENTRY_REGISTRY: dict[str, dict] = {
     "mirror_memory.server.stats": {
         "reads_memory": True,  # writes an access-audit row (M3 batch-2 task 2)
         "operation": "explain", "engine": "tenant(app)", "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL)",
+    },
+    "mirror_memory.server.export": {
+        "reads_memory": True,  # one page per request; audit row per page
+        "operation": "export", "engine": "tenant(app)",
+        "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL); re-authorized per page",
     },
     "mirror_memory.server.delete_memories": {
         "operation": "forget (allowed_regardless)", "engine": "tenant(app)",

@@ -111,6 +111,13 @@ def _library_drivers(eng: MemoryEngine, belief_id: int) -> dict[str, object]:
             user_id=USER, belief_id=belief_id, purpose=PURPOSE),
         "mirror_memory.api.MemoryEngine.explain": lambda: eng.explain(
             user_id=USER, belief_id=belief_id, purpose=PURPOSE),
+        "mirror_memory.api.MemoryEngine.export_page": lambda: eng.export_page(
+            user_id=USER, purpose=PURPOSE),
+        # the stream labels its pages as this entry; page_size large enough
+        # that beliefs/evidence/events are three pages -> three rows, the
+        # inventory check below counts rows per driver call
+        "mirror_memory.api.MemoryEngine.export": lambda: list(
+            eng.export(user_id=USER, purpose=PURPOSE, page_size=5000)),
     }
 
 
@@ -124,6 +131,7 @@ def _server_drivers(client: TestClient, belief_id: int) -> dict[str, object]:
         "mirror_memory.server.belief_by_id": lambda: client.get(
             f"/belief/{belief_id}", params={"user_id": USER}, headers=h),
         "mirror_memory.server.stats": lambda: client.get("/stats", params={"user_id": USER}, headers=h),
+        "mirror_memory.server.export": lambda: client.get("/export", params={"user_id": USER}, headers=h),
     }
 
 
@@ -155,7 +163,10 @@ def test_every_memory_reading_entry_in_the_registry_is_audited(db):
                 if hasattr(result, "status_code"):
                     assert result.status_code == 200, (key, result.status_code, result.text)
                 rows = _rows(db)
-                assert len(rows) == before + 1, (key, [r.entry for r in rows[before:]])
+                # the export stream is one row PER PAGE (three sections)
+                expected = 3 if key == "mirror_memory.api.MemoryEngine.export" else 1
+                assert len(rows) == before + expected, (key, [r.entry for r in rows[before:]])
+                assert {r.entry for r in rows[before:]} == {key}
                 row = rows[-1]
                 assert row.entry == key
                 assert row.decision == "allowed"
@@ -411,7 +422,10 @@ def test_each_allowed_read_adds_exactly_one_audit_insert(db):
         statements.clear()
         run()
         audit = [s for s in statements if "mm_access_audit" in s]
-        assert len(audit) == 1 and audit[0].upper().startswith("INSERT"), (key, audit)
+        # one INSERT per read; the export stream is one read per page
+        expected = 3 if key == "mirror_memory.api.MemoryEngine.export" else 1
+        assert len(audit) == expected, (key, audit)
+        assert all(a.upper().startswith("INSERT") for a in audit), (key, audit)
 
 
 def test_sqlite_concurrent_reads_complete_under_the_write_lock(tmp_path):

@@ -22,7 +22,7 @@ import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import NamedTuple, Any
+from typing import Any, Iterator, NamedTuple
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
@@ -40,6 +40,11 @@ ENTRY_GET_BELIEFS = "mirror_memory.api.MemoryEngine.get_beliefs"
 ENTRY_VERIFICATION_CANDIDATES = "mirror_memory.api.MemoryEngine.get_verification_candidates"
 ENTRY_BELIEF_HISTORY = "mirror_memory.api.MemoryEngine.belief_history"
 ENTRY_EXPLAIN = "mirror_memory.api.MemoryEngine.explain"
+ENTRY_EXPORT_PAGE = "mirror_memory.api.MemoryEngine.export_page"
+ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
+
+
+from mirror_memory.core.export import ExportPage  # re-exported for hosts
 
 
 class Authorized(NamedTuple):
@@ -1095,6 +1100,69 @@ class MemoryEngine:
                 "confidence": row.confidence,
             }
 
+    def export_page(
+        self,
+        *,
+        user_id: str,
+        purpose: str | None = None,
+        cursor: str | None = None,
+        page_size: int = 500,
+    ) -> "ExportPage":
+        """One page of the user's export (M3 batch-2 task 3): beliefs, then
+        evidence, then ledger events, each with its source purpose; schema
+        ``mm-export/1``.  Pass the page's ``next_cursor`` back to get the
+        next one; ``None`` means the export is complete.
+
+        Every page is its own transaction and AUTHORIZES AGAIN for the
+        ``export`` operation before reading -- a grant revoked mid-export
+        refuses the next page -- and writes one access-audit row with the
+        ids it returned.  Pages are not one consistent snapshot: each
+        carries the memory state ``revision`` so a consumer can detect a
+        change between pages.  Needs the ``export`` operation in the grant.
+        """
+        from mirror_memory.core.export import ExportPage, read_page, now_iso
+        from mirror_memory.core.repository import get_state_revision
+
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        self._ensure_db()
+        with self._session() as session:
+            authorized = self._authorize(session, user_id, purpose, "export", audit_entry=ENTRY_EXPORT_PAGE)
+            section, items, ids, next_cursor = read_page(
+                session, user_id, cursor=cursor, page_size=page_size,
+            )
+            revision = get_state_revision(session, user_id)
+            self._audit(session, authorized, user_id=user_id, operation="export",
+                        entry=ENTRY_EXPORT_PAGE, memory_ids=ids)
+            session.commit()
+        return ExportPage(
+            schema_version="mm-export/1",
+            user_id=user_id,
+            section=section,
+            items=items,
+            next_cursor=next_cursor,
+            revision=revision,
+            exported_at=now_iso(),
+            authorization={"purpose": authorized.purpose, "grant_version": authorized.grant_version},
+        )
+
+    def export(
+        self, *, user_id: str, purpose: str | None = None, page_size: int = 500,
+    ) -> "Iterator[ExportPage]":
+        """The whole export as a stream of pages (see :meth:`export_page`):
+        memory bounded by *page_size*, re-authorized before every page, one
+        audit row per page.  Stops when a page reports no next cursor."""
+        from mirror_memory.core import access_audit
+
+        cursor: str | None = None
+        while True:
+            with access_audit.entry_label(ENTRY_EXPORT):
+                page = self.export_page(user_id=user_id, purpose=purpose, cursor=cursor, page_size=page_size)
+            yield page
+            if page.next_cursor is None:
+                return
+            cursor = page.next_cursor
+
     def belief_history(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> list[dict]:
         """Return the version chain behind a belief, oldest first.
 
@@ -1146,6 +1214,18 @@ class MemoryEngine:
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_EXPLAIN)
             explained = explain_belief(session, user_id, belief_id)
+            if explained is not None:
+                from mirror_memory.core.export import source_purposes_for_beliefs
+
+                # M3 batch-2 task 3: who was allowed to see this, and under
+                # which purposes the evidence behind it was collected
+                explained["authorization"] = {
+                    "purpose": authorized.purpose,
+                    "grant_version": authorized.grant_version,
+                }
+                explained["evidence_source_purposes"] = source_purposes_for_beliefs(
+                    session, user_id, [belief_id],
+                ).get(belief_id, [])
             self._audit(session, authorized, user_id=user_id, operation="explain",
                         entry=ENTRY_EXPLAIN, memory_ids=[belief_id] if explained is not None else [])
             session.commit()

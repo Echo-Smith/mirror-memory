@@ -760,6 +760,34 @@ def create_app(
             logger.warning("belief fetch failed: %s", e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
 
+    @app.get("/export")
+    def export(
+        user_id: str = Query(..., min_length=1),
+        cursor: str | None = Query(None),
+        page_size: int = Query(500, ge=1, le=5000),
+        tenant: tuple[str, str] | None = Depends(_verify_api_key),
+        purpose: str | None = Depends(_request_purpose),
+    ):
+        """One page of the user's export (mm-export/1).  Pass the returned
+        ``next_cursor`` to fetch the next page; every page is authorized
+        again, so a revoked grant stops the export at the next request."""
+        from mirror_memory.core.export import InvalidCursor
+
+        engine = _get_engine(tenant)
+        try:
+            with access_audit.entry_label("mirror_memory.server.export"):
+                page = engine.export_page(
+                    user_id=user_id, purpose=purpose, cursor=cursor, page_size=page_size,
+                )
+            return page.to_dict()
+        except PurposeDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        except (InvalidCursor, ValidationError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.warning("export failed for user %s: %s", user_id[:8], e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Internal error")
+
     @app.get("/stats")
     def stats(
         user_id: str = Query(..., min_length=1),
