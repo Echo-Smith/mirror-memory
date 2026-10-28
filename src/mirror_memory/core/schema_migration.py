@@ -275,7 +275,15 @@ class AlterColumnClause(DDLElement):
     inherit_cache = True
 
     def __init__(self, table: str, column: str, clause: str) -> None:
-        if clause not in ("SET NOT NULL", "SET DEFAULT ''"):
+        allowed = ("SET NOT NULL", "SET DEFAULT ''")
+        # "SET DEFAULT '<value>'": step 6's optional legacy purpose is an
+        # operator-chosen constant; it must be a plain token (validated by
+        # the step) and is rendered as a quoted literal by the compiler
+        if clause.startswith("SET DEFAULT '") and clause.endswith("'"):
+            value = clause[len("SET DEFAULT '"):-1]
+            if value and not any(c.isspace() for c in value) and "'" not in value:
+                allowed = allowed + (clause,)
+        if clause not in allowed:
             raise MigrationError("unsupported ALTER COLUMN clause: " + repr(clause))
         self.table = table
         self.column = column
@@ -1217,6 +1225,24 @@ class Step5TenantUserIndexes:
 PURPOSE_TABLES = ("mm_purpose_grants", "mm_purpose_grant_events")
 
 
+def _count_legacy_jobs(engine: Engine) -> int:
+    """Pre-M3 evolution jobs (purpose == '') that the worker will CANCEL
+    at runtime (missing_purpose).  Whole-table count across all tenants --
+    the same cross-tenant maintenance read as the other migration helpers.
+    """
+    table = _live_table(engine, "mm_evolution_jobs")
+    if table is None or "purpose" not in table.c:
+        return 0
+    with system_scope(reason=_MIGRATION_REASON):
+        with engine.connect() as conn:
+            return int(
+                conn.execute(
+                    select(func.count()).select_from(table)
+                    .where(table.c.purpose == "")
+                ).scalar_one()
+            )
+
+
 @dataclass
 class Step6PurposeAuthorization:
     """Create the purpose-authorization tables and add ``mm_evolution_jobs
@@ -1232,10 +1258,16 @@ class Step6PurposeAuthorization:
       tenant primary key included -- both their keys are all-string and
       need no SQLite narrowing).
     - ``mm_evolution_jobs.purpose``: ``ADD COLUMN`` (nullable) -> batched
-      backfill to ``''`` -> non-blocking ``SET NOT NULL`` (the same
-      ``NOT VALID`` CHECK / ``VALIDATE`` / ``SET NOT NULL`` recipe as
-      step 1).  The empty purpose marks pre-M3 jobs; the worker refuses
-      them with ``missing_purpose`` instead of running them ungated.
+      backfill -> non-blocking ``SET NOT NULL`` (the same ``NOT VALID``
+      CHECK / ``VALIDATE`` / ``SET NOT NULL`` recipe as step 1).  The
+      backfill value is the OPTIONAL ``legacy_job_purpose`` (dataclass
+      argument, or ``MM_LEGACY_JOB_PURPOSE``): with it, pre-M3 jobs are
+      labelled with that purpose -- they still only run if a valid grant
+      for it exists at runtime; without it the empty purpose marks
+      pre-M3 jobs and the worker cancels them with ``missing_purpose``
+      instead of running them ungated.  The number of jobs that will be
+      cancelled that way is logged and returned by ``upgrade_database``
+      under ``legacy_jobs_to_cancel`` -- decide before upgrading.
     - PostgreSQL: the RLS posture is applied to the two new tables (the
       databases this step runs on already have step 3's roles and the
       tenant tables protected; a fresh database gets everything at once
@@ -1244,6 +1276,20 @@ class Step6PurposeAuthorization:
 
     version: int = 6
     name: str = "purpose authorization tables"
+    legacy_job_purpose: str | None = None
+
+    def _legacy_purpose(self) -> str:
+        import os
+
+        value = self.legacy_job_purpose
+        if value is None:
+            value = os.environ.get("MM_LEGACY_JOB_PURPOSE", "") or ""
+        value = value.strip()
+        if value and any(c.isspace() for c in value):
+            raise MigrationError(
+                "legacy_job_purpose must not contain whitespace"
+            )
+        return value
 
     def needed(self, engine: Engine) -> bool:
         insp = inspect(engine)
@@ -1252,13 +1298,18 @@ class Step6PurposeAuthorization:
         return "purpose" not in _table_columns(engine, "mm_evolution_jobs")
 
     def apply(self, engine: Engine) -> None:
+        from mirror_memory.core.models import EvolutionJob
+
+        self.legacy_jobs_to_cancel = 0
+        legacy = self._legacy_purpose()
+        backfill_value = legacy  # "" keeps the pre-M3 cancel-at-runtime shape
         for name in PURPOSE_TABLES:
             Base.metadata.tables[name].create(engine, checkfirst=True)
         if "purpose" not in _table_columns(engine, "mm_evolution_jobs"):
             if _is_postgres(engine):
                 _DDLPlan([AddColumn("mm_evolution_jobs", "purpose", "VARCHAR(64)")]).run(engine)
                 _backfill_column(
-                    engine, "mm_evolution_jobs", {"purpose": ""}, ["purpose"],
+                    engine, "mm_evolution_jobs", {"purpose": backfill_value}, ["purpose"],
                     DEFAULT_BACKFILL_BATCH,
                 )
                 notnull = [_lock_timeout_element()]
@@ -1266,18 +1317,42 @@ class Step6PurposeAuthorization:
                 notnull.append(check)
                 notnull.append(ValidateConstraint("mm_evolution_jobs", check.constraint_name))
                 notnull.append(AlterColumnClause("mm_evolution_jobs", "purpose", "SET NOT NULL"))
-                notnull.append(AlterColumnClause("mm_evolution_jobs", "purpose", "SET DEFAULT ''"))
+                notnull.append(
+                    AlterColumnClause(
+                        "mm_evolution_jobs", "purpose",
+                        "SET DEFAULT " + ("'" + backfill_value + "'" if backfill_value else "''"),
+                    )
+                )
                 notnull.append(DropConstraintByName("mm_evolution_jobs", check.constraint_name))
                 _DDLPlan(notnull).run(engine)
             else:
                 # SQLite allows ADD COLUMN with a NOT NULL constant default
                 _DDLPlan([AddColumn(
-                    "mm_evolution_jobs", "purpose", "VARCHAR(64) NOT NULL DEFAULT ''",
+                    "mm_evolution_jobs", "purpose",
+                    "VARCHAR(64) NOT NULL DEFAULT '%s'" % backfill_value,
                 )]).run(engine)
+        elif backfill_value:
+            # re-entry with a legacy purpose chosen between failed runs:
+            # stamp it onto rows still carrying the empty marker
+            _backfill_column(
+                engine, "mm_evolution_jobs", {"purpose": backfill_value},
+                ["purpose"], DEFAULT_BACKFILL_BATCH,
+            )
         if _is_postgres(engine):
             from mirror_memory.core import rls
 
             _DDLPlan(rls.rls_plan(engine, tables=list(PURPOSE_TABLES))).run(engine)
+        # How many pre-M3 jobs the worker will CANCEL (empty purpose =
+        # missing_purpose at runtime).  Logged and returned so the operator
+        # sees the blast radius of not choosing a legacy purpose.
+        self.legacy_jobs_to_cancel = _count_legacy_jobs(engine)
+        if self.legacy_jobs_to_cancel:
+            logger.warning(
+                "migration: %d pre-M3 evolution job(s) have no purpose and "
+                "will be cancelled at runtime; pass legacy_job_purpose "
+                "(MM_LEGACY_JOB_PURPOSE) before upgrading to keep them",
+                self.legacy_jobs_to_cancel,
+            )
 
     def verify(self, engine: Engine) -> None:
         if "purpose" not in _table_columns(engine, "mm_evolution_jobs"):

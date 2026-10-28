@@ -448,3 +448,61 @@ def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
     assert legacy_user_index_name("mm_beliefs") not in names
     assert not step2.needed(eng2)
     eng2.dispose()
+
+
+def test_step6_legacy_job_purpose_backfills_and_counts(base_db, tmp_path):
+    """M3 batch-1 patch task 4: legacy_job_purpose labels pre-M3 jobs with
+    the operator-chosen purpose (they still only run with a valid grant);
+    without it, jobs keep the empty marker and the returned/logged count
+    tells the operator how many will be cancelled."""
+    from mirror_memory.core import schema_migration as sm
+
+    # WITHOUT legacy purpose: jobs keep '' and the count is returned
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION
+    # one completed pre-M3 job came with the base database
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("mm_evolution_jobs")}
+    assert "purpose" in cols
+    eng.dispose()
+
+    # WITH legacy purpose: the job is labelled, count is 0
+    from sqlalchemy import MetaData, text as _text
+
+    eng2 = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    Base.metadata.create_all(eng2)
+    with eng2.begin() as conn:
+        conn.execute(_text(
+            "INSERT INTO mm_evolution_jobs (id, user_id, evidence_watermark, "
+            "idempotency_key, status, purpose, tenant_id, app_id, "
+            "lease_token, prompt_version, attempt_count, error_code, "
+            "claimed_revision, created_at) VALUES ('j1', 'u1', '{}', 'ik1', "
+            "'pending', '', 'legacy', 'app', 0, '', 0, '', 0, "
+            "CURRENT_TIMESTAMP)"
+        ))
+    # simulate a version-5 database: strip step-6 artifacts, set version 5
+    sm._ensure_version_table(eng2)
+    with eng2.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE mm_purpose_grants")
+        conn.exec_driver_sql("DROP TABLE mm_purpose_grant_events")
+        conn.exec_driver_sql("ALTER TABLE mm_evolution_jobs DROP COLUMN purpose")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=5, note="simulated v5"))
+    step = sm.Step6PurposeAuthorization(legacy_job_purpose="legacy-app")
+    assert step._legacy_purpose() == "legacy-app"
+    step.apply(eng2)
+    step.verify(eng2)
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    with no_audit_scope():
+        purpose = eng2.connect().execute(_text(
+            "SELECT purpose FROM mm_evolution_jobs WHERE id = 'j1'"
+        )).scalar_one()
+    assert purpose == "legacy-app"
+    assert step.legacy_jobs_to_cancel == 0
+    # whitespace-only / invalid values are refused
+    with pytest.raises(sm.MigrationError):
+        sm.Step6PurposeAuthorization(legacy_job_purpose="legacy app")._legacy_purpose()
+    eng2.dispose()

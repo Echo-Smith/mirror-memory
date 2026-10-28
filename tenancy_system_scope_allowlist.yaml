@@ -60,6 +60,16 @@
   reviewed_at: "2026-10-27"
 
 - module: mirror_memory.core.schema_migration
+  function: _count_legacy_jobs
+  reason: >
+    Migration step 6 counts pre-M3 evolution jobs (purpose == '') across
+    all tenants -- they will be cancelled at runtime unless the operator
+    chose a legacy_job_purpose before upgrading.  The count is logged and
+    returned by upgrade_database so the decision is informed.
+  reviewer: 待评审
+  reviewed_at: ""
+
+- module: mirror_memory.core.schema_migration
   function: _emit_primary_key_swaps
   reason: >
     Converting each tenant table's primary key to the composite tenant key
