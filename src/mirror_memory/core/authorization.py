@@ -119,31 +119,53 @@ def _operations_json(operations) -> str:
     return json.dumps(sorted(ops))
 
 
-def _load_grant(session, user_id: str, purpose: str, *, lock: bool = False):
-    """The grant row, re-read from the database on EVERY call.
+def _load_decision_row(session, user_id: str, purpose: str, operation: str, *, lock: bool = False):
+    """The authorization state in ONE statement (M3 patch task 6): the
+    grant row LEFT JOIN the feature consent row LEFT JOIN the global
+    preference.  Re-read from the database on EVERY call -- ``session.get``
+    is deliberately avoided (its identity map could serve an object from
+    an earlier transaction, and a committed revocation must bite the next
+    request; nothing here is cached beyond the transaction).
 
-    ``session.get`` is deliberately avoided: its identity map can serve an
-    object loaded earlier in this session's lifetime, which would be a
-    cache across transactions -- a committed revocation must bite the next
-    request.  A fresh ``query`` always reaches the database.  With
-    ``lock`` (PostgreSQL only) the row is selected ``FOR SHARE``: a
+    With ``lock`` (PostgreSQL only) the grant row is selected ``FOR SHARE``
+    (``OF`` the grant table only -- the joined switches stay lock-free): a
     concurrent revocation's UPDATE blocks until this transaction ends, so
     "revoke committed" can never slip between this check and this
     transaction's commit (M3 batch-1 task 4).  SQLite serializes writers
     by itself (rollback-journal EXCLUSIVE at commit); a ``FOR SHARE`` there
     is a syntax error, so it is not emitted.
-    """
-    from mirror_memory.core.models import PurposeGrant
 
-    query = session.query(PurposeGrant).filter(
-        PurposeGrant.user_id == user_id,
-        PurposeGrant.purpose == purpose,
+    Feature semantics match ``is_feature_enabled``: the feature-specific
+    consent row decides when present; otherwise the global memory
+    preference; a missing preference row is legacy-ON.
+    """
+    from sqlalchemy import select
+
+    from mirror_memory.core.models import ConsentGrant, MemoryPreference, PurposeGrant
+
+    feature = OPERATION_FEATURE[operation]
+    stmt = (
+        select(
+            PurposeGrant.version,
+            PurposeGrant.allowed_operations,
+            PurposeGrant.revoked_at,
+            PurposeGrant.expires_at,
+            ConsentGrant.granted,
+            MemoryPreference.enabled,
+        )
+        .outerjoin(
+            ConsentGrant,
+            (ConsentGrant.user_id == PurposeGrant.user_id)
+            & (ConsentGrant.feature == feature),
+        )
+        .outerjoin(MemoryPreference, MemoryPreference.user_id == PurposeGrant.user_id)
+        .where(PurposeGrant.user_id == user_id, PurposeGrant.purpose == purpose)
     )
     if lock and session.get_bind().dialect.name == "postgresql":
-        # SQLAlchemy 2.x: read=True renders FOR SHARE (the 1.x-era
-        # with_for_share name no longer exists on Query)
-        query = query.with_for_update(read=True)
-    return query.first()
+        # SQLAlchemy 2.x: read=True renders FOR SHARE; ``of`` restricts the
+        # lock to the grant row (the OUTER JOIN'd switches stay lock-free)
+        stmt = stmt.with_for_update(read=True, of=PurposeGrant)
+    return session.execute(stmt).first()
 
 
 def authorize(
@@ -176,22 +198,29 @@ def authorize(
         return Decision(False, REASON_MISSING_PURPOSE, None, "")
     purpose = str(purpose).strip()
 
-    grant = _load_grant(session, user_id, purpose, lock=lock)
-    if grant is None:
+    row = _load_decision_row(session, user_id, purpose, operation, lock=lock)
+    if row is None:
         # No implicit issuance, ever: an absent grant is a refusal.  Hosts
         # (and the test harness) grant explicitly through grant_purpose.
         return Decision(False, REASON_NO_GRANT, None, purpose)
-    if grant.revoked_at is not None:
-        return Decision(False, REASON_REVOKED, grant.version, purpose)
-    if grant.expires_at is not None and grant.expires_at <= _now():
-        return Decision(False, REASON_EXPIRED, grant.version, purpose)
-    if operation not in json.loads(grant.allowed_operations):
-        return Decision(False, REASON_OPERATION_NOT_ALLOWED, grant.version, purpose)
-    from mirror_memory.core.repository import is_feature_enabled
-
-    if not is_feature_enabled(session, user_id, OPERATION_FEATURE[operation]):
-        return Decision(False, REASON_FEATURE_DISABLED, grant.version, purpose)
-    return Decision(True, "granted", grant.version, purpose)
+    version, allowed_operations, revoked_at, expires_at, feature_granted, pref_enabled = row
+    if revoked_at is not None:
+        return Decision(False, REASON_REVOKED, version, purpose)
+    if expires_at is not None and expires_at <= _now():
+        return Decision(False, REASON_EXPIRED, version, purpose)
+    if operation not in json.loads(allowed_operations):
+        return Decision(False, REASON_OPERATION_NOT_ALLOWED, version, purpose)
+    # feature layer, same semantics as is_feature_enabled: the specific
+    # consent row decides, else the global preference, else legacy-ON
+    if feature_granted is not None:
+        feature_enabled = feature_granted
+    elif pref_enabled is not None:
+        feature_enabled = pref_enabled
+    else:
+        feature_enabled = True
+    if not feature_enabled:
+        return Decision(False, REASON_FEATURE_DISABLED, version, purpose)
+    return Decision(True, "granted", version, purpose)
 
 
 def authorize_or_raise(session, user_id: str, purpose: str | None, operation: str, *, lock: bool = False) -> Decision:
