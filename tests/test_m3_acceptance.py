@@ -1,8 +1,13 @@
-"""M3 acceptance (batch-2 task 5): after revocation -- and under a purpose
-that was never granted -- NO path returns memory.
+"""M3 acceptance (batch-2 task 5 + batch-3 additions): after revocation --
+and under a purpose that was never granted -- NO path returns memory, and
+after a revocation the OTHER purposes see nothing of the revoked one.
 
-Two scenarios, both driven by ENTRY_REGISTRY so a new entry is pulled in
-automatically:
+Three scenarios, all driven by ENTRY_REGISTRY so a new entry is pulled in
+automatically.  The suite runs on BOTH dialects: on PostgreSQL the engine
+and the server run through the app role under RLS, and the scenario
+grants are issued through the PRODUCT API (MemoryEngine.grant_purpose)
+-- no test-side grant plumbing for the setup path (task 4: at least one
+grant per acceptance run goes through product authorization).
 
 * **Revoked everywhere**: memory collected under purpose X (a sentinel
   claim), then X revoked.  Every memory-reading entry -- the library
@@ -11,6 +16,10 @@ automatically:
   it returns or raises.
 * **I5 (wrong purpose)**: X granted, every entry called with Y (never
   granted).  All refused.
+* **Cross-purpose (batch 3)**: X revoked, Q granted; every read entry
+  runs under Q and must SUCCEED while carrying zero sentinel -- the A2
+  visibility rule hides the X-only memory from every surface, and the
+  worker under Q writes nothing carrying it.
 
 The driver table must cover every registry entry flagged ``reads_memory``
 plus the worker's job entry; an entry without a driver fails the test.
@@ -21,6 +30,7 @@ v2 merge-plan invariant mapping (I5 and the related ones):
 |---|---|
 | I5 purpose mismatch refused on every path | ``test_i5_wrong_purpose_is_refused_on_every_path`` (here) |
 | revocation immediate, every path | ``test_after_revocation_no_path_returns_memory`` (here) |
+| cross-purpose hiding after revocation | ``test_cross_purpose_q_reads_nothing_of_the_revoked_p`` (here) |
 | I2 / PI revoke between claim and publish | tests/test_purpose_revocation.py (PG, 50 rounds), tests/test_purpose_revocation_sqlite.py |
 | refusal issues zero business SQL | tests/test_purpose_entries.py::test_refused_recall_issues_only_authorization_queries |
 | missing purpose refused before any SQL | tests/test_purpose_entries.py::test_missing_purpose_refused_before_any_sql |
@@ -47,22 +57,31 @@ from tests.conftest import refusing_authz
 
 USER = "u-accept"
 TENANT = ("default", "default")
-X, Y = "granted-x", "never-y"
+X, Y, Q = "granted-x", "never-y", "other-q"
 SENTINEL = "SENTINEL-SECRET-4242"
 WORKER_ENTRY = "mirror_memory.worker.evolution._process_single_job"
 
 
 class _FakeLLM:
     def generate(self, **kw):
-        return '{"patterns": [{"description": "' + SENTINEL + ' pattern", "confidence": 0.9}], "support_policy": {}}'
+        # invents nothing: a sentinel in anything the job writes can only
+        # have come from memory the job read
+        return '{"patterns": [], "support_policy": {}}'
 
 
-@pytest.fixture
-def db(tmp_path):
-    eng = create_engine(f"sqlite:///{tmp_path}/accept.db")
-    Base.metadata.create_all(eng)
-    yield eng
-    eng.dispose()
+@pytest.fixture(params=["sqlite", "postgres"])
+def db_url(request, tmp_path):
+    """The acceptance suite runs on both dialects; the postgres param is
+    the suite's RLS-protected app-role runtime (skipped on the SQLite
+    leg).  The pg fixture is pulled LAZILY so the sqlite param does not
+    demand a database."""
+    if request.param == "sqlite":
+        eng = create_engine(f"sqlite:///{tmp_path / 'accept.db'}")
+        Base.metadata.create_all(eng)
+        yield str(eng.url)
+        eng.dispose()
+    else:
+        yield request.getfixturevalue("pg_app_url")
 
 
 def _config():
@@ -72,19 +91,19 @@ def _config():
     return cfg
 
 
-def _engine(db) -> MemoryEngine:
-    F = sessionmaker(bind=db)
+def _engine(db_url) -> MemoryEngine:
+    F = sessionmaker(bind=create_engine(db_url))
     with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
         s = F()
         set_memory_enabled(s, USER, True)
         s.commit()
         s.close()
-    return MemoryEngine(config=_config(), database_url=str(db.url),
+    return MemoryEngine(config=_config(), database_url=db_url,
                         tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM())
 
 
-def _memory_counts(db) -> tuple[int, int, int]:
-    F = sessionmaker(bind=db)
+def _memory_counts(db_url) -> tuple[int, int, int]:
+    F = sessionmaker(bind=create_engine(db_url))
     with tenant_scope(*TENANT):
         s = F()
         try:
@@ -97,8 +116,8 @@ def _memory_counts(db) -> tuple[int, int, int]:
             s.close()
 
 
-def _first_belief_id(db) -> int:
-    F = sessionmaker(bind=db)
+def _first_belief_id(db_url) -> int:
+    F = sessionmaker(bind=create_engine(db_url))
     with tenant_scope(*TENANT):
         s = F()
         try:
@@ -108,6 +127,8 @@ def _first_belief_id(db) -> int:
 
 
 def _populate_under_x(eng: MemoryEngine) -> None:
+    # the setup grant goes through the PRODUCT API: on the postgres leg
+    # this INSERT runs as the app role under RLS in the consent write scope
     eng.grant_purpose(user_id=USER, purpose=X, operations=[
         "observe", "recall", "correct", "forget", "export", "explain", "extract"], issuer="t")
     eng.observe(user_id=USER, session_id="s1", text=f"I like {SENTINEL} and coffee.", purpose=X)
@@ -149,11 +170,21 @@ def _server_drivers(client: TestClient, purpose: str, belief_id: int) -> dict[st
     }
 
 
-def _worker_publish(db, purpose: str) -> EvolutionJob:
+def _beliefs_all(db_url) -> list[Belief]:
+    F = sessionmaker(bind=create_engine(db_url))
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            return s.execute(select(Belief).where(Belief.user_id == USER)).scalars().all()
+        finally:
+            s.close()
+
+
+def _worker_publish(db_url, purpose: str) -> EvolutionJob:
     """Enqueue a job carrying *purpose*, claim it, run the publish; return
     the job row as it ends up."""
     cfg = _config()
-    F = sessionmaker(bind=db)
+    F = sessionmaker(bind=create_engine(db_url))
     with tenant_scope(*TENANT):
         s = F()
         try:
@@ -180,8 +211,8 @@ def _assert_registry_covered(drivers: dict[str, object]) -> None:
     )
 
 
-def _run_all_refused(db, eng, drivers: dict[str, object], *, purpose: str, reason: str) -> None:
-    before = _memory_counts(db)
+def _run_all_refused(db_url, eng, drivers: dict[str, object], *, purpose: str, reason: str) -> None:
+    before = _memory_counts(db_url)
     for key, run in drivers.items():
         if key == WORKER_ENTRY:
             job = run()
@@ -200,7 +231,7 @@ def _run_all_refused(db, eng, drivers: dict[str, object], *, purpose: str, reaso
             run()
         assert info.value.decision.reason == reason, (key, info.value.decision.reason)
         assert SENTINEL not in str(info.value), key
-    assert _memory_counts(db) == before, "a refused path must not write memory either"
+    assert _memory_counts(db_url) == before, "a refused path must not write memory either"
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +239,10 @@ def _run_all_refused(db, eng, drivers: dict[str, object], *, purpose: str, reaso
 # ---------------------------------------------------------------------------
 
 
-def test_after_revocation_no_path_returns_memory(db):
-    eng = _engine(db)
+def test_after_revocation_no_path_returns_memory(db_url):
+    eng = _engine(db_url)
     _populate_under_x(eng)
-    belief_id = _first_belief_id(db)
+    belief_id = _first_belief_id(db_url)
     assert SENTINEL in (eng.recall(user_id=USER, query=SENTINEL, purpose=X) or ""), "sanity: X sees it before"
     eng.revoke_purpose(user_id=USER, purpose=X, actor="user", reason="withdrawn")
 
@@ -219,16 +250,16 @@ def test_after_revocation_no_path_returns_memory(db):
 
     server_mod._tenant_key_registry.clear()
     register_tenant_key("key-a", *TENANT, purposes={X, Y})
-    app = create_app(config=_config(), database_url=str(db.url))
+    app = create_app(config=_config(), database_url=db_url)
     try:
         with TestClient(app) as client:
             drivers = {
                 **_library_drivers(eng, X, belief_id),
                 **_server_drivers(client, X, belief_id),
-                WORKER_ENTRY: lambda: _worker_publish(db, X),
+                WORKER_ENTRY: lambda: _worker_publish(db_url, X),
             }
             _assert_registry_covered(drivers)
-            _run_all_refused(db, eng, drivers, purpose=X, reason="revoked")
+            _run_all_refused(db_url, eng, drivers, purpose=X, reason="revoked")
     finally:
         server_mod._tenant_key_registry.clear()
 
@@ -238,16 +269,16 @@ def test_after_revocation_no_path_returns_memory(db):
 # ---------------------------------------------------------------------------
 
 
-def test_i5_wrong_purpose_is_refused_on_every_path(db):
-    eng = _engine(db)
+def test_i5_wrong_purpose_is_refused_on_every_path(db_url):
+    eng = _engine(db_url)
     _populate_under_x(eng)
-    belief_id = _first_belief_id(db)
+    belief_id = _first_belief_id(db_url)
 
     from mirror_memory import server as server_mod
 
     server_mod._tenant_key_registry.clear()
     register_tenant_key("key-a", *TENANT, purposes={X, Y})
-    app = create_app(config=_config(), database_url=str(db.url))
+    app = create_app(config=_config(), database_url=db_url)
     try:
         # the harness would lazily grant Y on first touch; the whole
         # scenario runs with that off so Y is a genuine no_grant
@@ -255,11 +286,81 @@ def test_i5_wrong_purpose_is_refused_on_every_path(db):
             drivers = {
                 **_library_drivers(eng, Y, belief_id),
                 **_server_drivers(client, Y, belief_id),
-                WORKER_ENTRY: lambda: _worker_publish(db, Y),
+                WORKER_ENTRY: lambda: _worker_publish(db_url, Y),
             }
             _assert_registry_covered(drivers)
-            _run_all_refused(db, eng, drivers, purpose=Y, reason="no_grant")
+            _run_all_refused(db_url, eng, drivers, purpose=Y, reason="no_grant")
             # and X still works: the refusals were about Y, not the user
             assert SENTINEL in (eng.recall(user_id=USER, query=SENTINEL, purpose=X) or "")
     finally:
         server_mod._tenant_key_registry.clear()
+
+
+# ---------------------------------------------------------------------------
+# scenario 3 (batch 3): X revoked, Q reads -- success, zero sentinel
+# ---------------------------------------------------------------------------
+
+
+def test_cross_purpose_q_reads_nothing_of_the_revoked_p(db_url):
+    eng = _engine(db_url)
+    _populate_under_x(eng)
+    belief_id = _first_belief_id(db_url)
+    counts_before = _memory_counts(db_url)
+    eng.revoke_purpose(user_id=USER, purpose=X, actor="user", reason="withdrawn")
+    # Q's grant: the product API again (app role + RLS on the postgres leg)
+    eng.grant_purpose(user_id=USER, purpose=Q, operations=[
+        "observe", "recall", "correct", "forget", "export", "explain", "extract"], issuer="t")
+
+    from mirror_memory import server as server_mod
+
+    server_mod._tenant_key_registry.clear()
+    register_tenant_key("key-a", *TENANT, purposes={X, Y, Q})
+    app = create_app(config=_config(), database_url=db_url)
+    try:
+        with TestClient(app) as client:
+            drivers = {
+                **_library_drivers(eng, Q, belief_id),
+                **_server_drivers(client, Q, belief_id),
+            }
+            _assert_registry_covered(drivers | {WORKER_ENTRY: object()})
+            for key, run in drivers.items():
+                result = run()
+                if hasattr(result, "status_code"):
+                    # 200 (a visible-result surface) or 404 (an invisible
+                    # belief) -- never 403 (Q is authorized) and never a leak
+                    assert result.status_code in (200, 404), (key, result.status_code, result.text)
+                    assert SENTINEL not in result.text, key
+                elif key.endswith(".export"):
+                    pages = result
+                    for page in pages:
+                        assert SENTINEL not in page.to_dict().__str__(), key
+                else:
+                    assert SENTINEL not in repr(result), key
+            # the worker under Q: the job runs (Q is authorized) but reads
+            # nothing X-only, so nothing X-only is republished.  The X
+            # belief ROWS persist (hidden, not deleted) -- only what the
+            # job itself writes may carry content.
+            beliefs_before = {b.id for b in _beliefs_all(db_url)}
+            job = _worker_publish(db_url, Q)
+            assert job.status in ("completed", "cancelled"), (job.status, job.error_code)
+            F = sessionmaker(bind=create_engine(db_url))
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    new_beliefs = [
+                        b.claim_text for b in s.execute(select(Belief).where(Belief.user_id == USER)).scalars()
+                        if b.id not in beliefs_before
+                    ]
+                    snapshots = [
+                        snap.content_json for snap in s.execute(select(Snapshot)).scalars()
+                        if snap.source_purpose == Q
+                    ]
+                finally:
+                    s.close()
+            assert all(SENTINEL not in text for text in new_beliefs), new_beliefs
+            assert all(SENTINEL not in text for text in snapshots), snapshots
+            # and Q's own memory (none seeded here) simply reads empty
+            assert f"{SENTINEL}" not in (eng.recall(user_id=USER, query=SENTINEL, purpose=Q) or "")
+    finally:
+        server_mod._tenant_key_registry.clear()
+    assert _memory_counts(db_url)[:2] == counts_before[:2], "reads must not create beliefs or evidence"

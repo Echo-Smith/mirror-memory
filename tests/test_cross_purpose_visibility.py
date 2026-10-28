@@ -63,13 +63,16 @@ def db(tmp_path):
 
 
 def _engine(db) -> MemoryEngine:
-    F = sessionmaker(bind=db)
+    """*db* is an Engine (the sqlite fixture) or a URL (the postgres leg's
+    app-role runtime)."""
+    url = str(db.url) if hasattr(db, "url") else str(db)
+    F = sessionmaker(bind=create_engine(url) if isinstance(db, str) else db)
     with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
         s = F()
         set_memory_enabled(s, USER, True)
         s.commit()
         s.close()
-    return MemoryEngine(config=load_config("config/"), database_url=str(db.url),
+    return MemoryEngine(config=load_config("config/"), database_url=url,
                         tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM())
 
 
@@ -479,7 +482,7 @@ def test_worker_synthesis_never_reads_invisible_memory(db):
 # ---------------------------------------------------------------------------
 
 
-def _visibility_race_round(db, eng, round_no) -> None:
+def _visibility_race_round(eng, round_no) -> None:
     """One round: grant a fresh P (a revoked grant row cannot be re-granted
     without the CAS version -- unique purposes per round), seed, then a
     reader recalls under Q while the main thread commits the revocation.
@@ -549,7 +552,7 @@ def test_revocation_vs_visibility_50_rounds_sqlite(tmp_path):
         eng = _engine(db)
         _grant(eng, Q)
         for round_no in range(50):
-            _visibility_race_round(db, eng, round_no)
+            _visibility_race_round(eng, round_no)
     finally:
         db.dispose()
 
@@ -584,3 +587,13 @@ def test_session_summary_fallback_is_visibility_filtered(db):
     block = eng.recall(user_id=USER, query="journal attic", purpose=Q) or ""
     assert SENTINEL not in block
     assert "gardening" in block or "shed" in block
+
+
+def test_revocation_vs_visibility_50_rounds_postgres(pg_app_url):
+    """The same invariant under real PostgreSQL concurrency (MVCC: readers
+    never block the revoker): every recall that STARTED after the
+    revocation committed is sentinel-free."""
+    eng = _engine(pg_app_url)
+    _grant(eng, Q)
+    for round_no in range(50):
+        _visibility_race_round(eng, round_no)
