@@ -22,6 +22,15 @@
    default_tenant=..., default_app=..., confirm_backup=True)`）。它建表、
    补租户列、改复合主键，并在第 3 步安装 RLS（所有权转给 `mm_owner`、
    GRANT、`ENABLE`+`FORCE ROW LEVEL SECURITY`、两条策略）。每一步可重入。
+
+   **升级前选择（M3）**：迁移第 6 步给 `mm_evolution_jobs` 加 `purpose`
+   列。不提供 `legacy_job_purpose`（或 `MM_LEGACY_JOB_PURPOSE`）时，存量
+   任务的 purpose 回填为空——worker 会在运行时以 `missing_purpose` 取消
+   它们（数量在迁移日志和 `upgrade_database` 返回值
+   `legacy_jobs_to_cancel` 中给出）；提供该参数时，存量任务被打上这个
+   purpose——它们仍只在存在该 purpose 的有效授权时运行。若要「升级后
+   继续跑存量任务」，升级前先 `grant_purpose(purpose=<legacy>, ...,
+   operations=["extract", ...])`。
    **迁移不受应用超时约束**：迁移期间它借出的每个连接都设为会话级
    `statement_timeout = 0`（会话级而非 `SET LOCAL`，因为 `CREATE INDEX
    CONCURRENTLY` 在事务外执行），连接归还连接池时 `RESET` 回建连时的应用
@@ -36,6 +45,11 @@
 3. **设置维护登录**：`MM_MAINTENANCE_DATABASE_URL=postgresql+psycopg://mm_maintenance:...@host/db`。
    worker 的队列扫描与单租户启动探针都走它；未设置时这些路径**报错**而
    不是静默看到 0 行。
+
+**删除记忆 ≠ 撤销授权（M3）**：`delete_memories` 的级联范围不含
+`mm_consent_grants`、`mm_memory_preferences`、`mm_purpose_grants(_events)`
+——功能开关、全局偏好与 purpose 授权在删除后原样保留；「删除并撤销」
+由调用方显式两步（先 delete_memories，再 revoke_purpose / set_consent）。
 
 `MM_PG_RLS=0` 关闭 RLS 相关行为（不再设置事务级租户、不做姿态校验），
 **仅用于性能测量基线**，生产禁用。

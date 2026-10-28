@@ -2503,11 +2503,12 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     snapshots_deleted = (
         session.query(Snapshot).filter(Snapshot.user_id == user_id).delete(synchronize_session=False)
     )
-    consent_deleted = (
-        session.query(ConsentGrant)
-        .filter(ConsentGrant.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
+    # Authorization and switches are NOT memory content: the feature
+    # consent rows, the global memory preference and the purpose grants
+    # (and their audit trail) survive a memory delete.  Deleting them here
+    # silently re-enabled disabled features after a delete -- the fallback
+    # "missing feature row = global preference" flipped the user back on.
+    # "Delete AND revoke" is an explicit two-step for the caller.
     summaries_deleted = (
         session.query(SessionSummary)
         .filter(SessionSummary.user_id == user_id)
@@ -2520,7 +2521,6 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "evolution_jobs": int(jobs_deleted),
         "snapshots": int(snapshots_deleted),
         "intervention_events": int(interventions_deleted),
-        "consent_grants": int(consent_deleted),
         "session_summaries": int(summaries_deleted),
         "evidence": int(evidence_deleted),
         "belief_evidence_links": int(links_deleted),
