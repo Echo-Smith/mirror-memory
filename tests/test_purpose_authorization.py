@@ -34,13 +34,6 @@ from mirror_memory.core.tenancy import no_tenant_scope, system_scope, tenant_sco
 PURPOSE = "api"
 
 
-@pytest.fixture(autouse=True)
-def _no_autogrant(monkeypatch):
-    """These tests verify the refusal paths, so the conftest's test
-    autogrant is off unless a test turns it on explicitly."""
-    monkeypatch.delenv("MM_TEST_AUTOGRANT", raising=False)
-
-
 def _grant(session, user_id="u1", purpose=PURPOSE, operations=("recall", "observe"), **kw):
     grant = grant_purpose(
         session, user_id, purpose,

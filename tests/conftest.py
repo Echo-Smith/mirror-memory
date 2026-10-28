@@ -1,5 +1,8 @@
 """Shared test fixtures for mirror-memory."""
 
+import contextlib
+import contextvars
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -135,16 +138,68 @@ def _default_test_purpose(monkeypatch):
     yield
 
 
+#: True inside the granting wrapper; refusal tests flip it off for their
+#: duration (conftest-owned, deliberately NOT read by src -- an env-var
+#: auto-grant in engine code was removed as an authorization hole,
+#: M3 batch-1 patch task 1).
+_test_grants_active = contextvars.ContextVar("mm_test_grants_active", default=True)
+
+
 @pytest.fixture(autouse=True)
-def _test_autogrant(monkeypatch):
+def _grant_on_authorize(monkeypatch):
     """M3: the purpose authorization layer is on for every engine call in
     the suite.  Instead of seeding a grant per (user, purpose) pair in
-    every test, the test harness enables the authorization module's
-    explicit autogrant (a REAL grant row with a REAL audit event, issued
-    by "test-autogrant"); the purpose-gate tests turn it off locally.
-    Production never sets MM_TEST_AUTOGRANT."""
-    monkeypatch.setenv("MM_TEST_AUTOGRANT", "1")
+    every test, ``authorize_or_raise`` is wrapped so the harness ISSUES a
+    real, audited grant the first time a (user, purpose) pair is used.
+
+    The grant happens in an INDEPENDENT transaction (its own session on
+    the same bind, committed and closed before delegation) -- never inside
+    the caller's transaction, where a rollback would discard it or the
+    caller's locks could interleave with the grant write.  Refusal tests
+    opt out with the ``refusing_authz`` fixture.  src contains no trace of
+    this: tools/check_no_autogrant.py keeps it that way."""
+    import contextvars as _cv
+
+    from sqlalchemy.orm import Session as _Session
+
+    from mirror_memory.core import authorization as _authorization
+
+    original = _authorization.authorize_or_raise
+
+    def granting(session, user_id, purpose, operation, *, lock=False):
+        if not _test_grants_active.get():
+            return original(session, user_id, purpose, operation, lock=lock)
+        resolved = (purpose or "").strip()
+        if resolved:
+            bind = session.get_bind()
+            grant_session = _Session(bind=bind)
+            try:
+                _authorization.ensure_purpose_grant(
+                    grant_session, user_id, resolved,
+                    issuer="test-harness", operations=list(_authorization.OPERATIONS),
+                )
+                grant_session.commit()
+            except Exception:
+                grant_session.rollback()
+                raise
+            finally:
+                grant_session.close()
+        return original(session, user_id, purpose, operation, lock=lock)
+
+    monkeypatch.setattr(_authorization, "authorize_or_raise", granting)
     yield
+
+
+@contextlib.contextmanager
+def refusing_authz():
+    """Opt a code block out of the harness's lazy test-grant issuance:
+    authorize_or_raise delegates straight through, so missing grants
+    produce real no_grant refusals.  Import from tests.conftest."""
+    token = _test_grants_active.set(False)
+    try:
+        yield
+    finally:
+        _test_grants_active.reset(token)
 
 
 @pytest.fixture(autouse=True)

@@ -20,7 +20,6 @@ run inside a tenant-scoped session on the tenant (app) engine.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -106,15 +105,6 @@ def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _autogrant_enabled() -> bool:
-    """Test scaffolding ONLY (never set in production): a refused
-    ``no_grant`` auto-issues a full-operations grant instead.  The row and
-    its audit event are real -- nothing is waived silently -- but the
-    flag exists so the suite's existing tests do not each need explicit
-    grant fixtures.  The purpose-gate tests run with it off."""
-    return os.environ.get("MM_TEST_AUTOGRANT", "0") == "1"
-
-
 def _operations_json(operations) -> str:
     ops = list(operations)
     if not ops:
@@ -188,20 +178,9 @@ def authorize(
 
     grant = _load_grant(session, user_id, purpose, lock=lock)
     if grant is None:
-        if _autogrant_enabled():
-            # Concurrent first requests can both reach the autogrant; the
-            # CAS makes exactly one the issuer, and the loser re-reads the
-            # winner's grant instead of refusing (test scaffolding only).
-            try:
-                grant = _autogrant(session, user_id, purpose)
-            except StaleGrantVersion:
-                session.rollback()
-                grant = _load_grant(session, user_id, purpose, lock=lock)
-                if grant is None:
-                    raise
-        else:
-            return Decision(False, REASON_NO_GRANT, None, purpose)
-    assert grant is not None
+        # No implicit issuance, ever: an absent grant is a refusal.  Hosts
+        # (and the test harness) grant explicitly through grant_purpose.
+        return Decision(False, REASON_NO_GRANT, None, purpose)
     if grant.revoked_at is not None:
         return Decision(False, REASON_REVOKED, grant.version, purpose)
     if grant.expires_at is not None and grant.expires_at <= _now():
@@ -218,23 +197,6 @@ def authorize(
 def authorize_or_raise(session, user_id: str, purpose: str | None, operation: str, *, lock: bool = False) -> Decision:
     """:func:`authorize`, raising :class:`PurposeDenied` on refusal."""
     return authorize(session, user_id, purpose, operation, lock=lock).require(operation)
-
-
-def _autogrant(session, user_id: str, purpose: str):
-    """The test-only auto-issuance behind ``MM_TEST_AUTOGRANT``: a real
-    full-operations grant row with a real audit event, then re-loaded."""
-    from mirror_memory.core.models import PurposeGrant
-
-    grant = grant_purpose(
-        session,
-        user_id,
-        purpose,
-        operations=list(OPERATIONS),
-        issuer="test-autogrant",
-        reason="test autogrant (MM_TEST_AUTOGRANT=1)",
-    )
-    assert isinstance(grant, PurposeGrant)
-    return grant
 
 
 @_sanctioned_writer("consent")

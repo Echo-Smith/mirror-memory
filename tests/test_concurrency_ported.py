@@ -47,6 +47,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.conftest import refusing_authz
+
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.models import Belief, DeletionTombstone, Evidence, EvolutionJob
 from mirror_memory.core.proposal import TRANSITION_SUPPORT, StateTransitionProposal
@@ -567,13 +569,9 @@ def test_service_rejects_wrong_purpose(factory):
         # observe under the granted purpose works ...
         eng.observe(user_id=USER, session_id="s9", text="granted path", purpose="analytics")
         # ... and every operation under a purpose it does not carry is
-        # refused.  The harness autogrant is OFF for the probes -- the
+        # refused.  The harness lazy-grant is OFF for the probes -- the
         # refusal is the point (I5).
-        import mirror_memory.core.authorization as auth
-
-        previous = auth._autogrant_enabled
-        auth._autogrant_enabled = lambda: False
-        try:
+        with refusing_authz():
             for call in (
                 lambda p: eng.recall(user_id=USER, purpose=p),
                 lambda p: eng.correct(user_id=USER, belief_id=1, new_claim_text="x", purpose=p),
@@ -582,17 +580,14 @@ def test_service_rejects_wrong_purpose(factory):
             ):
                 with pytest.raises(PurposeDenied, match="no_grant"):
                     call("memory_management")
-        finally:
-            auth._autogrant_enabled = previous
     finally:
         eng._engine.dispose()
 
 
-def test_worker_rejects_wrong_purpose(factory, monkeypatch):
+def test_worker_rejects_wrong_purpose(factory):
     """I5 at the worker: the job carries its own purpose; a worker running a
-    job whose purpose has no grant is cancelled.  The test harness's
-    autogrant is OFF here -- the refusal is the point."""
-    monkeypatch.delenv("MM_TEST_AUTOGRANT", raising=False)
+    job whose purpose has no grant is cancelled.  The harness lazy-grant is
+    OFF here -- the refusal is the point."""
     cfg = make_config()
     job_id = "i5-worker-1"
     with tenant_scope(*TENANT), opened(factory) as s:
@@ -607,7 +602,8 @@ def test_worker_rejects_wrong_purpose(factory, monkeypatch):
         assert token == 1
         job_row = holder.get(EvolutionJob, pk(job_id))
         holder.commit()
-        _process_single_job(holder, job_row, cfg, lease_token=token)
+        with refusing_authz():
+            _process_single_job(holder, job_row, cfg, lease_token=token)
         with opened(factory) as s_check:
             row = s_check.get(EvolutionJob, pk(job_id))
             assert (row.status, row.error_code) == ("cancelled", "no_grant")

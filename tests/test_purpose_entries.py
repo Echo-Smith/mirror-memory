@@ -23,6 +23,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.conftest import refusing_authz
+
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.authorization import (
     ENTRY_REGISTRY,
@@ -228,24 +230,16 @@ def test_refused_recall_issues_only_authorization_queries(pg_app_url):
             session = Session(engine)
             set_memory_enabled(session, "u1", True)
             session.commit()
-            # no grant for ("u1", "never") and autogrant disabled
-            with pytest.raises(PurposeDenied) as excinfo:
-                session.execute  # noqa: B018 (placeholder to keep flake quiet)
-                from mirror_memory.core import authorization
+            # no grant for ("u1", "never"): the harness lazy-grant is off
+            with refusing_authz(), pytest.raises(PurposeDenied) as excinfo:
+                from mirror_memory.api import MemoryEngine
 
-                previous = authorization._autogrant_enabled
-                authorization._autogrant_enabled = lambda: False
-                try:
-                    from mirror_memory.api import MemoryEngine
-
-                    eng = MemoryEngine(
-                        config=load_config("config/"), database_url=pg_app_url,
-                        tenant_id="default", app_id="default", engine=engine,
-                        schema_ready=True, default_purpose=None,
-                    )
-                    eng.recall(user_id="u1", purpose="never")
-                finally:
-                    authorization._autogrant_enabled = previous
+                eng = MemoryEngine(
+                    config=load_config("config/"), database_url=pg_app_url,
+                    tenant_id="default", app_id="default", engine=engine,
+                    schema_ready=True, default_purpose=None,
+                )
+                eng.recall(user_id="u1", purpose="never")
         assert "missing_purpose" not in str(excinfo.value)
         assert "no_grant" in str(excinfo.value)
         business = [
@@ -374,15 +368,8 @@ def test_forget_after_revocation_is_allowed_and_audited(pg_app_url):
             )
             # observe would be refused (revoked) ...
             session = Session(engine)
-            from mirror_memory.core import authorization
-
-            previous = authorization._autogrant_enabled
-            authorization._autogrant_enabled = lambda: False
-            try:
-                with pytest.raises(PurposeDenied, match="revoked"):
-                    eng.observe(user_id="u1", session_id="s1", text="x", purpose="api")
-            finally:
-                authorization._autogrant_enabled = previous
+            with refusing_authz(), pytest.raises(PurposeDenied, match="revoked"):
+                eng.observe(user_id="u1", session_id="s1", text="x", purpose="api")
             session.close()
             # ... but the forget runs, and its invocation is on the audit trail
             assert eng.forget_belief(user_id="u1", belief_id=bid, purpose="api") is True
