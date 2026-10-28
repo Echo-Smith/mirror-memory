@@ -220,3 +220,122 @@ def test_worker_unbinds_the_session_after_the_job(db):
             assert provenance.current(s) == ""
         finally:
             s.close()
+
+
+def test_authorized_entries_never_write_the_unknown_marker(tmp_path):
+    """The '' guard (M3 batch 3 task 2): every entry that runs behind an
+    authorization stamps what it writes.  After each entry, every NEW row
+    in the provenance tables carries a non-empty source_purpose -- the
+    marker exists only for writes OUTSIDE authorized entries (direct
+    repository use, pre-M3 rows)."""
+    import json
+
+    from sqlalchemy import text
+
+    d = tmp_path / "guard"
+    d.mkdir()
+    eng0 = create_engine(f"sqlite:///{d}/guard.db")
+    Base.metadata.create_all(eng0)
+    F = sessionmaker(bind=eng0)
+    with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+
+    cfg = load_config("config/")
+
+    class ReplyLLM:
+        def generate(self, **kw):
+            return '{"patterns": [], "support_policy": {}}'
+
+    me = MemoryEngine(config=cfg, database_url=str(eng0.url),
+                      tenant_id=TENANT[0], app_id=TENANT[1], llm_client=ReplyLLM())
+    me.grant_purpose(user_id=USER, purpose="api", operations=list(
+        json.loads(json.dumps(["observe", "recall", "correct", "forget",
+                               "export", "explain", "extract"]))), issuer="t")
+
+    PROVENANCE_TABLES = ("mm_evidence", "mm_belief_events", "mm_snapshots", "mm_session_summaries")
+
+    # the bookkeeping reads are test-side (no tenant context, no product
+    # path): keep the auditor out of them, the entries under test stay in it
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    def max_ids():
+        with no_audit_scope(), eng0.connect() as conn:
+            return {
+                t: conn.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {t}")).scalar_one()
+                for t in PROVENANCE_TABLES
+            }
+
+    def assert_no_marker_after(label, before):
+        with no_audit_scope(), eng0.connect() as conn:
+            for t in PROVENANCE_TABLES:
+                rows = conn.execute(text(
+                    f"SELECT source_purpose FROM {t} WHERE id > :m"
+                ), {"m": before[t]}).all()
+                empty = [r[0] for r in rows if not r[0]]
+                assert not empty, (
+                    f"{label} wrote {len(empty)} provenance row(s) with the "
+                    f"unknown marker into {t}"
+                )
+
+    # observe
+    before = max_ids()
+    me.observe(user_id=USER, session_id="s1", text="I like coffee and I live in Berlin.",
+               purpose="api")
+    assert_no_marker_after("observe", before)
+
+    # correct (supersede + created/corrected events); a triple belief
+    # demands its object back (the repository refuses inconsistent
+    # corrections)
+    first = _rows(eng0, Belief)[0]
+    before = max_ids()
+    corrected = me.correct(user_id=USER, belief_id=first.id, new_claim_text="I like tea",
+                           new_object=getattr(first, "object", "") or None, purpose="api")
+    assert corrected is not None
+    assert_no_marker_after("correct", before)
+
+    # run_verification: inject a question, then confirm it -> publisher events
+    candidates = me.get_verification_candidates(user_id=USER, purpose="api")
+    before = max_ids()
+    if candidates:
+        result = me.run_verification(user_id=USER, session_id="s1",
+                                     reply="Yes that is right, exactly.", purpose="api")
+        assert result is not None
+    assert_no_marker_after("run_verification", before)
+
+    # run_metabolism (compaction / tier moves write events and digests)
+    before = max_ids()
+    me.run_metabolism(user_id=USER, purpose="api")
+    assert_no_marker_after("run_metabolism", before)
+
+    # the worker's publish under its job purpose (enqueue -> claim -> process)
+    from mirror_memory.core.models import EvolutionJob
+    from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqueue_job
+
+    before = max_ids()
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            job = enqueue_job(s, USER, cfg, purpose="api")
+            s.commit()
+            token = _claim_job(s, job.id, lease_seconds=60)
+            row = s.get(EvolutionJob, job.id)
+            _process_single_job(s, row, cfg, token)
+            s.commit()
+        finally:
+            s.close()
+    assert_no_marker_after("worker publish", before)
+
+    # the marker still exists where it always did: direct repository writes
+    with tenant_scope(*TENANT), fixture_write_scope("direct write outside any entry"):
+        s = F()
+        record_evidence(s, USER, ref="direct:1", content="unattributed", session_id="sd")
+        s.commit()
+        s.close()
+    with no_audit_scope(), eng0.connect() as conn:
+        marker = conn.execute(text(
+            "SELECT source_purpose FROM mm_evidence WHERE ref = 'direct:1'")).scalar_one()
+    assert marker == ""
+    eng0.dispose()
