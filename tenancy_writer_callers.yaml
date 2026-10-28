@@ -14,6 +14,31 @@
 # Adding a caller is a reviewed decision: add the module here in the same
 # commit that adds the call.
 
+# Wrapper functions (M3 batch-2 task 0): undecorated functions that write
+# classified tables by opening a write scope inline or by calling a
+# sanctioned writer.  A wrapper is a capability holder exactly like a
+# sanctioned writer -- its src callers must be registered here, and a call
+# from an unlisted module fails the scan.  (Tests are exempt, as usual.)
+wrappers:
+  grant_bench_purpose:
+    reason: >
+      Bench-side idempotent issuance wrapper (calls grant_purpose).
+      Only the bench harness may issue its own grants; engine code must
+      never use it.
+    callers:
+      - mirror_memory.bench.runner
+      - mirror_memory.bench.longrun
+      - mirror_memory.bench.metabolism
+      - mirror_memory.bench.statebench_runner
+      - mirror_memory.bench.statebench_v1_1_runner
+  enqueue_job:
+    reason: >
+      Writes mm_evolution_jobs via queue_write_scope inline (bulk INSERT /
+      CAS UPDATE).  Host-facing entry re-exported from mirror_memory.worker
+      for hosts and tests; no src module calls it today, and any future src
+      caller must be registered here in the same commit.
+    callers: []
+
 writers:
   # ---- consent class: purpose authorization (M3 batch 1, reviewer 待评审) ----
   grant_purpose:
@@ -24,8 +49,7 @@ writers:
       issuers from clobbering each other.
     callers:
       - mirror_memory.api
-      # the test-only autogrant path (MM_TEST_AUTOGRANT=1, conftest only)
-      - mirror_memory.core.authorization
+      - mirror_memory.bench  # grant_bench_purpose: idempotent bench-side issuance
 
   record_purpose_invocation:
     reason: >

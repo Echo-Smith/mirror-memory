@@ -48,7 +48,14 @@ def test_every_sanctioned_writer_is_registered():
     writers = set(tool.sanctioned_writers())
     registry = set(tool.load_registry())
     assert writers - registry == set(), "unregistered sanctioned writers"
-    assert registry - writers == set(), "ghost registry entries"
+    # registry keys beyond sanctioned writers are the WRAPPER entries
+    # (M3 batch-2 task 0): undecorated functions that write classified
+    # tables by opening a scope or calling a writer -- each must be
+    # defined in src
+    wrappers = registry - writers
+    assert wrappers <= tool.wrapper_names_found_in_src(wrappers), (
+        "wrapper registry entries whose function is gone from src"
+    )
 
 
 def test_scan_is_clean_on_the_current_tree():
@@ -139,3 +146,78 @@ def test_missing_registry_is_a_hard_error(tmp_path, monkeypatch):
     monkeypatch.setattr(tool, "REGISTRY", tmp_path / "absent.yaml")
     with pytest.raises(tool.RegistryError):
         tool.load_registry()
+
+
+def test_wrapper_callers_are_checked(tmp_path):
+    """M3 batch-2 task 0 counterexample: a temp src module calling the
+    ensure-wrapper (or any registered wrapper) must fail the scan."""
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    (src / "sneaky.py").write_text(
+        "from mirror_memory.bench import grant_bench_purpose\n\n\ndef steal():\n"
+        "    return grant_bench_purpose(None, ['u1'])\n",
+        encoding="utf-8",
+    )
+    tool = _load_tool()
+    # reuse the checker's attribution over the temp tree
+    import yaml as _yaml
+
+    registry_data = _yaml.safe_load(
+        (REPO / "tenancy_writer_callers.yaml").read_text(encoding="utf-8")
+    )
+    writers = set(tool.sanctioned_writers()) | set(
+        (registry_data.get("wrappers") or {}).keys()
+    )
+    # minimal inline scan of the temp tree
+    import ast as _ast
+
+    calls: dict[str, set[str]] = {}
+    for path in src.rglob("*.py"):
+        tree = _ast.parse(path.read_text(encoding="utf-8"))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                func = node.func
+                name = getattr(func, "id", None) or getattr(func, "attr", None)
+                if name in writers:
+                    calls.setdefault(name, set()).add("mirror_memory.sneaky")
+    assert calls, "the temp module call was not attributed at all"
+    allowed = tool.load_registry()
+    unregistered = {
+        name: mods
+        for name, mods in calls.items()
+        if mods - allowed.get(name, set())
+    }
+    assert unregistered, "the wrapper bypass was not caught"
+    assert "grant_bench_purpose" in unregistered
+
+
+def test_other_write_scope_openers_are_listed():
+    """The known inline-scope writers (functions that open a write scope
+    directly instead of calling a sanctioned writer) -- enumerated in the
+    batch-2 report; a new one must be added to this list and reviewed."""
+    import subprocess
+    import sys as _sys
+
+    result = subprocess.run(
+        [_sys.executable, "-c",
+         "import pathlib, re\n"
+         "hits = set()\n"
+         "for p in pathlib.Path('src').rglob('*.py'):\n"
+         "    text = p.read_text(encoding='utf-8')\n"
+         "    for m in re.finditer(r'with (\\w+_write_scope)\\(\\)', text):\n"
+         "        hits.add((str(p), m.group(1)))\n"
+         "for h in sorted(hits):\n"
+         "    print(f'{h[0]} {h[1]}')"],
+        capture_output=True, text=True, cwd=REPO,
+    )
+    openers = {tuple(line.split()) for line in result.stdout.splitlines()}
+    # reviewed set (file, scope): Publisher (savepoint commits are the
+    # sanctioned publish path), worker queue, snapshot persistence,
+    # verification telemetry, longrun bench backdating
+    assert openers == {
+        ("src/mirror_memory/core/publisher.py", "publisher_write_scope"),
+        ("src/mirror_memory/worker/evolution.py", "queue_write_scope"),
+        ("src/mirror_memory/worker/snapshot.py", "engine_write_scope"),
+        ("src/mirror_memory/extraction/verification.py", "telemetry_write_scope"),
+        ("src/mirror_memory/bench/longrun.py", "publisher_write_scope"),
+    }, openers

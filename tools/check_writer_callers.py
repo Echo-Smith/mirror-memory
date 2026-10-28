@@ -38,7 +38,10 @@ class RegistryError(RuntimeError):
 
 
 def _module_name(path: Path) -> str:
-    return ".".join(path.relative_to(SRC.parent).with_suffix("").parts)
+    parts = list(path.relative_to(SRC.parent).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
 
 
 def sanctioned_writers() -> dict[str, str]:
@@ -55,6 +58,25 @@ def sanctioned_writers() -> dict[str, str]:
                 if name == DECORATOR:
                     found[node.name] = _module_name(path)
     return found
+
+
+def wrapper_names_found_in_src(names: set[str]) -> set[str]:
+    """Wrapper names that are actually defined somewhere in src (a wrapper
+    entry is a ghost when its function is gone)."""
+    found: set[str] = set()
+    for path in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+                found.add(node.name)
+    return found
+
+
+def load_registry_wrapper_names() -> set[str]:
+    if not REGISTRY.exists():
+        return set()
+    data = yaml.safe_load(REGISTRY.read_text(encoding="utf-8")) or {}
+    return set((data.get("wrappers") or {}).keys())
 
 
 def call_sites(writers: set[str]) -> dict[str, set[str]]:
@@ -86,16 +108,24 @@ def load_registry() -> dict[str, set[str]]:
         )
     data = yaml.safe_load(REGISTRY.read_text(encoding="utf-8")) or {}
     writers = data.get("writers") or {}
+    # Wrapper functions (M3 batch-2 task 0): undecorated but they write
+    # classified tables by opening a write scope or calling a sanctioned
+    # writer.  Their callers are checked exactly like sanctioned writers'.
+    for name, spec in (data.get("wrappers") or {}).items():
+        writers[name] = spec
     registry: dict[str, set[str]] = {}
     for name, spec in writers.items():
         if not isinstance(spec, dict):
             raise RegistryError("writer entry " + repr(name) + " must be a mapping")
         callers = spec.get("callers") or []
-        if not callers:
+        if not callers and name not in (data.get("wrappers") or {}):
             raise RegistryError(
                 "writer entry " + repr(name) + " lists no callers; either the "
                 "function is dead or the entry is unfinished"
             )
+        # wrapper entries MAY have empty callers: a host-facing wrapper with
+        # no src callers (enqueue_job is called by hosts, not engine code) --
+        # the scan then asserts it STAYS caller-free
         registry[name] = set(callers)
     return registry
 
@@ -103,8 +133,12 @@ def load_registry() -> dict[str, set[str]]:
 def audit() -> tuple[list[str], list[str], list[str], dict[str, set[str]]]:
     """Return (unregistered callers, ghost entries, unlisted writers, sites)."""
     writers = set(sanctioned_writers())
+    # wrapper entries are checked for ghosts/callers exactly like writers,
+    # but they are not decorator-defined, so their definitions are looked
+    # up by name in src
+    wrapper_names = set(load_registry_wrapper_names())
     registry = load_registry()
-    sites = call_sites(writers)
+    sites = call_sites(writers | wrapper_names)
 
     unregistered: list[str] = []
     ghosts: list[str] = []
@@ -118,9 +152,10 @@ def audit() -> tuple[list[str], list[str], list[str], dict[str, set[str]]]:
         for module in sorted(sites.get(name, set()) - allowed):
             unregistered.append(module + "." + name)
 
+    defined = writers | wrapper_names_found_in_src(wrapper_names)
     for name in sorted(registry):
-        if name not in writers:
-            ghosts.append(name + " (function is no longer a sanctioned writer)")
+        if name not in defined:
+            ghosts.append(name + " (function no longer exists in src)")
             continue
         for module in sorted(registry[name] - sites.get(name, set())):
             ghosts.append(module + "." + name)

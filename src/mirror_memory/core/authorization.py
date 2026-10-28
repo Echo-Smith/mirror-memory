@@ -408,26 +408,6 @@ def revoke_purpose(
     ).first()
 
 
-def ensure_purpose_grant(session, user_id: str, purpose: str, *, issuer: str, operations: list[str] | None = None):
-    """Idempotent issuance for hosts that run their own jobs against
-    themselves (the benchmark harness): grant when missing, return the
-    existing row otherwise."""
-    from mirror_memory.core.models import PurposeGrant
-
-    existing = (
-        session.query(PurposeGrant)
-        .filter(PurposeGrant.user_id == user_id, PurposeGrant.purpose == purpose)
-        .first()
-    )
-    if existing is not None:
-        return existing
-    return grant_purpose(
-        session, user_id, purpose,
-        operations=list(operations or OPERATIONS), issuer=issuer,
-        reason="ensure_purpose_grant (idempotent host-side issuance)",
-    )
-
-
 @_sanctioned_writer("consent")
 def record_purpose_invocation(
     session,
