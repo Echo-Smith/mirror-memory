@@ -160,7 +160,7 @@ class MemoryEngine:
         the main database file.  backend "postgres": the log table in a
         SEPARATE database at ``deletion_log.url`` (outside any pg_dump of
         the main DB), where the app role holds INSERT/SELECT only."""
-        from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog
+        from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog, default_directory
 
         settings = self._config.deletion_log
         if settings.backend == "none":
@@ -170,16 +170,7 @@ class MemoryEngine:
             if not url:
                 raise ValueError("deletion_log.backend=postgres requires deletion_log.url")
             return PgDeletionLog(url)
-        directory = settings.directory
-        if not directory:
-            if self._database_url.startswith("sqlite:///"):
-                db_path = self._database_url[len("sqlite:///"):]
-                directory = str((Path(db_path).parent / "deletions").resolve())
-            else:
-                import hashlib as _hashlib
-
-                digest = _hashlib.sha1(self._database_url.encode()).hexdigest()[:12]
-                directory = str(Path(tempfile.gettempdir()) / f"mm-deletions-{digest}")
+        directory = settings.directory or default_directory(self._database_url)
         return FileDeletionLog(directory)
 
     @staticmethod

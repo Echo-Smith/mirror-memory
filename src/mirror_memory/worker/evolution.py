@@ -194,7 +194,7 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
             from mirror_memory.core import replay as deletion_replay
             from mirror_memory.core.deletion import DeletionLogStale, ReplayPending
 
-            log = _deletion_log_for(config)
+            log = _deletion_log_for(config, str(session.get_bind().url))
             if log is not None:
                 try:
                     deletion_replay.reconcile(session_factory, log)
@@ -204,6 +204,10 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
                 except DeletionLogStale as exc:
                     logger.error("deletion log is older than the main DB: %s", exc)
                     return
+                except Exception:
+                    # the reconciliation infrastructure must never wedge the
+                    # worker: log and continue (the sweep still runs)
+                    logger.warning("deletion reconcile failed; continuing", exc_info=True)
 
             # Crash recovery: expire leases whose holder is gone.  The
             # lease_token is deliberately NOT reset -- it is the monotonic
@@ -680,37 +684,25 @@ def _previous_snapshot_purposes(session: object, user_id: str) -> set[str]:
 _BUSY_BOOKKEEPING_TIMEOUT = 6.0
 
 
-def _deletion_log_for(config: MemoryConfig):
+def _deletion_log_for(config: MemoryConfig, database_url: str):
     """The deletion log for the worker's reconciliation (M4 task 3), built
-    from the same configuration rules as the engine's."""
-    cached = getattr(config, "_deletion_log_instance", None)
-    if cached is not None or hasattr(config, "_deletion_log_instance"):
-        return cached
-    from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog
+    with the SAME derivation the engine uses for *database_url* -- a
+    mismatched pairing would wedge the worker in replay-refusal forever."""
+    cache = getattr(config, "_deletion_log_instances", None)
+    if cache is None:
+        cache = config._deletion_log_instances = {}
+    if database_url in cache:
+        return cache[database_url]
+    from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog, default_directory
 
     settings = config.deletion_log
     instance = None
     if settings.backend == "postgres" and settings.url:
         instance = PgDeletionLog(settings.url)
     elif settings.backend == "file":
-        directory = settings.directory or _default_deletion_directory(config)
-        instance = FileDeletionLog(directory)
-    config._deletion_log_instance = instance
+        instance = FileDeletionLog(settings.directory or default_directory(database_url))
+    cache[database_url] = instance
     return instance
-
-
-def _default_deletion_directory(config: MemoryConfig) -> str:
-    from pathlib import Path
-
-    url = getattr(config, "database_url", "") or ""
-    if url.startswith("sqlite:///"):
-        db_path = url[len("sqlite:///"):]
-        return str((Path(db_path).parent / "deletions").resolve())
-    import hashlib
-    import tempfile
-
-    digest = hashlib.sha1(url.encode()).hexdigest()[:12]
-    return str(Path(tempfile.gettempdir()) / f"mm-deletions-{digest}")
 
 
 def _is_sqlite_busy(exc: BaseException) -> bool:

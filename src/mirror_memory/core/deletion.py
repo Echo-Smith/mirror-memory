@@ -366,3 +366,27 @@ class PgDeletionLog(DeletionLog):
 
 def new_db_id() -> str:
     return uuid.uuid4().hex
+
+
+def default_directory(database_url: str) -> str:
+    """The default log directory for *database_url* -- the ONE derivation
+    every component (engine, worker, server) must use, so the log a
+    deletion was written to is the log the replay reads:
+    SQLite -> a ``deletions/`` directory next to the database file;
+    everything else -> a temp directory keyed by the URL hash."""
+    if database_url.startswith("sqlite:///"):
+        db_path = database_url[len("sqlite:///"):]
+        return str((Path(db_path).parent / "deletions").resolve())
+    import hashlib
+    import tempfile
+
+    from sqlalchemy.engine import make_url
+
+    try:
+        # hash the SANITIZED form: str(engine.url) hides the password, and
+        # the engine (raw string) and the worker (bind.url) must agree
+        sanitized = make_url(database_url).render_as_string(hide_password=True)
+    except Exception:
+        sanitized = database_url
+    digest = hashlib.sha1(sanitized.encode()).hexdigest()[:12]
+    return str(Path(tempfile.gettempdir()) / f"mm-deletions-{digest}")

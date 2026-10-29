@@ -1729,7 +1729,14 @@ def ensure_watermark(engine: Engine) -> tuple[str, int]:
     brings back the backup's db_id and applied seq -- which is exactly how
     a restore is detected (see core.replay)."""
     table = _watermark_table(MetaData())
-    table.create(engine, checkfirst=True)
+    if not inspect(engine).has_table(WATERMARK_TABLE):
+        # concurrent creators race on the DDL; the loser re-checks (the
+        # winner's table is identical) instead of failing the startup
+        try:
+            table.create(engine, checkfirst=True)
+        except Exception:
+            if not inspect(engine).has_table(WATERMARK_TABLE):
+                raise
     with engine.begin() as conn:
         row = conn.execute(select(table.c.db_id, table.c.applied_seq)
                            .where(table.c.id == 1)).first()
@@ -1737,7 +1744,15 @@ def ensure_watermark(engine: Engine) -> tuple[str, int]:
             import uuid as _uuid
 
             db_id = _uuid.uuid4().hex
-            conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+            try:
+                conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+            except Exception:
+                if conn.execute(select(table.c.id).where(table.c.id == 1)).first() is None:
+                    raise
+                conn.rollback()
+                row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                                   .where(table.c.id == 1)).first()
+                return str(row[0]), int(row[1])
             return db_id, 0
         return str(row[0]), int(row[1])
 
