@@ -998,6 +998,11 @@ class MemoryEngine:
             belief = session.get(Belief, belief_id)
             if belief is None or belief.user_id != user_id:
                 return False
+            from mirror_memory.core import provenance
+
+            rule = provenance.visibility(session, user_id, self._purpose_or_default(purpose))
+            if not provenance.belief_is_visible(session, user_id, rule, belief_id):
+                return False  # identical to not-found; nothing written
             from_tier = belief.memory_tier or "hot"
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
@@ -1079,7 +1084,11 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
-            self._authorize(session, user_id, purpose, "correct")
+            authorized = self._authorize(session, user_id, purpose, "correct")
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            if not provenance.belief_is_visible(session, user_id, rule, belief_id):
+                # identical to the not-found return; no events, no writes
+                return None
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_CORRECT,

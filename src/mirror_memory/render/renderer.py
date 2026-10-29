@@ -270,7 +270,7 @@ def render_memory_block_with_ids(
     items: list[tuple[str, object | None]] = []
 
     # -- Rejected beliefs (D8 equivalent) -- fixed first slot ----------------
-    rejected = list_rejected_beliefs(session, user_id, limit=5)
+    rejected = list_rejected_beliefs(session, user_id, limit=5, visibility=visibility)
     if rejected:
         rejected_labels = [
             label
@@ -490,17 +490,15 @@ def _retrieve_session_snippets(
     """
     from mirror_memory.core.models import SessionSummary
 
-    summaries = (
-        session.query(SessionSummary)
-        .filter(SessionSummary.user_id == user_id)
-        .order_by(SessionSummary.created_at.desc())
-        .limit(60 if visibility else 20)
-        .all()
+    summary_query = session.query(SessionSummary).filter(
+        SessionSummary.user_id == user_id
     )
     if visibility is not None:
-        summaries = [r for r in summaries if visibility.purpose_visible(r.source_purpose)][:20]
-    if not summaries or not query:
-        return []
+        # in the WHERE, before the limit (starvation, M3 batch-3 patch task 4)
+        summary_query = summary_query.filter(
+            SessionSummary.source_purpose.in_(sorted(visibility.visible_purposes()))
+        )
+    summaries = summary_query.order_by(SessionSummary.created_at.desc()).limit(20).all()
     if not summaries or not query:
         return []
 

@@ -90,7 +90,7 @@ def build_panel(
             })
 
     # Rejected beliefs (boundary items)
-    rejected = list_rejected_beliefs(session, user_id, limit=5)
+    rejected = list_rejected_beliefs(session, user_id, limit=5, visibility=visibility)
     if rejected:
         boundary_labels = [
             label

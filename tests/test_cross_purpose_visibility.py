@@ -803,3 +803,61 @@ def test_digest_hint_gates_on_the_digest_union(db):
 # ---------------------------------------------------------------------------
 # batch-3 patch task 3: the residual entries
 # ---------------------------------------------------------------------------
+
+
+def test_correct_and_restore_treat_invisible_as_not_found_with_zero_writes(db):
+    eng = _p_q_setup(db)
+    p_belief = next(b for b in _beliefs(db) if SENTINEL in b.claim_text)
+    events_before = len(_events(db))
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+
+    # correct: None, exactly like a missing belief
+    missing = eng.correct(user_id=USER, belief_id=999_999,
+                          new_claim_text="x", purpose=Q)
+    corrected = eng.correct(user_id=USER, belief_id=p_belief.id,
+                            new_claim_text="rewritten", purpose=Q)
+    assert corrected is None and missing is None
+    # restore: False, exactly like a missing belief
+    assert eng.restore_belief(user_id=USER, belief_id=999_999, purpose=Q) is False
+    assert eng.restore_belief(user_id=USER, belief_id=p_belief.id, purpose=Q) is False
+    assert len(_events(db)) == events_before, "an invisible belief must not be touched"
+    # and the belief itself is unchanged
+    assert SENTINEL in next(b for b in _beliefs(db) if b.id == p_belief.id).claim_text
+
+
+def test_rejected_beliefs_are_visibility_filtered(db):
+    eng = _p_q_setup(db)
+    p_belief = next(b for b in _beliefs(db) if SENTINEL in b.claim_text)
+    q_belief = next(b for b in _beliefs(db) if "Berlin" in b.claim_text)
+    from mirror_memory.core.repository import reject_belief
+
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("reject both"):
+        s = F()
+        provenance.bind(s, Q)
+        reject_belief(s, USER, p_belief.id)
+        reject_belief(s, USER, q_belief.id)
+        s.commit()
+        s.close()
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+    rejected = eng.get_rejected(user_id=USER, purpose=Q) if hasattr(eng, "get_rejected") else None
+    from mirror_memory.core.repository import list_rejected_beliefs
+
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rule = provenance.visibility(s, USER)
+            rows = list_rejected_beliefs(s, USER, limit=5, visibility=rule)
+        finally:
+            s.close()
+    assert [b.id for b in rows] == [q_belief.id]
+
+
+def _events(db) -> list[BeliefEvent]:
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            return s.execute(select(BeliefEvent)).scalars().all()
+        finally:
+            s.close()

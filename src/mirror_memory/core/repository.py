@@ -1116,6 +1116,70 @@ def get_active_belief(session: Session, user_id: str, key: str) -> Belief | None
     return None
 
 
+def _visibility_sql_predicate(rule: "VisibilityRule"):
+    """The A2 rule as one SQL clause (M3 batch-3 patch task 4): applied
+    BEFORE the limit so a purpose with many invisible rows cannot starve
+    another purpose's few visible ones.  The EXISTS probes carry the full
+    composite key (belief ids are only unique per tenant)."""
+    from sqlalchemy import and_, exists, false as sa_false, or_
+
+    from mirror_memory.core.models import BeliefEvent, BeliefEvidenceLink, Evidence
+    from mirror_memory.core.provenance import PROVENANCE_EVENT_TYPES
+    from mirror_memory.core.tenancy import current_tenant
+
+    visible = sorted(rule.visible_purposes())
+    if not visible:
+        return sa_false()
+    tenant_id, app_id = current_tenant()
+
+    link = BeliefEvidenceLink
+    visible_evidence = (
+        select(Evidence.id).where(
+            Evidence.tenant_id == tenant_id,
+            Evidence.app_id == app_id,
+            Evidence.source_purpose.in_(visible),
+        )
+    )
+    link_ok = exists(
+        select(1).select_from(link).where(
+            link.tenant_id == tenant_id,
+            link.app_id == app_id,
+            link.belief_id == Belief.id,
+            link.evidence_id.in_(visible_evidence),
+        )
+    )
+    any_link = exists(
+        select(1).select_from(link).where(
+            link.tenant_id == tenant_id,
+            link.app_id == app_id,
+            link.belief_id == Belief.id,
+        )
+    )
+    prov = BeliefEvent
+    prov_ok = exists(
+        select(1).select_from(prov).where(
+            prov.tenant_id == tenant_id,
+            prov.app_id == app_id,
+            prov.belief_id == Belief.id,
+            prov.event_type.in_(PROVENANCE_EVENT_TYPES),
+            prov.source_purpose.in_(visible),
+        )
+    )
+    any_prov = exists(
+        select(1).select_from(prov).where(
+            prov.tenant_id == tenant_id,
+            prov.app_id == app_id,
+            prov.belief_id == Belief.id,
+            prov.event_type.in_(PROVENANCE_EVENT_TYPES),
+        )
+    )
+    # links present -> any visible link; no links -> any visible provenance
+    # event; neither recorded -> the unknown marker (visible while the
+    # global switch is on)
+    unrecorded = and_(~any_link, ~any_prov) if rule.unknown_visible else sa_false()
+    return or_(link_ok, and_(~any_link, prov_ok), unrecorded)
+
+
 def list_active_beliefs(
     session: Session,
     user_id: str,
@@ -1155,15 +1219,16 @@ def list_active_beliefs(
         conditions.append(Belief.status == "active")
     if dimensions:
         conditions.append(Belief.dimension.in_(dimensions))
+    # Cross-purpose visibility runs INSIDE the query, before the limit
+    # (M3 batch-3 patch task 4): post-limit filtering starves a purpose
+    # whose rows are older than another purpose's invisible bulk.
+    if visibility is not None:
+        conditions.append(_visibility_sql_predicate(visibility))
     stmt = select(Belief).where(*conditions).order_by(desc(Belief.last_evidence_at)).limit(limit)
     results = list(session.scalars(stmt))
     # Filter out expired life events.
     results = [b for b in results if not _is_expired(b)]
     results = _filter_by_temporal_mode(results, temporal_mode)
-    # Cross-purpose visibility (M3 batch 3): with a rule, only beliefs whose
-    # provenance passes it come back.  None = unfiltered (bench/tests).
-    if visibility is not None:
-        results = provenance.beliefs_visible(session, user_id, visibility, results)
     return results
 
 
@@ -1253,6 +1318,8 @@ def recall_candidates(
             for token in sorted(tokens)
         ])
         conditions = [Belief.user_id == user_id, Belief.status.in_(statuses), tier_filter, pattern]
+        if visibility is not None:
+            conditions.append(_visibility_sql_predicate(visibility))
         if dimensions:
             conditions.append(Belief.dimension.in_(dimensions))
         relevant = list(session.scalars(
@@ -1264,6 +1331,8 @@ def recall_candidates(
     recent: list[Belief] = []
     if recent_limit > 0:
         conditions = [Belief.user_id == user_id, Belief.status == "active", tier_filter]
+        if visibility is not None:
+            conditions.append(_visibility_sql_predicate(visibility))
         if dimensions:
             conditions.append(Belief.dimension.in_(dimensions))
         recent = list(session.scalars(
@@ -1283,10 +1352,8 @@ def recall_candidates(
 
     merged = [b for b in merged if not _is_expired(b)]
     merged = _filter_by_temporal_mode(merged, temporal_mode)
-    # Cross-purpose visibility BEFORE the slot logic: an invisible belief
-    # must not suppress an older visible one in its single-value slot.
-    if visibility is not None:
-        merged = provenance.beliefs_visible(session, user_id, visibility, merged)
+    # (visibility is applied inside the SQL -- both slices -- so the slot
+    # logic only ever sees visible beliefs)
     merged = _keep_newest_per_single_slot(merged, temporal_mode, _SINGLE_VALUED_PREDICATES)
     return _filter_withdrawn(merged, temporal_mode)
 
@@ -1537,8 +1604,13 @@ def _interval_is_current(belief: Belief, now: datetime) -> bool:
     return True
 
 
-def list_rejected_beliefs(session: Session, user_id: str, *, limit: int = 5) -> list[Belief]:
-    """Rejected beliefs, most-recently updated first."""
+def list_rejected_beliefs(
+    session: Session, user_id: str, *, limit: int = 5,
+    visibility: "VisibilityRule | None" = None,
+) -> list[Belief]:
+    """Rejected beliefs, most-recently updated first.  With a visibility
+    rule, only beliefs whose provenance passes it (a rejected belief is
+    still the user's boundary statement -- collected under a purpose)."""
     if not is_memory_enabled(session, user_id):
         return []
     stmt = (
@@ -1547,7 +1619,10 @@ def list_rejected_beliefs(session: Session, user_id: str, *, limit: int = 5) -> 
         .order_by(desc(Belief.updated_at))
         .limit(limit)
     )
-    return list(session.scalars(stmt))
+    results = list(session.scalars(stmt))
+    if visibility is not None:
+        results = provenance.beliefs_visible(session, user_id, visibility, results)
+    return results
 
 
 def get_belief_events(session: Session, user_id: str, belief_id: int, *, limit: int = 50) -> list[BeliefEvent]:
