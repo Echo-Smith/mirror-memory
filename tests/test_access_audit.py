@@ -16,6 +16,7 @@ it, so a new memory-reading entry cannot ship un-audited.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -428,6 +429,10 @@ def test_each_allowed_read_adds_exactly_one_audit_insert(db):
         assert all(a.upper().startswith("INSERT") for a in audit), (key, audit)
 
 
+@pytest.mark.skipif(
+    os.environ.get("MM_DATABASE_URL", "").startswith("postgresql"),
+    reason="the embedded write-lock behaviour under concurrent audited reads "
+           "is SQLite semantics (PG readers do not take the file write lock)")
 def test_sqlite_concurrent_reads_complete_under_the_write_lock(tmp_path):
     """On SQLite every audited read is now a write transaction: concurrent
     readers serialise on the file's write lock instead of running in

@@ -25,6 +25,12 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
+        "sqlite_only(reason): the test exercises embedded-SQLite behaviour "
+        "(the file write lock) that PostgreSQL does not have; mandatory "
+        "reason, mirrored",
+    )
+    config.addinivalue_line(
+        "markers",
         "postgres_only(reason): the test exercises PostgreSQL catalog "
         "behaviour that SQLite cannot express; mandatory reason, mirrored "
         "on the sqlite_only side by dialect-conditional skips",

@@ -201,8 +201,11 @@ def _pg_dump(main_db: str, out: str) -> None:
             env=env, capture_output=True, check=True)
         Path(out).write_bytes(result.stdout)
     else:
-        subprocess.run(["pg_dump", "--format=custom",
-                        "--file", out, main_db], env=env, check=True)
+        # the CI runner has the client tools; connect explicitly (a bare
+        # db name would use the OS user's local socket)
+        pg_url = os.environ["MM_DATABASE_URL"].split("+", 1)[0]
+        subprocess.run(["pg_dump", "--format=custom", "--file", out, pg_url],
+                       env=env, check=True)
 
 
 def _pg_restore(main_db: str, dump: str) -> None:

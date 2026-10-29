@@ -2651,7 +2651,7 @@ def bump_deletion_generation(
     from mirror_memory.core.models import DeletionGeneration
     from mirror_memory.core.tenancy import current_tenant, deletion_write_scope
 
-    for _ in range(8):
+    for _ in range(64):
         latest = session.scalar(
             select(func.max(DeletionGeneration.generation)).where(
                 DeletionGeneration.user_id == user_id
