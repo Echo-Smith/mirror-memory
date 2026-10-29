@@ -926,3 +926,108 @@ def test_forget_session_deletes_all_purpose_rows_and_every_read_is_clean(db):
     assert all(SENTINEL not in b.claim_text for b in beliefs)
     page = eng.export_page(user_id=USER, purpose=Q)
     assert SENTINEL not in json.dumps(page.to_dict(), default=str)
+
+
+# ---------------------------------------------------------------------------
+# M4 task 0: snapshot invalidation on deletion (sentinel tests)
+# ---------------------------------------------------------------------------
+
+
+def _worker_rebuild(db, purpose: str):
+    """Run one worker job under *purpose* and return what it wrote."""
+    cfg = load_config("config/")
+    cfg.llm_client = _FakeLLM()
+    cfg.worker.job_lease_seconds = 60
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            job = enqueue_job(s, USER, cfg, purpose=purpose)
+            s.commit()
+            token = _claim_job(s, job.id, lease_seconds=60)
+            _process_single_job(s, s.get(EvolutionJob, job.id), cfg, token)
+            s.commit()
+            s.expire_all()
+            return s.get(EvolutionJob, job.id)
+        finally:
+            s.close()
+
+
+def test_belief_forget_invalidates_snapshots_rebuild_carries_no_sentinel(db):
+    """A snapshot synthesized from a belief survives only until that
+    belief is forgotten: forget_belief deletes ALL the user's snapshots in
+    the deletion transaction (stronger than read-skip), the worker's
+    rebuild contains none of the forgotten content, and no read path
+    surfaces it."""
+    eng = _engine(db)
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I like {SENTINEL} and coffee.", P, "s1")
+    _observe(eng, "I live in Berlin and work as a nurse.", Q, "s2")
+    _worker_rebuild(db, P)
+    from mirror_memory.core.models import Snapshot
+
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            assert s.execute(select(Snapshot)).scalars().all(), "sanity: a snapshot exists"
+        finally:
+            s.close()
+    belief = next(b for b in _beliefs(db) if SENTINEL in b.claim_text)
+    assert eng.forget_belief(user_id=USER, belief_id=belief.id, purpose=P) is True
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            assert s.execute(select(Snapshot)).scalars().all() == [], (
+                "the deletion transaction must invalidate every snapshot"
+            )
+        finally:
+            s.close()
+    _worker_rebuild(db, Q)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            snaps = [x.content_json for x in s.execute(select(Snapshot)).scalars()]
+            jobs = [j.error_code for j in s.execute(select(EvolutionJob)).scalars()]
+        finally:
+            s.close()
+    assert all(SENTINEL not in text for text in snaps), snaps
+    # the whole read surface too
+    assert SENTINEL not in (eng.recall(user_id=USER, query=SENTINEL, purpose=Q) or "")
+    assert SENTINEL not in json.dumps(eng.export_page(user_id=USER, purpose=Q).to_dict(), default=str)
+
+
+def test_session_forget_leaves_no_summary_text_and_snapshots_unaffected(db):
+    """Session scope: the raw text lives only in the summary rows; the
+    forget removes every purpose's rows, and snapshots (which synthesize
+    from beliefs, not summaries) are untouched by design."""
+    cfg = load_config("config/")
+    cfg.session_summary_enabled = True
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+    eng = MemoryEngine(config=cfg, database_url=str(db.url),
+                       tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM())
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I keep notes about {SENTINEL} in the attic.", P, "shared")
+    _observe(eng, "I keep notes about gardening in the shed.", Q, "shared")
+    _worker_rebuild(db, Q)
+    from mirror_memory.core.models import SessionSummary, Snapshot
+
+    eng.forget_session(user_id=USER, session_id="shared", purpose=Q)
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            assert s.execute(select(SessionSummary)).scalars().all() == []
+            snaps = [x.content_json for x in s.execute(select(Snapshot)).scalars()]
+        finally:
+            s.close()
+    assert all(SENTINEL not in text for text in snaps)
+    assert SENTINEL not in (eng.recall(user_id=USER, query="attic notes", purpose=Q) or "")
