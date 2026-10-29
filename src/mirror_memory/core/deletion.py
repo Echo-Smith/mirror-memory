@@ -301,7 +301,7 @@ class PgDeletionLog(DeletionLog):
                 " purpose VARCHAR(64) NOT NULL DEFAULT '',"
                 " prev_hash CHAR(64) NOT NULL,"
                 " hash CHAR(64) NOT NULL,"
-                " created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+                " created_at TIMESTAMP NOT NULL DEFAULT now(),"
                 " PRIMARY KEY (db_id, seq))"
             ))
 
