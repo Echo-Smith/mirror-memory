@@ -8,6 +8,7 @@ scoring and budget computation.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -178,7 +179,30 @@ def render_memory_block(
     tail_load: int = 0,
     trace_hook: object | None = None,
     now: datetime | None = None,
+    visibility: "VisibilityRule | None" = None,
 ) -> str | None:
+    """Render a memory block for prompt injection (see
+    :func:`render_memory_block_with_ids`, which also returns the ids of
+    the beliefs that reached the block -- the access audit needs them)."""
+    block, _ids = render_memory_block_with_ids(
+        session, user_id, config, user_message=user_message, language=language,
+        tail_load=tail_load, trace_hook=trace_hook, now=now, visibility=visibility,
+    )
+    return block
+
+
+def render_memory_block_with_ids(
+    session: object,
+    user_id: str,
+    config: MemoryConfig,
+    *,
+    user_message: str = "",
+    language: str = "zh",
+    tail_load: int = 0,
+    trace_hook: object | None = None,
+    now: datetime | None = None,
+    visibility: "VisibilityRule | None" = None,
+) -> tuple[str | None, list[int]]:
     """Render a memory block for prompt injection.
 
     Parameters
@@ -209,9 +233,9 @@ def render_memory_block(
 
     Returns
     -------
-    str or None
-        The rendered memory block, or ``None`` if there is nothing to
-        render.
+    (block, belief_ids)
+        The rendered memory block (``None`` if there is nothing to render)
+        and the ids of the beliefs that reached it, in render order.
     """
     def _trace(stage: str, **fields: object) -> None:
         if trace_hook is None:
@@ -246,7 +270,7 @@ def render_memory_block(
     items: list[tuple[str, object | None]] = []
 
     # -- Rejected beliefs (D8 equivalent) -- fixed first slot ----------------
-    rejected = list_rejected_beliefs(session, user_id, limit=5)
+    rejected = list_rejected_beliefs(session, user_id, limit=5, visibility=visibility)
     if rejected:
         rejected_labels = [
             label
@@ -284,6 +308,7 @@ def render_memory_block(
     all_beliefs = recall_candidates(
         session, user_id, query=user_message,
         temporal_mode=_detect_temporal_mode(user_message),
+        visibility=visibility,
     )
     now = now or datetime.now(UTC)
     # Evidence is a first-class entity now, so the multi-evidence bonus counts
@@ -384,7 +409,7 @@ def render_memory_block(
         digests = digests_for_beliefs(session, [b.id for b in evidence_beliefs])
         for belief in evidence_beliefs:
             digest = digests.get(belief.id)
-            if digest is not None and digest.summary:
+            if digest is not None and digest.summary and _digest_hint_visible(digest, visibility):
                 hint = f"[evidence] {belief.key}: {digest.summary}"
             else:
                 count = evidence_counts.get(belief.id) or 0
@@ -403,7 +428,9 @@ def render_memory_block(
         # Check if key query terms appear in the block.
         matched = sum(1 for w in query_nouns if w in block_lower)
         if query_nouns and matched < len(query_nouns) * QUERY_NOUN_MATCH_THRESHOLD:
-            snippets = _retrieve_session_snippets(session, user_id, user_message, limit=3)
+            snippets = _retrieve_session_snippets(
+                session, user_id, user_message, limit=3, visibility=visibility,
+            )
             if snippets:
                 snippet_text = " | ".join(snippets)
                 # Allow 2x budget for snippet overflow.
@@ -425,7 +452,23 @@ def render_memory_block(
         budget=budget,
         used_snippet_fallback=bool(user_message and config.session_summary_enabled and "[context]" in (block or "")),
     )
-    return block or None
+    return (block or None), list(accessed_ids)
+
+
+def _digest_hint_visible(digest: object, visibility: "VisibilityRule | None") -> bool:
+    """The digest folds its evidence's TEXT (M3 batch-3 patch): show the
+    hint only when every purpose in the digest's recorded input union is
+    visible.  Pre-patch digests (empty union) keep the safe fallback --
+    the observation-count hint -- when a rule is active."""
+    if visibility is None:
+        return True
+    try:
+        listed = [p for p in json.loads(digest.source_purposes_json or "[]") if p]
+    except (ValueError, AttributeError, TypeError):
+        return False
+    from mirror_memory.core import provenance
+
+    return provenance.merged_visible(visibility, listed)
 
 
 def _retrieve_session_snippets(
@@ -433,21 +476,29 @@ def _retrieve_session_snippets(
     user_id: str,
     query: str,
     limit: int = 3,
+    *,
+    visibility: "VisibilityRule | None" = None,
 ) -> list[str]:
     """Search session summaries for snippets matching query keywords.
 
     Returns the most relevant snippets (by keyword hit count), preserving
     specific details like dates, names, and numbers.
+
+    With a visibility rule, summaries collected under purposes the rule
+    refuses are withheld: the fallback returns raw message text, so a
+    summary is provenance exactly like evidence (M3 batch 3).
     """
     from mirror_memory.core.models import SessionSummary
 
-    summaries = (
-        session.query(SessionSummary)
-        .filter(SessionSummary.user_id == user_id)
-        .order_by(SessionSummary.created_at.desc())
-        .limit(20)
-        .all()
+    summary_query = session.query(SessionSummary).filter(
+        SessionSummary.user_id == user_id
     )
+    if visibility is not None:
+        # in the WHERE, before the limit (starvation, M3 batch-3 patch task 4)
+        summary_query = summary_query.filter(
+            SessionSummary.source_purpose.in_(sorted(visibility.visible_purposes()))
+        )
+    summaries = summary_query.order_by(SessionSummary.created_at.desc()).limit(20).all()
     if not summaries or not query:
         return []
 

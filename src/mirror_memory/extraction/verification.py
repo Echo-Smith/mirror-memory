@@ -92,6 +92,7 @@ def get_question_candidates(
     config: MemoryConfig,
     *,
     limit: int = 1,
+    visibility: "VisibilityRule | None" = None,
 ) -> list[Belief]:
     """Get L4 beliefs eligible for verification questioning.
 
@@ -122,6 +123,12 @@ def get_question_candidates(
         )
     )
 
+    if visibility is not None:
+        # a question quotes the claim text: an invisible belief must never
+        # be surfaced for questioning under a purpose that cannot see it
+        from mirror_memory.core import provenance
+
+        rows = provenance.beliefs_visible(session, user_id, visibility, rows)
     pending = [
         b
         for b in rows

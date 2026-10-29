@@ -56,6 +56,7 @@ from sqlalchemy import (
     inspect,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.engine import Engine
@@ -275,7 +276,15 @@ class AlterColumnClause(DDLElement):
     inherit_cache = True
 
     def __init__(self, table: str, column: str, clause: str) -> None:
-        if clause not in ("SET NOT NULL", "SET DEFAULT ''"):
+        allowed = ("SET NOT NULL", "SET DEFAULT ''")
+        # "SET DEFAULT '<value>'": step 6's optional legacy purpose is an
+        # operator-chosen constant; it must be a plain token (validated by
+        # the step) and is rendered as a quoted literal by the compiler
+        if clause.startswith("SET DEFAULT '") and clause.endswith("'"):
+            value = clause[len("SET DEFAULT '"):-1]
+            if value and not any(c.isspace() for c in value) and "'" not in value:
+                allowed = allowed + (clause,)
+        if clause not in allowed:
             raise MigrationError("unsupported ALTER COLUMN clause: " + repr(clause))
         self.table = table
         self.column = column
@@ -431,36 +440,40 @@ def _backfill_column(
     assignments: dict[str, str],
     null_predicate_names: list[str],
     batch: int,
+    *,
+    marker: str | None = None,
 ) -> int:
     """Batched, re-entrant backfill of *assignments* on rows where any of
-    *null_predicate_names* is NULL.
+    *null_predicate_names* is NULL -- or, with *marker*, equals that marker
+    (the empty-string "unknown" marker steps 6 and 7 leave behind, so a
+    re-entry can stamp a value chosen between runs onto them).
 
     Expressed with SQLAlchemy constructs: the batch subquery selects primary
     keys, the outer statement updates only those rows, every assigned value
-    is a bound parameter.
+    is a bound parameter.  Composite primary keys (every tenant table after
+    step 2) are matched as a row value, ``(tenant_id, app_id, id) IN
+    (SELECT ...)``; a single-column key degenerates to the plain ``IN``.
     """
     table = _live_table(engine, name)
     if table is None:
         return 0
     pk = list(table.primary_key.columns)
-    if len(pk) != 1:
-        raise MigrationError(
-            "batched backfill needs a single-column primary key on " + name
-        )
-    pk_col = pk[0]
+    if not pk:
+        raise MigrationError("batched backfill needs a primary key on " + name)
     null_filter = None
     for col_name in null_predicate_names:
         condition = table.c[col_name].is_(None)
+        if marker is not None:
+            condition = condition | (table.c[col_name] == marker)
         null_filter = condition if null_filter is None else (null_filter | condition)
 
+    key = pk[0] if len(pk) == 1 else tuple_(*pk)
     total = 0
     while True:
-        batch_ids = (
-            select(pk_col).where(null_filter).limit(batch).scalar_subquery()
-        )
+        batch_keys = select(*pk).where(null_filter).limit(batch)
         stmt = (
             update(table)
-            .where(pk_col.in_(batch_ids))
+            .where(key.in_(batch_keys))
             .values(assignments)
         )
         with system_scope(reason=_MIGRATION_REASON):
@@ -1210,6 +1223,490 @@ class Step5TenantUserIndexes:
                 )
 
 
+# ---------------------------------------------------------------------------
+# Step 6: purpose authorization tables (M3 batch-1 task 1)
+# ---------------------------------------------------------------------------
+
+PURPOSE_TABLES = ("mm_purpose_grants", "mm_purpose_grant_events")
+
+
+def _count_legacy_jobs(engine: Engine) -> int:
+    """Pre-M3 evolution jobs (purpose == '') that the worker will CANCEL
+    at runtime (missing_purpose).  Whole-table count across all tenants --
+    the same cross-tenant maintenance read as the other migration helpers.
+    """
+    table = _live_table(engine, "mm_evolution_jobs")
+    if table is None or "purpose" not in table.c:
+        return 0
+    with system_scope(reason=_MIGRATION_REASON):
+        with engine.connect() as conn:
+            return int(
+                conn.execute(
+                    select(func.count()).select_from(table)
+                    .where(table.c.purpose == "")
+                ).scalar_one()
+            )
+
+
+def _legacy_purpose_value(explicit: str | None) -> str:
+    """The operator's purpose for pre-M3 rows: the explicit dataclass
+    argument, else ``MM_LEGACY_JOB_PURPOSE``; "" means "keep the empty
+    marker".  Shared by steps 6 (jobs) and 7 (provenance rows) so one
+    choice labels both."""
+    import os
+
+    value = explicit
+    if value is None:
+        value = os.environ.get("MM_LEGACY_JOB_PURPOSE", "") or ""
+    value = value.strip()
+    if value and any(c.isspace() for c in value):
+        raise MigrationError("legacy_job_purpose must not contain whitespace")
+    return value
+
+
+@dataclass
+class Step6PurposeAuthorization:
+    """Create the purpose-authorization tables and add ``mm_evolution_jobs
+    .purpose``.
+
+    Fresh databases get everything from ``create_all``; this step brings
+    databases already at version 5 up.  Re-entrant: tables are created
+    with ``checkfirst``, the column addition resumes its backfill, and the
+    RLS plan is idempotent.
+
+    - The two tables are created FROM THE MODEL METADATA, so every dialect
+      gets the same shape ``create_all`` would have made (the composite
+      tenant primary key included -- both their keys are all-string and
+      need no SQLite narrowing).
+    - ``mm_evolution_jobs.purpose``: ``ADD COLUMN`` (nullable) -> batched
+      backfill -> non-blocking ``SET NOT NULL`` (the same ``NOT VALID``
+      CHECK / ``VALIDATE`` / ``SET NOT NULL`` recipe as step 1).  The
+      backfill value is the OPTIONAL ``legacy_job_purpose`` (dataclass
+      argument, or ``MM_LEGACY_JOB_PURPOSE``): with it, pre-M3 jobs are
+      labelled with that purpose -- they still only run if a valid grant
+      for it exists at runtime; without it the empty purpose marks
+      pre-M3 jobs and the worker cancels them with ``missing_purpose``
+      instead of running them ungated.  The number of jobs that will be
+      cancelled that way is logged and returned by ``upgrade_database``
+      under ``legacy_jobs_to_cancel`` -- decide before upgrading.
+    - PostgreSQL: the RLS posture is applied to the two new tables (the
+      databases this step runs on already have step 3's roles and the
+      tenant tables protected; a fresh database gets everything at once
+      from ``install_row_level_security``).
+    """
+
+    version: int = 6
+    name: str = "purpose authorization tables"
+    legacy_job_purpose: str | None = None
+
+    def _legacy_purpose(self) -> str:
+        return _legacy_purpose_value(self.legacy_job_purpose)
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        if any(not insp.has_table(name) for name in PURPOSE_TABLES):
+            return True
+        return "purpose" not in _table_columns(engine, "mm_evolution_jobs")
+
+    def apply(self, engine: Engine) -> None:
+        from mirror_memory.core.models import EvolutionJob
+
+        self.legacy_jobs_to_cancel = 0
+        legacy = self._legacy_purpose()
+        backfill_value = legacy  # "" keeps the pre-M3 cancel-at-runtime shape
+        for name in PURPOSE_TABLES:
+            Base.metadata.tables[name].create(engine, checkfirst=True)
+        if "purpose" not in _table_columns(engine, "mm_evolution_jobs"):
+            if _is_postgres(engine):
+                _DDLPlan([AddColumn("mm_evolution_jobs", "purpose", "VARCHAR(64)")]).run(engine)
+                _backfill_column(
+                    engine, "mm_evolution_jobs", {"purpose": backfill_value}, ["purpose"],
+                    DEFAULT_BACKFILL_BATCH,
+                )
+                notnull = [_lock_timeout_element()]
+                check = AddNotNullCheck("mm_evolution_jobs", "purpose")
+                notnull.append(check)
+                notnull.append(ValidateConstraint("mm_evolution_jobs", check.constraint_name))
+                notnull.append(AlterColumnClause("mm_evolution_jobs", "purpose", "SET NOT NULL"))
+                notnull.append(
+                    AlterColumnClause(
+                        "mm_evolution_jobs", "purpose",
+                        "SET DEFAULT " + ("'" + backfill_value + "'" if backfill_value else "''"),
+                    )
+                )
+                notnull.append(DropConstraintByName("mm_evolution_jobs", check.constraint_name))
+                _DDLPlan(notnull).run(engine)
+            else:
+                # SQLite allows ADD COLUMN with a NOT NULL constant default
+                _DDLPlan([AddColumn(
+                    "mm_evolution_jobs", "purpose",
+                    "VARCHAR(64) NOT NULL DEFAULT '%s'" % backfill_value,
+                )]).run(engine)
+        elif backfill_value:
+            # re-entry with a legacy purpose chosen between failed runs:
+            # stamp it onto rows still carrying the empty marker
+            _backfill_column(
+                engine, "mm_evolution_jobs", {"purpose": backfill_value},
+                ["purpose"], DEFAULT_BACKFILL_BATCH, marker="",
+            )
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=list(PURPOSE_TABLES))).run(engine)
+        # How many pre-M3 jobs the worker will CANCEL (empty purpose =
+        # missing_purpose at runtime).  Logged and returned so the operator
+        # sees the blast radius of not choosing a legacy purpose.
+        self.legacy_jobs_to_cancel = _count_legacy_jobs(engine)
+        if self.legacy_jobs_to_cancel:
+            logger.warning(
+                "migration: %d pre-M3 evolution job(s) have no purpose and "
+                "will be cancelled at runtime; pass legacy_job_purpose "
+                "(MM_LEGACY_JOB_PURPOSE) before upgrading to keep them",
+                self.legacy_jobs_to_cancel,
+            )
+
+    def verify(self, engine: Engine) -> None:
+        if "purpose" not in _table_columns(engine, "mm_evolution_jobs"):
+            raise MigrationError("verification failed: mm_evolution_jobs.purpose missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=list(PURPOSE_TABLES))
+
+
+#: Tables that record where memory came from and therefore carry the
+#: purpose it was collected under (M3 batch-2 task 1).
+SOURCE_PURPOSE_TABLES: tuple[str, ...] = ("mm_evidence", "mm_belief_events", "mm_snapshots")
+
+
+@dataclass
+class Step7SourcePurpose:
+    """Add ``source_purpose`` to the provenance tables.
+
+    ``mm_evidence``, ``mm_belief_events`` and ``mm_snapshots`` gain a NOT
+    NULL ``VARCHAR(64)`` whose value is the purpose the writing entry was
+    authorized for -- observe's purpose on evidence and ledger events, the
+    job's purpose on the snapshot the worker synthesises (see
+    ``core.provenance``).  Fresh databases get the column from
+    ``create_all`` (``server_default=''``); this step brings version-6
+    databases up.  Re-entrant: a table that already has the column is
+    skipped (or, with a legacy purpose, only re-stamped).
+
+    - Existing rows are backfilled with the EMPTY MARKER ``''`` -- "source
+      not recorded" -- unless the OPTIONAL ``legacy_job_purpose`` (the same
+      dataclass argument / ``MM_LEGACY_JOB_PURPOSE`` step 6 uses) is given,
+      in which case pre-M3 rows are labelled with it: one operator choice
+      labels the pre-M3 jobs and the pre-M3 memory alike.  Re-entering
+      with a legacy purpose chosen between runs stamps it onto the rows
+      still carrying ``''``.
+    - The column's server default is always ``''``: the legacy purpose
+      labels what exists, it must never leak onto rows written later.
+    - PostgreSQL: ``ADD COLUMN`` (nullable) -> batched backfill -> the
+      non-blocking ``NOT VALID`` CHECK / ``VALIDATE`` / ``SET NOT NULL``
+      recipe -> ``SET DEFAULT ''``.  SQLite: ``ADD COLUMN ... NOT NULL
+      DEFAULT ''`` then the batched backfill for the legacy purpose.
+    - No new table, so the RLS posture and the write-guard classes are
+      unchanged; the only system_scope use is the reviewed
+      ``_backfill_column``.
+    """
+
+    version: int = 7
+    name: str = "source purpose on evidence, belief events and snapshots"
+    legacy_job_purpose: str | None = None
+
+    def _legacy_purpose(self) -> str:
+        return _legacy_purpose_value(self.legacy_job_purpose)
+
+    def needed(self, engine: Engine) -> bool:
+        return any(
+            "source_purpose" not in _table_columns(engine, table)
+            for table in SOURCE_PURPOSE_TABLES
+        )
+
+    def apply(self, engine: Engine) -> None:
+        legacy = self._legacy_purpose()
+        self.rows_labelled: dict[str, int] = {}
+        for table in SOURCE_PURPOSE_TABLES:
+            if "source_purpose" not in _table_columns(engine, table):
+                if _is_postgres(engine):
+                    _DDLPlan([AddColumn(table, "source_purpose", "VARCHAR(64)")]).run(engine)
+                    filled = _backfill_column(
+                        engine, table, {"source_purpose": legacy}, ["source_purpose"],
+                        DEFAULT_BACKFILL_BATCH,
+                    )
+                    check = AddNotNullCheck(table, "source_purpose")
+                    _DDLPlan([
+                        _lock_timeout_element(),
+                        check,
+                        ValidateConstraint(table, check.constraint_name),
+                        AlterColumnClause(table, "source_purpose", "SET NOT NULL"),
+                        AlterColumnClause(table, "source_purpose", "SET DEFAULT ''"),
+                        DropConstraintByName(table, check.constraint_name),
+                    ]).run(engine)
+                    self.rows_labelled[table] = filled if legacy else 0
+                    continue
+                _DDLPlan([AddColumn(
+                    table, "source_purpose", "VARCHAR(64) NOT NULL DEFAULT ''",
+                )]).run(engine)
+            if legacy:
+                self.rows_labelled[table] = _backfill_column(
+                    engine, table, {"source_purpose": legacy}, ["source_purpose"],
+                    DEFAULT_BACKFILL_BATCH, marker="",
+                )
+        if legacy:
+            logger.info(
+                "migration: source_purpose labelled with %r on %s",
+                legacy,
+                ", ".join(f"{t}={n}" for t, n in self.rows_labelled.items()),
+            )
+
+    def verify(self, engine: Engine) -> None:
+        for table in SOURCE_PURPOSE_TABLES:
+            cols = {c["name"]: c for c in inspect(engine).get_columns(table)}
+            if "source_purpose" not in cols:
+                raise MigrationError(f"verification failed: {table}.source_purpose missing")
+            if cols["source_purpose"].get("nullable", True):
+                raise MigrationError(f"verification failed: {table}.source_purpose is nullable")
+
+
+#: The access audit table (M3 batch-2 task 2).
+ACCESS_AUDIT_TABLE = "mm_access_audit"
+
+
+@dataclass
+class Step8AccessAudit:
+    """Create ``mm_access_audit`` (M3 batch-2 task 2).
+
+    Fresh databases get it from ``create_all``; this step brings version-7
+    databases up.  Created FROM THE MODEL METADATA with ``checkfirst`` (so
+    every dialect gets the composite tenant primary key and the two
+    tenant-prefixed indexes ``create_all`` would make), then on PostgreSQL
+    the RLS posture is applied to the new table.  Re-entrant: the create is
+    skipped when the table exists and the RLS plan is idempotent.  Nothing
+    to backfill -- the table starts empty.
+    """
+
+    version: int = 8
+    name: str = "access audit table"
+
+    def needed(self, engine: Engine) -> bool:
+        return not inspect(engine).has_table(ACCESS_AUDIT_TABLE)
+
+    def apply(self, engine: Engine) -> None:
+        Base.metadata.tables[ACCESS_AUDIT_TABLE].create(engine, checkfirst=True)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=[ACCESS_AUDIT_TABLE])).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        if not inspect(engine).has_table(ACCESS_AUDIT_TABLE):
+            raise MigrationError("verification failed: mm_access_audit missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=[ACCESS_AUDIT_TABLE])
+
+
+#: The bare ``belief_id`` indexes step 9 replaces (SQLAlchemy's default
+#: names for ``index=True`` on those columns).
+LEGACY_BELIEF_INDEXES: dict[str, str] = {
+    "mm_belief_evidence_links": "ix_mm_belief_evidence_links_belief_id",
+    "mm_belief_events": "ix_mm_belief_events_belief_id",
+}
+
+#: The tenant-prefixed replacements (the model declares them for fresh
+#: databases).
+TENANT_BELIEF_INDEXES: dict[str, str] = {
+    "mm_belief_evidence_links": "ix_mm_belief_evidence_links_tenant_belief",
+    "mm_belief_events": "ix_mm_belief_events_tenant_belief",
+}
+
+
+def _belief_index_pair(table_name: str, concurrently: bool):
+    """(new tenant-prefixed index, legacy single-column index) on a DETACHED
+    copy of the model table -- the model already declares the composite one,
+    and the legacy name is not in the metadata any more."""
+    table = Base.metadata.tables[table_name].to_metadata(MetaData())
+    for index in list(table.indexes):
+        if index.name in (TENANT_BELIEF_INDEXES[table_name], LEGACY_BELIEF_INDEXES[table_name]):
+            table.indexes.discard(index)
+    new = Index(
+        TENANT_BELIEF_INDEXES[table_name],
+        table.c.tenant_id, table.c.app_id, table.c.belief_id,
+        postgresql_concurrently=concurrently,
+    )
+    old = Index(LEGACY_BELIEF_INDEXES[table_name], table.c.belief_id,
+                postgresql_concurrently=concurrently)
+    return new, old
+
+
+@dataclass
+class Step9RecallVisibility:
+    """Recall-visibility support (M3 batch 3): tenant-prefixed belief_id
+    indexes and provenance on the session summaries.
+
+    - ``mm_belief_evidence_links`` / ``mm_belief_events``: the bare
+      ``belief_id`` index is REPLACED by ``(tenant_id, app_id, belief_id)``
+      -- the visibility filter's probes (and every other per-belief lookup)
+      always carry the tenant predicates, so the bare index matched every
+      tenant's rows for an id and was intersected with the primary key.
+      Replacement, not addition: the index count per table does not grow.
+      PostgreSQL: ``CREATE INDEX CONCURRENTLY`` the new index (an INVALID
+      leftover of a failed build is dropped and rebuilt), then
+      ``DROP INDEX CONCURRENTLY`` the old one -- both outside transactions,
+      both re-entrant.  SQLite: plain create/drop.
+    - ``mm_session_summaries.source_purpose``: recall's session-summary
+      fallback returns raw message text, so the summaries are provenance
+      like evidence.  The same NOT NULL VARCHAR(64) / server default ''
+      recipe as step 7; existing rows carry the empty marker unless the
+      OPTIONAL ``legacy_job_purpose`` (shared with steps 6 and 7) labels
+      them.  Re-entrant per artifact.
+    """
+
+    version: int = 9
+    name: str = "recall visibility: tenant belief indexes + summary provenance"
+    legacy_job_purpose: str | None = None
+
+    def _legacy_purpose(self) -> str:
+        return _legacy_purpose_value(self.legacy_job_purpose)
+
+    def needed(self, engine: Engine) -> bool:
+        if "source_purpose" not in _table_columns(engine, "mm_session_summaries"):
+            return True
+        states = {
+            name: _index_state(engine, table, TENANT_BELIEF_INDEXES[table])
+            for table, name in TENANT_BELIEF_INDEXES.items()
+        }
+        return any(state != "valid" for state in states.values())
+
+    def apply(self, engine: Engine) -> None:
+        pg = _is_postgres(engine)
+        legacy = self._legacy_purpose()
+        for table in TENANT_BELIEF_INDEXES:
+            new, old = _belief_index_pair(table, concurrently=pg)
+            elements = []
+            if pg:
+                if _index_state(engine, table, new.name) == "invalid":
+                    elements.append(DropIndex(new, if_exists=True))
+                if _index_state(engine, table, new.name) != "valid":
+                    elements.append(CreateIndex(new))
+                if _index_state(engine, table, old.name) is not None:
+                    elements.append(DropIndex(old, if_exists=True))
+                if elements:
+                    _DDLPlan(elements, autocommit=True).run(engine)
+            else:
+                new.create(engine, checkfirst=True)
+                old.drop(engine, checkfirst=True)
+        if "source_purpose" not in _table_columns(engine, "mm_session_summaries"):
+            if pg:
+                _DDLPlan([AddColumn("mm_session_summaries", "source_purpose", "VARCHAR(64)")]).run(engine)
+                _backfill_column(
+                    engine, "mm_session_summaries", {"source_purpose": legacy},
+                    ["source_purpose"], DEFAULT_BACKFILL_BATCH,
+                )
+                check = AddNotNullCheck("mm_session_summaries", "source_purpose")
+                _DDLPlan([
+                    _lock_timeout_element(),
+                    check,
+                    ValidateConstraint("mm_session_summaries", check.constraint_name),
+                    AlterColumnClause("mm_session_summaries", "source_purpose", "SET NOT NULL"),
+                    AlterColumnClause("mm_session_summaries", "source_purpose", "SET DEFAULT ''"),
+                    DropConstraintByName("mm_session_summaries", check.constraint_name),
+                ]).run(engine)
+            else:
+                _DDLPlan([AddColumn(
+                    "mm_session_summaries", "source_purpose",
+                    "VARCHAR(64) NOT NULL DEFAULT ''",
+                )]).run(engine)
+        if legacy:
+            # label the rows still carrying the empty marker -- the just-added
+            # column's rows and any a previous run left unlabelled alike
+            _backfill_column(
+                engine, "mm_session_summaries", {"source_purpose": legacy},
+                ["source_purpose"], DEFAULT_BACKFILL_BATCH, marker="",
+            )
+
+    def verify(self, engine: Engine) -> None:
+        cols = {c["name"] for c in inspect(engine).get_columns("mm_session_summaries")}
+        if "source_purpose" not in cols:
+            raise MigrationError("verification failed: mm_session_summaries.source_purpose missing")
+        for table, index_name in TENANT_BELIEF_INDEXES.items():
+            state = _index_state(engine, table, index_name)
+            if state != "valid":
+                raise MigrationError(
+                    f"verification failed: {table} lacks a valid {index_name}"
+                )
+            if LEGACY_BELIEF_INDEXES[table] in {
+                ix["name"] for ix in inspect(engine).get_indexes(table)
+            }:
+                raise MigrationError(
+                    f"verification failed: {table} still carries {LEGACY_BELIEF_INDEXES[table]}"
+                )
+
+
+#: Derived free-text tables that record the UNION of their inputs'
+#: provenance (M3 batch-3 patch task 2): merged content follows the AND
+#: rule -- every input purpose must be visible.
+DERIVED_PROVENANCE_COLUMNS: dict[str, str] = {
+    "mm_snapshots": "source_purposes_json",
+    "mm_evidence_digests": "source_purposes_json",
+}
+
+
+@dataclass
+class Step10DerivedProvenance:
+    """``source_purposes_json`` on snapshots and evidence digests (M3
+    batch-3 patch task 2).
+
+    Both tables hold MERGED free text synthesised from several inputs, so
+    a single source_purpose cannot express their provenance: the JSON list
+    records the union of the inputs' source purposes, and readers apply
+    the AND rule (every listed purpose visible).  Same NOT NULL
+    TEXT / server-default-'[]' recipe as steps 7 and 9; existing rows keep
+    the empty list and readers fall back to the row's single
+    ``source_purpose`` (snapshots) or the belief's link graph (digests).
+    Re-entrant per artifact.  No session-summary constraint change: the
+    per-purpose summary rows of the same patch key on
+    ``(user_id, session_id, source_purpose)`` and the table never had a
+    unique constraint beyond the primary key.
+    """
+
+    version: int = 10
+    name: str = "derived provenance unions on snapshots and digests"
+
+    def needed(self, engine: Engine) -> bool:
+        return any(
+            column not in _table_columns(engine, table)
+            for table, column in DERIVED_PROVENANCE_COLUMNS.items()
+        )
+
+    def apply(self, engine: Engine) -> None:
+        for table, column in DERIVED_PROVENANCE_COLUMNS.items():
+            if column in _table_columns(engine, table):
+                continue
+            if _is_postgres(engine):
+                _DDLPlan([AddColumn(table, column, "TEXT")]).run(engine)
+                check = AddNotNullCheck(table, column)
+                _DDLPlan([
+                    _lock_timeout_element(),
+                    check,
+                    ValidateConstraint(table, check.constraint_name),
+                    AlterColumnClause(table, column, "SET NOT NULL"),
+                    AlterColumnClause(table, column, "SET DEFAULT '[]'"),
+                    DropConstraintByName(table, check.constraint_name),
+                ]).run(engine)
+            else:
+                _DDLPlan([AddColumn(
+                    table, column, "TEXT NOT NULL DEFAULT '[]'",
+                )]).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        for table, column in DERIVED_PROVENANCE_COLUMNS.items():
+            if column not in {c["name"] for c in inspect(engine).get_columns(table)}:
+                raise MigrationError(f"verification failed: {table}.{column} missing")
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1219,6 +1716,11 @@ DEFAULT_STEPS: list = [
     Step3RowLevelSecurity(),
     Step4PendingJobsIndex(),
     Step5TenantUserIndexes(),
+    Step6PurposeAuthorization(),
+    Step7SourcePurpose(),
+    Step8AccessAudit(),
+    Step9RecallVisibility(),
+    Step10DerivedProvenance(),
 ]
 
 #: The version a freshly upgraded database records.
@@ -1267,7 +1769,8 @@ def upgrade_database(
                     continue
                 if hasattr(step, "default_tenant"):
                     step.default_tenant = (default_tenant, default_app)
-                if step.needed(engine):
+                applied = step.needed(engine)
+                if applied:
                     logger.info("migration: applying step %d (%s)", step.version, step.name)
                     if isinstance(step, StepAddColumnBackfill):
                         step.apply(engine, batch=batch)
@@ -1275,6 +1778,10 @@ def upgrade_database(
                         step.apply(engine)
                 step.verify(engine)
                 _record_version(engine, step.version, step.name)
+                if applied and hasattr(step, "legacy_jobs_to_cancel"):
+                    # the operator's cancel count (step 6 docstring): logged
+                    # by the step, surfaced here as promised
+                    before["legacy_jobs_to_cancel"] = int(step.legacy_jobs_to_cancel)
         except Exception as exc:
             _restore_sqlite(engine, backup)
             if isinstance(exc, MigrationError):

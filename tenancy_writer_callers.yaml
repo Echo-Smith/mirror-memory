@@ -14,7 +14,93 @@
 # Adding a caller is a reviewed decision: add the module here in the same
 # commit that adds the call.
 
+# Wrapper functions (M3 batch-2 task 0): undecorated functions that write
+# classified tables by opening a write scope inline or by calling a
+# sanctioned writer.  A wrapper is a capability holder exactly like a
+# sanctioned writer -- its src callers must be registered here, and a call
+# from an unlisted module fails the scan.  (Tests are exempt, as usual.)
+wrappers:
+  grant_bench_purpose:
+    reason: >
+      Bench-side idempotent issuance wrapper (calls grant_purpose).
+      Only the bench harness may issue its own grants; engine code must
+      never use it.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
+    callers:
+      - mirror_memory.bench.runner
+      - mirror_memory.bench.longrun
+      - mirror_memory.bench.metabolism
+      - mirror_memory.bench.statebench_runner
+      - mirror_memory.bench.statebench_v1_1_runner
+  enqueue_job:
+    reason: >
+      Writes mm_evolution_jobs via queue_write_scope inline (bulk INSERT /
+      CAS UPDATE).  Host-facing entry re-exported from mirror_memory.worker
+      for hosts and tests; no src module calls it today, and any future src
+      caller must be registered here in the same commit.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
+    callers: []
+
 writers:
+  # ---- audit class: the access audit (M3 batch-2 task 2) ------------------
+  # Reviewed 2026-10-30 by Echo-Smith: the write class "audit"
+  # (TABLE_WRITE_CLASSES / audit_write_scope) and both writers below.
+  record_access:
+    reason: >
+      Appends one access-audit row per memory read (or refused read) in the
+      same transaction as the read; fail-closed -- the entry returns
+      nothing if the row cannot be written.  Written only through the
+      engine (MemoryEngine._authorize / _audit); the server routes that
+      read through their own session call those engine helpers.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
+    callers:
+      - mirror_memory.api
+  purge_access_audit:
+    reason: >
+      The one sanctioned deletion on the append-only audit table: the
+      tenant-scoped retention purge behind MemoryEngine.purge_access_audit
+      and the worker's batched maintenance pass.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
+    callers:
+      - mirror_memory.api
+      - mirror_memory.worker.maintenance
+
+  # ---- consent class: purpose authorization (M3 batch 1; reviewed
+  # 2026-10-30 by Echo-Smith) ----
+  grant_purpose:
+    reason: >
+      Writes mm_purpose_grants and appends mm_purpose_grant_events: the
+      purpose-authorization store and its audit trail.  Issuance and
+      update are authorization changes; the version CAS keeps concurrent
+      issuers from clobbering each other.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
+    callers:
+      - mirror_memory.api
+      - mirror_memory.bench  # grant_bench_purpose: idempotent bench-side issuance
+
+  record_purpose_invocation:
+    reason: >
+      Appends a mm_purpose_grant_events row for an operation that ran
+      without/around a grant decision: the forget path (admitted
+      regardless of authorization state, but audited) and the worker's
+      publish-time authorization record (snapshot/publish versions).
+    callers:
+      - mirror_memory.api
+      - mirror_memory.worker.evolution
+
+  revoke_purpose:
+    reason: >
+      Revokes one purpose grant (sets revoked_at, bumps the version,
+      appends the audit event).  Immediate by construction -- authorize
+      re-reads the row on every call.
+    callers:
+      - mirror_memory.api
+
   # ---- engine class: memory content (Publisher + repository mutators) ----
   record_evidence:
     reason: >

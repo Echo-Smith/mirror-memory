@@ -272,6 +272,7 @@ def run_cases(
         config=config,
         config_path=None if config is not None else config_path,
         database_url=database_url,
+        default_purpose="benchmark",
     )
     pipeline_hook = collector.hook
     # Route every funnel stage through the collector.  The pipeline is created
@@ -288,7 +289,10 @@ def run_cases(
     for case in normalised:
         groups.setdefault(case.group, []).append(case)
 
+    from mirror_memory.bench import grant_bench_purpose
+
     for group, group_cases in groups.items():
+        grant_bench_purpose(engine, [group])
         _ingest(engine, group, group_cases[0].turns, collector)
 
         for case in group_cases:

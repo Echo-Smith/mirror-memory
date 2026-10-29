@@ -1,5 +1,8 @@
 """Shared test fixtures for mirror-memory."""
 
+import contextlib
+import contextvars
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -114,6 +117,194 @@ def _scope_strict():
         os.environ.pop("MM_SCOPE_STRICT", None)
     else:
         os.environ["MM_SCOPE_STRICT"] = old
+
+
+@pytest.fixture(autouse=True)
+def _default_test_purpose(monkeypatch):
+    """M3: every MemoryEngine the tests build gets the explicit default
+    purpose "test" (the engine parameter is the sanctioned way to default
+    a purpose; nothing implicit in engine code).  A test that needs an
+    engine WITHOUT a default (the purpose-gate tests) passes
+    default_purpose=None explicitly, which setdefault respects."""
+    from mirror_memory.api import MemoryEngine
+
+    original = MemoryEngine.__init__
+
+    def with_default_purpose(self, *args, **kwargs):
+        kwargs.setdefault("default_purpose", "test")
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryEngine, "__init__", with_default_purpose)
+    yield
+
+
+#: True inside the granting wrapper; refusal tests flip it off for their
+#: duration (conftest-owned, deliberately NOT read by src -- an env-var
+#: auto-grant in engine code was removed as an authorization hole,
+#: M3 batch-1 patch task 1).
+_test_grants_active = contextvars.ContextVar("mm_test_grants_active", default=True)
+
+
+@pytest.fixture(autouse=True)
+def _grant_on_authorize(monkeypatch):
+    """M3: the purpose authorization layer is on for every engine call in
+    the suite, and the harness issues REAL grant rows for the identities a
+    test touches (src has no trace of this; tools/check_no_autogrant.py
+    keeps it that way).
+
+    Why not a fixture-prep pre-issuance (M3 batch-2 task 0): the user ids,
+    tenants and purposes a test uses only appear inside its body, so a
+    grant is issued on first touch of each (tenant, user, purpose) and
+    then REMEMBERED -- read-only paths add no statement after that, which
+    is what keeps the SQLite perf measurement free of harness cost.
+
+    Per dialect:
+    - PostgreSQL: the grant is committed through a dedicated admin engine
+      (own one-connection pool -- it never borrows from the engine under
+      test, so a pool-exhaustion storm cannot deadlock on it) and memoised
+      for the test.
+    - SQLite: an admin engine would be a different database (in-memory is
+      per-engine), so the row is inserted in the caller's session inside a
+      SAVEPOINT released at once.  It is memoised only when that savepoint
+      was outermost (RELEASE == COMMIT, durable); see _grant_in_savepoint.
+
+    Still lazy, by necessity (the list the task asked for): every first
+    touch of a new (tenant, user, purpose); and on SQLite every authorize
+    that runs inside a transaction some earlier DML opened (the worker's
+    publish re-check, bench seeding under fixture_write_scope) -- those
+    re-check with one SELECT because a later rollback could discard the
+    row.
+
+    Refusal tests opt out with the ``refusing_authz`` context manager."""
+    import json as _json
+
+    from sqlalchemy import create_engine as _create_engine
+    from sqlalchemy.orm import sessionmaker as _sessionmaker
+
+    from mirror_memory.core import authorization as _authorization
+    from mirror_memory.core.models import PurposeGrant as _PurposeGrant
+    from mirror_memory.core.tenancy import peek_tenant as _peek_tenant
+
+    original = _authorization.authorize_or_raise
+    admin: dict = {"engine": None}
+    granted: set[tuple[str, str, str, str]] = set()
+    sqlite_granted: dict[tuple[int, str, str, str, str], object] = {}
+
+    def _grant_now(bind, tenant_id, app_id, user_id, purpose):
+        """PostgreSQL only: idempotent issuance in an independent, COMMITTED
+        transaction on the admin engine (own pool of one: no contention
+        with the engine under test, no borrowing from its pool)."""
+        if admin["engine"] is None:
+            # the URL OBJECT (not str()): str() masks the password, and an
+            # engine built on the masked URL fails authentication
+            admin["engine"] = _create_engine(bind.url, pool_size=1, max_overflow=0)
+        Session = _sessionmaker(bind=admin["engine"])
+        gs = Session()
+        try:
+            existing = (
+                gs.query(_PurposeGrant)
+                .filter_by(user_id=user_id, purpose=purpose)
+                .first()
+            )
+            if existing is None:
+                _authorization.grant_purpose(
+                    gs, user_id, purpose,
+                    operations=list(_authorization.OPERATIONS),
+                    issuer="test-harness",
+                    reason="harness lazy grant (pg admin engine)",
+                )
+            gs.commit()
+        except Exception:
+            gs.rollback()
+            raise
+        finally:
+            gs.close()
+        granted.add((tenant_id, app_id, user_id, purpose))
+
+    def _grant_in_savepoint(bind, session, user_id, purpose):
+        """SQLite: an admin engine would see a DIFFERENT database (in-memory
+        is per-engine), so the grant row is inserted directly in the
+        caller's session inside a SAVEPOINT released immediately -- no CAS,
+        no event row.  A collision with a grant issued meanwhile (e.g. the
+        bench's own grant_bench_purpose) is tolerated by rolling the
+        savepoint back and carrying on.
+
+        Memoised only when the row is known to be durable: pysqlite's
+        legacy mode does not BEGIN for SELECTs, so when authorize is the
+        session's first statement the SAVEPOINT is outermost and its
+        RELEASE *is* a COMMIT (SQLite semantics) -- the row survives any
+        later rollback and read-only paths pay nothing further.  When some
+        earlier DML already opened the transaction (worker publish
+        re-check, bench seeding inside fixture_write_scope) the savepoint is
+        nested and a later rollback would discard the row, so those calls
+        re-check with one SELECT each time."""
+        from mirror_memory.core.tenancy import fixture_write_scope as _fws
+
+        # grant rows are tenant-scoped: the same user under another tenant
+        # on the same database has no row yet
+        tenant = _peek_tenant() or ("", "")
+        key = (id(bind), tenant[0], tenant[1], user_id, purpose)
+        if key in sqlite_granted:
+            return
+        existing = (
+            session.query(_PurposeGrant)
+            .filter_by(user_id=user_id, purpose=purpose)
+            .first()
+        )
+        if existing is not None:
+            return
+        dbapi = session.connection().connection.dbapi_connection
+        outermost = not getattr(dbapi, "in_transaction", True)
+        nested = session.begin_nested()
+        try:
+            with _fws("harness lazy grant (sqlite savepoint)"):
+                session.add(_PurposeGrant(
+                    user_id=user_id,
+                    purpose=purpose,
+                    version=1,
+                    allowed_operations=_json.dumps(list(_authorization.OPERATIONS)),
+                    issuer="test-harness",
+                ))
+            nested.commit()
+        except Exception:
+            nested.rollback()
+            return
+        if outermost:
+            sqlite_granted[key] = bind  # the reference pins id(bind) for the test
+
+    def granting(session, user_id, purpose, operation, *, lock=False):
+        if not _test_grants_active.get():
+            return original(session, user_id, purpose, operation, lock=lock)
+        resolved = (purpose or "").strip()
+        if not resolved:
+            return original(session, user_id, purpose, operation, lock=lock)
+        bind = session.get_bind()
+        if bind.url.get_backend_name() == "postgresql":
+            tenant = _peek_tenant() or ("", "")
+            key = (tenant[0], tenant[1], user_id, resolved)
+            if key not in granted:
+                _grant_now(bind, tenant[0], tenant[1], user_id, resolved)
+        else:
+            _grant_in_savepoint(bind, session, user_id, resolved)
+        return original(session, user_id, purpose, operation, lock=lock)
+
+    monkeypatch.setattr(_authorization, "authorize_or_raise", granting)
+    yield
+
+    if admin["engine"] is not None:
+        admin["engine"].dispose()
+
+
+@contextlib.contextmanager
+def refusing_authz():
+    """Opt a code block out of the harness's lazy test-grant issuance:
+    authorize_or_raise delegates straight through, so missing grants
+    produce real no_grant refusals.  Import from tests.conftest."""
+    token = _test_grants_active.set(False)
+    try:
+        yield
+    finally:
+        _test_grants_active.reset(token)
 
 
 @pytest.fixture(autouse=True)
@@ -301,7 +492,9 @@ def _pg_fresh_schema(admin_engine) -> None:
     try:
         drop_bounded()
     except OperationalError as exc:
-        if "55P03" not in str(exc) and "lock timeout" not in str(exc).lower():
+        # 55P03 lock timeout and 40P01 deadlock both mean someone else's
+        # locks are in the way -- the self-healing below applies to both
+        if "55P03" not in str(exc) and "40P01" not in str(exc) and "lock timeout" not in str(exc).lower() and "deadlock" not in str(exc).lower():
             raise
         with admin_engine.connect() as conn:
             conn.rollback()

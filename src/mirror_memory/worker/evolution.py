@@ -17,16 +17,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy.exc import OperationalError
+
 from mirror_memory.config.schema import MemoryConfig
+from mirror_memory.core.authorization import Decision, PurposeDenied
 from mirror_memory.core.constants import (
     FORMULATE_MIN_CONFIDENCE,
     JOB_BATCH_LIMIT,
     LOAD_EVIDENCE_LIMIT,
 )
+from mirror_memory.core import provenance
 from mirror_memory.core.models import Belief, EvolutionJob
 from mirror_memory.core.utils import truncate_id
 from mirror_memory.worker.snapshot import promote_shadow_if_ready
@@ -39,15 +44,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> EvolutionJob | None:
+def enqueue_job(
+    session: object,
+    user_id: str,
+    config: MemoryConfig,
+    *,
+    purpose: str,
+) -> EvolutionJob | None:
     """Write or merge an evolution job for *user_id*.
 
     Idempotent: same user + same evidence watermark produces at most
     one pending job.  Returns the job row, or ``None`` if the user
     has no active beliefs.
+
+    ``purpose`` is REQUIRED (M3 batch-1 task 2): the job carries the
+    purpose of the observe that triggered it, and the worker re-checks
+    the authorization with it (operation ``extract``) before compute and
+    again before publish.  There is no default.
     """
     from mirror_memory.core.repository import is_memory_enabled
 
+    if not purpose or not str(purpose).strip():
+        raise PurposeDenied(
+            Decision(False, "missing_purpose", None, ""), "enqueue"
+        )
+    purpose = str(purpose).strip()
     if not is_memory_enabled(session, user_id):
         return None
 
@@ -118,6 +139,7 @@ def enqueue_job(session: object, user_id: str, config: MemoryConfig) -> Evolutio
         job = EvolutionJob(
             id=uuid.uuid4().hex[:16],
             user_id=user_id,
+            purpose=purpose,
             evidence_watermark=json.dumps({"latest_update": watermark}),
             prompt_version=config.worker.prompt_version,
             idempotency_key=idempotency_key,
@@ -327,21 +349,55 @@ def _process_single_job(
     job_id, user_id = job.id, job.user_id
     attempt_count, watermark = job.attempt_count, job.evidence_watermark
     try:
+        from mirror_memory.core.authorization import authorize_or_raise
         from mirror_memory.core.repository import get_state_revision, is_memory_enabled
 
-        # Renew the lease before the compute-heavy nodes: the publish below
-        # must not race an expiry that happened while the LLM was thinking.
+        # Renew the lease before the compute-heavy nodes: the pre-compute
+        # renewal must find the token still held; a lost lease aborts before
+        # any compute.  A second renewal happens at the publish transaction
+        # (below), so the publish itself never runs on an expired lease
+        # either -- the lease only has to be held at two instants, not
+        # across the whole compute.
         if token is not None and not _renew_lease(
             session, job_id, token, config.worker.job_lease_seconds
         ):
-            raise LeaseLost(f"job {job_id}: lease lost before publish")
+            raise LeaseLost(f"job {job_id}: lease lost before compute")
 
         # -- snapshot transaction ------------------------------------------
-        # Consent gate: a disabled user's beliefs must not even be read into
-        # a compute payload, let alone published.
+        # Consent gate first (its reason is the long-standing one): a
+        # disabled user's beliefs must not even be read into a compute
+        # payload, let alone published.
         if not is_memory_enabled(session, user_id):
             _block_job(session, job, "memory_disabled", token)
             return
+
+        # Authorization gate (M3 batch-1 task 2): the job carries the
+        # purpose of the observe that enqueued it; the worker re-checks it
+        # for the extract operation.  A pre-M3 job (empty purpose) is
+        # cancelled, never run ungated; a refusal cancels the job with the
+        # decision's reason.
+        if not (job.purpose or "").strip():
+            from mirror_memory.core import metrics
+
+            metrics.inc(metrics.MISSING_PURPOSE)
+            _block_job(session, job, "missing_purpose", token)
+            return
+        try:
+            grant_version = authorize_or_raise(
+                session, user_id, job.purpose, "extract"
+            ).grant_version
+        except PurposeDenied as exc:
+            _block_job(session, job, exc.decision.reason, token)
+            return
+        # The rows the publish writes (ledger events) are collected under
+        # the job's purpose -- the purpose of the observe that enqueued it.
+        provenance.bind(session, job.purpose)
+        # Cross-purpose visibility (M3 batch 3): the job may only READ
+        # memory collected under purposes that are still live (the A2
+        # rule) -- a job under Q must not synthesize from P-only evidence
+        # after P was revoked.  One rule per job, computed inside this
+        # transaction.
+        visibility_rule = provenance.visibility(session, user_id)
 
         # We intentionally ignore job.claimed_revision here (a snapshot from
         # enqueue time).  The revision may have been bumped by state mutations
@@ -349,8 +405,9 @@ def _process_single_job(
         # compare against the post-compute revision at Node 6.
         expected_revision = get_state_revision(session, user_id)
 
-        # Node 1: load_evidence (plain data, no ORM instances retained)
-        evidence = _load_evidence(session, user_id)
+        # Node 1: load_evidence (plain data, no ORM instances retained),
+        # filtered to memory the job's purpose may see
+        evidence, visible_beliefs = _load_evidence(session, user_id, visibility=visibility_rule)
 
         # Node 5's read half (K3): the beliefs/summaries the synthesis prompt
         # needs, taken in the same snapshot.  Fail-open like the node itself.
@@ -358,7 +415,7 @@ def _process_single_job(
 
         synthesizer = Synthesizer(config)
         try:
-            k3_prepared = synthesizer.prepare(session, user_id, config)
+            k3_prepared = synthesizer.prepare(session, user_id, config, visibility=visibility_rule)
         except Exception:
             logger.warning("evolution: K3 synthesis skipped in worker (job=%s)", truncate_id(job_id))
             k3_prepared = None
@@ -388,11 +445,72 @@ def _process_single_job(
         if understanding is not None:
             content["understanding"] = understanding
 
+        # The snapshot is MERGED free text: its provenance is the UNION of
+        # everything the synthesis read -- the visible beliefs' provenance,
+        # the previous snapshots' unions, and the job's own purpose (M3
+        # batch-3 patch task 2).  ONE batched probe for the whole set:
+        # per-belief queries would multiply the publish transaction's
+        # statements (and its lock-holding time) by the belief count.
+        input_purposes: set[str] = {job.purpose}
+        if visible_beliefs:
+            link_purposes, event_purposes = provenance.provenance_purposes(
+                session, user_id, [b.id for b in visible_beliefs],
+            )
+            for belief in visible_beliefs:
+                input_purposes |= link_purposes.get(belief.id, set()) | event_purposes.get(belief.id, set())
+        input_purposes |= _previous_snapshot_purposes(session, user_id)
+
         # -- publish transaction -------------------------------------------
         # Nothing read for the snapshot is trusted here: expire the identity
         # map so the Publisher's consent / revision / authority re-checks
         # read the database as it is now, in a fresh transaction.
         session.expire_all()
+
+        # Renew once more now that the compute is done (M3 batch-1 task 0):
+        # a compute longer than the lease must not publish on an expired
+        # one.  The renewal is fenced on the token -- if another worker
+        # re-claimed during the compute, this fails and nothing of ours is
+        # written.  _renew_lease commits, so the publish's own statements
+        # open the fresh transaction after it.
+        if token is not None and not _renew_lease(
+            session, job_id, token, config.worker.job_lease_seconds
+        ):
+            raise LeaseLost(f"job {job_id}: lease lost before publish")
+
+        # Consent gate again (pre-existing semantics: its reason wins)
+        if not is_memory_enabled(session, user_id):
+            _block_job(session, job, "memory_disabled", token)
+            return
+
+        # Authorization re-check (M3 batch-1 task 4, patch task 3): only
+        # "is extract still allowed right now" matters.  The version is
+        # recorded, not compared -- a renewal or an added operation during
+        # the compute publishes normally; a revocation, an expiry, or the
+        # operation being removed cancels.  authorize(lock=True) takes FOR
+        # SHARE on the grant row (PostgreSQL): a concurrent revocation's
+        # UPDATE blocks until this transaction ends, so a committed
+        # revocation can never slip between this check and the publish's
+        # commit.  SQLite serializes writers by itself.  The refusal (or a
+        # lost authorization) cancels the job with the decision's reason
+        # before the Publisher writes, so nothing lands.  Both versions --
+        # the snapshot's and the publish-time's -- go to the authorization
+        # audit trail and the log.
+        from mirror_memory.core.authorization import authorize_or_raise, record_purpose_invocation
+
+        try:
+            decision = authorize_or_raise(
+                session, user_id, job.purpose, "extract", lock=True
+            )
+        except PurposeDenied as exc:
+            _block_job(session, job, exc.decision.reason, token)
+            return
+        publish_grant_version = decision.grant_version
+        record_purpose_invocation(
+            session, user_id, job.purpose,
+            operation="extract", decision="published",
+            actor="worker",
+            reason=f"snapshot_version={grant_version} publish_version={publish_grant_version}",
+        )
 
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
@@ -412,6 +530,7 @@ def _process_single_job(
                 "policy": policy,
                 "watermark": watermark,
                 "shadow": is_shadow,
+                "source_purposes": sorted(input_purposes),
             },
         )
         decision = Publisher(session, config).publish(proposal)
@@ -440,10 +559,44 @@ def _process_single_job(
             truncate_id(job_id),
         )
     except Exception as exc:
+        # A failure surfaced OUTSIDE the publish's savepoint (e.g. the
+        # authorization re-check) leaves the transaction aborted on
+        # PostgreSQL: roll it back before any bookkeeping.  The fenced
+        # completion UPDATE still guards the bookkeeping itself.
+        session.rollback()
+        busy = _is_sqlite_busy(exc)
         changes = {
-            "status": "failed" if attempt_count >= config.worker.max_attempts else "pending",
-            "error_code": type(exc).__name__,
+            # A SQLite lock collision (database is locked / BUSY) is
+            # TRANSIENT: it must not burn an attempt -- the job goes back to
+            # pending with its attempt count restored, deferred to the end
+            # of the queue (M3 patch task 0)
+            "status": "pending" if busy else (
+                "failed" if attempt_count >= config.worker.max_attempts else "pending"
+            ),
+            "error_code": type(exc).__name__ if not busy else "database_is_locked",
         }
+        if busy:
+            changes["attempt_count"] = max(0, attempt_count - 1)
+            changes["created_at"] = datetime.now(UTC)  # defer: end of the queue
+            # the contending writer may still hold the lock while this
+            # bookkeeping runs: retry the fenced bookkeeping under a
+            # bounded deadline (the sweep's next pass would only hit the
+            # same lock).  PG failures never take this path (the text
+            # check is SQLite-specific).
+            deadline = time.monotonic() + _BUSY_BOOKKEEPING_TIMEOUT
+            while True:
+                try:
+                    _set_job_state(session, job_id, token, changes)
+                    logger.info(
+                        "evolution: job=%s deferred (sqlite busy); attempt "
+                        "count restored", truncate_id(job_id),
+                    )
+                    return
+                except OperationalError as busy_exc:
+                    if not _is_sqlite_busy(busy_exc) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.4)
+            # unreachable: the loop returns or raises
         try:
             _set_job_state(session, job_id, token, changes)
         except LeaseLost:
@@ -454,6 +607,45 @@ def _process_single_job(
             )
             return
         logger.warning("evolution: failed job=%s error=%s", truncate_id(job_id), type(exc).__name__)
+    finally:
+        # a session reused across jobs must not carry this job's purpose
+        # into the next one
+        provenance.unbind(session)
+
+
+def _previous_snapshot_purposes(session: object, user_id: str) -> set[str]:
+    """The provenance unions of the user's live snapshots (the synthesis
+    reads the latest as context -- its inputs are inputs here too)."""
+    from mirror_memory.core.models import Snapshot
+
+    purposes: set[str] = set()
+    for snap in (
+        session.query(Snapshot)
+        .filter(Snapshot.user_id == user_id, Snapshot.status.in_(("active", "shadow")))
+        .all()
+    ):
+        try:
+            listed = [p for p in json.loads(snap.source_purposes_json or "[]") if p]
+        except ValueError:
+            listed = []
+        if listed:
+            purposes |= set(listed)
+        elif snap.source_purpose:
+            purposes.add(snap.source_purpose)
+    return purposes
+
+
+#: How long the BUSY bookkeeping keeps retrying the fenced pending-update
+#: before giving up and surfacing the lock error (the sweep retries anyway).
+_BUSY_BOOKKEEPING_TIMEOUT = 6.0
+
+
+def _is_sqlite_busy(exc: BaseException) -> bool:
+    """True for a SQLite lock collision: the error text carries
+    'database is locked' / 'database table is locked' (pysqlite raises
+    OperationalError with those messages; there is no distinct SQLSTATE)."""
+    text = str(exc)
+    return "database is locked" in text or "database table is locked" in text
 
 
 def _end_snapshot_transaction(session: object) -> None:
@@ -544,8 +736,19 @@ def _current_watermark(session: object, user_id: str) -> str:
     return latest.isoformat() if latest else "none"
 
 
-def _load_evidence(session: object, user_id: str) -> dict:
-    """Node 1: Read active beliefs, background, and session count."""
+def _load_evidence(
+    session: object, user_id: str, *, visibility: "VisibilityRule | None" = None,
+) -> tuple[dict, list]:
+    """Returns ``(evidence payload, the visible Belief rows)`` -- the rows
+    are what the synthesis actually read, and the snapshot's provenance
+    union is computed from them (M3 batch-3 patch)."""
+    """Node 1: Read active beliefs, background, and session count.
+
+    With a visibility rule only beliefs whose provenance passes it feed the
+    synthesis -- and ``distinct_sessions`` counts the VISIBLE page only
+    (the shadow gate asks whether the job's purpose has seen the user in
+    more than one session, which is a question about what this job may
+    use)."""
     beliefs = (
         session.query(Belief)
         .filter(Belief.user_id == user_id, Belief.status == "active")
@@ -553,6 +756,8 @@ def _load_evidence(session: object, user_id: str) -> dict:
         .limit(LOAD_EVIDENCE_LIMIT)
         .all()
     )
+    if visibility is not None:
+        beliefs = provenance.beliefs_visible(session, user_id, visibility, beliefs)
     belief_data = []
     for b in beliefs:
         belief_data.append({
@@ -564,18 +769,15 @@ def _load_evidence(session: object, user_id: str) -> dict:
             "value": b.value_json,
         })
 
-    distinct_sessions = (
-        session.query(Belief.origin_session_id)
-        .filter(Belief.user_id == user_id, Belief.status == "active")
-        .distinct()
-        .count()
-    )
+    distinct_sessions = len({
+        b.origin_session_id for b in beliefs if b.origin_session_id
+    })
 
     return {
         "beliefs": belief_data,
         "user_id": user_id,
         "distinct_sessions": distinct_sessions,
-    }
+    }, beliefs
 
 
 def _formulate(
@@ -729,11 +931,19 @@ async def evolution_worker(
     """
     session_factory = config.session_factory
     poll_interval = config.worker.poll_interval_seconds
+    # audit-retention maintenance runs on its own (much longer) cadence
+    maintenance_state: dict[str, float] = {}
+    from mirror_memory.worker.maintenance import next_due, purge_expired_audit
 
     while not stop.is_set():
         try:
             await asyncio.to_thread(process_pending, session_factory, config)
         except Exception:
             logger.warning("evolution: worker will retry on next tick", exc_info=True)
+        if next_due(maintenance_state, config):
+            try:
+                await asyncio.to_thread(purge_expired_audit, session_factory, config)
+            except Exception:
+                logger.warning("audit maintenance: will retry next interval", exc_info=True)
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_interval)

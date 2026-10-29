@@ -21,6 +21,7 @@ def build_panel(
     config: MemoryConfig,
     *,
     language: str = "zh",
+    visibility: "VisibilityRule | None" = None,
 ) -> dict:
     """Build panel data for the user's memory profile.
 
@@ -57,10 +58,13 @@ def build_panel(
         return {
             "memory": {"enabled": False, "has_data": _has_data(session, user_id)},
             "sections": [],
+            "belief_ids": [],
         }
 
     sections: list[dict] = []
     seen_dimensions: set[str] = set()
+    # the beliefs that produced a visible item (the access audit records them)
+    belief_ids: list[int] = []
 
     # Iterate configured dimensions (all dimensions are shown in panel by default).
     for dim in config.dimensions:
@@ -68,11 +72,14 @@ def build_panel(
         header = display.dimension_header(dim_id, language)
         items: list[dict] = []
 
-        beliefs = list_active_beliefs(session, user_id, dimensions=(dim_id,), limit=10)
+        beliefs = list_active_beliefs(
+            session, user_id, dimensions=(dim_id,), limit=10, visibility=visibility,
+        )
         for belief in beliefs:
             item = _item_for(belief, display, language)
             if item:
                 items.append(item)
+                belief_ids.append(int(belief.id))
 
         if header and items:
             seen_dimensions.add(dim_id)
@@ -83,7 +90,7 @@ def build_panel(
             })
 
     # Rejected beliefs (boundary items)
-    rejected = list_rejected_beliefs(session, user_id, limit=5)
+    rejected = list_rejected_beliefs(session, user_id, limit=5, visibility=visibility)
     if rejected:
         boundary_labels = [
             label
@@ -91,6 +98,7 @@ def build_panel(
             if label
         ]
         if boundary_labels:
+            belief_ids.extend(int(b.id) for b in rejected)
             is_en = language.strip().lower() == "en"
             sep = ", " if is_en else "\u3001"
             sections.append({
@@ -109,6 +117,7 @@ def build_panel(
             "has_data": _has_data(session, user_id),
         },
         "sections": sections,
+        "belief_ids": belief_ids,
     }
 
 

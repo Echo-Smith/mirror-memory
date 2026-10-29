@@ -46,7 +46,7 @@ def app_url(tmp_path):
 
 
 def _seed(db_url, tenant, key, claim):
-    register_tenant_key(key, tenant[0], tenant[1])
+    register_tenant_key(key, tenant[0], tenant[1], purposes={"test"})
     engine = create_engine(db_url)
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)
@@ -90,7 +90,7 @@ def test_missing_or_wrong_key_401_and_no_sql(tmp_path, app_url):
             r1 = client.get("/beliefs", params={"user_id": "u1"})  # no key
             assert r1.status_code == 401
             r2 = client.get("/beliefs", params={"user_id": "u1"},
-                            headers={"Authorization": "Bearer wrong-key"})
+                            headers={"Authorization": "Bearer wrong-key", "X-MM-Purpose": "test"})
             assert r2.status_code == 401
             assert issued == [], (
                 f"SQL issued during rejected requests: {issued[:3]}"
@@ -108,16 +108,16 @@ def test_cross_tenant_id_returns_404(tmp_path, app_url):
     with _client(app_url) as client:
         # B asks for A's belief id -> 404, indistinguishable from missing
         r = client.get(f"/belief/{bid_a}", params={"user_id": "u1"},
-                       headers={"Authorization": "Bearer key-B"})
+                       headers={"Authorization": "Bearer key-B", "X-MM-Purpose": "test"})
         assert r.status_code == 404
         # a nonexistent id from B -> also 404 (same shape)
         r2 = client.get("/belief/999999", params={"user_id": "u1"},
-                        headers={"Authorization": "Bearer key-B"})
+                        headers={"Authorization": "Bearer key-B", "X-MM-Purpose": "test"})
         assert r2.status_code == 404
         assert r.json() == r2.json()
         # A can read its own
         r3 = client.get(f"/belief/{bid_a}", params={"user_id": "u1"},
-                        headers={"Authorization": "Bearer key-A"})
+                        headers={"Authorization": "Bearer key-A", "X-MM-Purpose": "test"})
         assert r3.status_code == 200
         assert r3.json()["claim_text"] == "A-SECRET"
 
@@ -140,10 +140,10 @@ def test_100_concurrent_alternating_keys(tmp_path, app_url):
                 "/observe",
                 json={"user_id": "u1", "session_id": f"s{i}",
                       "text": f"turn {i}"},
-                headers={"Authorization": f"Bearer {key}"},
+                headers={"Authorization": f"Bearer {key}", "X-MM-Purpose": "test"},
             )
             b = client.get("/beliefs", params={"user_id": "u1"},
-                           headers={"Authorization": f"Bearer {key}"})
+                           headers={"Authorization": f"Bearer {key}", "X-MM-Purpose": "test"})
             got = [x["claim_text"] for x in b.json()["beliefs"]]
             with lock:
                 results.append((key, expected, set(got)))
@@ -188,11 +188,11 @@ def test_exception_leaves_next_request_clean(tmp_path, app_url):
         raise RuntimeError("boom")
 
     with TestClient(app, raise_server_exceptions=False) as client:
-        r = client.get("/boom", headers={"Authorization": "Bearer key-A"})
+        r = client.get("/boom", headers={"Authorization": "Bearer key-A", "X-MM-Purpose": "test"})
         assert r.status_code == 500
         # next request: clean tenant context, correct data
         b = client.get("/beliefs", params={"user_id": "u1"},
-                       headers={"Authorization": "Bearer key-B"})
+                       headers={"Authorization": "Bearer key-B", "X-MM-Purpose": "test"})
         assert b.status_code == 200
         claims = [x["claim_text"] for x in b.json()["beliefs"]]
         assert claims == ["B"]
@@ -211,6 +211,8 @@ def test_forged_tenant_headers_ignored(tmp_path, app_url):
             params={"user_id": "u1"},
             headers={
                 "Authorization": "Bearer key-A",
+                "X-MM-Purpose": "test",
+                "X-MM-Purpose": "test",
                 "X-Tenant-Id": "tB",
                 "X-App-Id": "app",
                 "X-Tenant": "tB",
@@ -247,7 +249,7 @@ def test_engine_cache_lru_evicts_and_disposes(tmp_path, app_url, monkeypatch):
         for i in range(4):
             r = client.get(
                 "/beliefs", params={"user_id": "u1"},
-                headers={"Authorization": f"Bearer key-{i}"},
+                headers={"Authorization": f"Bearer key-{i}", "X-MM-Purpose": "test"},
             )
             assert r.status_code == 200
         assert len(server_mod._tenant_engines) == 2  # bounded
@@ -256,7 +258,7 @@ def test_engine_cache_lru_evicts_and_disposes(tmp_path, app_url, monkeypatch):
         for i in (2, 3):
             r = client.get(
                 "/beliefs", params={"user_id": "u1"},
-                headers={"Authorization": f"Bearer key-{i}"},
+                headers={"Authorization": f"Bearer key-{i}", "X-MM-Purpose": "test"},
             )
             claims = [x["claim_text"] for x in r.json()["beliefs"]]
             assert claims == [f"T{i}"]
@@ -280,7 +282,7 @@ def test_engine_cache_thread_safe_single_engine_per_tenant(tmp_path, monkeypatch
 
     tenants = [(f"t{i}", "app") for i in range(6)]
     for tenant in tenants:
-        server_mod.register_tenant_key(f"key-{tenant[0]}", tenant[0], tenant[1])
+        server_mod.register_tenant_key(f"key-{tenant[0]}", tenant[0], tenant[1], purposes={"test"})
         _seed(db_url, tenant, f"key-{tenant[0]}", f"ROW-{tenant[0]}")
 
     server_mod._app_state.update(

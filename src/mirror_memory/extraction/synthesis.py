@@ -11,6 +11,7 @@ alone may commit a snapshot and which does so only after the revision guard.
 
 from __future__ import annotations
 
+import json
 import logging
 
 from mirror_memory.config.schema import MemoryConfig
@@ -110,6 +111,8 @@ class Synthesizer:
         session: object,
         user_id: str,
         config: MemoryConfig,
+        *,
+        visibility: "VisibilityRule | None" = None,
     ) -> dict | None:
         """The read half: everything the model call needs, as plain data.
 
@@ -130,7 +133,7 @@ class Synthesizer:
             logger.warning("synthesis: k3_system prompt is empty, skipping")
             return None
 
-        beliefs = list_active_beliefs(session, user_id, limit=_MAX_BELIEFS)
+        beliefs = list_active_beliefs(session, user_id, limit=_MAX_BELIEFS, visibility=visibility)
         if len(beliefs) < 2:
             logger.debug("synthesis: insufficient beliefs (%d), skipping", len(beliefs))
             return None
@@ -142,8 +145,8 @@ class Synthesizer:
         # Slice summaries are optional.  Checkin trends are not implemented
         # in the base engine (no check-in model defined) -- callers that
         # have check-in data can override _build_k3_payload.
-        slice_summaries = _get_slice_summaries(session, user_id)
-        current = _get_current_understanding(session, user_id)
+        slice_summaries = _get_slice_summaries(session, user_id, visibility=visibility)
+        current = _get_current_understanding(session, user_id, visibility=visibility)
 
         return {
             "user_id": user_id,
@@ -178,9 +181,30 @@ def _parse_understanding(raw: str) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
-def _get_slice_summaries(session: object, user_id: str) -> str:
+def _snapshot_provenance_visible(snapshot: object, visibility: "VisibilityRule") -> bool:
+    """The AND rule over the snapshot's recorded input union (M3 batch-3
+    patch): the snapshot merges several inputs' text, so EVERY input
+    purpose must be visible.  Pre-patch rows (empty JSON list) fall back
+    to the single source_purpose."""
+    from mirror_memory.core import provenance
+
+    try:
+        listed = [p for p in json.loads(getattr(snapshot, "source_purposes_json", "") or "[]") if p]
+    except ValueError:
+        listed = []
+    if not listed:
+        listed = [snapshot.source_purpose] if snapshot.source_purpose else []
+    return provenance.merged_visible(visibility, listed)
+
+
+def _get_slice_summaries(session: object, user_id: str, *, visibility: "VisibilityRule | None" = None) -> str:
     """Get recent slice summaries as text.  Returns empty string if
-    the session does not provide the required model."""
+    the session does not provide the required model.
+
+    With a visibility rule, snapshots synthesized under a purpose the rule
+    refuses are skipped -- their content was shaped by memory the reading
+    job may not use (the batch-3 snapshot decision: read-time gating; a
+    skipped snapshot is rebuilt by the next completed job)."""
     try:
         from mirror_memory.core.models import Snapshot
 
@@ -188,9 +212,14 @@ def _get_slice_summaries(session: object, user_id: str) -> str:
             session.query(Snapshot)
             .filter(Snapshot.user_id == user_id)
             .order_by(Snapshot.created_at.desc())
-            .limit(_MAX_SUMMARIES)
+            .limit(_MAX_SUMMARIES * 4 if visibility else _MAX_SUMMARIES)
             .all()
         )
+        if visibility is not None:
+            rows = [
+                r for r in rows
+                if _snapshot_provenance_visible(r, visibility)
+            ][:_MAX_SUMMARIES]
         lines = []
         for r in rows:
             lines.append(f"- {r.created_at.strftime('%Y-%m-%d') if r.created_at else '?'}: {r.content_json[:200]}")
@@ -199,9 +228,14 @@ def _get_slice_summaries(session: object, user_id: str) -> str:
         return ""
 
 
-def _get_current_understanding(session: object, user_id: str) -> str:
+def _get_current_understanding(session: object, user_id: str, *, visibility: "VisibilityRule | None" = None) -> str:
     """Read the user's current understanding JSON from the latest
-    active snapshot."""
+    active snapshot.
+
+    With a visibility rule the latest snapshot is used only when its own
+    provenance (the job purpose that synthesized it) passes; otherwise it
+    is treated as absent -- no fallback to older, staler versions.  The
+    next completed job under a visible purpose rebuilds one."""
     try:
         from mirror_memory.core.models import Snapshot
 
@@ -212,6 +246,8 @@ def _get_current_understanding(session: object, user_id: str) -> str:
             .limit(1)
             .first()
         )
+        if snap and visibility is not None and not _snapshot_provenance_visible(snap, visibility):
+            return ""
         if snap and snap.content_json and snap.content_json != "{}":
             return snap.content_json
     except Exception:

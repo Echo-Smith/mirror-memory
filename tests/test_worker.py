@@ -29,31 +29,31 @@ class TestEnqueueJob:
         set_memory_enabled(db_session, "u1", True)
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="test", confidence=0.5, session_id="s1")
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
         assert job is not None
         assert job.status == "pending"
 
     def test_disabled_memory_returns_none(self, db_session, config):
         set_memory_enabled(db_session, "u1", False)
-        assert enqueue_job(db_session, "u1", config) is None
+        assert enqueue_job(db_session, "u1", config, purpose="test") is None
 
     def test_existing_pending_returns_same(self, db_session, config):
         set_memory_enabled(db_session, "u1", True)
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="test", confidence=0.5, session_id="s1")
-        j1 = enqueue_job(db_session, "u1", config)
-        j2 = enqueue_job(db_session, "u1", config)
+        j1 = enqueue_job(db_session, "u1", config, purpose="test")
+        j2 = enqueue_job(db_session, "u1", config, purpose="test")
         assert j1.id == j2.id
 
     def test_updates_watermark_on_existing(self, db_session, config):
         set_memory_enabled(db_session, "u1", True)
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="test", confidence=0.5, session_id="s1")
-        j1 = enqueue_job(db_session, "u1", config)
+        j1 = enqueue_job(db_session, "u1", config, purpose="test")
         wm1 = j1.evidence_watermark
         record_claim(db_session, "u1", dimension="topic", key="work",
                      claim_text="new evidence", confidence=0.5, session_id="s1")
-        j2 = enqueue_job(db_session, "u1", config)
+        j2 = enqueue_job(db_session, "u1", config, purpose="test")
         assert j2.id == j1.id
         assert j2.evidence_watermark != wm1
 
@@ -61,12 +61,12 @@ class TestEnqueueJob:
         set_memory_enabled(db_session, "u1", True)
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="test", confidence=0.5, session_id="s1")
-        j1 = enqueue_job(db_session, "u1", config)
+        j1 = enqueue_job(db_session, "u1", config, purpose="test")
         db_session.query(EvolutionJob).filter(
             EvolutionJob.id == j1.id
         ).update({"status": "completed"}, synchronize_session=False)
         db_session.commit()
-        j2 = enqueue_job(db_session, "u1", config)
+        j2 = enqueue_job(db_session, "u1", config, purpose="test")
         assert j2.id == j1.id
         assert j2.status == "pending"
 
@@ -88,7 +88,7 @@ class TestProcessPending:
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="User has trouble sleeping", confidence=0.8,
                      session_id="s1")
-        enqueue_job(db_session, "u1", config)
+        enqueue_job(db_session, "u1", config, purpose="test")
 
         def factory():
             return db_session
@@ -101,7 +101,7 @@ class TestProcessPending:
         set_memory_enabled(db_session, "u1", True)
         record_claim(db_session, "u1", dimension="topic", key="sleep",
                      claim_text="test", confidence=0.5, session_id="s1")
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
         job_id = job.id
         # simulate a crashed claim via an explicit filtered UPDATE (the
         # deferred identity-keyed flush would trip the SQL auditor)
@@ -140,12 +140,12 @@ class TestLoadEvidence:
                      claim_text="test", confidence=0.5, session_id="s1")
         record_claim(db_session, "u1", dimension="topic", key="work",
                      claim_text="test", confidence=0.5, session_id="s2")
-        evidence = _load_evidence(db_session, "u1")
+        evidence, _visible = _load_evidence(db_session, "u1")
         assert len(evidence["beliefs"]) >= 2
         assert evidence["distinct_sessions"] == 2
 
     def test_empty_user(self, db_session):
-        evidence = _load_evidence(db_session, "nonexistent")
+        evidence, _visible = _load_evidence(db_session, "nonexistent")
         assert evidence["beliefs"] == []
 
 

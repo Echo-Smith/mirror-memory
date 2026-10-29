@@ -140,7 +140,7 @@ class TestStaleWriteLeavesDatabaseUnchanged:
         """The headline regression: revision bumped mid-job → nothing published."""
         _seed_user(db_session)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
         assert job is not None
 
         before = _dump_memory_state(db_session)
@@ -157,7 +157,7 @@ class TestStaleWriteLeavesDatabaseUnchanged:
         """Even the job row may change only in status / completion / reason."""
         _seed_user(db_session)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
 
         before_job = _dump_job(db_session, job.id)
         _bump_during_formulate(monkeypatch)
@@ -175,7 +175,7 @@ class TestStaleWriteLeavesDatabaseUnchanged:
         _seed_user(db_session)
         persist_snapshot(db_session, "u1", {"v": 1}, {}, "wm1", shadow=True)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
 
         before = _dump_memory_state(db_session)
         snapshot_before = _dump_memory_state(db_session)["mm_snapshots"]
@@ -192,7 +192,7 @@ class TestStaleWriteLeavesDatabaseUnchanged:
         """The exact old hole: K3 used to write its own snapshot before the guard."""
         _seed_user(db_session)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
 
         before = _dump_memory_state(db_session)
         _bump_during_formulate(monkeypatch)
@@ -241,7 +241,7 @@ class TestMemoryDisabledRuntime:
         """Disabling memory while the worker computes must stop the publish."""
         _seed_user(db_session)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
 
         before = _dump_memory_state(db_session)
 
@@ -263,7 +263,7 @@ class TestMemoryDisabledRuntime:
         """The consent gate runs before any evidence is read into a payload."""
         _seed_user(db_session)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
         set_memory_enabled(db_session, "u1", False)
 
         called = []
@@ -283,7 +283,7 @@ class TestMemoryDisabledRuntime:
     def test_enqueue_refuses_when_disabled(self, db_session):
         set_memory_enabled(db_session, "u1", False)
         config = _fake_config()
-        assert enqueue_job(db_session, "u1", config) is None
+        assert enqueue_job(db_session, "u1", config, purpose="test") is None
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +335,7 @@ class TestComputeNodesArePure:
         """A clean run publishes exactly one snapshot and nothing else."""
         _seed_user(db_session)
         config = _fake_config()
-        job = enqueue_job(db_session, "u1", config)
+        job = enqueue_job(db_session, "u1", config, purpose="test")
 
         before = _dump_memory_state(db_session)
         _process_single_job(db_session, job, config)

@@ -366,8 +366,11 @@ def run_longrun(
     import os
 
     url = database_url or os.environ.get("MM_LONGRUN_DATABASE_URL") or "sqlite://"
-    engine = MemoryEngine(config=config, database_url=url)
+    engine = MemoryEngine(config=config, database_url=url, default_purpose="benchmark")
     engine._ensure_db()
+    from mirror_memory.bench import grant_bench_purpose
+
+    grant_bench_purpose(engine, [user_id])
     start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
     def stamp(day: int) -> datetime:

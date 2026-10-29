@@ -37,9 +37,11 @@
   reason: >
     Batched backfill of tenant/other columns: selects primary keys across
     all tenants and updates them with the configured default.  Called only
-    from migration steps.
+    from migration steps.  M3 re-review (2026-10-30, Echo-Smith): the
+    function body gained composite-primary-key row-value matching and the
+    ``marker`` empty-marker predicate -- scope and reason unchanged.
   reviewer: Echo-Smith
-  reviewed_at: "2026-10-27"
+  reviewed_at: "2026-10-30"
 
 - module: mirror_memory.core.schema_migration
   function: _verify_column
@@ -60,6 +62,16 @@
   reviewed_at: "2026-10-27"
 
 - module: mirror_memory.core.schema_migration
+  function: _count_legacy_jobs
+  reason: >
+    Migration step 6 counts pre-M3 evolution jobs (purpose == '') across
+    all tenants -- they will be cancelled at runtime unless the operator
+    chose a legacy_job_purpose before upgrading.  The count is logged and
+    returned by upgrade_database so the decision is informed.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-30"
+
+- module: mirror_memory.core.schema_migration
   function: _emit_primary_key_swaps
   reason: >
     Converting each tenant table's primary key to the composite tenant key
@@ -77,3 +89,15 @@
     configuration.  Runs a single bounded query at engine construction.
   reviewer: Echo-Smith
   reviewed_at: "2026-10-25"
+
+- module: mirror_memory.worker.maintenance
+  function: purge_expired_audit
+  reason: >
+    Audit-retention maintenance (M3 batch 3): enumerates the DISTINCT
+    tenants holding access-audit rows once (a read of the audit table's
+    tenant columns) so each tenant's retention purge can then run inside
+    its own tenant_scope through the sanctioned writer.  The enumeration
+    is the only cross-tenant statement; the deletions are per-tenant and
+    batched.  Reached from the worker loop's periodic maintenance pass.
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-30"

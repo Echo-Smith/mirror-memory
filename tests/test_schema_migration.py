@@ -347,7 +347,7 @@ def test_database_already_at_version_1_advances_to_step_2(base_db):
 
     # The full plan now runs only the steps above version 1.
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
     after = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
     if eng.dialect.name == "postgresql":
         assert after == ["tenant_id", "app_id", "id"], after
@@ -398,7 +398,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
 
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 5
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
     step = sm.Step4PendingJobsIndex()
@@ -416,7 +416,7 @@ def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
     from mirror_memory.core import schema_migration as sm
     from mirror_memory.core.tenancy import legacy_user_index_name, tenant_user_index_name
 
-    assert len(TENANT_USER_INDEXED_TABLES) == 14
+    assert len(TENANT_USER_INDEXED_TABLES) == 16
     eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
     Base.metadata.create_all(eng)
     insp = inspect(eng)
@@ -448,3 +448,383 @@ def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
     assert legacy_user_index_name("mm_beliefs") not in names
     assert not step2.needed(eng2)
     eng2.dispose()
+
+
+def test_step6_legacy_job_purpose_backfills_and_counts(base_db, tmp_path):
+    """M3 batch-1 patch task 4: legacy_job_purpose labels pre-M3 jobs with
+    the operator-chosen purpose (they still only run with a valid grant);
+    without it, jobs keep the empty marker and the returned/logged count
+    tells the operator how many will be cancelled."""
+    from mirror_memory.core import schema_migration as sm
+
+    # WITHOUT legacy purpose: jobs keep '' and the count is returned
+    eng = _engine(base_db)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    # one completed pre-M3 job came with the base database
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("mm_evolution_jobs")}
+    assert "purpose" in cols
+    eng.dispose()
+
+    # WITH legacy purpose: the job is labelled, count is 0
+    from sqlalchemy import MetaData, text as _text
+
+    eng2 = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    Base.metadata.create_all(eng2)
+    with eng2.begin() as conn:
+        conn.execute(_text(
+            "INSERT INTO mm_evolution_jobs (id, user_id, evidence_watermark, "
+            "idempotency_key, status, purpose, tenant_id, app_id, "
+            "lease_token, prompt_version, attempt_count, error_code, "
+            "claimed_revision, created_at) VALUES ('j1', 'u1', '{}', 'ik1', "
+            "'pending', '', 'legacy', 'app', 0, '', 0, '', 0, "
+            "CURRENT_TIMESTAMP)"
+        ))
+    # simulate a version-5 database: strip step-6 artifacts, set version 5
+    sm._ensure_version_table(eng2)
+    with eng2.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE mm_purpose_grants")
+        conn.exec_driver_sql("DROP TABLE mm_purpose_grant_events")
+        conn.exec_driver_sql("ALTER TABLE mm_evolution_jobs DROP COLUMN purpose")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=5, note="simulated v5"))
+    step = sm.Step6PurposeAuthorization(legacy_job_purpose="legacy-app")
+    assert step._legacy_purpose() == "legacy-app"
+    step.apply(eng2)
+    step.verify(eng2)
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    with no_audit_scope():
+        purpose = eng2.connect().execute(_text(
+            "SELECT purpose FROM mm_evolution_jobs WHERE id = 'j1'"
+        )).scalar_one()
+    assert purpose == "legacy-app"
+    assert step.legacy_jobs_to_cancel == 0
+    # whitespace-only / invalid values are refused
+    with pytest.raises(sm.MigrationError):
+        sm.Step6PurposeAuthorization(legacy_job_purpose="legacy app")._legacy_purpose()
+    eng2.dispose()
+
+
+def _insert_job(conn, job_id: str, purpose: str, tenant: str = "t", app: str = "a") -> None:
+    from sqlalchemy import text as _text
+
+    conn.execute(
+        _text(
+            "INSERT INTO mm_evolution_jobs (id, user_id, evidence_watermark, "
+            "idempotency_key, status, purpose, tenant_id, app_id, lease_token, "
+            "prompt_version, attempt_count, error_code, claimed_revision, "
+            "created_at) VALUES (:id, 'u1', '{}', :ik, 'pending', :purpose, "
+            ":tenant, :app, 0, '', 0, '', 0, CURRENT_TIMESTAMP)"
+        ),
+        {"id": job_id, "ik": "ik-" + job_id, "purpose": purpose, "tenant": tenant, "app": app},
+    )
+
+
+def test_backfill_column_handles_composite_pk_and_empty_marker(tmp_path):
+    """M3 batch-2 task 1 finding: ``_backfill_column`` refused every table
+    with a composite primary key (all tenant tables after step 2 -- on
+    PostgreSQL that is every table step 6 touches, so step 6 could not run
+    on a real v5 database), and it only matched NULL, so the documented
+    re-entry 'stamp rows still carrying the empty marker' matched nothing.
+    Composite keys are now matched as a row value and ``marker`` widens the
+    predicate to the empty marker."""
+    from sqlalchemy import text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'composite.db'}")
+    Base.metadata.create_all(eng)
+    live = sm._live_table(eng, "mm_evolution_jobs")
+    assert [c.name for c in live.primary_key.columns] == ["tenant_id", "app_id", "id"]
+    with eng.begin() as conn:
+        _insert_job(conn, "j0", "")
+        _insert_job(conn, "j1", "", tenant="t2")
+        _insert_job(conn, "j2", "keep")
+    with no_audit_scope():
+        # batch of 1 forces several rounds through the row-value IN
+        stamped = sm._backfill_column(
+            eng, "mm_evolution_jobs", {"purpose": "legacy-app"}, ["purpose"], 1, marker="",
+        )
+        rows = eng.connect().execute(
+            _text("SELECT id, purpose FROM mm_evolution_jobs ORDER BY id")
+        ).all()
+    assert stamped == 2
+    assert rows == [("j0", "legacy-app"), ("j1", "legacy-app"), ("j2", "keep")]
+    with no_audit_scope():
+        # without the marker only NULL rows qualify: nothing left to do
+        assert sm._backfill_column(
+            eng, "mm_evolution_jobs", {"purpose": "x"}, ["purpose"], 10,
+        ) == 0
+    eng.dispose()
+
+
+def test_step6_reentry_stamps_empty_marker_jobs(tmp_path):
+    """Re-entering step 6 with a legacy purpose chosen between runs must
+    label the jobs that the first run left with the empty marker."""
+    from sqlalchemy import MetaData, text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'reentry.db'}")
+    Base.metadata.create_all(eng)
+    with eng.begin() as conn:
+        _insert_job(conn, "j0", "")
+        _insert_job(conn, "j1", "already")
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=5, note="simulated v5 after a run without legacy purpose"))
+    step = sm.Step6PurposeAuthorization(legacy_job_purpose="legacy-app")
+    step.apply(eng)  # column already present -> re-entry branch
+    step.verify(eng)
+    with no_audit_scope():
+        rows = eng.connect().execute(
+            _text("SELECT id, purpose FROM mm_evolution_jobs ORDER BY id")
+        ).all()
+    assert rows == [("j0", "legacy-app"), ("j1", "already")]
+    assert step.legacy_jobs_to_cancel == 0
+    eng.dispose()
+
+
+def _seed_provenance_rows(conn, n: int = 1) -> None:
+    """One row in each provenance table, written without naming
+    source_purpose (the pre-M3 shape; after the migration the server
+    default supplies it)."""
+    from sqlalchemy import text as _text
+
+    conn.execute(_text(
+        "INSERT INTO mm_evidence (user_id, session_id, ref, content, source_type, "
+        "extraction_method, authority, observed_at, created_at, retention_state, "
+        "tenant_id, app_id) VALUES ('u1', 's1', :ref, 'c', 'message', '', 'user', "
+        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'hot', 't', 'a')"
+    ), {"ref": f"s1:{n}"})
+    conn.execute(_text(
+        "INSERT INTO mm_belief_events (belief_id, user_id, event_type, evidence_json, "
+        "detail_json, created_at, tenant_id, app_id) VALUES (1, 'u1', 'created', '[]', "
+        "'{}', CURRENT_TIMESTAMP, 't', 'a')"
+    ))
+    conn.execute(_text(
+        "INSERT INTO mm_snapshots (id, user_id, version, status, content_json, "
+        "support_policy_json, evidence_watermark, prompt_version, created_at, "
+        "tenant_id, app_id) VALUES (:id, 'u1', :n, 'active', '{}', '{}', '{}', "
+        "'v1', CURRENT_TIMESTAMP, 't', 'a')"
+    ), {"id": f"snap{n}", "n": n})
+
+
+def _source_purposes(eng) -> dict[str, list[str]]:
+    from sqlalchemy import text as _text
+
+    from mirror_memory.core.schema_migration import SOURCE_PURPOSE_TABLES
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    out = {}
+    with no_audit_scope(), eng.connect() as conn:
+        for table in SOURCE_PURPOSE_TABLES:
+            out[table] = [r[0] for r in conn.execute(_text(f"SELECT source_purpose FROM {table}")).all()]
+    return out
+
+
+def _simulate_version6(eng) -> None:
+    """Strip step 7's columns and record version 6."""
+    from sqlalchemy import MetaData
+
+    from mirror_memory.core import schema_migration as sm
+
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        for table in sm.SOURCE_PURPOSE_TABLES:
+            conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN source_purpose")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=6, note="simulated v6"))
+
+
+def test_step7_adds_source_purpose_to_a_version6_database(tmp_path):
+    """M3 batch-2 task 1: existing provenance rows get the empty 'source
+    not recorded' marker; the column is NOT NULL with server default ''."""
+    from sqlalchemy import text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'v6.db'}")
+    Base.metadata.create_all(eng)
+    _simulate_version6(eng)
+    with eng.begin() as conn:
+        _seed_provenance_rows(conn)
+    step = sm.Step7SourcePurpose()
+    assert step.needed(eng)
+
+    counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    assert "legacy_jobs_to_cancel" not in counts, "step 6 did not run: no stale count"
+    insp = inspect(eng)
+    for table in sm.SOURCE_PURPOSE_TABLES:
+        col = {c["name"]: c for c in insp.get_columns(table)}["source_purpose"]
+        assert col["nullable"] is False, table
+    assert _source_purposes(eng) == {t: [""] for t in sm.SOURCE_PURPOSE_TABLES}
+    # a row written after the migration without the column named still
+    # gets the marker from the server default
+    with no_audit_scope(), eng.begin() as conn:
+        _seed_provenance_rows(conn, 2)
+    assert all(v == ["", ""] for v in _source_purposes(eng).values())
+    assert not sm.Step7SourcePurpose().needed(eng)
+    eng.dispose()
+
+
+def test_step7_legacy_purpose_labels_existing_rows_only(tmp_path):
+    """With legacy_job_purpose (the same parameter step 6 uses) the pre-M3
+    rows are labelled; the server default stays '' so later rows are not.
+    Re-entering with the purpose chosen after a first run stamps the rows
+    still carrying the marker."""
+    from sqlalchemy import text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'v6-legacy.db'}")
+    Base.metadata.create_all(eng)
+    _simulate_version6(eng)
+    with eng.begin() as conn:
+        _seed_provenance_rows(conn)
+
+    # first run WITHOUT a legacy purpose: markers
+    sm.Step7SourcePurpose().apply(eng)
+    assert _source_purposes(eng) == {t: [""] for t in sm.SOURCE_PURPOSE_TABLES}
+    # a row written in between carries the marker too
+    with no_audit_scope(), eng.begin() as conn:
+        conn.execute(_text(
+            "INSERT INTO mm_snapshots (id, user_id, version, status, content_json, "
+            "support_policy_json, evidence_watermark, prompt_version, created_at, "
+            "tenant_id, app_id) VALUES ('snap2', 'u1', 2, 'active', '{}', '{}', '{}', "
+            "'v1', CURRENT_TIMESTAMP, 't', 'a')"
+        ))
+    # re-entry WITH the legacy purpose: every marker row is stamped
+    step = sm.Step7SourcePurpose(legacy_job_purpose="legacy-app")
+    step.apply(eng)
+    step.verify(eng)
+    assert _source_purposes(eng) == {
+        "mm_evidence": ["legacy-app"],
+        "mm_belief_events": ["legacy-app"],
+        "mm_snapshots": ["legacy-app", "legacy-app"],
+    }
+    assert step.rows_labelled == {"mm_evidence": 1, "mm_belief_events": 1, "mm_snapshots": 2}
+    # rows written AFTER the labelled migration still default to the marker
+    with no_audit_scope(), eng.begin() as conn:
+        _seed_provenance_rows(conn, 3)
+    assert _source_purposes(eng)["mm_evidence"] == ["legacy-app", ""]
+    # the env fallback and the whitespace refusal are the shared resolver's
+    with pytest.raises(sm.MigrationError):
+        sm.Step7SourcePurpose(legacy_job_purpose="legacy app")._legacy_purpose()
+    eng.dispose()
+
+
+def test_upgrade_database_returns_the_step6_cancel_count(base_db):
+    """The step-6 docstring promised the pre-M3 cancel count in
+    ``upgrade_database``'s return value; batch 1 only logged it."""
+    eng = _engine(base_db)
+    counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert isinstance(counts.get("legacy_jobs_to_cancel"), int)
+    eng.dispose()
+
+
+def test_step8_creates_the_access_audit_table_on_a_version7_database(tmp_path):
+    """M3 batch-2 task 2: a version-7 database gains mm_access_audit with
+    the model's shape (composite tenant key, tenant-prefixed indexes);
+    re-entrant."""
+    from sqlalchemy import MetaData
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.tenancy import tenant_user_index_name
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'v7.db'}")
+    Base.metadata.create_all(eng)
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE mm_access_audit")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=7, note="simulated v7"))
+    step = sm.Step8AccessAudit()
+    assert step.needed(eng)
+    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    insp = inspect(eng)
+    assert insp.has_table("mm_access_audit")
+    names = {ix["name"] for ix in insp.get_indexes("mm_access_audit")}
+    assert tenant_user_index_name("mm_access_audit") in names
+    assert "ix_mm_access_audit_tenant_created" in names
+    cols = {c["name"] for c in insp.get_columns("mm_access_audit")}
+    assert {"tenant_id", "app_id", "id", "user_id", "purpose", "operation", "entry",
+            "decision", "reason", "grant_version", "memory_count", "memory_ids_json",
+            "truncated", "created_at"} <= cols
+    assert not step.needed(eng)
+    step.apply(eng)  # re-entry is a no-op
+    step.verify(eng)
+    eng.dispose()
+
+
+def test_step9_swaps_belief_indexes_and_stamps_summaries(tmp_path):
+    """M3 batch 3 step 9: the bare belief_id indexes are REPLACED by
+    tenant-prefixed composites and mm_session_summaries gains
+    source_purpose (existing rows carry the empty marker unless the legacy
+    purpose labels them); re-entrant per artifact."""
+    from sqlalchemy import MetaData, text as _text
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'v8.db'}")
+    Base.metadata.create_all(eng)
+    sm._ensure_version_table(eng)
+    with eng.begin() as conn:
+        # simulate v8: legacy single-column belief indexes, no summary column
+        for table, legacy in sm.LEGACY_BELIEF_INDEXES.items():
+            conn.exec_driver_sql(f"DROP INDEX {sm.TENANT_BELIEF_INDEXES[table]}")
+            conn.exec_driver_sql(
+                f"CREATE INDEX {legacy} ON {table} (belief_id)")
+        conn.exec_driver_sql("ALTER TABLE mm_session_summaries DROP COLUMN source_purpose")
+        vt = sm._version_table(MetaData())
+        conn.execute(vt.delete())
+        conn.execute(vt.insert().values(version=8, note="simulated v8"))
+        conn.execute(_text(
+            "INSERT INTO mm_session_summaries (user_id, session_id, summary_text, "
+            "turn_count, created_at, tenant_id, app_id) VALUES ('u1', 's1', 'c', 1, "
+            "CURRENT_TIMESTAMP, 't', 'a')"
+        ))
+    step = sm.Step9RecallVisibility(legacy_job_purpose="legacy-app")
+    assert step.needed(eng)
+    upgrade_database(eng, default_tenant="legacy", default_app="app",
+                     steps=[step])
+    assert sm.current_version(eng) == 9
+    insp = inspect(eng)
+    for table, composite in sm.TENANT_BELIEF_INDEXES.items():
+        names = {ix["name"] for ix in insp.get_indexes(table)}
+        assert composite in names, (table, names)
+        assert sm.LEGACY_BELIEF_INDEXES[table] not in names, table
+    with no_audit_scope(), eng.connect() as conn:
+        purpose = conn.execute(_text(
+            "SELECT source_purpose FROM mm_session_summaries")).scalar_one()
+    assert purpose == "legacy-app"
+    # a summary written after the migration carries the marker default
+    with no_audit_scope(), eng.begin() as conn:
+        conn.execute(_text(
+            "INSERT INTO mm_session_summaries (user_id, session_id, summary_text, "
+            "turn_count, created_at, tenant_id, app_id) VALUES ('u1', 's2', 'c2', 1, "
+            "CURRENT_TIMESTAMP, 't', 'a')"
+        ))
+    with no_audit_scope(), eng.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT session_id, source_purpose FROM mm_session_summaries ORDER BY session_id")).all()
+    assert rows == [("s1", "legacy-app"), ("s2", "")]
+    step2 = sm.Step9RecallVisibility()
+    assert not step2.needed(eng)
+    step2.apply(eng)  # re-entry: no-op
+    step2.verify(eng)
+    eng.dispose()

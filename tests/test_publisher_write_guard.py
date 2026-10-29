@@ -66,7 +66,7 @@ def test_every_tenant_table_is_classified():
 def test_mapping_covers_exactly_the_tenant_tables():
     from mirror_memory.core.models import Base
 
-    assert len(TABLE_WRITE_CLASSES) == len(Base.metadata.tables) == 18
+    assert len(TABLE_WRITE_CLASSES) == len(Base.metadata.tables) == 21
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +92,9 @@ def test_queue_class_wrong_scope_refused(tmp_path):
     with tenant_scope("default", "default"):
         s = factory()
         with pytest.raises(WriteGuardViolation):
-            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik"))
+            s.add(EvolutionJob(id="j1", user_id="u1", idempotency_key="ik", purpose="test"))
         with queue_write_scope():
-            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2"))
+            s.add(EvolutionJob(id="j2", user_id="u1", idempotency_key="ik2", purpose="test"))
         s.rollback()
         s.close()
 
@@ -245,4 +245,26 @@ def test_confirm_rate_unclear_is_a_count_noop(tmp_path):
         _update_confirm_rate(s, "u1", belief.id, "unclear", None)
         val = json.loads(belief.value_json)
         assert val["confirm_alpha"] == 1.0 and val["confirm_beta"] == 1.0
+        s.close()
+
+
+def test_audit_class_wrong_scope_refused(tmp_path):
+    """M3 batch-2 task 2: the access audit is its own write class -- the
+    engine scope does not cover it and vice versa."""
+    from mirror_memory.core.models import AccessAudit
+    from mirror_memory.core.tenancy import audit_write_scope
+
+    factory = session_at(f"sqlite:///{tmp_path}/a.db")
+    with tenant_scope("default", "default"):
+        s = factory()
+        with pytest.raises(WriteGuardViolation):
+            s.add(AccessAudit(user_id="u1", operation="recall", entry="x", decision="allowed"))
+        with engine_write_scope(), pytest.raises(WriteGuardViolation):
+            s.add(AccessAudit(user_id="u1", operation="recall", entry="x", decision="allowed"))
+        with audit_write_scope():
+            s.add(AccessAudit(user_id="u1", operation="recall", entry="x", decision="allowed"))
+            s.flush()
+        with audit_write_scope(), pytest.raises(WriteGuardViolation):
+            s.add(Belief(user_id="u1", dimension="d", key="k", claim_text="x"))
+        s.rollback()
         s.close()

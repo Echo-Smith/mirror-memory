@@ -95,7 +95,7 @@ def test_refuses_with_server_middleware(tmp_path):
 
     url = f"sqlite:///{tmp_path}/mutual.db"
     server_mod._tenant_key_registry.clear()
-    server_mod.register_tenant_key("some-key", "tA", "app")
+    server_mod.register_tenant_key("some-key", "tA", "app", purposes={"test"})
     try:
         with pytest.raises(RuntimeError, match="mutually exclusive"):
             make_engine(url, single_tenant_mode=True)._ensure_db()

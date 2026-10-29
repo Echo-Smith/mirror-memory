@@ -24,9 +24,11 @@ Classification (task requirement; one row per v2 test):
 | 14 | BG test_evidence_deleted_between_claim_and_publish| 按 v1 语义改写 | v2 forget(evidence_ids) -> v1 evidence rows deleted; the Publisher's authority gate refuses (`evidence_missing`) |
 | 15 | BG test_no_memory_with_revocation_does_not_mark_ready | 按 v1 语义改写 | the revoke half is M3; the v1 core -- a refused publish leaves the job cancelled, never completed -- is kept via the consent gate |
 
-v1 addition required by the task: the version CAS under REAL thread
-concurrency (``test_cas_real_concurrency_only_one_side_wins``, 8 threads,
-50 rounds).
+The v1 addition the M2 task asked for -- a version CAS under REAL thread
+concurrency -- moved to tests/test_purpose_authorization.py in M3 batch 1
+(``test_cas_first_issuance_exactly_one_winner`` /
+``test_cas_update_exactly_one_winner``, 50 rounds) when the CAS under
+test became the purpose-grant version.
 
 Race tests loop 50x so a pass is not luck.  Threads do not inherit
 ContextVars: every thread body opens its own ``tenant_scope`` (the RLS
@@ -46,6 +48,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
+from tests.conftest import refusing_authz
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.core.models import Belief, DeletionTombstone, Evidence, EvolutionJob
@@ -121,12 +125,11 @@ def seed_beliefs(session, count=1):
     session.commit()
 
 
-def seed_job(session, job_id):
+def seed_job(session, job_id, purpose="test"):
     with queue_write_scope():
         session.add(EvolutionJob(
             id=job_id, user_id=USER, evidence_watermark="{}",
-            idempotency_key=f"{job_id}:ik", status="pending",
-        ))
+            idempotency_key=f"{job_id}:ik", status="pending", purpose=purpose))
     session.commit()
 
 
@@ -477,64 +480,134 @@ def test_refused_publish_does_not_mark_completed(factory):
 
 
 # ---------------------------------------------------------------------------
-# The M3-dependent four (purpose-bound consent): turn positive at M3
+# 3 / 8 / 6 / 7 (M3): purpose-bound consent, now implemented
 # ---------------------------------------------------------------------------
 
-_M3 = "M3: purpose-bound consent (v2 AuthorizationSnapshot has no v1 counterpart yet)"
+from mirror_memory.core.authorization import PurposeDenied, grant_purpose, revoke_purpose  # noqa: E402
+
+PURPOSE = "revoke-test"
 
 
-@pytest.mark.xfail(reason=_M3, strict=True)
+def pg_url() -> str:
+    return os.environ["MM_DATABASE_URL"]
+
+
 def test_revoke_between_claim_and_publish(factory):
-    raise NotImplementedError(_M3)
+    """I2 (v2 shape, v1 semantics): the job is claimed, the purpose grant is
+    revoked mid-compute, the publish must not land.  The publish re-check
+    (FOR SHARE on the grant row) cancels the job with zero memory written."""
+    cfg = make_config()
+    job_id = "i2-revoke-1"
+    with tenant_scope(*TENANT), opened(factory) as s:
+        seed_beliefs(s)
+        grant_purpose(s, USER, PURPOSE, operations=["extract"], issuer="reviewer")
+        seed_job(s, job_id, purpose=PURPOSE)
+    with tenant_scope(*TENANT), opened(factory, expire_on_commit=False) as holder:
+        token = _claim_job(holder, job_id, lease_seconds=LEASE_SECONDS)
+        assert token == 1
+        job_row = holder.get(EvolutionJob, pk(job_id))
+        holder.commit()
+        # interfere: the grant is revoked while the worker "computes"
+        with opened(factory) as s_rev:
+            revoke_purpose(s_rev, USER, PURPOSE, actor="reviewer", reason="i2")
+            s_rev.commit()
+        _process_single_job(holder, job_row, cfg, lease_token=token)
+        with opened(factory) as s_check:
+            row = s_check.get(EvolutionJob, pk(job_id))
+            assert row.status == "cancelled", (row.status, row.error_code)
+            assert row.error_code in ("authorization_revoked", "revoked")
+            assert belief_count(s_check) == 1  # the seed; nothing published
 
 
-@pytest.mark.xfail(reason=_M3, strict=True)
-def test_service_rejects_wrong_purpose(factory):
-    raise NotImplementedError(_M3)
-
-
-@pytest.mark.xfail(reason=_M3, strict=True)
-def test_worker_rejects_wrong_purpose(factory):
-    raise NotImplementedError(_M3)
-
-
-@pytest.mark.xfail(reason=_M3 + " -- interleaved variant", strict=True)
 def test_revoke_between_claim_and_publish_interleaved(factory):
-    raise NotImplementedError(_M3)
+    """PI variant: the revocation lands after the compute-side renewal but
+    before the publish; same outcome (the publish re-check), and the seed
+    belief set is all that exists."""
+    cfg = make_config()
+    job_id = "pi-revoke-1"
+    with tenant_scope(*TENANT), opened(factory) as s:
+        seed_beliefs(s)
+        grant_purpose(s, USER, PURPOSE, operations=["extract"], issuer="reviewer")
+        seed_job(s, job_id, purpose=PURPOSE)
+    with tenant_scope(*TENANT), opened(factory, expire_on_commit=False) as holder:
+        token = _claim_job(holder, job_id, lease_seconds=LEASE_SECONDS)
+        assert token == 1
+        job_row = holder.get(EvolutionJob, pk(job_id))
+        holder.commit()
+        # the compute-side renewal succeeds (still the holder) ...
+        with opened(factory) as s_mid:
+            assert _renew_lease(s_mid, job_id, token, LEASE_SECONDS)
+        # ... then the grant is revoked ...
+        with opened(factory) as s_rev:
+            revoke_purpose(s_rev, USER, PURPOSE, actor="reviewer", reason="pi")
+            s_rev.commit()
+        # ... and the publish must not land
+        _process_single_job(holder, job_row, cfg, lease_token=token)
+        with opened(factory) as s_check:
+            row = s_check.get(EvolutionJob, pk(job_id))
+            assert row.status == "cancelled", (row.status, row.error_code)
+            assert row.error_code in ("authorization_revoked", "revoked")
+            assert belief_count(s_check) == 1
 
 
-# ---------------------------------------------------------------------------
-# v1 addition: the version CAS under real thread concurrency
-# ---------------------------------------------------------------------------
+def test_service_rejects_wrong_purpose(factory):
+    """I5: the grant covers purpose X; calling with purpose Y is refused
+    (no_grant), at the service layer, before any business statement."""
+    from mirror_memory.core.authorization import PurposeDenied, grant_purpose
+    from mirror_memory.api import MemoryEngine
+
+    with tenant_scope(*TENANT), opened(factory) as s:
+        seed_beliefs(s)
+        grant_purpose(s, USER, "analytics", operations=["observe"], issuer="reviewer")
+        s.commit()
+
+    from tests.conftest import _pg_runtime_url
+
+    eng = MemoryEngine(
+        config=make_config(), database_url=_pg_runtime_url(),
+        tenant_id=TENANT[0], app_id=TENANT[1], default_purpose=None,
+    )
+    try:
+        # observe under the granted purpose works ...
+        eng.observe(user_id=USER, session_id="s9", text="granted path", purpose="analytics")
+        # ... and every operation under a purpose it does not carry is
+        # refused.  The harness lazy-grant is OFF for the probes -- the
+        # refusal is the point (I5).
+        with refusing_authz():
+            for call in (
+                lambda p: eng.recall(user_id=USER, purpose=p),
+                lambda p: eng.correct(user_id=USER, belief_id=1, new_claim_text="x", purpose=p),
+                lambda p: eng.explain(user_id=USER, belief_id=1, purpose=p),
+                lambda p: eng.observe(user_id=USER, session_id="s9", text="x", purpose=p),
+            ):
+                with pytest.raises(PurposeDenied, match="no_grant"):
+                    call("memory_management")
+    finally:
+        eng._engine.dispose()
 
 
-def test_cas_real_concurrency_only_one_side_wins(factory):
-    threads_n = 8
-    for round_no in range(ROUNDS):
-        with tenant_scope(*TENANT), opened(factory) as s:
-            set_memory_enabled(s, USER, True)  # the revision row must exist
-            s.commit()
-            revision = get_state_revision(s, USER)
-        outcomes = []
-        barrier = threading.Barrier(threads_n)
+def test_worker_rejects_wrong_purpose(factory):
+    """I5 at the worker: the job carries its own purpose; a worker running a
+    job whose purpose has no grant is cancelled.  The harness lazy-grant is
+    OFF here -- the refusal is the point."""
+    cfg = make_config()
+    job_id = "i5-worker-1"
+    with tenant_scope(*TENANT), opened(factory) as s:
+        seed_beliefs(s)
+        # the grant covers only "worker-purpose" ...
+        grant_purpose(s, USER, "worker-purpose", operations=["extract"], issuer="reviewer")
+        s.commit()
+        # ... but the job was enqueued under a DIFFERENT purpose
+        seed_job(s, job_id, purpose="other-purpose")
+    with tenant_scope(*TENANT), opened(factory, expire_on_commit=False) as holder:
+        token = _claim_job(holder, job_id, lease_seconds=LEASE_SECONDS)
+        assert token == 1
+        job_row = holder.get(EvolutionJob, pk(job_id))
+        holder.commit()
+        with refusing_authz():
+            _process_single_job(holder, job_row, cfg, lease_token=token)
+        with opened(factory) as s_check:
+            row = s_check.get(EvolutionJob, pk(job_id))
+            assert (row.status, row.error_code) == ("cancelled", "no_grant")
+            assert belief_count(s_check) == 1
 
-        def cas(n):
-            with tenant_scope(*TENANT), opened(factory) as session:
-                barrier.wait(timeout=10)
-                new = cas_bump_state_revision(session, USER, revision)
-                if new is None:
-                    session.rollback()
-                else:
-                    session.commit()
-                outcomes.append(new)
-
-        ts = [threading.Thread(target=cas, args=(n,)) for n in range(threads_n)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join(timeout=20)
-        assert len(outcomes) == threads_n, (round_no, outcomes)
-        landed = [o for o in outcomes if o is not None]
-        assert landed == [revision + 1], (round_no, outcomes)
-        with tenant_scope(*TENANT), opened(factory) as s:
-            assert get_state_revision(s, USER) == revision + 1

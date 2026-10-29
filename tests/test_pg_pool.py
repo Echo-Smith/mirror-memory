@@ -178,7 +178,7 @@ def test_fifty_tenants_share_one_pool_within_its_bound(
 
     tenants = [(f"t{i:02d}", "app") for i in range(50)]
     for tenant in tenants:
-        server_mod.register_tenant_key(f"key-{tenant[0]}", *tenant)
+        server_mod.register_tenant_key(f"key-{tenant[0]}", *tenant, purposes={"test"})
     app = server_mod.create_app(config=load_config("config/"), database_url=pg_app_url)
 
     samples: list[int] = []
@@ -203,7 +203,8 @@ def test_fifty_tenants_share_one_pool_within_its_bound(
         for i in range(25):
             tenant = tenants[(offset + i * 7) % len(tenants)]
             r = client.get("/beliefs", params={"user_id": "u1"},
-                           headers={"Authorization": f"Bearer key-{tenant[0]}"})
+                           headers={"Authorization": f"Bearer key-{tenant[0]}",
+                                    "X-MM-Purpose": "test"})
             with lock:
                 statuses.append(r.status_code)
 
@@ -237,7 +238,8 @@ def test_fifty_tenants_share_one_pool_within_its_bound(
         assert all(e._engine is shared and not e._owns_engine for _, e in resident)
         assert shared.pool is pool_before
         probe = TestClient(app).get("/beliefs", params={"user_id": "u1"},
-                                    headers={"Authorization": "Bearer key-t00"})
+                                    headers={"Authorization": "Bearer key-t00",
+                                             "X-MM-Purpose": "test"})
         assert probe.status_code == 200
 
 

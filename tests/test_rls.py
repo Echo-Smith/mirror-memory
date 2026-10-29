@@ -82,7 +82,7 @@ def _seed_tenant(app_url, tenant, user, config, *, jobs: bool = True) -> None:
                 session_id="s1",
             )
             if jobs:
-                assert enqueue_job(session, user, config) is not None
+                assert enqueue_job(session, user, config, purpose="test") is not None
             session.commit()
         finally:
             session.close()

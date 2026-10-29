@@ -236,6 +236,14 @@ class Evidence(TenantScoped, Base):
     # Who the statement is attributable to: "user" / "assistant" / "system" /
     # "derived".  Drives how much weight the evidence can carry.
     authority: Mapped[str] = mapped_column(String(32), default="user")
+    # The purpose the entry that collected this row was authorized for
+    # (M3 batch-2 task 1): observe's purpose, the worker's job purpose.
+    # "" = source not recorded (pre-M3 rows, direct repository use).  Set
+    # from the session's bound provenance, never by the caller; see
+    # core.provenance.  Recorded only -- not yet filtered on.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     # Memory metabolism (PR3).  ``hot`` rows are live provenance;
@@ -291,6 +299,13 @@ class EvidenceDigest(TenantScoped, Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # JSON list of the evidence ids kept as the surviving sample.
     representative_ids: Mapped[str] = mapped_column(Text, default="[]")
+    # The union of source purposes of the evidence this digest aggregates
+    # (M3 batch-3 patch task 2) -- the summary folds their TEXT, so readers
+    # apply the AND rule over this list (empty list = pre-patch digest:
+    # readers fall back to the belief's link graph).
+    source_purposes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]",
+    )
     # Rule-generated one-liner (no model): "48 observations since 2025-03,
     # sources: message, authority: user".
     summary: Mapped[str] = mapped_column(Text, default="")
@@ -325,7 +340,10 @@ class BeliefEvidenceLink(TenantScoped, Base):
     __tablename__ = "mm_belief_evidence_links"
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
-    belief_id: Mapped[int] = mapped_column(Integer, index=True)
+    # the per-belief lookups (visibility filter, evidence graph) always run
+    # inside one tenant, so the index is tenant-prefixed (M3 batch-3 step 9;
+    # the bare belief_id index it replaces matched every tenant's rows)
+    belief_id: Mapped[int] = mapped_column(Integer)
     evidence_id: Mapped[int] = mapped_column(Integer, index=True)
     relation: Mapped[str] = mapped_column(String(16), default="support")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -334,6 +352,8 @@ class BeliefEvidenceLink(TenantScoped, Base):
         PrimaryKeyConstraint("tenant_id", "app_id", "id"),
         UniqueConstraint("belief_id", "evidence_id", "relation",
                          name="uq_mm_belief_evidence_link"),
+        Index("ix_mm_belief_evidence_links_tenant_belief",
+              "tenant_id", "app_id", "belief_id"),
     )
 
 
@@ -350,15 +370,26 @@ class BeliefEvent(TenantScoped, Base):
     """
 
     __tablename__ = "mm_belief_events"
-    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
+        Index("ix_mm_belief_events_tenant_belief",
+              "tenant_id", "app_id", "belief_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
-    belief_id: Mapped[int] = mapped_column(Integer, index=True)
+    # tenant-prefixed (M3 batch-3 step 9): the visibility filter's
+    # provenance-events probe is per-belief and per-tenant
+    belief_id: Mapped[int] = mapped_column(Integer)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     event_type: Mapped[str] = mapped_column(String(32))
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
     detail_json: Mapped[str] = mapped_column(Text, default="{}")
     origin_stats_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The purpose the entry that caused this event was authorized for
+    # (M3 batch-2 task 1); "" = not recorded.  See core.provenance.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -612,6 +643,19 @@ class Snapshot(TenantScoped, Base):
     support_policy_json: Mapped[str] = mapped_column(Text, default="{}")
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
+    # The purpose of the job that synthesised this snapshot (M3 batch-2
+    # task 1) -- the worker's provenance row; "" = not recorded.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
+    # The UNION of provenance of everything the synthesis actually read:
+    # the filtered evidence/beliefs, their events, and the previous
+    # snapshot (M3 batch-3 patch task 2).  The snapshot is MERGED free
+    # text, so readers apply the AND rule: every purpose in the list must
+    # be visible (empty list = pre-patch row: fall back to source_purpose).
+    source_purposes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -645,6 +689,7 @@ class EvolutionJob(TenantScoped, Base):
 
     id: Mapped[str] = mapped_column(String(64))
     user_id: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     evidence_watermark: Mapped[str] = mapped_column(Text, default="{}")
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
     idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
@@ -686,6 +731,13 @@ class SessionSummary(TenantScoped, Base):
     session_id: Mapped[str] = mapped_column(String(128), index=True)
     summary_text: Mapped[str] = mapped_column(Text, default="")
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    # The purpose the observe that stored this snippet was authorized for
+    # (M3 batch-3 step 9) -- recall's session-summary fallback returns raw
+    # message text, so it is provenance like evidence; "" = not recorded.
+    # First collection wins: appends to an existing row keep its purpose.
+    source_purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -712,6 +764,103 @@ class InterventionEvent(TenantScoped, Base):
     session_id: Mapped[str] = mapped_column(String(128))
     kind: Mapped[str] = mapped_column(String(32))  # "question_injected" / "question_answered"
     detail_json: Mapped[str] = mapped_column(Text, default="{}")  # belief_label, belief_key, verdict
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Access audit (M3 batch-2 task 2): append-only record of every memory read
+# ---------------------------------------------------------------------------
+
+
+class AccessAudit(TenantScoped, Base):
+    """One row per read of memory (or refused read): who, under which
+    purpose and grant version, through which entry, how many memories and
+    which ids.  Ids only, never content, so it survives delete_memories.
+    Append-only; the one sanctioned deletion is the tenant-scoped retention
+    purge (core.access_audit.purge_access_audit)."""
+
+    __tablename__ = "mm_access_audit"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "id"),
+        # the retention purge scans by age inside one tenant
+        Index("ix_mm_access_audit_tenant_created", "tenant_id", "app_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(64), default="")
+    operation: Mapped[str] = mapped_column(String(16))
+    #: the ENTRY_REGISTRY key of the outermost entry (server route or
+    #: library method)
+    entry: Mapped[str] = mapped_column(String(96))
+    decision: Mapped[str] = mapped_column(String(8))  # "allowed" / "denied"
+    reason: Mapped[str] = mapped_column(String(32), default="")
+    grant_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    memory_count: Mapped[int] = mapped_column(Integer, default=0)
+    memory_ids_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of ids
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Purpose authorization (M3 batch 1)
+# ---------------------------------------------------------------------------
+
+
+class PurposeGrant(TenantScoped, Base):
+    """One purpose's authorization for one user (M3 batch 1 task 1).
+
+    ``purpose`` is the caller's declared reason for touching memory
+    (``"api"``, ``"worker"``, ``"benchmark"``, ...); ``allowed_operations``
+    is a JSON array over the fixed operation vocabulary
+    (``core.authorization.OPERATIONS``).  ``version`` is a monotonically
+    increasing optimistic-locking counter: every change is a
+    compare-and-swap on it, so concurrent issuers cannot clobber each
+    other, and a worker that recorded a version can detect any later
+    change.  ``revoked_at`` set means refused everywhere, immediately
+    (``authorize`` never caches -- it re-reads this row on every call).
+    """
+
+    __tablename__ = "mm_purpose_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "user_id", "purpose"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(64))
+    purpose: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    allowed_operations: Mapped[str] = mapped_column(Text, default="[]")  # JSON array
+    issued_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    issuer: Mapped[str] = mapped_column(String(64), default="")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PurposeGrantEvent(TenantScoped, Base):
+    """Append-only audit trail of purpose-grant changes (M3 batch 1 task 1).
+
+    One row per issuance, update, or revocation: the version transition,
+    who did it, when, and why.  Never updated or deleted; the grant row's
+    current state is stored denormalized on mm_purpose_grants for the hot
+    authorize() path, and this table is what makes every authorization
+    change reviewable after the fact.
+    """
+
+    __tablename__ = "mm_purpose_grant_events"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "app_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16))  # "granted" / "updated" / "revoked" / "invoked"
+    # For grant-change events both are empty; a forget invocation records
+    # operation="forget", decision="allowed_regardless" (M3 batch-1 task 3).
+    operation: Mapped[str] = mapped_column(String(16), default="")
+    decision: Mapped[str] = mapped_column(String(32), default="")
+    old_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actor: Mapped[str] = mapped_column(String(64), default="")
+    reason: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

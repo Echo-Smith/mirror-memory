@@ -1,0 +1,19 @@
+{
+  "audit_on": {
+    "samples": 200,
+    "lock_skips": 0,
+    "p50_ms": 58.02,
+    "p90_ms": 262.98,
+    "p99_ms": 473.73,
+    "median_ms": 58.02
+  },
+  "audit_off": {
+    "samples": 200,
+    "lock_skips": 0,
+    "p50_ms": 52.85,
+    "p90_ms": 187.88,
+    "p99_ms": 477.6,
+    "median_ms": 52.98
+  },
+  "note": "min across repeats per configuration; lock_skips = recalls refused by the busy timeout (lock outcomes, not latencies)"
+}

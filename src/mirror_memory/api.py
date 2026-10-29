@@ -22,7 +22,7 @@ import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, NamedTuple
 
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
@@ -30,6 +30,31 @@ from mirror_memory.exceptions import ValidationError
 from mirror_memory.models import BeliefInfo, DeleteResult, PanelData
 
 logger = logging.getLogger(__name__)
+
+
+#: ENTRY_REGISTRY keys of the memory-reading library entries (the audit
+#: rows name them; the server relabels with its own route key).
+ENTRY_RECALL = "mirror_memory.api.MemoryEngine.recall"
+ENTRY_PANEL = "mirror_memory.api.MemoryEngine.panel"
+ENTRY_GET_BELIEFS = "mirror_memory.api.MemoryEngine.get_beliefs"
+ENTRY_VERIFICATION_CANDIDATES = "mirror_memory.api.MemoryEngine.get_verification_candidates"
+ENTRY_BELIEF_HISTORY = "mirror_memory.api.MemoryEngine.belief_history"
+ENTRY_EXPLAIN = "mirror_memory.api.MemoryEngine.explain"
+ENTRY_EXPORT_PAGE = "mirror_memory.api.MemoryEngine.export_page"
+ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
+
+
+from mirror_memory.core import provenance
+from mirror_memory.core.export import ExportPage  # re-exported for hosts
+
+
+class Authorized(NamedTuple):
+    """What an entry knows after its authorization passed: the resolved
+    purpose and the grant version that allowed it (both go into the
+    access audit row)."""
+
+    purpose: str
+    grant_version: int | None
 
 
 class MemoryEngine:
@@ -72,6 +97,7 @@ class MemoryEngine:
         single_tenant_mode: bool | None = None,
         engine: Any | None = None,
         schema_ready: bool = False,
+        default_purpose: str | None = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -94,6 +120,10 @@ class MemoryEngine:
         self._shared_engine = engine
         self._owns_engine = engine is None
         self._schema_ready = bool(schema_ready and engine is not None)
+        # M3: an explicit engine-level default purpose (an end-side
+        # single-tenant host sets it once).  None means NO default: callers
+        # must pass a purpose; there is no implicit one.
+        self._default_purpose = default_purpose
         # Task 6: end-side single-tenant mode (None -> env MM_SINGLE_TENANT).
         import os
 
@@ -233,6 +263,89 @@ class MemoryEngine:
             self._pipeline = ExtractionPipeline(config=self._config, llm_client=self._llm_client)
         return self._pipeline
 
+    # -- purpose authorization (M3 batch-1 tasks 2/3) ------------------------
+
+    def _purpose_or_default(self, purpose: str | None) -> str:
+        """The effective purpose: the call's argument or the engine-level
+        default.  Neither present -> PurposeDenied(missing_purpose); there
+        is no implicit default."""
+        from mirror_memory.core import metrics
+        from mirror_memory.core.authorization import Decision, PurposeDenied
+
+        resolved = purpose if purpose is not None else self._default_purpose
+        if not resolved or not str(resolved).strip():
+            # decided in Python before any SQL (batch-1 invariant): the
+            # count is in-process, never a query
+            metrics.inc(metrics.MISSING_PURPOSE)
+            raise PurposeDenied(Decision(False, "missing_purpose", None, ""), "unresolved")
+        return str(resolved).strip()
+
+    def _authorize(
+        self, session, user_id: str, purpose: str | None, operation: str,
+        *, audit_entry: str | None = None,
+    ) -> "Authorized":
+        """Authorize *operation* in the CURRENT transaction, before any
+        business statement; raises PurposeDenied on refusal.
+
+        With *audit_entry* (the ENTRY_REGISTRY key of a memory-reading
+        entry) a refusal is written to the access audit -- decision
+        ``denied`` with the reason -- and COMMITTED before the exception
+        propagates: nothing else is pending this early in the transaction,
+        and a probing caller must leave a trace.  The one refusal that is
+        NOT audited is ``missing_purpose``: it is decided in Python before
+        any SQL (batch-1 invariant) and has nothing to attribute -- no
+        purpose, possibly no real user.  The audit INSERT on the allowed
+        path is the entry's own job (:meth:`_audit`)."""
+        from mirror_memory.core import access_audit, authorization, provenance
+
+        resolved = self._purpose_or_default(purpose)
+        try:
+            decision = authorization.authorize_or_raise(session, user_id, resolved, operation)
+        except authorization.PurposeDenied as exc:
+            if audit_entry is not None:
+                access_audit.record_access(
+                    session, user_id=user_id, purpose=resolved,
+                    operation=operation, entry=audit_entry, decision=access_audit.DENIED,
+                    reason=exc.decision.reason, grant_version=exc.decision.grant_version,
+                    max_ids=self._config.access_audit.max_ids,
+                )
+                session.commit()
+            raise
+        # everything this transaction writes is collected under `resolved`
+        provenance.bind(session, resolved)
+        return Authorized(resolved, decision.grant_version)
+
+    def _audit(
+        self, session, authorized: "Authorized", *, user_id: str, operation: str,
+        entry: str, memory_ids: list[int],
+    ) -> None:
+        """Append the allowed-access audit row for a read entry.  Same
+        transaction as the read; the caller commits -- and a failure of
+        either the INSERT or that commit propagates, so the entry returns
+        nothing (fail-closed: memory never leaves unrecorded)."""
+        from mirror_memory.core import access_audit
+
+        access_audit.record_access(
+            session, user_id=user_id, purpose=authorized.purpose, operation=operation,
+            entry=entry, decision=access_audit.ALLOWED,
+            grant_version=authorized.grant_version, memory_ids=memory_ids,
+            max_ids=self._config.access_audit.max_ids,
+        )
+
+    def _record_forget_invocation(self, session, user_id: str, purpose: str | None) -> str:
+        """The forget paths run regardless of authorization state (a revoked
+        user can still have their data erased) but must carry a purpose, and
+        every invocation is written to the authorization audit trail."""
+        from mirror_memory.core import authorization, provenance
+
+        resolved = self._purpose_or_default(purpose)
+        authorization.record_purpose_invocation(
+            session, user_id, resolved,
+            operation="forget", decision="allowed_regardless", actor="engine",
+        )
+        provenance.bind(session, resolved)
+        return resolved
+
     def observe(
         self,
         *,
@@ -240,6 +353,7 @@ class MemoryEngine:
         session_id: str,
         text: str,
         turn_count: int = 1,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> int:
         """Process a single conversation turn — extract and store beliefs.
@@ -270,6 +384,7 @@ class MemoryEngine:
         pipeline = self._get_pipeline()
         started = time.monotonic()
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "observe")
             claims = pipeline.observe(
                 session,
                 user_id=user_id,
@@ -295,6 +410,7 @@ class MemoryEngine:
         tail_load: int = 0,
         trace_hook: Any | None = None,
         now: Any | None = None,
+        purpose: str | None = None,
     ) -> str | None:
         """Retrieve a rendered memory block for prompt injection.
 
@@ -334,11 +450,13 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.render.renderer import render_memory_block
+        from mirror_memory.render.renderer import render_memory_block_with_ids
 
         started = time.monotonic()
         with self._session() as session:
-            result = render_memory_block(
+            authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            result, rendered_ids = render_memory_block_with_ids(
                 session,
                 user_id,
                 config=self._config,
@@ -347,16 +465,16 @@ class MemoryEngine:
                 tail_load=tail_load,
                 trace_hook=trace_hook,
                 now=now,
+                visibility=rule,
             )
-            # Recall records access telemetry (which beliefs reached the
-            # prompt — the reheat signal for memory metabolism).  The
-            # telemetry must never break recall, so a failed commit just
-            # discards it and returns the already-rendered block.
-            try:
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.warning("recall: access telemetry commit failed; discarded")
+            # The access audit row (M3 batch-2 task 2) rides the same
+            # transaction as the read, together with the access telemetry
+            # (which beliefs reached the prompt -- the reheat signal).  The
+            # commit is mandatory: if the audit cannot be written the block
+            # is NOT returned (fail-closed).
+            self._audit(session, authorized, user_id=user_id, operation="recall",
+                        entry=ENTRY_RECALL, memory_ids=rendered_ids)
+            session.commit()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "recall: user=%s chars=%d latency=%dms",
@@ -364,7 +482,9 @@ class MemoryEngine:
         )
         return result
 
-    def run_metabolism(self, *, user_id: str, dry_run: bool = False, now: Any | None = None) -> dict:
+    def run_metabolism(
+        self, *, user_id: str, dry_run: bool = False, now: Any | None = None, purpose: str | None = None,
+    ) -> dict:
         """Run one memory-metabolism cycle for a user.
 
         Scans the user's beliefs, scores heat, applies protection, and
@@ -404,6 +524,7 @@ class MemoryEngine:
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "extract")
             report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)
             session.commit()
             return report.as_dict()
@@ -413,6 +534,7 @@ class MemoryEngine:
         *,
         user_id: str,
         language: str = "en",
+        purpose: str | None = None,
     ) -> PanelData:
         """Build a structured panel of the user's memory for frontend display.
 
@@ -435,7 +557,12 @@ class MemoryEngine:
         from mirror_memory.render.panel import build_panel
 
         with self._session() as session:
-            raw = build_panel(session, user_id, config=self._config, language=language)
+            authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_PANEL)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            raw = build_panel(session, user_id, config=self._config, language=language, visibility=rule)
+            self._audit(session, authorized, user_id=user_id, operation="recall",
+                        entry=ENTRY_PANEL, memory_ids=list(raw.get("belief_ids", [])))
+            session.commit()
             return PanelData(
                 memory=raw.get("memory", {}),
                 sections=raw.get("sections", []),
@@ -448,6 +575,7 @@ class MemoryEngine:
         user_id: str,
         dimensions: list[str] | None = None,
         limit: int = 50,
+        purpose: str | None = None,
     ) -> list[BeliefInfo]:
         """List active beliefs for a user.
 
@@ -470,7 +598,14 @@ class MemoryEngine:
         from mirror_memory.core.repository import list_active_beliefs
 
         with self._session() as session:
-            beliefs = list_active_beliefs(session, user_id, dimensions=dimensions, limit=limit)
+            authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_GET_BELIEFS)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            beliefs = list_active_beliefs(
+                session, user_id, dimensions=dimensions, limit=limit, visibility=rule,
+            )
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_GET_BELIEFS, memory_ids=[b.id for b in beliefs])
+            session.commit()
             return [
                 BeliefInfo(
                     dimension=b.dimension,
@@ -490,7 +625,9 @@ class MemoryEngine:
                 for b in beliefs
             ]
 
-    def get_verification_candidates(self, *, user_id: str, limit: int = 1, session_id: str = "") -> list[dict]:
+    def get_verification_candidates(
+        self, *, user_id: str, limit: int = 1, session_id: str = "", purpose: str | None = None,
+    ) -> list[dict]:
         """Get beliefs eligible for verification questioning.
 
         Selects L4 beliefs (confidence >= question threshold, cross-session
@@ -539,9 +676,15 @@ class MemoryEngine:
         )
 
         with self._session() as session:
+            authorized = self._authorize(
+                session, user_id, purpose, "explain", audit_entry=ENTRY_VERIFICATION_CANDIDATES,
+            )
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            results: list[dict] = []
             try:
-                beliefs = get_question_candidates(session, user_id, self._config, limit=limit)
-                results: list[dict] = []
+                beliefs = get_question_candidates(
+                    session, user_id, self._config, limit=limit, visibility=rule,
+                )
                 injected = False
                 for belief in beliefs:
                     recorded = False
@@ -563,14 +706,21 @@ class MemoryEngine:
                             "injected": recorded,
                         }
                     )
-                session.commit()
-                return results
             except Exception:
+                # the candidate selection is fail-open (an empty list, never
+                # an error for the caller) -- the audit below is not
                 logger.warning("get_verification_candidates failed; returning []", exc_info=True)
                 session.rollback()
-                return []
+                results = []
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_VERIFICATION_CANDIDATES,
+                        memory_ids=[r["belief_id"] for r in results])
+            session.commit()
+            return results
 
-    def run_verification(self, *, user_id: str, session_id: str, user_text: str) -> bool:
+    def run_verification(
+        self, *, user_id: str, session_id: str, user_text: str, purpose: str | None = None,
+    ) -> bool:
         """Run verification judgment for this turn. Returns True if turn consumed.
 
         Judges the user's reply against the pending verification question
@@ -596,6 +746,7 @@ class MemoryEngine:
         from mirror_memory.extraction.verification import run_verification_judgment
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "correct")
             try:
                 consumed = run_verification_judgment(
                     session,
@@ -634,6 +785,72 @@ class MemoryEngine:
             set_memory_enabled(session, user_id, enabled)
             session.commit()
 
+    def grant_purpose(
+        self,
+        *,
+        user_id: str,
+        purpose: str,
+        operations: list[str],
+        issuer: str,
+        expires_at: Any | None = None,
+        expected_version: int | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Issue or update one purpose authorization (M3 batch 1 task 1).
+
+        First issuance takes no ``expected_version``; updating an existing
+        grant requires it (the optimistic lock -- a stale issuer is
+        refused, concurrent issuers cannot clobber each other).  Every
+        accepted change appends a row to ``mm_purpose_grant_events``.
+        """
+        self._ensure_db()
+        from mirror_memory.core import authorization
+
+        with self._session() as session:
+            grant = authorization.grant_purpose(
+                session, user_id, purpose,
+                operations=operations, issuer=issuer, expires_at=expires_at,
+                expected_version=expected_version, reason=reason,
+            )
+            session.commit()
+            return {
+                "user_id": grant.user_id,
+                "purpose": grant.purpose,
+                "version": grant.version,
+                "allowed_operations": grant.allowed_operations,
+                "revoked": grant.revoked_at is not None,
+            }
+
+    def revoke_purpose(
+        self,
+        *,
+        user_id: str,
+        purpose: str,
+        actor: str,
+        reason: str = "",
+        expected_version: int | None = None,
+    ) -> dict:
+        """Revoke one purpose authorization (immediate: the next
+        ``authorize`` re-reads the row).  Idempotent."""
+        self._ensure_db()
+        from mirror_memory.core import authorization
+
+        with self._session() as session:
+            grant = authorization.revoke_purpose(
+                session, user_id, purpose, actor=actor, reason=reason,
+                expected_version=expected_version,
+            )
+            session.commit()
+            if grant is None:
+                return {"user_id": user_id, "purpose": purpose, "revoked": False, "existed": False}
+            return {
+                "user_id": grant.user_id,
+                "purpose": grant.purpose,
+                "version": grant.version,
+                "revoked": grant.revoked_at is not None,
+                "existed": True,
+            }
+
     def set_consent(self, *, user_id: str, feature: str, granted: bool) -> None:
         """Set feature-level consent for a user.
 
@@ -663,7 +880,25 @@ class MemoryEngine:
             set_feature_consent(session, user_id, feature.strip(), granted)
             session.commit()
 
-    def delete_memories(self, *, user_id: str) -> DeleteResult:
+    def purge_access_audit(self, *, older_than: Any | None = None) -> int:
+        """Maintenance: delete this tenant's access-audit rows that are out
+        of retention (``config.access_audit.retention_days``, or an explicit
+        *older_than* instant).  Returns the number removed.  Not purpose
+        gated: it reads no memory and is the operator's retention duty, run
+        per tenant by the host.  Never automatic."""
+        from mirror_memory.core import access_audit
+
+        self._ensure_db()
+        cutoff = older_than if older_than is not None else access_audit.retention_cutoff(
+            self._config.access_audit.retention_days,
+        )
+        with self._session() as session:
+            removed = access_audit.purge_access_audit(session, older_than=cutoff)
+            session.commit()
+        logger.info("access audit: purged %d row(s) older than %s", removed, cutoff)
+        return removed
+
+    def delete_memories(self, *, user_id: str, purpose: str | None = None) -> DeleteResult:
         """Delete all memory data for a user.
 
         Returns
@@ -683,11 +918,12 @@ class MemoryEngine:
         from mirror_memory.core.repository import delete_user_memories
 
         with self._session() as session:
+            self._record_forget_invocation(session, user_id, purpose)
             counts = delete_user_memories(session, user_id)
             session.commit()
             return DeleteResult(**counts)
 
-    def forget_belief(self, *, user_id: str, belief_id: int) -> bool:
+    def forget_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Targeted forget: delete a single belief and everything derived from it.
 
         The deletion is one transaction — belief, events, evidence links,
@@ -717,6 +953,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
+            self._record_forget_invocation(session, user_id, purpose)
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_FORGET,
@@ -728,7 +965,7 @@ class MemoryEngine:
             session.commit()
             return decision.committed
 
-    def restore_belief(self, *, user_id: str, belief_id: int) -> bool:
+    def restore_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Restore an archived belief into the default retrieval scan.
 
         Archiving is reversible by design: an archived belief has left the
@@ -757,9 +994,15 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
+            self._authorize(session, user_id, purpose, "correct")
             belief = session.get(Belief, belief_id)
             if belief is None or belief.user_id != user_id:
                 return False
+            from mirror_memory.core import provenance
+
+            rule = provenance.visibility(session, user_id, self._purpose_or_default(purpose))
+            if not provenance.belief_is_visible(session, user_id, rule, belief_id):
+                return False  # identical to not-found; nothing written
             from_tier = belief.memory_tier or "hot"
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
@@ -778,7 +1021,7 @@ class MemoryEngine:
             session.commit()
             return decision.committed
 
-    def forget_session(self, *, user_id: str, session_id: str) -> bool:
+    def forget_session(self, *, user_id: str, session_id: str, purpose: str | None = None) -> bool:
         """Targeted forget: delete a session summary by session_id.
 
         Returns ``True`` if the summary was found and deleted.
@@ -797,6 +1040,7 @@ class MemoryEngine:
         from mirror_memory.core.repository import forget_session_summary
 
         with self._session() as session:
+            self._record_forget_invocation(session, user_id, purpose)
             result = forget_session_summary(session, user_id, session_id)
             session.commit()
             return result
@@ -811,6 +1055,7 @@ class MemoryEngine:
         new_predicate: str | None = None,
         new_object: str | None = None,
         new_value: dict | None = None,
+        purpose: str | None = None,
     ) -> dict | None:
         """User-initiated correction: supersede a belief with corrected text.
 
@@ -839,6 +1084,11 @@ class MemoryEngine:
         from mirror_memory.core.repository import get_state_revision
 
         with self._session() as session:
+            authorized = self._authorize(session, user_id, purpose, "correct")
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            if not provenance.belief_is_visible(session, user_id, rule, belief_id):
+                # identical to the not-found return; no events, no writes
+                return None
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_CORRECT,
@@ -873,7 +1123,71 @@ class MemoryEngine:
                 "confidence": row.confidence,
             }
 
-    def belief_history(self, *, user_id: str, belief_id: int) -> list[dict]:
+    def export_page(
+        self,
+        *,
+        user_id: str,
+        purpose: str | None = None,
+        cursor: str | None = None,
+        page_size: int = 500,
+    ) -> "ExportPage":
+        """One page of the user's export (M3 batch-2 task 3): beliefs, then
+        evidence, then ledger events, each with its source purpose; schema
+        ``mm-export/1``.  Pass the page's ``next_cursor`` back to get the
+        next one; ``None`` means the export is complete.
+
+        Every page is its own transaction and AUTHORIZES AGAIN for the
+        ``export`` operation before reading -- a grant revoked mid-export
+        refuses the next page -- and writes one access-audit row with the
+        ids it returned.  Pages are not one consistent snapshot: each
+        carries the memory state ``revision`` so a consumer can detect a
+        change between pages.  Needs the ``export`` operation in the grant.
+        """
+        from mirror_memory.core.export import ExportPage, read_page, now_iso
+        from mirror_memory.core.repository import get_state_revision
+
+        if not user_id or not user_id.strip():
+            raise ValidationError("user_id must be a non-empty string")
+        self._ensure_db()
+        with self._session() as session:
+            authorized = self._authorize(session, user_id, purpose, "export", audit_entry=ENTRY_EXPORT_PAGE)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            section, items, ids, next_cursor = read_page(
+                session, user_id, cursor=cursor, page_size=page_size, visibility=rule,
+            )
+            revision = get_state_revision(session, user_id)
+            self._audit(session, authorized, user_id=user_id, operation="export",
+                        entry=ENTRY_EXPORT_PAGE, memory_ids=ids)
+            session.commit()
+        return ExportPage(
+            schema_version="mm-export/1",
+            user_id=user_id,
+            section=section,
+            items=items,
+            next_cursor=next_cursor,
+            revision=revision,
+            exported_at=now_iso(),
+            authorization={"purpose": authorized.purpose, "grant_version": authorized.grant_version},
+        )
+
+    def export(
+        self, *, user_id: str, purpose: str | None = None, page_size: int = 500,
+    ) -> "Iterator[ExportPage]":
+        """The whole export as a stream of pages (see :meth:`export_page`):
+        memory bounded by *page_size*, re-authorized before every page, one
+        audit row per page.  Stops when a page reports no next cursor."""
+        from mirror_memory.core import access_audit
+
+        cursor: str | None = None
+        while True:
+            with access_audit.entry_label(ENTRY_EXPORT):
+                page = self.export_page(user_id=user_id, purpose=purpose, cursor=cursor, page_size=page_size)
+            yield page
+            if page.next_cursor is None:
+                return
+            cursor = page.next_cursor
+
+    def belief_history(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> list[dict]:
         """Return the version chain behind a belief, oldest first.
 
         The versioned ledger is the authoritative history: one identity per
@@ -897,9 +1211,15 @@ class MemoryEngine:
         from mirror_memory.core.repository import belief_history
 
         with self._session() as session:
-            return belief_history(session, user_id, belief_id)
+            authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_BELIEF_HISTORY)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            history = belief_history(session, user_id, belief_id, visibility=rule)
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_BELIEF_HISTORY, memory_ids=[belief_id] if history else [])
+            session.commit()
+            return history
 
-    def explain(self, *, user_id: str, belief_id: int) -> dict | None:
+    def explain(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> dict | None:
         """Return the provenance chain for a belief.
 
         Returns a dict with belief state, event history, evidence sources,
@@ -917,4 +1237,22 @@ class MemoryEngine:
         from mirror_memory.core.repository import explain_belief
 
         with self._session() as session:
-            return explain_belief(session, user_id, belief_id)
+            authorized = self._authorize(session, user_id, purpose, "explain", audit_entry=ENTRY_EXPLAIN)
+            rule = provenance.visibility(session, user_id, authorized.purpose)
+            explained = explain_belief(session, user_id, belief_id, visibility=rule)
+            if explained is not None:
+                from mirror_memory.core.export import source_purposes_for_beliefs
+
+                # M3 batch-2 task 3: who was allowed to see this, and under
+                # which purposes the evidence behind it was collected
+                explained["authorization"] = {
+                    "purpose": authorized.purpose,
+                    "grant_version": authorized.grant_version,
+                }
+                explained["evidence_source_purposes"] = source_purposes_for_beliefs(
+                    session, user_id, [belief_id],
+                ).get(belief_id, [])
+            self._audit(session, authorized, user_id=user_id, operation="explain",
+                        entry=ENTRY_EXPLAIN, memory_ids=[belief_id] if explained is not None else [])
+            session.commit()
+            return explained

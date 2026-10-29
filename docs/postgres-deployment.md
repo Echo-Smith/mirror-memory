@@ -22,6 +22,43 @@
    default_tenant=..., default_app=..., confirm_backup=True)`）。它建表、
    补租户列、改复合主键，并在第 3 步安装 RLS（所有权转给 `mm_owner`、
    GRANT、`ENABLE`+`FORCE ROW LEVEL SECURITY`、两条策略）。每一步可重入。
+
+   **升级前选择（M3）**：迁移第 6 步给 `mm_evolution_jobs` 加 `purpose`
+   列。不提供 `legacy_job_purpose`（或 `MM_LEGACY_JOB_PURPOSE`）时，存量
+   任务的 purpose 回填为空——worker 会在运行时以 `missing_purpose` 取消
+   它们（数量在迁移日志和 `upgrade_database` 返回值
+   `legacy_jobs_to_cancel` 中给出）；提供该参数时，存量任务被打上这个
+   purpose——它们仍只在存在该 purpose 的有效授权时运行。若要「升级后
+   继续跑存量任务」，升级前先 `grant_purpose(purpose=<legacy>, ...,
+   operations=["extract", ...])`。
+   **第 7 步（M3 第二批）**给 `mm_evidence`、`mm_belief_events`、
+   `mm_snapshots` 加 `source_purpose` 列——该行是在哪个 purpose 的授权下
+   收集的（observe 写当前 purpose，worker 写任务的 purpose）。存量行回填
+   为空标记 `''`（含义：来源未记录）；提供**同一个** `legacy_job_purpose`
+   / `MM_LEGACY_JOB_PURPOSE` 时，存量行改打该 purpose——一个选择同时标注
+   存量任务与存量记忆。列的服务端默认值始终是 `''`，legacy purpose 只标注
+   已存在的行，不会泄漏到之后写入的行上。本批只记录、不按它过滤召回。
+   **第 8 步**建访问审计表 `mm_access_audit`（租户表：复合主键、RLS、
+   写入守卫类别 `audit`）：每次读取记忆的入口（recall / panel / beliefs /
+   belief_by_id / stats / explain / belief_history / 验证候选）在**同一事务**
+   里追加一行——user_id、purpose、授权版本、入口名、返回的记忆数量与 id
+   列表（只存 id，超过 `access_audit.max_ids` 截断并标记）；被拒绝的读取
+   也记一行（decision=denied + reason；缺 purpose 的拒绝仍在 Python 层零 SQL
+   拒绝，不记）。审计写不进去则读取失败、不返回数据。`delete_memories`
+   不删审计。保留期 `access_audit.retention_days`（默认 90 天）只由显式的
+   `MemoryEngine.purge_access_audit()` 按租户清理，宿主对每个租户各跑一次；
+   引擎不会替宿主枚举租户。
+   **第 9 步（M3 第三批）**替换两张出处表的 `belief_id` 单列索引为租户
+   前缀复合索引，并给 `mm_session_summaries` 补上 `source_purpose`
+   （recall 的会话摘要回退会返回原始消息文本，摘要与证据一样是出处）。
+   **`''` 的语义（M3 第三批起）**：M3 之后所有经授权入口的写入都不会再
+   产生 `''`（有测试锁定）；它只出现在两类行上——迁移前的存量行、绕过
+   授权入口的直接写入（测试播种等）。可见性上 `''` 在**用户全局记忆开关
+   为开时视为可见**（这正是它被收集时的同意制度；开关本身仍在两层授权
+   里单独检查，关掉开关整个读取都被拒绝）。要把存量记忆绑定到某个具体
+   purpose（从而受该 purpose 的撤销约束），必须在**升级前**决定
+   `legacy_job_purpose`——迁移完成后补标需要另行处理，引擎不提供事后
+   打标工具。
    **迁移不受应用超时约束**：迁移期间它借出的每个连接都设为会话级
    `statement_timeout = 0`（会话级而非 `SET LOCAL`，因为 `CREATE INDEX
    CONCURRENTLY` 在事务外执行），连接归还连接池时 `RESET` 回建连时的应用
@@ -36,6 +73,11 @@
 3. **设置维护登录**：`MM_MAINTENANCE_DATABASE_URL=postgresql+psycopg://mm_maintenance:...@host/db`。
    worker 的队列扫描与单租户启动探针都走它；未设置时这些路径**报错**而
    不是静默看到 0 行。
+
+**删除记忆 ≠ 撤销授权（M3）**：`delete_memories` 的级联范围不含
+`mm_consent_grants`、`mm_memory_preferences`、`mm_purpose_grants(_events)`
+——功能开关、全局偏好与 purpose 授权在删除后原样保留；「删除并撤销」
+由调用方显式两步（先 delete_memories，再 revoke_purpose / set_consent）。
 
 `MM_PG_RLS=0` 关闭 RLS 相关行为（不再设置事务级租户、不做姿态校验），
 **仅用于性能测量基线**，生产禁用。

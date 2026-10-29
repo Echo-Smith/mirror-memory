@@ -1,0 +1,150 @@
+name: m3-perf-acceptance
+
+# M3 acceptance (batch 1: the authorization layer; batch 2: provenance +
+# access audit + export; batch 3: cross-purpose visibility): the overhead,
+# measured with
+# the M1/M2 methodology (auditor OFF -- the guards stay on; ID intersection
+# between the two revisions; junit-verified rounds; same-run interleaved
+# x3):
+#   - SQLite full suite: main 403f38d vs HEAD
+#   - PostgreSQL longrun (mode A, the production shape): main vs HEAD
+# Target: increment <= +3% on both; over target does not block but must be
+# reported with the statements/time added per operation.
+
+on:
+  push:
+    branches: ["perf/m3-batch1", "perf/m3-batch2", "perf/m3-batch3", "perf/m3-batch3-patch", "perf/m3-premerge"]
+  workflow_dispatch:
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[server,llm,dev,postgres]"
+          pip install "sqlglot>=25.0"
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 60); do
+            if python -c "import psycopg; psycopg.connect('postgresql://postgres:mm@127.0.0.1:5432/mm_test').close()" 2>/dev/null; then
+              echo "postgres ready after attempt $i"; exit 0
+            fi
+            sleep 3
+          done
+          echo "postgres not ready"; exit 1
+
+      - name: Collect the ID intersection (main vs HEAD)
+        run: |
+          set -eu
+          python tools/perf_ids.py collect 403f38d HEAD --out /tmp/ids.txt
+          # Mechanism tests that cannot run under the measurement口径
+          # (auditor off): the two auditor verdict-cache tests require the
+          # audit listener installed; the writer-caller scanner tests
+          # compare src against the repo-root yaml, which the revision
+          # checkout does not rewind.  They carry zero timing signal.
+          grep -v "test_sql_auditor.py::test_cache_context" /tmp/ids.txt \
+            | grep -v "tests/test_writer_callers.py" > /tmp/ids_filtered.txt || true
+          mv /tmp/ids_filtered.txt /tmp/ids.txt
+          wc -l < /tmp/ids.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s /tmp/ids.txt
+          grep "test_longrun_bench" /tmp/ids.txt > /tmp/lr_ids.txt
+          wc -l < /tmp/lr_ids.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: SQLite full suite, interleaved x3 (auditor off, guards on)
+        run: |
+          set -u -o pipefail
+          measure() {
+            local rev="$1" round="$2" tag="$3"
+            git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
+            for f in $(git ls-files -- src tests); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            for f in $(find tests src -name '*.py' 2>/dev/null); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            git checkout -f -q "$rev" -- src tests pyproject.toml
+            # the allowlist yaml files and the scanners are part of the
+            # measured surface: without rewinding them the base revision
+            # sees the HEAD yaml and its scope/writer scans report ghosts
+            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
+            export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
+            local start end
+            start=$(python -c 'import time; print(time.monotonic())')
+            python tools/run_ids.py /tmp/ids.txt -q -p no:cacheprovider \
+              --junitxml="/tmp/sql_${tag}_$round.xml" > /tmp/sql_${tag}_$round.txt 2>&1 || true
+            end=$(python -c 'import time; print(time.monotonic())')
+            echo "sqlite-$tag($rev) round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/sql_${tag}_$round.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          for round in 1 2 3; do
+            measure 403f38d "$round" main
+            measure HEAD "$round" head
+            if python tools/perf_ids.py verify "/tmp/sql_main_$round.xml" "/tmp/sql_head_$round.xml" | tee -a "$GITHUB_STEP_SUMMARY"; then
+              echo "sqlite round $round VALID" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: PostgreSQL longrun (mode A), interleaved x3 (auditor off, guards on)
+        run: |
+          set -u -o pipefail
+          use_rev() {
+            local rev="$1"
+            git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
+            for f in $(git ls-files -- src tests); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            for f in $(find tests src -name '*.py' 2>/dev/null); do
+              grep -qx "$f" /tmp/keep.txt || rm -f "$f"
+            done
+            git checkout -f -q "$rev" -- src tests pyproject.toml
+          }
+          use_rev() {
+            local rev="$1"
+            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
+          }
+          measure() {
+            local rev="$1" round="$2" tag="$3"
+            use_rev "$rev"
+            export MM_SQL_AUDIT=0 MM_DATABASE_URL="postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test"
+            unset MM_TENANT_READ_FILTER MM_PG_RLS MM_ALLOW_UNFILTERED_MEASUREMENT || true
+            local start end
+            start=$(python -c 'import time; print(time.monotonic())')
+            python tools/run_ids.py /tmp/lr_ids.txt -q -p no:cacheprovider \
+              --junitxml="/tmp/lr_${tag}_$round.xml" > /tmp/lr_${tag}_$round.txt 2>&1 || true
+            end=$(python -c 'import time; print(time.monotonic())')
+            echo "longrun-$tag($rev) round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/lr_${tag}_$round.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          for round in 1 2 3; do
+            measure 403f38d "$round" main
+            measure HEAD "$round" head
+            if python tools/perf_ids.py verify "/tmp/lr_main_$round.xml" "/tmp/lr_head_$round.xml" | tee -a "$GITHUB_STEP_SUMMARY"; then
+              echo "longrun round $round VALID" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Final sanity (HEAD, SQLite, auditor + guards on)
+        run: |
+          git checkout -f -q HEAD -- src tests pyproject.toml
+          unset MM_SQL_AUDIT || true
+          python -m pytest -q -p no:cacheprovider 2>&1 | tail -3 | tee -a "$GITHUB_STEP_SUMMARY"

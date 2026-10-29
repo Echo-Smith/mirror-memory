@@ -7,7 +7,7 @@ name: dual-db
 
 on:
   push:
-    branches: [main, "feat/m2-postgres"]
+    branches: [main, "feat/m2-postgres", "feat/m3-purpose"]
   pull_request:
   workflow_dispatch:
 
@@ -115,4 +115,5 @@ jobs:
         if: matrix.db == 'sqlite'
         run: |
           python tools/check_system_scope.py | tee -a "$GITHUB_STEP_SUMMARY"
+          python tools/check_no_autogrant.py | tee -a "$GITHUB_STEP_SUMMARY"
           python tools/check_writer_callers.py | tee -a "$GITHUB_STEP_SUMMARY"

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -73,8 +74,7 @@ def _seed(session, job_id: str) -> None:
     with queue_write_scope():
         session.add(EvolutionJob(
             id=job_id, user_id=USER, evidence_watermark="{}",
-            idempotency_key=f"{job_id}:ik", status="pending",
-        ))
+            idempotency_key=f"{job_id}:ik", status="pending", purpose="test"))
     session.commit()
 
 
@@ -152,5 +152,103 @@ def test_snapshot_objects_do_not_lazy_load_during_compute(pg_app_url):
             finally:
                 session.close()
         assert statements == [], statements  # no SQL at all while the model ran
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M3 batch-1 task 0: the lease is renewed again at the publish transaction
+# ---------------------------------------------------------------------------
+
+
+def test_compute_longer_than_lease_still_completes_via_publish_renewal(pg_app_url, monkeypatch):
+    """A compute that outlives the lease, with nobody re-claiming: the
+    renewal at the publish transaction extends the lease, so the job
+    completes with a lease that was valid at publish time."""
+    engine = build_engine(pg_app_url)
+    llm = SleepyLLM(2.5, engine)  # compute 2.5 s > lease 1 s
+    cfg = _config(llm)
+    cfg.worker.job_lease_seconds = 1
+    factory = sessionmaker(bind=engine)
+    try:
+        with tenant_scope(*TENANT):
+            session = factory()
+            try:
+                _seed(session, "renew-1")
+                session.commit()
+                token = _claim_job(session, "renew-1", lease_seconds=1)
+                assert token == 1
+                job_row = session.get(EvolutionJob, (*TENANT, "renew-1"))
+                _process_single_job(session, job_row, cfg, lease_token=token)
+                row = session.get(EvolutionJob, (*TENANT, "renew-1"))
+                assert row.status == "completed", row.error_code
+                # the lease on record outlives the original 1 s window: the
+                # publish-start renewal extended it (compute alone ran 2.5 s)
+                assert row.lease_expires_at is not None
+                assert row.completed_at is not None
+                assert row.lease_expires_at > row.completed_at  # still held at completion
+                session.close()
+            finally:
+                session.rollback()
+    finally:
+        engine.dispose()
+
+
+def test_reclaim_during_compute_fails_the_publish_renewal(pg_app_url):
+    """The lease is re-claimed by another worker DURING the compute: the
+    pre-compute renewal succeeded (token still held then), the publish-start
+    renewal finds a moved token and the whole transaction rolls back --
+    zero memory writes."""
+    engine = build_engine(pg_app_url)
+    cfg = _config(None)
+    cfg.worker.job_lease_seconds = 1
+    factory = sessionmaker(bind=engine)
+
+    state = {"reclaimed": False}
+
+    class ReclaimingLLM:
+        """Performs the hostile re-claim from 'inside the compute'."""
+
+        def generate(self, **kw):
+            with tenant_scope(*TENANT):
+                s = factory()
+                try:
+                    s.query(EvolutionJob).filter(EvolutionJob.id == "renew-2").update(
+                        {"lease_expires_at": datetime.now(UTC) - timedelta(seconds=5),
+                         "status": "pending"},
+                        synchronize_session=False,
+                    )
+                    s.commit()
+                    tok = _claim_job(s, "renew-2", lease_seconds=60)
+                    # the claim bumps the token: 1 (claim) -> 2 (A's
+                    # pre-compute renewal) -> 3 (the hostile re-claim)
+                    assert tok == 3
+                    state["reclaimed"] = True
+                finally:
+                    s.close()
+            return '{"patterns": [], "support_policy": {}}'
+
+    cfg.llm_client = ReclaimingLLM()
+    try:
+        with tenant_scope(*TENANT):
+            session = factory()
+            try:
+                _seed(session, "renew-2")
+                session.commit()
+                beliefs_before = session.query(Belief).filter(Belief.user_id == USER).count()
+                token = _claim_job(session, "renew-2", lease_seconds=1)
+                assert token == 1
+                job_row = session.get(EvolutionJob, (*TENANT, "renew-2"))
+                _process_single_job(session, job_row, cfg, lease_token=token)
+                assert state["reclaimed"]
+                s2 = factory()
+                row = s2.get(EvolutionJob, (*TENANT, "renew-2"))
+                assert row.lease_token == 3  # the hostile worker holds it
+                beliefs_after = s2.query(Belief).filter(Belief.user_id == USER).count()
+                assert beliefs_after == beliefs_before  # zero writes by the displaced worker
+                s2.close()
+                session.close()
+            finally:
+                session.rollback()
     finally:
         engine.dispose()
