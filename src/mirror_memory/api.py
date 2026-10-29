@@ -223,6 +223,17 @@ class MemoryEngine:
         from mirror_memory.core import schema_migration
 
         self._db_id, self._applied_seq = schema_migration.ensure_watermark(self._engine)
+        # M4: startup check against the deletion log.  Equal -> normal; the
+        # main DB behind its log (a restored backup) -> replay now, in this
+        # process, before any entry serves; the log behind the main DB ->
+        # refuse.  Another instance holding the replay lock raises
+        # ReplayPending: this engine fails to start and the caller retries.
+        from sqlalchemy.orm import Session as _Session
+
+        from mirror_memory.core import replay
+
+        replay.reconcile(lambda: _Session(self._engine), self._deletion_log,
+                         tenant=self._tenant)
         # A database written by an older engine lacks the metabolism columns
         # the ORM now expects; fail with instructions instead of a mid-query
         # "no such column" error.
@@ -402,12 +413,21 @@ class MemoryEngine:
             )
         if not self._db_id:
             raise DeletionLogUnavailable("the deletion watermark is missing: run the schema setup first")
-        self._deletion_log.append(DeletionEntry(
+        entry = self._deletion_log.append(DeletionEntry(
             db_id=self._db_id, tenant_id=self._tenant[0], app_id=self._tenant[1],
             user_id=user_id, scope=scope, scope_key=scope_key,
             fingerprints=fingerprints, generation=generation,
             purpose=self._purpose_or_default(purpose),
         ))
+        # the entry is APPLIED by this very transaction: advance the
+        # watermark here, so a committed deletion never needs a replay
+        # (only a restore does)
+        from mirror_memory.core import schema_migration
+
+        wtable = schema_migration._watermark_table(schema_migration.MetaData())
+        session.execute(
+            wtable.update().where(wtable.c.id == 1).values(applied_seq=entry.seq))
+        self._applied_seq = entry.seq
 
     def _current_deletion_generation(self, session, user_id: str) -> int:
         from sqlalchemy import func as _func, select as _select

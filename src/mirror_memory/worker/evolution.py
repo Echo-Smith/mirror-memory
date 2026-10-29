@@ -186,6 +186,25 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
             # (core.tenancy routes system_scope sessions), where the
             # cross-tenant scan can see every tenant's jobs.
             session = session_factory() if callable(session_factory) else session_factory
+            # M4 task 3: keep the main DB aligned with its deletion log.
+            # A mismatch means a restore happened (or a replay is running
+            # elsewhere): the worker attempts the replay itself and
+            # otherwise skips this tick -- it must not process jobs while
+            # the database is behind its log.
+            from mirror_memory.core import replay as deletion_replay
+            from mirror_memory.core.deletion import DeletionLogStale, ReplayPending
+
+            log = _deletion_log_for(config)
+            if log is not None:
+                try:
+                    deletion_replay.reconcile(session_factory, log)
+                except ReplayPending:
+                    logger.warning("deletion replay in progress elsewhere; skipping this tick")
+                    return
+                except DeletionLogStale as exc:
+                    logger.error("deletion log is older than the main DB: %s", exc)
+                    return
+
             # Crash recovery: expire leases whose holder is gone.  The
             # lease_token is deliberately NOT reset -- it is the monotonic
             # fencing generation (I3).
@@ -404,6 +423,13 @@ def _process_single_job(
         # between enqueue and compute, so we re-read the current value to
         # compare against the post-compute revision at Node 6.
         expected_revision = get_state_revision(session, user_id)
+        # M4 task 4: the deletion generation at claim time -- the publish
+        # re-checks it (with the revision) so a deletion -- or a backup
+        # restore + replay -- that happened during the compute cancels the
+        # job instead of writing deleted content back.
+        from mirror_memory.core.repository import current_deletion_generation
+
+        expected_generation = current_deletion_generation(session, user_id)
 
         # Node 1: load_evidence (plain data, no ORM instances retained),
         # filtered to memory the job's purpose may see
@@ -511,6 +537,20 @@ def _process_single_job(
             actor="worker",
             reason=f"snapshot_version={grant_version} publish_version={publish_grant_version}",
         )
+        # M4 task 4: the deletion generation, re-checked WITH the revision
+        # at the same point and under the same lock -- a deletion that
+        # committed during the compute (or a restore + replay that moved
+        # the generation) must cancel the job, never write through it.
+        # This also fixes the revision ABA: a restore rewinds the revision
+        # to a stale-but-matching value, but the replay raises the
+        # generation past the claim-time one.
+        from mirror_memory.core.repository import current_deletion_generation
+
+        current_generation = current_deletion_generation(session, user_id)
+        if current_generation != expected_generation:
+            session.rollback()
+            _block_job(session, job, "deletion_generation_changed", token)
+            return
 
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
@@ -638,6 +678,39 @@ def _previous_snapshot_purposes(session: object, user_id: str) -> set[str]:
 #: How long the BUSY bookkeeping keeps retrying the fenced pending-update
 #: before giving up and surfacing the lock error (the sweep retries anyway).
 _BUSY_BOOKKEEPING_TIMEOUT = 6.0
+
+
+def _deletion_log_for(config: MemoryConfig):
+    """The deletion log for the worker's reconciliation (M4 task 3), built
+    from the same configuration rules as the engine's."""
+    cached = getattr(config, "_deletion_log_instance", None)
+    if cached is not None or hasattr(config, "_deletion_log_instance"):
+        return cached
+    from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog
+
+    settings = config.deletion_log
+    instance = None
+    if settings.backend == "postgres" and settings.url:
+        instance = PgDeletionLog(settings.url)
+    elif settings.backend == "file":
+        directory = settings.directory or _default_deletion_directory(config)
+        instance = FileDeletionLog(directory)
+    config._deletion_log_instance = instance
+    return instance
+
+
+def _default_deletion_directory(config: MemoryConfig) -> str:
+    from pathlib import Path
+
+    url = getattr(config, "database_url", "") or ""
+    if url.startswith("sqlite:///"):
+        db_path = url[len("sqlite:///"):]
+        return str((Path(db_path).parent / "deletions").resolve())
+    import hashlib
+    import tempfile
+
+    digest = hashlib.sha1(url.encode()).hexdigest()[:12]
+    return str(Path(tempfile.gettempdir()) / f"mm-deletions-{digest}")
 
 
 def _is_sqlite_busy(exc: BaseException) -> bool:

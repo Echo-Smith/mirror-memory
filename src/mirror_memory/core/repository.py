@@ -2693,9 +2693,12 @@ def _collect(session: Session, model, criteria, fingerprints: list | None,
             select(model.id, model.created_at).where(*criteria)
         ).all()
         for row_id, created_at in rows:
+            # mm_evolution_jobs.id is a string (uuid) -- ids are stored as
+            # given, only converted where the column is an integer
             fingerprints.append({
-                "table": table, "id": int(row_id),
+                "table": table, "id": row_id if isinstance(row_id, int) else str(row_id),
                 "created_at": created_at.isoformat() if created_at else None,
+                "_fp": fingerprint(table, row_id, created_at),
             })
         ids = [r[0] for r in rows]
     query = session.query(model).filter(*criteria)
@@ -2712,10 +2715,21 @@ def _fingerprint_row(table: str, row) -> dict:
 
     created = getattr(row, "created_at", None)
     return {
-        "table": table, "id": int(row.id),
+        "table": table, "id": row.id if isinstance(row.id, int) else str(row.id),
         "created_at": created.isoformat() if created else None,
         "_fp": fingerprint(table, row.id, created),
     }
+
+
+def current_deletion_generation(session: Session, user_id: str) -> int:
+    """The user's current deletion generation (0 before any deletion).
+    The LOG is the authority; this in-database view is aligned by replay."""
+    from mirror_memory.core.models import DeletionGeneration
+
+    return int(session.scalar(
+        select(func.max(DeletionGeneration.generation))
+        .where(DeletionGeneration.user_id == user_id)
+    ) or 0)
 
 
 def ensure_deletion_watermark(session: Session) -> tuple[str, int]:

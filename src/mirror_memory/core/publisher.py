@@ -679,6 +679,8 @@ class Publisher:
         from mirror_memory.worker.snapshot import persist_snapshot
 
         payload = proposal.payload
+        from mirror_memory.core.repository import current_deletion_generation
+
         persist_snapshot(
             self._session,
             proposal.user_id,
@@ -687,6 +689,7 @@ class Publisher:
             payload.get("watermark") or "",
             shadow=bool(payload.get("shadow", False)),
             source_purposes=list(payload.get("source_purposes") or []),
+            source_generation=current_deletion_generation(self._session, proposal.user_id),
         )
         return get_state_revision(self._session, proposal.user_id)
 
