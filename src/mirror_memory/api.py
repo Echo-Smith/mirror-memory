@@ -47,6 +47,10 @@ ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
 
 from mirror_memory.core import provenance
 from mirror_memory.core.deletion import DeletionEntry, DeletionLog, DeletionLogUnavailable
+
+# the __init__ default: builds the log from config unless an explicit
+# instance (including an explicit None) is passed
+_DELETION_LOG_DEFAULT = object()
 from mirror_memory.core.export import ExportPage  # re-exported for hosts
 
 
@@ -100,7 +104,7 @@ class MemoryEngine:
         engine: Any | None = None,
         schema_ready: bool = False,
         default_purpose: str | None = None,
-        deletion_log: "DeletionLog | None" = None,
+        deletion_log: "DeletionLog | None | object" = _DELETION_LOG_DEFAULT,
     ) -> None:
         if config is not None:
             self._config = config
@@ -141,7 +145,12 @@ class MemoryEngine:
         # otherwise the config decides (backend file|postgres).  None =>
         # deletions are refused (fail-closed: an unlogged deletion cannot
         # be replayed after a restore).
-        self._deletion_log = deletion_log if deletion_log is not None else self._build_deletion_log()
+        # an explicitly PASSED None (vs the absent default) must mean "no
+        # log": distinguish via the parameter sentinel below
+        self._deletion_log = (
+            deletion_log if deletion_log is not _DELETION_LOG_DEFAULT
+            else self._build_deletion_log()
+        )
         self._db_id: str | None = None
 
     def _build_deletion_log(self) -> "DeletionLog | None":

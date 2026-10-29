@@ -1794,15 +1794,18 @@ class Step11DeletionReplay:
     def apply(self, engine: Engine) -> None:
         Base.metadata.tables["mm_deletion_generations"].create(engine, checkfirst=True)
         if "source_generation" not in _table_columns(engine, "mm_snapshots"):
-            if _is_postgres(engine):
-                _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
-            else:
-                _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
+            _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
         ensure_watermark(engine)
         if _is_postgres(engine):
             from mirror_memory.core import rls
 
             _DDLPlan(rls.rls_plan(engine, tables=["mm_deletion_generations"])).run(engine)
+            # the app role reads the watermark at startup and advances it in
+            # the deletion transaction (owner-created table, like every other)
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"GRANT SELECT, INSERT, UPDATE ON {WATERMARK_TABLE} "
+                    f"TO {rls.app_role()}"))
 
     def verify(self, engine: Engine) -> None:
         cols = {c["name"] for c in inspect(engine).get_columns("mm_deletion_generations")}

@@ -186,6 +186,9 @@ def apply_entry(session, entry: DeletionEntry) -> dict[str, int]:
                 counts["evidence"] = candidates(Evidence)
                 counts["stats"] = candidates(ExtractionStats)
                 counts["interventions"] = candidates(InterventionEvent)
+                # the per-purpose summary split (M3 batch-3 patch) means a
+                # user has one row per (session, purpose) -- all of them go
+                counts["summaries"] = candidates(SessionSummary)
                 counts["links"] = _delete_matching(
                     session, BeliefEvidenceLink,
                     (BeliefEvidenceLink.tenant_id == tenant_id,

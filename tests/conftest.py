@@ -519,6 +519,19 @@ def _pg_fresh_schema(admin_engine) -> None:
     if rls.rls_enabled():
         install_row_level_security(admin_engine, verify=False)
 
+    # M4: the deletion watermark lives outside the model metadata -- the
+    # runtime (app role) reads and advances it, so it needs the grants too
+    from mirror_memory.core import rls as _rls, schema_migration as _sm
+    from mirror_memory.core.tenancy import system_scope as _system_scope
+
+    with _system_scope(reason="test harness: watermark parity with step 11"):
+        _sm.ensure_watermark(admin_engine)
+    with admin_engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"GRANT SELECT, INSERT, UPDATE ON mm_deletion_watermark "
+            f"TO {_rls.app_role()}")
+
+
 
 @pytest.fixture
 def pg_admin_engine():
