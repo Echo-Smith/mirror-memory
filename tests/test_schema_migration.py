@@ -347,7 +347,7 @@ def test_database_already_at_version_1_advances_to_step_2(base_db):
 
     # The full plan now runs only the steps above version 1.
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     after = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
     if eng.dialect.name == "postgresql":
         assert after == ["tenant_id", "app_id", "id"], after
@@ -398,7 +398,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
 
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
     step = sm.Step4PendingJobsIndex()
@@ -460,7 +460,7 @@ def test_step6_legacy_job_purpose_backfills_and_counts(base_db, tmp_path):
     # WITHOUT legacy purpose: jobs keep '' and the count is returned
     eng = _engine(base_db)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     # one completed pre-M3 job came with the base database
     insp = inspect(eng)
     cols = {c["name"] for c in insp.get_columns("mm_evolution_jobs")}
@@ -662,7 +662,7 @@ def test_step7_adds_source_purpose_to_a_version6_database(tmp_path):
     assert step.needed(eng)
 
     counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     assert "legacy_jobs_to_cancel" not in counts, "step 6 did not run: no stale count"
     insp = inspect(eng)
     for table in sm.SOURCE_PURPOSE_TABLES:
@@ -754,7 +754,7 @@ def test_step8_creates_the_access_audit_table_on_a_version7_database(tmp_path):
     step = sm.Step8AccessAudit()
     assert step.needed(eng)
     upgrade_database(eng, default_tenant="legacy", default_app="app")
-    assert sm.current_version(eng) == sm.LATEST_VERSION == 10
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     insp = inspect(eng)
     assert insp.has_table("mm_access_audit")
     names = {ix["name"] for ix in insp.get_indexes("mm_access_audit")}
@@ -802,7 +802,7 @@ def test_step9_swaps_belief_indexes_and_stamps_summaries(tmp_path):
     assert step.needed(eng)
     upgrade_database(eng, default_tenant="legacy", default_app="app",
                      steps=[step])
-    assert sm.current_version(eng) == 9
+    assert sm.current_version(eng) == sm.LATEST_VERSION - 2
     insp = inspect(eng)
     for table, composite in sm.TENANT_BELIEF_INDEXES.items():
         names = {ix["name"] for ix in insp.get_indexes(table)}

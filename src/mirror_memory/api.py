@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +46,7 @@ ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
 
 
 from mirror_memory.core import provenance
+from mirror_memory.core.deletion import DeletionEntry, DeletionLog, DeletionLogUnavailable
 from mirror_memory.core.export import ExportPage  # re-exported for hosts
 
 
@@ -98,6 +100,7 @@ class MemoryEngine:
         engine: Any | None = None,
         schema_ready: bool = False,
         default_purpose: str | None = None,
+        deletion_log: "DeletionLog | None" = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -134,6 +137,41 @@ class MemoryEngine:
         )
         self._initialized = False
         self._pipeline = None  # lazy-initialized
+        # M4: the independent deletion log.  An explicit instance wins;
+        # otherwise the config decides (backend file|postgres).  None =>
+        # deletions are refused (fail-closed: an unlogged deletion cannot
+        # be replayed after a restore).
+        self._deletion_log = deletion_log if deletion_log is not None else self._build_deletion_log()
+        self._db_id: str | None = None
+
+    def _build_deletion_log(self) -> "DeletionLog | None":
+        """The deletion log from configuration (M4 task 1).  backend
+        "file" (default): an append-only JSONL file per database life
+        under ``deletion_log.directory`` -- fsynced, hash-chained, NEVER
+        the main database file.  backend "postgres": the log table in a
+        SEPARATE database at ``deletion_log.url`` (outside any pg_dump of
+        the main DB), where the app role holds INSERT/SELECT only."""
+        from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog
+
+        settings = self._config.deletion_log
+        if settings.backend == "none":
+            return None
+        if settings.backend == "postgres":
+            url = settings.url
+            if not url:
+                raise ValueError("deletion_log.backend=postgres requires deletion_log.url")
+            return PgDeletionLog(url)
+        directory = settings.directory
+        if not directory:
+            if self._database_url.startswith("sqlite:///"):
+                db_path = self._database_url[len("sqlite:///"):]
+                directory = str((Path(db_path).parent / "deletions").resolve())
+            else:
+                import hashlib as _hashlib
+
+                digest = _hashlib.sha1(self._database_url.encode()).hexdigest()[:12]
+                directory = str(Path(tempfile.gettempdir()) / f"mm-deletions-{digest}")
+        return FileDeletionLog(directory)
 
     @staticmethod
     def _build_llm(api_key: str | None, model: str, base_url: str | None) -> Any:
@@ -159,6 +197,11 @@ class MemoryEngine:
             if self._schema_ready:
                 # The owner of the shared engine ran the schema / posture /
                 # single-tenant checks once; a per-tenant wrapper only binds.
+                from mirror_memory.core import schema_migration
+
+                self._db_id, self._applied_seq = schema_migration.read_watermark(
+                    self._engine
+                ) or (None, 0)
                 self._initialized = True
                 return
         else:
@@ -171,6 +214,15 @@ class MemoryEngine:
             prepare_runtime_engine(self._engine)
         else:
             Base.metadata.create_all(self._engine)
+        # M4: the deletion watermark (db_id + applied seq) is created
+        # OUTSIDE any transaction -- it must exist before the first
+        # deletion (which only READS it; creating it here also avoids a
+        # second-connection DDL inside a SQLite write transaction).  A
+        # fresh database gets a fresh db_id; a RESTORED one brings its
+        # watermark row back, which is how a restore is detected.
+        from mirror_memory.core import schema_migration
+
+        self._db_id, self._applied_seq = schema_migration.ensure_watermark(self._engine)
         # A database written by an older engine lacks the metabolism columns
         # the ORM now expects; fail with instructions instead of a mid-query
         # "no such column" error.
@@ -331,6 +383,41 @@ class MemoryEngine:
             grant_version=authorized.grant_version, memory_ids=memory_ids,
             max_ids=self._config.access_audit.max_ids,
         )
+
+    def _append_deletion_log(self, session, user_id: str, *, scope: str,
+                             scope_key: str, fingerprints: list[dict],
+                             generation: int, purpose: str | None) -> None:
+        """Write the deletion-log entry for a deletion that is about to
+        commit.  The log write happens BEFORE the main-DB commit (the
+        entry is part of the transaction's preconditions): a log failure
+        raises and rolls the deletion back; the reverse window -- log
+        written, commit fails -- is safe because replay matches
+        fingerprints that will never be found (core.deletion docstring)."""
+        from mirror_memory.core.deletion import DeletionEntry
+
+        if self._deletion_log is None:
+            raise DeletionLogUnavailable(
+                "no deletion log is configured: deletions are refused "
+                "(an unlogged deletion cannot be replayed after a restore)"
+            )
+        if not self._db_id:
+            raise DeletionLogUnavailable("the deletion watermark is missing: run the schema setup first")
+        self._deletion_log.append(DeletionEntry(
+            db_id=self._db_id, tenant_id=self._tenant[0], app_id=self._tenant[1],
+            user_id=user_id, scope=scope, scope_key=scope_key,
+            fingerprints=fingerprints, generation=generation,
+            purpose=self._purpose_or_default(purpose),
+        ))
+
+    def _current_deletion_generation(self, session, user_id: str) -> int:
+        from sqlalchemy import func as _func, select as _select
+
+        from mirror_memory.core.models import DeletionGeneration
+
+        return int(session.scalar(
+            _select(_func.max(DeletionGeneration.generation))
+            .where(DeletionGeneration.user_id == user_id)
+        ) or 0)
 
     def _record_forget_invocation(self, session, user_id: str, purpose: str | None) -> str:
         """The forget paths run regardless of authorization state (a revoked
@@ -919,8 +1006,15 @@ class MemoryEngine:
 
         with self._session() as session:
             self._record_forget_invocation(session, user_id, purpose)
-            counts = delete_user_memories(session, user_id)
+            fingerprints: list[dict] = []
+            counts = delete_user_memories(session, user_id, fingerprints=fingerprints)
+            self._append_deletion_log(
+                session, user_id, scope="user", scope_key="",
+                fingerprints=fingerprints, generation=counts["generation"],
+                purpose=purpose,
+            )
             session.commit()
+            counts.pop("generation", None)
             return DeleteResult(**counts)
 
     def forget_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
@@ -954,14 +1048,24 @@ class MemoryEngine:
 
         with self._session() as session:
             self._record_forget_invocation(session, user_id, purpose)
+            collector: dict = {"fingerprints": [], "generation": None}
             decision = Publisher(session, self._config).publish(
                 StateTransitionProposal(
                     transition=TRANSITION_FORGET,
                     user_id=user_id,
                     target_belief_id=belief_id,
                     expected_revision=get_state_revision(session, user_id),
+                    payload={"deletion_collector": collector},
                 )
             )
+            if decision.committed and collector["generation"] is not None:
+                # the deletion log is written BEFORE the main-DB commit
+                # (fail-closed: a log failure rolls the deletion back)
+                self._append_deletion_log(
+                    session, user_id, scope="belief", scope_key=str(belief_id),
+                    fingerprints=collector["fingerprints"],
+                    generation=collector["generation"], purpose=purpose,
+                )
             session.commit()
             return decision.committed
 
@@ -1041,7 +1145,20 @@ class MemoryEngine:
 
         with self._session() as session:
             self._record_forget_invocation(session, user_id, purpose)
-            result = forget_session_summary(session, user_id, session_id)
+            fingerprints: list[dict] = []
+            result = forget_session_summary(session, user_id, session_id,
+                                            fingerprints=fingerprints)
+            if result:
+                # the summary rows were deleted: log before commit.  Session
+                # scope does not bump the generation (no belief content
+                # changed) -- M4's log entry records the deletion for replay
+                # with the user's CURRENT generation.
+                self._append_deletion_log(
+                    session, user_id, scope="session", scope_key=session_id,
+                    fingerprints=fingerprints,
+                    generation=self._current_deletion_generation(session, user_id),
+                    purpose=purpose,
+                )
             session.commit()
             return result
 

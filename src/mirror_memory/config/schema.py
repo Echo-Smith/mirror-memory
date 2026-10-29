@@ -419,6 +419,37 @@ class AccessAuditConfig(BaseModel):
     )
 
 
+class DeletionLogConfig(BaseModel):
+    """The independent deletion log (M4 task 1)."""
+
+    backend: str = Field(
+        default="file",
+        description=(
+            '"file" (embedded: an append-only JSONL file per database life, '
+            'fsynced, hash-chained, never the main DB file) or "postgres" (a '
+            'SEPARATE database whose app role holds INSERT/SELECT only) or '
+            '"none" (deletions are refused).'
+        ),
+    )
+    directory: str = Field(
+        default="",
+        description='Directory for the "file" backend; empty = derived from the database URL.',
+    )
+    url: str = Field(
+        default="",
+        description='Connection string for the "postgres" backend (its own database).',
+    )
+    retention_days: int = Field(
+        default=35, ge=1,
+        description=(
+            "How long deletion entries must be kept.  Must not be shorter than "
+            "the backup retention (a log older than the backups it protects "
+            "cannot replay them).  Enforcement (pruning) lands with log "
+            "compaction in a later batch -- entries are never deleted now."
+        ),
+    )
+
+
 class MemoryConfig(BaseModel):
     """Root configuration object assembled from multiple YAML files.
 
@@ -438,6 +469,7 @@ class MemoryConfig(BaseModel):
     render: RenderConfig = Field(default_factory=RenderConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     access_audit: AccessAuditConfig = Field(default_factory=AccessAuditConfig)
+    deletion_log: DeletionLogConfig = Field(default_factory=DeletionLogConfig)
     question_value_tiers: dict[str, int] = Field(
         default_factory=dict,
         description="Dimension -> priority tier for verification question candidates "

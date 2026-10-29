@@ -217,7 +217,10 @@ class TestDeleteUserMemories:
 
     def test_delete_empty_user(self, db_session):
         counts = delete_user_memories(db_session, "nonexistent")
-        assert all(v == 0 for v in counts.values())
+        # the generation advances (1) even when there was nothing to delete:
+        # the deletion happened, so the counter moves
+        assert all(v == 0 for k, v in counts.items() if k != "generation")
+        assert counts["generation"] == 1
 
 
 class TestStoreSessionSummary:
@@ -352,7 +355,7 @@ class TestForget:
 
         from mirror_memory.core.repository import forget_belief
         result = forget_belief(db_session, "u_forget", b.id)
-        assert result is True
+        assert result == 1  # the advanced deletion generation
         assert get_belief(db_session, "u_forget", "sleep") is None
 
     def test_forget_belief_wrong_user(self, db_session):
@@ -363,7 +366,7 @@ class TestForget:
         )
         from mirror_memory.core.repository import forget_belief
         result = forget_belief(db_session, "u2", b.id)
-        assert result is False
+        assert result is None  # not found: nothing deleted, no generation
 
     def test_forget_session_summary(self, db_session):
         from mirror_memory.core.repository import forget_session_summary, store_session_summary

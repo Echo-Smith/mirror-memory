@@ -599,12 +599,16 @@ class Publisher:
         return corrected.id if corrected is not None else None
 
     def _commit_forget(self, proposal: StateTransitionProposal) -> int | None:
-        forget_belief(
+        collector = proposal.payload.get("deletion_collector")
+        generation = forget_belief(
             self._session,
             proposal.user_id,
             proposal.target_belief_id,
             bump_revision=False,
+            fingerprints=collector["fingerprints"] if collector else None,
         )
+        if collector is not None:
+            collector["generation"] = generation
         return None
 
     def _commit_verify(self, proposal: StateTransitionProposal) -> int | None:

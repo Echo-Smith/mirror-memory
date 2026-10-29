@@ -474,6 +474,34 @@ class DeletionTombstone(TenantScoped, Base):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Deletion generation (M4): the per-user counter behind the revision barrier
+# ---------------------------------------------------------------------------
+
+
+class DeletionGeneration(TenantScoped, Base):
+    """One row per (user, generation): the counter is advanced by INSERTING
+    the next value, so the primary key IS the compare-and-swap -- two
+    concurrent deletions racing for generation N+1 cannot both win, and
+    the history of generations is the table.  The AUTHORITY for a user's
+    generation is the independent deletion log; after a backup restore +
+    replay the rows here are (re)aligned to the log's per-user maximum,
+    so a restore can never roll the generation back.
+
+    Written only by the deletion paths (write class ``deletion``) and the
+    replayer."""
+
+    __tablename__ = "mm_deletion_generations"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "user_id", "generation"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer)
+    scope: Mapped[str] = mapped_column(String(16), default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ProposalLog(TenantScoped, Base):
     """Append-only record of every *committed* proposal.
 
@@ -656,6 +684,12 @@ class Snapshot(TenantScoped, Base):
     source_purposes_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default="[]",
     )
+    # The user's deletion generation when this snapshot was synthesised
+    # (M4): a reader skips the snapshot when the user's CURRENT generation
+    # differs -- any deletion after synthesis (or a restore + replay)
+    # invalidates the merged text, and the next job rebuilds it.  NULL =
+    # pre-M4 snapshot: always skipped (conservative).
+    source_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

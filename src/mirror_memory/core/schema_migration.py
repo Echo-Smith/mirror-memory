@@ -1707,6 +1707,117 @@ class Step10DerivedProvenance:
                 raise MigrationError(f"verification failed: {table}.{column} missing")
 
 
+#: The watermark row is deliberately OUTSIDE Base.metadata (like
+#: mm_schema_version): one row per database, no tenant columns, and it must
+#: be restored together with the main DB (that is the whole mechanism).
+WATERMARK_TABLE = "mm_deletion_watermark"
+
+
+def _watermark_table(metadata: MetaData) -> Table:
+    return Table(
+        WATERMARK_TABLE,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("db_id", String(32), nullable=False),
+        Column("applied_seq", Integer, nullable=False, server_default=text("0")),
+    )
+
+
+def ensure_watermark(engine: Engine) -> tuple[str, int]:
+    """Create the watermark table and its single row on first use; returns
+    ``(db_id, applied_seq)``.  The row lives in the main DB, so a restore
+    brings back the backup's db_id and applied seq -- which is exactly how
+    a restore is detected (see core.replay)."""
+    table = _watermark_table(MetaData())
+    table.create(engine, checkfirst=True)
+    with engine.begin() as conn:
+        row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                           .where(table.c.id == 1)).first()
+        if row is None:
+            import uuid as _uuid
+
+            db_id = _uuid.uuid4().hex
+            conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+            return db_id, 0
+        return str(row[0]), int(row[1])
+
+
+def read_watermark(engine: Engine) -> tuple[str, int] | None:
+    """(db_id, applied_seq) or None when the row is absent (a fresh or
+    restored-without-watermark database)."""
+    table = _watermark_table(MetaData())
+    if not inspect(engine).has_table(WATERMARK_TABLE):
+        return None
+    with engine.connect() as conn:
+        row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                           .where(table.c.id == 1)).first()
+    return (str(row[0]), int(row[1])) if row else None
+
+
+def advance_watermark(engine: Engine, seq: int) -> None:
+    table = _watermark_table(MetaData())
+    with engine.begin() as conn:
+        conn.execute(table.update().where(table.c.id == 1)
+                     .values(applied_seq=seq))
+
+
+@dataclass
+class Step11DeletionReplay:
+    """Deletion-replay support (M4): the generation counter, the watermark
+    table and the snapshot synthesis generation.
+
+    - ``mm_deletion_generations``: one row per (user, generation) -- the
+      composite key IS the CAS; created FROM THE MODEL METADATA, RLS
+      posture applied, write class ``deletion``.
+    - ``mm_deletion_watermark``: single row (db_id, applied_seq), outside
+      the model metadata (like mm_schema_version).  It rolls back WITH the
+      main database -- comparing it to the deletion log's tail is how a
+      restore is detected.
+    - ``mm_snapshots.source_generation`` (nullable): the user's deletion
+      generation at synthesis time; a reader skips snapshots whose value
+      is missing or behind the user's current generation (pre-M4
+      snapshots and anything invalidated by a deletion / restore +
+      replay are rebuilt by the next job).
+    """
+
+    version: int = 11
+    name: str = "deletion replay: generations, watermark, snapshot generation"
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        if not insp.has_table("mm_deletion_generations"):
+            return True
+        if "source_generation" not in _table_columns(engine, "mm_snapshots"):
+            return True
+        return not insp.has_table(WATERMARK_TABLE)
+
+    def apply(self, engine: Engine) -> None:
+        Base.metadata.tables["mm_deletion_generations"].create(engine, checkfirst=True)
+        if "source_generation" not in _table_columns(engine, "mm_snapshots"):
+            if _is_postgres(engine):
+                _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
+            else:
+                _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
+        ensure_watermark(engine)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=["mm_deletion_generations"])).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        cols = {c["name"] for c in inspect(engine).get_columns("mm_deletion_generations")}
+        if "generation" not in cols:
+            raise MigrationError("verification failed: mm_deletion_generations missing")
+        if "source_generation" not in _table_columns(engine, "mm_snapshots"):
+            raise MigrationError("verification failed: mm_snapshots.source_generation missing")
+        if not inspect(engine).has_table(WATERMARK_TABLE):
+            raise MigrationError("verification failed: watermark table missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=["mm_deletion_generations"])
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1721,6 +1832,7 @@ DEFAULT_STEPS: list = [
     Step8AccessAudit(),
     Step9RecallVisibility(),
     Step10DerivedProvenance(),
+    Step11DeletionReplay(),
 ]
 
 #: The version a freshly upgraded database records.
