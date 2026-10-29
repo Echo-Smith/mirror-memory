@@ -13,7 +13,7 @@ name: m3-perf-acceptance
 
 on:
   push:
-    branches: ["perf/m3-batch1", "perf/m3-batch2", "perf/m3-batch3", "perf/m3-batch3-patch"]
+    branches: ["perf/m3-batch1", "perf/m3-batch2", "perf/m3-batch3", "perf/m3-batch3-patch", "perf/m3-premerge"]
   workflow_dispatch:
 
 jobs:
