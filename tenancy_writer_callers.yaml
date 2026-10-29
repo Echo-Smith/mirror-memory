@@ -25,6 +25,8 @@ wrappers:
       Bench-side idempotent issuance wrapper (calls grant_purpose).
       Only the bench harness may issue its own grants; engine code must
       never use it.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
     callers:
       - mirror_memory.bench.runner
       - mirror_memory.bench.longrun
@@ -37,10 +39,14 @@ wrappers:
       CAS UPDATE).  Host-facing entry re-exported from mirror_memory.worker
       for hosts and tests; no src module calls it today, and any future src
       caller must be registered here in the same commit.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
     callers: []
 
 writers:
-  # ---- audit class: the access audit (M3 batch-2 task 2, reviewer 待评审) ----
+  # ---- audit class: the access audit (M3 batch-2 task 2) ------------------
+  # Reviewed 2026-10-30 by Echo-Smith: the write class "audit"
+  # (TABLE_WRITE_CLASSES / audit_write_scope) and both writers below.
   record_access:
     reason: >
       Appends one access-audit row per memory read (or refused read) in the
@@ -48,6 +54,8 @@ writers:
       nothing if the row cannot be written.  Written only through the
       engine (MemoryEngine._authorize / _audit); the server routes that
       read through their own session call those engine helpers.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
     callers:
       - mirror_memory.api
   purge_access_audit:
@@ -55,17 +63,22 @@ writers:
       The one sanctioned deletion on the append-only audit table: the
       tenant-scoped retention purge behind MemoryEngine.purge_access_audit
       and the worker's batched maintenance pass.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
     callers:
       - mirror_memory.api
       - mirror_memory.worker.maintenance
 
-  # ---- consent class: purpose authorization (M3 batch 1, reviewer 待评审) ----
+  # ---- consent class: purpose authorization (M3 batch 1; reviewed
+  # 2026-10-30 by Echo-Smith) ----
   grant_purpose:
     reason: >
       Writes mm_purpose_grants and appends mm_purpose_grant_events: the
       purpose-authorization store and its audit trail.  Issuance and
       update are authorization changes; the version CAS keeps concurrent
       issuers from clobbering each other.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-10-30"
     callers:
       - mirror_memory.api
       - mirror_memory.bench  # grant_bench_purpose: idempotent bench-side issuance

@@ -37,9 +37,11 @@
   reason: >
     Batched backfill of tenant/other columns: selects primary keys across
     all tenants and updates them with the configured default.  Called only
-    from migration steps.
+    from migration steps.  M3 re-review (2026-10-30, Echo-Smith): the
+    function body gained composite-primary-key row-value matching and the
+    ``marker`` empty-marker predicate -- scope and reason unchanged.
   reviewer: Echo-Smith
-  reviewed_at: "2026-10-27"
+  reviewed_at: "2026-10-30"
 
 - module: mirror_memory.core.schema_migration
   function: _verify_column
@@ -66,8 +68,8 @@
     all tenants -- they will be cancelled at runtime unless the operator
     chose a legacy_job_purpose before upgrading.  The count is logged and
     returned by upgrade_database so the decision is informed.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-30"
 
 - module: mirror_memory.core.schema_migration
   function: _emit_primary_key_swaps
@@ -97,5 +99,5 @@
     its own tenant_scope through the sanctioned writer.  The enumeration
     is the only cross-tenant statement; the deletions are per-tenant and
     batched.  Reached from the worker loop's periodic maintenance pass.
-  reviewer: 待评审
-  reviewed_at: ""
+  reviewer: Echo-Smith
+  reviewed_at: "2026-10-30"
