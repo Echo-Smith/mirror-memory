@@ -448,13 +448,16 @@ def _process_single_job(
         # The snapshot is MERGED free text: its provenance is the UNION of
         # everything the synthesis read -- the visible beliefs' provenance,
         # the previous snapshots' unions, and the job's own purpose (M3
-        # batch-3 patch task 2).
+        # batch-3 patch task 2).  ONE batched probe for the whole set:
+        # per-belief queries would multiply the publish transaction's
+        # statements (and its lock-holding time) by the belief count.
         input_purposes: set[str] = {job.purpose}
-        for belief in visible_beliefs:
+        if visible_beliefs:
             link_purposes, event_purposes = provenance.provenance_purposes(
-                session, user_id, [belief.id],
+                session, user_id, [b.id for b in visible_beliefs],
             )
-            input_purposes |= link_purposes.get(belief.id, set()) | event_purposes.get(belief.id, set())
+            for belief in visible_beliefs:
+                input_purposes |= link_purposes.get(belief.id, set()) | event_purposes.get(belief.id, set())
         input_purposes |= _previous_snapshot_purposes(session, user_id)
 
         # -- publish transaction -------------------------------------------
