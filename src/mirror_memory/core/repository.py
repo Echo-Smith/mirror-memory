@@ -2954,12 +2954,18 @@ def store_session_summary(
     from mirror_memory.core.models import SessionSummary
 
     snippet = text.strip()[:snippet_max]
-
+    # One row per (user, session, source_purpose) (M3 batch-3 patch task 1):
+    # a session observed under two purposes produces two rows.  Appending
+    # across purposes would merge text collected under P into a row Q may
+    # be shown -- the summary is raw message text, so its provenance is
+    # per-row and the AND/OR rule collapses to the row's single purpose.
+    purpose = provenance.current(session)
     existing = (
         session.query(SessionSummary)
         .filter(
             SessionSummary.user_id == user_id,
             SessionSummary.session_id == session_id,
+            SessionSummary.source_purpose == purpose,
         )
         .first()
     )
@@ -2975,7 +2981,7 @@ def store_session_summary(
             session_id=session_id,
             summary_text=snippet,
             turn_count=turn_count,
-            source_purpose=provenance.current(session),
+            source_purpose=purpose,
         ))
     session.flush()
 

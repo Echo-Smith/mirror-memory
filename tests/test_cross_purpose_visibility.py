@@ -597,3 +597,43 @@ def test_revocation_vs_visibility_50_rounds_postgres(pg_app_url):
     _grant(eng, Q)
     for round_no in range(50):
         _visibility_race_round(eng, round_no)
+
+
+# ---------------------------------------------------------------------------
+# batch-3 patch task 1: session summaries are per-purpose rows
+# ---------------------------------------------------------------------------
+
+
+def test_session_summary_rows_are_split_by_purpose(db):
+    """The same session observed under Q then P produces two rows; the P
+    row's text never reaches a Q recall after P is revoked (the AND/OR
+    rule collapses to the row's single purpose)."""
+    cfg = load_config("config/")
+    cfg.session_summary_enabled = True
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+    eng = MemoryEngine(config=cfg, database_url=str(db.url),
+                       tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM())
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I keep notes about {SENTINEL} in the attic.", P, "shared")
+    _observe(eng, "I keep notes about gardening in the shed.", Q, "shared")
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+
+    from mirror_memory.core.models import SessionSummary
+
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rows = s.execute(select(SessionSummary)).scalars().all()
+        finally:
+            s.close()
+    assert {(r.source_purpose, SENTINEL in r.summary_text) for r in rows} == {
+        ("p-src", True), ("q-reader", False),
+    }, [(r.source_purpose, r.summary_text) for r in rows]
+    block = eng.recall(user_id=USER, query="notes attic", purpose=Q) or ""
+    assert SENTINEL not in block
