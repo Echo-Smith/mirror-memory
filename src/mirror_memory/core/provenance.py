@@ -120,6 +120,14 @@ def visibility(session: Session, user_id: str, purpose: str | None = None) -> Vi
     return VisibilityRule(live=frozenset(r[0] for r in rows if r[0]))
 
 
+def merged_visible(rule: VisibilityRule, purposes: list[str] | set[str]) -> bool:
+    """The AND rule for MERGED free text (snapshots, digests, summaries):
+    every input purpose must still be visible.  Empty list = nothing
+    recorded -- the caller decides the fallback (pre-patch rows fall back
+    to their single source_purpose)."""
+    return all(rule.purpose_visible(p) for p in purposes if p)
+
+
 def provenance_purposes(
     session: Session, user_id: str, belief_ids: list[int],
 ) -> tuple[dict[int, set[str]], dict[int, set[str]]]:
@@ -132,9 +140,14 @@ def provenance_purposes(
     another tenant's evidence row of the same number.
     """
     from mirror_memory.core.models import BeliefEvent, BeliefEvidenceLink, Evidence
+    from mirror_memory.core.tenancy import current_tenant
 
     if not belief_ids:
         return {}, {}
+    # belief ids are only unique per tenant: every probe carries the full
+    # composite key, or tenant A's belief 5 could pair with tenant B's
+    # link/evidence rows of the same number
+    tenant_id, app_id = current_tenant()
     link_purposes: dict[int, set[str]] = {b: set() for b in belief_ids}
     rows = session.execute(
         select(BeliefEvidenceLink.belief_id, Evidence.source_purpose)
@@ -145,6 +158,8 @@ def provenance_purposes(
             & (Evidence.id == BeliefEvidenceLink.evidence_id),
         )
         .where(
+            BeliefEvidenceLink.tenant_id == tenant_id,
+            BeliefEvidenceLink.app_id == app_id,
             BeliefEvidenceLink.belief_id.in_(belief_ids),
             Evidence.user_id == user_id,
         )
@@ -155,6 +170,8 @@ def provenance_purposes(
     rows = session.execute(
         select(BeliefEvent.belief_id, BeliefEvent.source_purpose)
         .where(
+            BeliefEvent.tenant_id == tenant_id,
+            BeliefEvent.app_id == app_id,
             BeliefEvent.belief_id.in_(belief_ids),
             BeliefEvent.user_id == user_id,
             BeliefEvent.event_type.in_(PROVENANCE_EVENT_TYPES),

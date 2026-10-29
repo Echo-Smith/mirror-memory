@@ -8,6 +8,7 @@ scoring and budget computation.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -408,7 +409,7 @@ def render_memory_block_with_ids(
         digests = digests_for_beliefs(session, [b.id for b in evidence_beliefs])
         for belief in evidence_beliefs:
             digest = digests.get(belief.id)
-            if digest is not None and digest.summary:
+            if digest is not None and digest.summary and _digest_hint_visible(digest, visibility):
                 hint = f"[evidence] {belief.key}: {digest.summary}"
             else:
                 count = evidence_counts.get(belief.id) or 0
@@ -454,6 +455,22 @@ def render_memory_block_with_ids(
     return (block or None), list(accessed_ids)
 
 
+def _digest_hint_visible(digest: object, visibility: "VisibilityRule | None") -> bool:
+    """The digest folds its evidence's TEXT (M3 batch-3 patch): show the
+    hint only when every purpose in the digest's recorded input union is
+    visible.  Pre-patch digests (empty union) keep the safe fallback --
+    the observation-count hint -- when a rule is active."""
+    if visibility is None:
+        return True
+    try:
+        listed = [p for p in json.loads(digest.source_purposes_json or "[]") if p]
+    except (ValueError, AttributeError, TypeError):
+        return False
+    from mirror_memory.core import provenance
+
+    return provenance.merged_visible(visibility, listed)
+
+
 def _retrieve_session_snippets(
     session: object,
     user_id: str,
@@ -482,6 +499,8 @@ def _retrieve_session_snippets(
     )
     if visibility is not None:
         summaries = [r for r in summaries if visibility.purpose_visible(r.source_purpose)][:20]
+    if not summaries or not query:
+        return []
     if not summaries or not query:
         return []
 

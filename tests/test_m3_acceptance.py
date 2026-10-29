@@ -40,6 +40,8 @@ v2 merge-plan invariant mapping (I5 and the related ones):
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -336,6 +338,37 @@ def test_cross_purpose_q_reads_nothing_of_the_revoked_p(db_url):
                         assert SENTINEL not in page.to_dict().__str__(), key
                 else:
                     assert SENTINEL not in repr(result), key
+            # the residual entries (M3 batch-3 patch task 3): correct and
+            # restore treat an invisible belief EXACTLY like a missing one,
+            # and the per-id sweep covers every id 1..N
+            from mirror_memory.core.models import BeliefEvent
+
+            def _event_count():
+                F = sessionmaker(bind=create_engine(db_url))
+                with tenant_scope(*TENANT):
+                    s = F()
+                    try:
+                        return len(s.execute(select(BeliefEvent)).scalars().all())
+                    finally:
+                        s.close()
+
+            all_ids = sorted(b.id for b in _beliefs_all(db_url))
+            events_before = _event_count()
+            for belief_id in all_ids:
+                assert eng.correct(user_id=USER, belief_id=belief_id,
+                                   new_claim_text="rewritten", purpose=Q) is None
+                assert eng.restore_belief(user_id=USER, belief_id=belief_id, purpose=Q) is False
+                explained = eng.explain(user_id=USER, belief_id=belief_id, purpose=Q)
+                assert explained is None or SENTINEL not in json.dumps(explained, default=str)
+                history = eng.belief_history(user_id=USER, belief_id=belief_id, purpose=Q)
+                assert SENTINEL not in json.dumps(history, default=str)
+            # a genuinely missing id behaves byte-identically to an invisible one
+            ghost = max(all_ids) + 10_000
+            assert eng.correct(user_id=USER, belief_id=ghost,
+                               new_claim_text="x", purpose=Q) is None
+            assert eng.restore_belief(user_id=USER, belief_id=ghost, purpose=Q) is False
+            assert _event_count() == events_before, "invisible beliefs must not be touched"
+
             # the worker under Q: the job runs (Q is authorized) but reads
             # nothing X-only, so nothing X-only is republished.  The X
             # belief ROWS persist (hidden, not deleted) -- only what the

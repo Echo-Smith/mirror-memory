@@ -433,8 +433,12 @@ def evidence_summary(
     # Only visible provenance is listed; and the compaction digest -- whose
     # summary may fold text from ANY linked evidence -- is included only
     # when every linked evidence is visible.
+    digest = _digest_for_belief(session, belief_id)
     if visibility is not None:
-        all_visible = all(visibility.purpose_visible(e.source_purpose) for e, _r in pairs)
+        # the digest folds the linked evidence's TEXT: visible only when its
+        # recorded input union (or, for pre-patch digests, the whole current
+        # link graph) is visible; the pairs list itself keeps only visible rows
+        all_visible = _digest_text_visible(session, visibility, digest, pairs)
         pairs = [(e, r) for e, r in pairs if visibility.purpose_visible(e.source_purpose)]
     else:
         all_visible = True
@@ -457,7 +461,7 @@ def evidence_summary(
         "counts": {relation: len(items) for relation, items in grouped.items()},
         "by_relation": grouped,
     }
-    digest = _digest_for_belief(session, belief_id) if all_visible else None
+    digest = digest if all_visible else None
     if digest is not None:
         summary["digest"] = {
             "support_count": digest.support_count,
@@ -652,6 +656,20 @@ def apply_evidence_compaction(
             row.content = ""
         else:
             row.retention_state = "representative"
+
+    # The digest folds this evidence's TEXT: its provenance is the union of
+    # everything in the graph plus the compacting entry's purpose (M3
+    # batch-3 patch task 2) -- readers apply the AND rule over the list.
+    purposes: set[str] = set()
+    try:
+        purposes |= {p for p in json.loads(digest.source_purposes_json or "[]") if p}
+    except ValueError:
+        pass
+    purposes |= {row.source_purpose for row in evidence_rows if row.source_purpose}
+    if provenance.current(session):
+        purposes.add(provenance.current(session))
+    digest.source_purposes_json = json.dumps(sorted(purposes), ensure_ascii=False)
+    session.flush()
 
     belief.compacted_into = digest.id
     _append_event(
@@ -2858,6 +2876,24 @@ def correct_belief(
     if bump_revision:
         touch_memory_state(session, user_id)
     return corrected
+
+
+def _digest_text_visible(
+    session: Session, visibility: "VisibilityRule",
+    digest: "EvidenceDigest | None", pairs: list,
+) -> bool:
+    """May the digest's folded TEXT be shown under this rule?  Pre-patch
+    digests (empty union) fall back to the current link graph: every
+    linked evidence must be visible."""
+    if digest is None:
+        return True
+    try:
+        listed = [p for p in json.loads(digest.source_purposes_json or "[]") if p]
+    except ValueError:
+        listed = []
+    if listed:
+        return provenance.merged_visible(visibility, listed)
+    return all(visibility.purpose_visible(e.source_purpose) for e, _r in pairs)
 
 
 def explain_belief(

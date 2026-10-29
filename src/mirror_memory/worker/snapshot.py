@@ -24,6 +24,7 @@ def persist_snapshot(
     watermark: str,
     *,
     shadow: bool = False,
+    source_purposes: list[str] | None = None,
 ) -> Snapshot:
     """Save a versioned snapshot for *user_id*.
 
@@ -81,6 +82,11 @@ def persist_snapshot(
             evidence_watermark=watermark,
             prompt_version="v1",
             source_purpose=provenance.current(session),
+            # merged free text: the UNION of what the synthesis read (M3
+            # batch-3 patch) -- readers apply the AND rule over this list
+            source_purposes_json=json.dumps(
+                sorted(set(source_purposes or [])), ensure_ascii=False,
+            ),
         )
         session.add(snapshot)
         session.flush()

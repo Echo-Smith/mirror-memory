@@ -331,10 +331,14 @@ def test_v5_database_upgrades_to_latest_with_interrupted_step(pg_admin_engine):
     assert purpose == "", "step 6 ran without a legacy purpose: the pre-M3 job keeps the marker"
 
     # the interrupted re-run: everything from 7 to latest, WITH the shared
-    # legacy choice
-    steps = list(sm.DEFAULT_STEPS[6:])
-    steps[0] = sm.Step7SourcePurpose(legacy_job_purpose="legacy-app")
-    steps[-1] = sm.Step9RecallVisibility(legacy_job_purpose="legacy-app")
+    # legacy choice (explicit list -- swapping steps[-1] would drop step 10
+    # and duplicate version 9)
+    steps = [
+        sm.Step7SourcePurpose(legacy_job_purpose="legacy-app"),
+        sm.Step8AccessAudit(),
+        sm.Step9RecallVisibility(legacy_job_purpose="legacy-app"),
+        sm.Step10DerivedProvenance(),
+    ]
     upgrade_database(pg_admin_engine, default_tenant="tA", default_app="app",
                      steps=steps, confirm_backup=True)
     assert sm.current_version(pg_admin_engine) == sm.LATEST_VERSION

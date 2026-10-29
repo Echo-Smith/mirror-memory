@@ -11,6 +11,7 @@ alone may commit a snapshot and which does so only after the revision guard.
 
 from __future__ import annotations
 
+import json
 import logging
 
 from mirror_memory.config.schema import MemoryConfig
@@ -180,6 +181,22 @@ def _parse_understanding(raw: str) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
+def _snapshot_provenance_visible(snapshot: object, visibility: "VisibilityRule") -> bool:
+    """The AND rule over the snapshot's recorded input union (M3 batch-3
+    patch): the snapshot merges several inputs' text, so EVERY input
+    purpose must be visible.  Pre-patch rows (empty JSON list) fall back
+    to the single source_purpose."""
+    from mirror_memory.core import provenance
+
+    try:
+        listed = [p for p in json.loads(getattr(snapshot, "source_purposes_json", "") or "[]") if p]
+    except ValueError:
+        listed = []
+    if not listed:
+        listed = [snapshot.source_purpose] if snapshot.source_purpose else []
+    return provenance.merged_visible(visibility, listed)
+
+
 def _get_slice_summaries(session: object, user_id: str, *, visibility: "VisibilityRule | None" = None) -> str:
     """Get recent slice summaries as text.  Returns empty string if
     the session does not provide the required model.
@@ -199,7 +216,10 @@ def _get_slice_summaries(session: object, user_id: str, *, visibility: "Visibili
             .all()
         )
         if visibility is not None:
-            rows = [r for r in rows if visibility.purpose_visible(r.source_purpose)][:_MAX_SUMMARIES]
+            rows = [
+                r for r in rows
+                if _snapshot_provenance_visible(r, visibility)
+            ][:_MAX_SUMMARIES]
         lines = []
         for r in rows:
             lines.append(f"- {r.created_at.strftime('%Y-%m-%d') if r.created_at else '?'}: {r.content_json[:200]}")
@@ -226,7 +246,7 @@ def _get_current_understanding(session: object, user_id: str, *, visibility: "Vi
             .limit(1)
             .first()
         )
-        if snap and visibility is not None and not visibility.purpose_visible(snap.source_purpose):
+        if snap and visibility is not None and not _snapshot_provenance_visible(snap, visibility):
             return ""
         if snap and snap.content_json and snap.content_json != "{}":
             return snap.content_json

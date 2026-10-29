@@ -1645,6 +1645,68 @@ class Step9RecallVisibility:
                 )
 
 
+#: Derived free-text tables that record the UNION of their inputs'
+#: provenance (M3 batch-3 patch task 2): merged content follows the AND
+#: rule -- every input purpose must be visible.
+DERIVED_PROVENANCE_COLUMNS: dict[str, str] = {
+    "mm_snapshots": "source_purposes_json",
+    "mm_evidence_digests": "source_purposes_json",
+}
+
+
+@dataclass
+class Step10DerivedProvenance:
+    """``source_purposes_json`` on snapshots and evidence digests (M3
+    batch-3 patch task 2).
+
+    Both tables hold MERGED free text synthesised from several inputs, so
+    a single source_purpose cannot express their provenance: the JSON list
+    records the union of the inputs' source purposes, and readers apply
+    the AND rule (every listed purpose visible).  Same NOT NULL
+    TEXT / server-default-'[]' recipe as steps 7 and 9; existing rows keep
+    the empty list and readers fall back to the row's single
+    ``source_purpose`` (snapshots) or the belief's link graph (digests).
+    Re-entrant per artifact.  No session-summary constraint change: the
+    per-purpose summary rows of the same patch key on
+    ``(user_id, session_id, source_purpose)`` and the table never had a
+    unique constraint beyond the primary key.
+    """
+
+    version: int = 10
+    name: str = "derived provenance unions on snapshots and digests"
+
+    def needed(self, engine: Engine) -> bool:
+        return any(
+            column not in _table_columns(engine, table)
+            for table, column in DERIVED_PROVENANCE_COLUMNS.items()
+        )
+
+    def apply(self, engine: Engine) -> None:
+        for table, column in DERIVED_PROVENANCE_COLUMNS.items():
+            if column in _table_columns(engine, table):
+                continue
+            if _is_postgres(engine):
+                _DDLPlan([AddColumn(table, column, "TEXT")]).run(engine)
+                check = AddNotNullCheck(table, column)
+                _DDLPlan([
+                    _lock_timeout_element(),
+                    check,
+                    ValidateConstraint(table, check.constraint_name),
+                    AlterColumnClause(table, column, "SET NOT NULL"),
+                    AlterColumnClause(table, column, "SET DEFAULT '[]'"),
+                    DropConstraintByName(table, check.constraint_name),
+                ]).run(engine)
+            else:
+                _DDLPlan([AddColumn(
+                    table, column, "TEXT NOT NULL DEFAULT '[]'",
+                )]).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        for table, column in DERIVED_PROVENANCE_COLUMNS.items():
+            if column not in {c["name"] for c in inspect(engine).get_columns(table)}:
+                raise MigrationError(f"verification failed: {table}.{column} missing")
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1658,6 +1720,7 @@ DEFAULT_STEPS: list = [
     Step7SourcePurpose(),
     Step8AccessAudit(),
     Step9RecallVisibility(),
+    Step10DerivedProvenance(),
 ]
 
 #: The version a freshly upgraded database records.

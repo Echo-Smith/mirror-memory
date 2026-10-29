@@ -407,7 +407,7 @@ def _process_single_job(
 
         # Node 1: load_evidence (plain data, no ORM instances retained),
         # filtered to memory the job's purpose may see
-        evidence = _load_evidence(session, user_id, visibility=visibility_rule)
+        evidence, visible_beliefs = _load_evidence(session, user_id, visibility=visibility_rule)
 
         # Node 5's read half (K3): the beliefs/summaries the synthesis prompt
         # needs, taken in the same snapshot.  Fail-open like the node itself.
@@ -444,6 +444,18 @@ def _process_single_job(
         content = dict(validated)
         if understanding is not None:
             content["understanding"] = understanding
+
+        # The snapshot is MERGED free text: its provenance is the UNION of
+        # everything the synthesis read -- the visible beliefs' provenance,
+        # the previous snapshots' unions, and the job's own purpose (M3
+        # batch-3 patch task 2).
+        input_purposes: set[str] = {job.purpose}
+        for belief in visible_beliefs:
+            link_purposes, event_purposes = provenance.provenance_purposes(
+                session, user_id, [belief.id],
+            )
+            input_purposes |= link_purposes.get(belief.id, set()) | event_purposes.get(belief.id, set())
+        input_purposes |= _previous_snapshot_purposes(session, user_id)
 
         # -- publish transaction -------------------------------------------
         # Nothing read for the snapshot is trusted here: expire the identity
@@ -515,6 +527,7 @@ def _process_single_job(
                 "policy": policy,
                 "watermark": watermark,
                 "shadow": is_shadow,
+                "source_purposes": sorted(input_purposes),
             },
         )
         decision = Publisher(session, config).publish(proposal)
@@ -595,6 +608,28 @@ def _process_single_job(
         # a session reused across jobs must not carry this job's purpose
         # into the next one
         provenance.unbind(session)
+
+
+def _previous_snapshot_purposes(session: object, user_id: str) -> set[str]:
+    """The provenance unions of the user's live snapshots (the synthesis
+    reads the latest as context -- its inputs are inputs here too)."""
+    from mirror_memory.core.models import Snapshot
+
+    purposes: set[str] = set()
+    for snap in (
+        session.query(Snapshot)
+        .filter(Snapshot.user_id == user_id, Snapshot.status.in_(("active", "shadow")))
+        .all()
+    ):
+        try:
+            listed = [p for p in json.loads(snap.source_purposes_json or "[]") if p]
+        except ValueError:
+            listed = []
+        if listed:
+            purposes |= set(listed)
+        elif snap.source_purpose:
+            purposes.add(snap.source_purpose)
+    return purposes
 
 
 #: How long the BUSY bookkeeping keeps retrying the fenced pending-update
@@ -700,7 +735,10 @@ def _current_watermark(session: object, user_id: str) -> str:
 
 def _load_evidence(
     session: object, user_id: str, *, visibility: "VisibilityRule | None" = None,
-) -> dict:
+) -> tuple[dict, list]:
+    """Returns ``(evidence payload, the visible Belief rows)`` -- the rows
+    are what the synthesis actually read, and the snapshot's provenance
+    union is computed from them (M3 batch-3 patch)."""
     """Node 1: Read active beliefs, background, and session count.
 
     With a visibility rule only beliefs whose provenance passes it feed the
@@ -736,7 +774,7 @@ def _load_evidence(
         "beliefs": belief_data,
         "user_id": user_id,
         "distinct_sessions": distinct_sessions,
-    }
+    }, beliefs
 
 
 def _formulate(

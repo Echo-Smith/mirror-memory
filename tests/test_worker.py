@@ -140,12 +140,12 @@ class TestLoadEvidence:
                      claim_text="test", confidence=0.5, session_id="s1")
         record_claim(db_session, "u1", dimension="topic", key="work",
                      claim_text="test", confidence=0.5, session_id="s2")
-        evidence = _load_evidence(db_session, "u1")
+        evidence, _visible = _load_evidence(db_session, "u1")
         assert len(evidence["beliefs"]) >= 2
         assert evidence["distinct_sessions"] == 2
 
     def test_empty_user(self, db_session):
-        evidence = _load_evidence(db_session, "nonexistent")
+        evidence, _visible = _load_evidence(db_session, "nonexistent")
         assert evidence["beliefs"] == []
 
 

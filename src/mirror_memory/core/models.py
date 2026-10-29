@@ -299,6 +299,13 @@ class EvidenceDigest(TenantScoped, Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # JSON list of the evidence ids kept as the surviving sample.
     representative_ids: Mapped[str] = mapped_column(Text, default="[]")
+    # The union of source purposes of the evidence this digest aggregates
+    # (M3 batch-3 patch task 2) -- the summary folds their TEXT, so readers
+    # apply the AND rule over this list (empty list = pre-patch digest:
+    # readers fall back to the belief's link graph).
+    source_purposes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]",
+    )
     # Rule-generated one-liner (no model): "48 observations since 2025-03,
     # sources: message, authority: user".
     summary: Mapped[str] = mapped_column(Text, default="")
@@ -640,6 +647,14 @@ class Snapshot(TenantScoped, Base):
     # task 1) -- the worker's provenance row; "" = not recorded.
     source_purpose: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default="",
+    )
+    # The UNION of provenance of everything the synthesis actually read:
+    # the filtered evidence/beliefs, their events, and the previous
+    # snapshot (M3 batch-3 patch task 2).  The snapshot is MERGED free
+    # text, so readers apply the AND rule: every purpose in the list must
+    # be visible (empty list = pre-patch row: fall back to source_purpose).
+    source_purposes_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]",
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

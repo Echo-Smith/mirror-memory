@@ -682,6 +682,7 @@ class Publisher:
             payload.get("policy") or {},
             payload.get("watermark") or "",
             shadow=bool(payload.get("shadow", False)),
+            source_purposes=list(payload.get("source_purposes") or []),
         )
         return get_state_revision(self._session, proposal.user_id)
 

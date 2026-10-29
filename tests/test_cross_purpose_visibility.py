@@ -600,6 +600,60 @@ def test_revocation_vs_visibility_50_rounds_postgres(pg_app_url):
 
 
 # ---------------------------------------------------------------------------
+# batch-3 patch task 4: filter before limit (no starvation)
+# ---------------------------------------------------------------------------
+
+
+def test_no_starvation_when_the_revoked_purpose_bulks_the_limit(db):
+    """P has 200 NEWER beliefs, Q has 5 older ones.  After P is revoked,
+    recall / get_beliefs / panel / the summary fallback must still return
+    Q's content -- the visibility rule runs inside the query, before the
+    limit."""
+    eng = _engine(db)
+    _grant(eng, P)
+    _grant(eng, Q)
+    # deterministic seeding through the repository with bound provenance:
+    # 200 NEWER P beliefs (created events under P) and 5 OLDER Q beliefs
+    # -- the created-event branch of the rule
+    from mirror_memory.core.repository import record_claim
+
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("seed the bulk"):
+        s = F()
+        provenance.bind(s, P)
+        for i in range(200):
+            record_claim(s, USER, dimension="topic", key=f"p{i}",
+                         claim_text=f"P fact {i} about {SENTINEL}", confidence=0.8,
+                         session_id=f"sp{i}")
+        s.commit()
+        s.close()
+    with tenant_scope(*TENANT), fixture_write_scope("seed the Q rows"):
+        s = F()
+        provenance.bind(s, Q)
+        # anchor keys: the panel only renders keys with display labels
+        for i, key in enumerate(("work", "family", "health", "travel", "hobby")):
+            record_claim(s, USER, dimension="topic", key=key,
+                         claim_text=f"Q gardening fact {i}", confidence=0.8,
+                         session_id="sq")
+        s.commit()
+        s.close()
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+
+    beliefs = eng.get_beliefs(user_id=USER, purpose=Q, limit=10)
+    assert beliefs and all("gardening" in b.claim_text for b in beliefs), (
+        f"get_beliefs starved: {[b.claim_text for b in beliefs]}"
+    )
+    block = eng.recall(user_id=USER, query="gardening", purpose=Q) or ""
+    assert "gardening" in block and SENTINEL not in block, block
+    panel = eng.panel(user_id=USER, purpose=Q)
+    items = [i for sec in panel.sections for i in sec.get("items", [])]
+    assert items, "panel starved: no visible items"
+    assert all(SENTINEL not in repr(i) for i in items)
+    page = eng.export_page(user_id=USER, purpose=Q)
+    assert SENTINEL not in json.dumps(page.to_dict(), default=str)
+
+
+# ---------------------------------------------------------------------------
 # batch-3 patch task 1: session summaries are per-purpose rows
 # ---------------------------------------------------------------------------
 
@@ -637,3 +691,115 @@ def test_session_summary_rows_are_split_by_purpose(db):
     }, [(r.source_purpose, r.summary_text) for r in rows]
     block = eng.recall(user_id=USER, query="notes attic", purpose=Q) or ""
     assert SENTINEL not in block
+
+
+# ---------------------------------------------------------------------------
+# batch-3 patch task 2: snapshots record their INPUT provenance union
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_records_the_input_union_and_k3_applies_the_and_rule(db):
+    """A Q job synthesizes while P is live: the snapshot's union records
+    BOTH purposes (the inputs it read).  After P is revoked the snapshot
+    is AND-invisible to K3 even though the job purpose (Q) still is --
+    merged free text needs every input visible."""
+    from mirror_memory.extraction.synthesis import _get_current_understanding
+    from mirror_memory.core.models import Snapshot
+
+    eng = _engine(db)
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I like {SENTINEL} and coffee.", P, "s1")
+    _observe(eng, "I live in Berlin and work as a nurse.", Q, "s2")
+
+    # a Q job: its evidence load sees BOTH beliefs (P live), so the
+    # snapshot's union is {P, Q}, not just {Q}
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rule = provenance.visibility(s, USER)
+            from mirror_memory.worker.evolution import _previous_snapshot_purposes
+
+            assert _previous_snapshot_purposes(s, USER) == set(), "no snapshots yet"
+        finally:
+            s.close()
+    beliefs = _beliefs(db)
+    with tenant_scope(*TENANT), fixture_write_scope("persist a snapshot"):
+        s = F()
+        from mirror_memory.worker.snapshot import persist_snapshot
+
+        union: set[str] = {Q}
+        link_purposes, event_purposes = provenance.provenance_purposes(
+            s, USER, [b.id for b in beliefs])
+        for b in beliefs:
+            union |= link_purposes.get(b.id, set()) | event_purposes.get(b.id, set())
+        persist_snapshot(s, USER, {"note": "merged"}, {}, "{}", source_purposes=sorted(union))
+        s.commit()
+        s.close()
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            snap = s.execute(select(Snapshot)).scalars().one()
+            assert sorted(json.loads(snap.source_purposes_json)) == [P, Q], snap.source_purposes_json
+            rule = provenance.visibility(s, USER)
+            assert "merged" in _get_current_understanding(s, USER, visibility=rule)
+        finally:
+            s.close()
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rule = provenance.visibility(s, USER)
+            # AND rule: Q alone is not enough -- the union had P in it
+            assert _get_current_understanding(s, USER, visibility=rule) == ""
+        finally:
+            s.close()
+
+
+def test_digest_hint_gates_on_the_digest_union(db):
+    """The renderer's evidence hint prints the digest's folded TEXT: with a
+    digest whose union includes a revoked purpose, the hint falls back to
+    the observation count."""
+    from mirror_memory.core.models import EvidenceDigest
+    from mirror_memory.render.renderer import _digest_hint_visible
+
+    eng = _engine(db)
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I like {SENTINEL} and coffee.", P, "s1")
+    belief = _beliefs(db)[0]
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("seed digest"):
+        s = F()
+        s.add(EvidenceDigest(user_id=USER, belief_id=belief.id,
+                             summary=f"digest mentions {SENTINEL}",
+                             source_purposes_json=json.dumps([P, Q])))
+        s.commit()
+        s.close()
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rule = provenance.visibility(s, USER)
+            from mirror_memory.core.models import EvidenceDigest as ED
+
+            digest = s.execute(select(ED)).scalars().one()
+            assert _digest_hint_visible(digest, rule) is True
+        finally:
+            s.close()
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rule = provenance.visibility(s, USER)
+            from mirror_memory.core.models import EvidenceDigest as ED
+
+            digest = s.execute(select(ED)).scalars().one()
+            assert _digest_hint_visible(digest, rule) is False
+        finally:
+            s.close()
+
+
+# ---------------------------------------------------------------------------
+# batch-3 patch task 3: the residual entries
+# ---------------------------------------------------------------------------
