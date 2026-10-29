@@ -216,7 +216,7 @@ def test_migrated_database_runs_representative_flows(base_db):
         # forget the current row for the key
         current = get_belief(s, "u1", "sleep")
         assert current is not None
-        assert forget_belief(s, "u1", current.id) is True
+        assert forget_belief(s, "u1", current.id) >= 1
         s.commit()
         assert get_belief(s, "u1", "sleep") is None
         s.close()

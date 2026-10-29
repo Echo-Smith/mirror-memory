@@ -220,4 +220,6 @@ def test_other_write_scope_openers_are_listed():
         ("src/mirror_memory/worker/snapshot.py", "engine_write_scope"),
         ("src/mirror_memory/extraction/verification.py", "telemetry_write_scope"),
         ("src/mirror_memory/bench/longrun.py", "publisher_write_scope"),
+        ("src/mirror_memory/core/repository.py", "deletion_write_scope"),
+        ("src/mirror_memory/core/replay.py", "deletion_write_scope"),
     }, openers

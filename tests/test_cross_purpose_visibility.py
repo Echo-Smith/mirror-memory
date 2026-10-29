@@ -418,7 +418,8 @@ def test_snapshot_context_is_gated_by_its_own_provenance(db):
     with tenant_scope(*TENANT), fixture_write_scope("seed snapshot"):
         s = sessionmaker(bind=db)()
         s.add(Snapshot(id="snap-p", user_id=USER, version=1, status="active",
-                       content_json='{"note": "shaped by P"}', source_purpose=P))
+                       content_json='{"note": "shaped by P"}', source_purpose=P,
+                       source_generation=0))
         s.commit()
         s.close()
     with tenant_scope(*TENANT):
@@ -734,7 +735,10 @@ def test_snapshot_records_the_input_union_and_k3_applies_the_and_rule(db):
             s, USER, [b.id for b in beliefs])
         for b in beliefs:
             union |= link_purposes.get(b.id, set()) | event_purposes.get(b.id, set())
-        persist_snapshot(s, USER, {"note": "merged"}, {}, "{}", source_purposes=sorted(union))
+        from mirror_memory.core.repository import current_deletion_generation
+
+        persist_snapshot(s, USER, {"note": "merged"}, {}, "{}", source_purposes=sorted(union),
+                         source_generation=current_deletion_generation(s, USER))
         s.commit()
         s.close()
     with tenant_scope(*TENANT):

@@ -69,6 +69,16 @@ writers:
       - mirror_memory.api
       - mirror_memory.worker.maintenance
 
+  # ---- deletion class: the deletion-generation counter (M4, reviewer 待评审) ----
+  bump_deletion_generation:
+    reason: >
+      Advances the user's deletion generation by inserting the next value;
+      the composite primary key is the compare-and-swap.  Called by the
+      forget paths inside their deletion transaction and by the replayer
+      (generation alignment to the log).
+    callers:
+      - mirror_memory.core.repository
+
   # ---- consent class: purpose authorization (M3 batch 1; reviewed
   # 2026-10-30 by Echo-Smith) ----
   grant_purpose:

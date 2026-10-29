@@ -66,7 +66,7 @@ def test_every_tenant_table_is_classified():
 def test_mapping_covers_exactly_the_tenant_tables():
     from mirror_memory.core.models import Base
 
-    assert len(TABLE_WRITE_CLASSES) == len(Base.metadata.tables) == 21
+    assert len(TABLE_WRITE_CLASSES) == len(Base.metadata.tables) == 22
 
 
 # ---------------------------------------------------------------------------

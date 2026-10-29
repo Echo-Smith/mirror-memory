@@ -112,7 +112,7 @@ class TestTargetedForgetPurgesLedger:
         assert versions == 2
         assert identities == 1
 
-        assert forget_belief(db_session, "u1", belief_id) is True
+        assert forget_belief(db_session, "u1", belief_id) >= 1
 
         versions, identities, _proposals = _ledger_counts(db_session)
         assert versions == 0, "the version chain still holds the deleted content"
@@ -125,7 +125,7 @@ class TestTargetedForgetPurgesLedger:
         _versions, _identities, proposals = _ledger_counts(db_session)
         assert proposals == 1
 
-        assert forget_belief(db_session, "u1", belief_id) is True
+        assert forget_belief(db_session, "u1", belief_id) >= 1
 
         # The row that produced the deleted belief is gone; a direct
         # repository forget writes no log row of its own.

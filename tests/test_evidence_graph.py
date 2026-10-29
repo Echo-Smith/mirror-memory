@@ -185,7 +185,7 @@ class TestEvidenceLifecycle:
         ev = record_evidence(db_session, "u1", ref="m1")
         link_evidence(db_session, belief.id, ev.id, relation="support")
 
-        assert forget_belief(db_session, "u1", belief.id) is True
+        assert forget_belief(db_session, "u1", belief.id) >= 1
         assert db_session.query(BeliefEvidenceLink).count() == 0
 
     def test_shared_evidence_survives_forget(self, db_session):
