@@ -2821,23 +2821,24 @@ def _purge_belief_ledger(session: Session, belief: Belief) -> dict[str, int]:
 
 
 def forget_session_summary(session: Session, user_id: str, session_id: str) -> bool:
-    """Targeted forget: delete a session summary by session_id.
+    """Targeted forget: delete EVERY session summary for (user, session).
 
-    Returns ``True`` if the summary was found and deleted.
+    Since the per-purpose summary split (M3 batch-3 patch) a session
+    observed under several purposes has one row PER purpose -- a
+    single-row delete would leave the other purposes' text behind, and
+    forget must be unconditional (any authorization state, no visibility
+    filter).  Returns ``True`` if at least one row was removed.
     """
-    summary = (
+    removed = (
         session.query(SessionSummary)
         .filter(
             SessionSummary.user_id == user_id,
             SessionSummary.session_id == session_id,
         )
-        .first()
+        .delete(synchronize_session=False)
     )
-    if summary is None:
-        return False
-    session.delete(summary)
     session.flush()
-    return True
+    return removed > 0
 
 
 # ---------------------------------------------------------------------------

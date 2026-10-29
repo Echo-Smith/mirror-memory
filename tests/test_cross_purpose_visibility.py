@@ -861,3 +861,68 @@ def _events(db) -> list[BeliefEvent]:
             return s.execute(select(BeliefEvent)).scalars().all()
         finally:
             s.close()
+
+
+# ---------------------------------------------------------------------------
+# pre-merge fix: forget_session removes EVERY purpose's summary rows
+# ---------------------------------------------------------------------------
+
+
+def test_forget_session_deletes_all_purpose_rows_and_every_read_is_clean(db):
+    """The per-purpose split made one (user, session) hold several rows;
+    forget must remove ALL of them -- unconditionally (any purpose, any
+    authorization state, no visibility filter) -- and afterwards no read
+    path may surface the session's text."""
+    cfg = load_config("config/")
+    cfg.session_summary_enabled = True
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+    eng = MemoryEngine(config=cfg, database_url=str(db.url),
+                       tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM())
+    _grant(eng, P)
+    _grant(eng, Q)
+    _observe(eng, f"I keep notes about {SENTINEL} in the attic.", P, "shared")
+    _observe(eng, "I keep notes about gardening in the shed.", Q, "shared")
+
+    from mirror_memory.core.models import SessionSummary
+
+    def summary_rows():
+        with tenant_scope(*TENANT):
+            s = F()
+            try:
+                return s.execute(select(SessionSummary)).scalars().all()
+            finally:
+                s.close()
+
+    assert len(summary_rows()) == 2
+
+    # forget under Q (the session was observed under Q, but the call is
+    # unconditional): both rows go
+    assert eng.forget_session(user_id=USER, session_id="shared", purpose=Q) is True
+    assert summary_rows() == []
+
+    # observe again under P, then revoke P and forget with P revoked: the
+    # forget still runs (unconditional) and still removes everything
+    _observe(eng, f"more notes about {SENTINEL} upstairs.", P, "shared")
+    assert len(summary_rows()) == 1
+    eng.revoke_purpose(user_id=USER, purpose=P, actor="user", reason="withdrawn")
+    assert eng.forget_session(user_id=USER, session_id="shared", purpose=Q) is True
+    assert summary_rows() == []
+
+    # nothing was ever forgotten: False, and no exception (a missing
+    # session forgets nothing)
+    assert eng.forget_session(user_id=USER, session_id="never-existed", purpose=Q) is False
+
+    # the whole read surface carries zero sentinel text (P itself is
+    # revoked: it must be refused outright)
+    assert SENTINEL not in (eng.recall(user_id=USER, query="attic notes", purpose=Q) or "")
+    with pytest.raises(PurposeDenied):
+        eng.recall(user_id=USER, query="attic notes", purpose=P)
+    beliefs = eng.get_beliefs(user_id=USER, purpose=Q)
+    assert all(SENTINEL not in b.claim_text for b in beliefs)
+    page = eng.export_page(user_id=USER, purpose=Q)
+    assert SENTINEL not in json.dumps(page.to_dict(), default=str)
