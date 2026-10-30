@@ -1737,25 +1737,42 @@ def ensure_watermark(engine: Engine) -> tuple[str, int]:
         except Exception:
             if not inspect(engine).has_table(WATERMARK_TABLE):
                 raise
-    # the insert races with concurrent startups (the server engine cache
-    # warming several tenants at once): an IntegrityError aborts the whole
-    # transaction, so each attempt runs in a FRESH one, and the loser
-    # re-reads the winner's row
-    for _ in range(3):
-        with engine.begin() as conn:
-            row = conn.execute(select(table.c.db_id, table.c.applied_seq)
-                               .where(table.c.id == 1)).first()
-            if row is not None:
-                return str(row[0]), int(row[1])
-            import uuid as _uuid
+    # First-time creation is serialised per database (a session-level
+    # advisory lock on a DEDICATED connection -- the caller's transaction
+    # must not hold it): concurrent startups (the server engine cache
+    # warming several tenants at once) queue instead of racing on the
+    # INSERT, so no request loses its transaction to the DDL race.
+    is_postgres = engine.dialect.name == "postgresql"
+    lock_conn = engine.connect() if is_postgres else None
+    try:
+        if lock_conn is not None:
+            lock_conn.execution_options(isolation_level="AUTOCOMMIT").execute(
+                text("SELECT pg_advisory_lock(hashtext(:k))"),
+                {"k": f"mm-watermark:{engine.url.render_as_string(hide_password=True)}"},
+            )
+        for _ in range(3):
+            with engine.begin() as conn:
+                row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                                   .where(table.c.id == 1)).first()
+                if row is not None:
+                    return str(row[0]), int(row[1])
+                import uuid as _uuid
 
-            db_id = _uuid.uuid4().hex
-            try:
-                conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
-                return db_id, 0
-            except Exception:
-                pass  # the aborted transaction is discarded with the connection
-    raise RuntimeError("the deletion watermark row could not be created")
+                db_id = _uuid.uuid4().hex
+                try:
+                    conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+                    return db_id, 0
+                except Exception:
+                    pass  # the aborted transaction is discarded with the connection
+        raise RuntimeError("the deletion watermark row could not be created")
+    finally:
+        if lock_conn is not None:
+            with contextlib.suppress(Exception):
+                lock_conn.execute(text(
+                    "SELECT pg_advisory_unlock(hashtext(:k))"),
+                    {"k": f"mm-watermark:{engine.url.render_as_string(hide_password=True)}"},
+                )
+            lock_conn.close()
 
 
 def read_watermark(engine: Engine) -> tuple[str, int] | None:

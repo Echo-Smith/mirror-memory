@@ -189,7 +189,7 @@ def _docker() -> str | None:
     return None
 
 
-def _pg_dump(main_db: str, out: str) -> None:
+def _pg_dump(main_db: str, out: str, main_url: str | None = None) -> None:
     """A custom-format dump of *main_db*, taken inside the container when
     the server runs there (the file lands on the host either way)."""
     env = dict(os.environ, PGPASSWORD="mm")
@@ -204,7 +204,7 @@ def _pg_dump(main_db: str, out: str) -> None:
         # the CI runner has the client tools; connect explicitly (a bare
         # db name would use the OS user's local socket).  Strip ONLY the
         # driver segment: "+psycopg" leaves a bare scheme otherwise.
-        pg_url = main_url.replace("postgresql+psycopg://", "postgresql://", 1)
+        pg_url = (main_url or "").replace("postgresql+psycopg://", "postgresql://", 1)
         subprocess.run(["pg_dump", "--format=custom", "--file", out, pg_url],
                        env=env, check=True)
 
@@ -301,7 +301,7 @@ def test_backup_restore_replay_end_to_end_pg(tmp_path):
                     text="I like PGSENTINEL and coffee.", purpose="api")
 
         # BACKUP (the real tool)
-        _pg_dump(main_db, dump_path)
+        _pg_dump(main_db, dump_path, main_url=main_url)
 
         # three scopes of deletion
         F = sessionmaker(bind=create_engine(runtime_url))

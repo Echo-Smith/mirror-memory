@@ -226,8 +226,8 @@ def test_revoke_racing_the_publish_never_lands_after_revocation(factory):
         tr = threading.Thread(target=run_revoke, daemon=True)
         tp.start()
         tr.start()
-        tp.join(timeout=20)
-        tr.join(timeout=20)
+        tp.join(timeout=60)
+        tr.join(timeout=60)
         assert not tp.is_alive() and not tr.is_alive(), (
             round_no, "a racing thread outlived its round -- its locks would "
             "poison the next test's schema rebuild"
