@@ -255,9 +255,12 @@ def _pg_restore(main_db: str, dump: str, main_url: str) -> None:
         # the native pg_restore connects explicitly and MUST target the
         # e2e's own database -- restoring into MM_DATABASE_URL (the shared
         # mm_test) would wipe the shared state mid-run
+        # libpq only recognises a URI when the scheme is a bare
+        # postgresql:// -- the "+psycopg" driver segment would make it
+        # fall back to the local socket
         pg_url = (
             make_url(main_url)
-            .set(username="postgres", password="mm")
+            .set(drivername="postgresql", username="postgres", password="mm")
             .render_as_string(hide_password=False)
         )
         result = subprocess.run(
