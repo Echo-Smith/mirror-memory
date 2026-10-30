@@ -236,11 +236,17 @@ def _pg_restore(main_db: str, dump: str) -> None:
     if result.returncode != 0:
         raise RuntimeError(f"drop failed: {result.stderr or result.stdout}")
     subprocess.run(psql + [f'CREATE DATABASE "{main_db}"'], env=env, check=True)
-    restore = (["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
-                "pg_restore", "-U", "postgres",
-                "--dbname", main_db] if docker else
-               ["pg_restore", "--dbname", main_db])
-    subprocess.run(restore, input=Path(dump).read_bytes(), env=env, check=True)
+    if docker:
+        restore = ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+                   "pg_restore", "-U", "postgres", "--dbname", main_db]
+        subprocess.run(restore, input=Path(dump).read_bytes(), env=env, check=True)
+    else:
+        # the native pg_restore connects explicitly (a bare db name would
+        # use the OS user's local socket)
+        pg_url = os.environ["MM_DATABASE_URL"].replace(
+            "postgresql+psycopg://", "postgresql://", 1)
+        subprocess.run(["pg_restore", "--dbname", pg_url],
+                       input=Path(dump).read_bytes(), env=env, check=True)
 
 
 @pytest.mark.skipif(
