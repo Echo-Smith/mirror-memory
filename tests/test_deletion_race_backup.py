@@ -251,8 +251,11 @@ def _pg_restore(main_db: str, dump: str) -> None:
             "postgresql+psycopg://", "postgresql://", 1)
         result = None
         for attempt in range(5):
+            # --clean --if-exists: the restored database may still hold
+            # tables (a FORCE-terminated backend's in-flight CREATE TABLE
+            # can have committed), and pg_restore cannot drop them itself
             result = subprocess.run(
-                ["pg_restore", "--dbname", pg_url],
+                ["pg_restore", "--clean", "--if-exists", "--dbname", pg_url],
                 input=Path(dump).read_bytes(), env=env, capture_output=True)
             if result.returncode == 0:
                 break
