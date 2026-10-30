@@ -367,10 +367,14 @@ def test_backup_restore_replay_end_to_end_pg(tmp_path):
         install_row_level_security(owner_engine, verify=False)
         Step11DeletionReplay().apply(owner_engine)
         Step11DeletionReplay().verify(owner_engine)
-        reconcile(lambda: sessionmaker(bind=owner_engine)(), log)
+        status = reconcile(lambda: sessionmaker(bind=owner_engine)(), log)
         owner_engine.dispose()
+        dbg_engine = create_engine(main_url)
+        _db_id_dbg, applied_owner = sm.read_watermark(dbg_engine)
+        dbg_engine.dispose()
         _db_id2, applied2 = sm.read_watermark(create_engine(runtime_url))
-        assert applied2 == tail, (applied2, tail)
+        assert applied2 == tail == applied_owner, (
+            applied2, tail, applied_owner, status)
 
         # every read surface is clean (the SAME log instance: a default-
         # constructed engine would look at a different log and refuse)
