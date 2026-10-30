@@ -209,7 +209,7 @@ def _pg_dump(main_db: str, out: str, main_url: str | None = None) -> None:
                        env=env, check=True)
 
 
-def _pg_restore(main_db: str, dump: str) -> None:
+def _pg_restore(main_db: str, dump: str, main_url: str) -> None:
     env = dict(os.environ, PGPASSWORD="mm")
     docker = _docker()
     if docker:
@@ -356,7 +356,7 @@ def test_backup_restore_replay_end_to_end_pg(tmp_path):
 
         # RESTORE with the real tool: the watermark row comes back with it
         sqlalchemy_engine.dispose()
-        _pg_restore(main_db, dump_path)
+        _pg_restore(main_db, dump_path, main_url=main_url)
 
         # STARTUP: the replay happens at reconcile -- the app role cannot
         # run the watermark DDL, so the check runs owner-side first (a
