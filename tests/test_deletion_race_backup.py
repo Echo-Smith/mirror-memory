@@ -212,8 +212,15 @@ def _pg_dump(main_db: str, out: str, main_url: str | None = None) -> None:
 def _pg_restore(main_db: str, dump: str) -> None:
     env = dict(os.environ, PGPASSWORD="mm")
     docker = _docker()
-    psql = (["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg", "psql",
-             "-U", "postgres"] if docker else ["psql", "-U", "postgres"]) + ["-c"]
+    if docker:
+        psql = (["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg", "psql",
+                 "-U", "postgres"]) + ["-c"]
+    else:
+        # the CI runner's psql connects via TCP with the password (there is
+        # no local socket for a service-container server)
+        pg_admin = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/postgres"
+        pg_admin = pg_admin.replace("postgresql+psycopg://", "postgresql://", 1)
+        psql = ["psql", pg_admin, "-c"]
     import time
 
     result = None
