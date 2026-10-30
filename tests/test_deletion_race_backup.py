@@ -360,6 +360,13 @@ def test_backup_restore_replay_end_to_end_pg(tmp_path):
         # restored production database is brought up by the owner too),
         # then the app engine serves
         owner_engine = create_engine(main_url)
+        # a real bring-up of a restored database re-applies the RLS
+        # posture and the watermark grants owner-side first (the restore
+        # dropped the app role's grants -- they ride the dumped objects)
+        _Base.metadata.create_all(owner_engine)
+        install_row_level_security(owner_engine, verify=False)
+        Step11DeletionReplay().apply(owner_engine)
+        Step11DeletionReplay().verify(owner_engine)
         reconcile(lambda: sessionmaker(bind=owner_engine)(), log)
         owner_engine.dispose()
         _db_id2, applied2 = sm.read_watermark(create_engine(runtime_url))
