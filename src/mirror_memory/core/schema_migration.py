@@ -1737,24 +1737,25 @@ def ensure_watermark(engine: Engine) -> tuple[str, int]:
         except Exception:
             if not inspect(engine).has_table(WATERMARK_TABLE):
                 raise
-    with engine.begin() as conn:
-        row = conn.execute(select(table.c.db_id, table.c.applied_seq)
-                           .where(table.c.id == 1)).first()
-        if row is None:
+    # the insert races with concurrent startups (the server engine cache
+    # warming several tenants at once): an IntegrityError aborts the whole
+    # transaction, so each attempt runs in a FRESH one, and the loser
+    # re-reads the winner's row
+    for _ in range(3):
+        with engine.begin() as conn:
+            row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                               .where(table.c.id == 1)).first()
+            if row is not None:
+                return str(row[0]), int(row[1])
             import uuid as _uuid
 
             db_id = _uuid.uuid4().hex
             try:
                 conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+                return db_id, 0
             except Exception:
-                if conn.execute(select(table.c.id).where(table.c.id == 1)).first() is None:
-                    raise
-                conn.rollback()
-                row = conn.execute(select(table.c.db_id, table.c.applied_seq)
-                                   .where(table.c.id == 1)).first()
-                return str(row[0]), int(row[1])
-            return db_id, 0
-        return str(row[0]), int(row[1])
+                pass  # the aborted transaction is discarded with the connection
+    raise RuntimeError("the deletion watermark row could not be created")
 
 
 def read_watermark(engine: Engine) -> tuple[str, int] | None:

@@ -202,8 +202,9 @@ def _pg_dump(main_db: str, out: str) -> None:
         Path(out).write_bytes(result.stdout)
     else:
         # the CI runner has the client tools; connect explicitly (a bare
-        # db name would use the OS user's local socket)
-        pg_url = os.environ["MM_DATABASE_URL"].split("+", 1)[0]
+        # db name would use the OS user's local socket).  Strip ONLY the
+        # driver segment: "+psycopg" leaves a bare scheme otherwise.
+        pg_url = main_url.replace("postgresql+psycopg://", "postgresql://", 1)
         subprocess.run(["pg_dump", "--format=custom", "--file", out, pg_url],
                        env=env, check=True)
 
