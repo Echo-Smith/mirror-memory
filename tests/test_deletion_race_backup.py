@@ -234,7 +234,10 @@ def _pg_restore(main_db: str, dump: str) -> None:
             break
         time.sleep(0.5 * (attempt + 1))  # terminated backends take a moment
     if result.returncode != 0:
-        raise RuntimeError(f"drop failed: {result.stderr or result.stdout}")
+        detail = result.stderr or result.stdout or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        raise RuntimeError(f"drop failed: {detail}")
     subprocess.run(psql + [f'CREATE DATABASE "{main_db}"'], env=env, check=True)
     if docker:
         restore = ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
