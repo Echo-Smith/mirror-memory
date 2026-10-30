@@ -250,19 +250,19 @@ def _pg_restore(main_db: str, dump: str) -> None:
         # and the restore must not race the terminated backends: retry
         import time
 
-        pg_url = os.environ["MM_DATABASE_URL"].replace(
-            "postgresql+psycopg://", "postgresql://", 1)
-        result = None
-        for attempt in range(5):
-            # --clean --if-exists: the restored database may still hold
-            # tables (a FORCE-terminated backend's in-flight CREATE TABLE
-            # can have committed), and pg_restore cannot drop them itself
-            result = subprocess.run(
-                ["pg_restore", "--clean", "--if-exists", "--dbname", pg_url],
-                input=Path(dump).read_bytes(), env=env, capture_output=True)
-            if result.returncode == 0:
-                break
-            time.sleep(0.5 * (attempt + 1))
+        from sqlalchemy.engine import make_url
+
+        # the native pg_restore connects explicitly and MUST target the
+        # e2e's own database -- restoring into MM_DATABASE_URL (the shared
+        # mm_test) would wipe the shared state mid-run
+        pg_url = (
+            make_url(main_url)
+            .set(username="postgres", password="mm")
+            .render_as_string(hide_password=False)
+        )
+        result = subprocess.run(
+            ["pg_restore", "--dbname", pg_url],
+            input=Path(dump).read_bytes(), env=env, capture_output=True)
         if result.returncode != 0:
             detail = result.stderr or result.stdout or ""
             if isinstance(detail, bytes):
