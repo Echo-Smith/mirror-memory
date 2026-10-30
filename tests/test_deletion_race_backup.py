@@ -258,8 +258,10 @@ def _pg_restore(main_db: str, dump: str) -> None:
                 break
             time.sleep(0.5 * (attempt + 1))
         if result.returncode != 0:
-            raise RuntimeError(
-                f"pg_restore failed: {result.stderr or result.stdout}")
+            detail = (result.stderr or result.stdout)
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            raise RuntimeError(f"pg_restore failed: {detail}")
 
 
 @pytest.mark.skipif(
