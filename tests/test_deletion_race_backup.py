@@ -253,12 +253,12 @@ def _pg_restore(main_db: str, dump: str) -> None:
         for attempt in range(5):
             result = subprocess.run(
                 ["pg_restore", "--dbname", pg_url],
-                input=Path(dump).read_bytes(), env=env, capture_output=True, text=True)
+                input=Path(dump).read_bytes(), env=env, capture_output=True)
             if result.returncode == 0:
                 break
             time.sleep(0.5 * (attempt + 1))
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout)
+            detail = result.stderr or result.stdout or ""
             if isinstance(detail, bytes):
                 detail = detail.decode("utf-8", "replace")
             raise RuntimeError(f"pg_restore failed: {detail}")
