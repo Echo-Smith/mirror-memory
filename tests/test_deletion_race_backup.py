@@ -242,11 +242,24 @@ def _pg_restore(main_db: str, dump: str) -> None:
         subprocess.run(restore, input=Path(dump).read_bytes(), env=env, check=True)
     else:
         # the native pg_restore connects explicitly (a bare db name would
-        # use the OS user's local socket)
+        # use the OS user's local socket); pg_restore CANNOT restore into a
+        # database that has live connections, so the drop used WITH (FORCE)
+        # and the restore must not race the terminated backends: retry
+        import time
+
         pg_url = os.environ["MM_DATABASE_URL"].replace(
             "postgresql+psycopg://", "postgresql://", 1)
-        subprocess.run(["pg_restore", "--dbname", pg_url],
-                       input=Path(dump).read_bytes(), env=env, check=True)
+        result = None
+        for attempt in range(5):
+            result = subprocess.run(
+                ["pg_restore", "--dbname", pg_url],
+                input=Path(dump).read_bytes(), env=env, capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+            time.sleep(0.5 * (attempt + 1))
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"pg_restore failed: {result.stderr or result.stdout}")
 
 
 @pytest.mark.skipif(
