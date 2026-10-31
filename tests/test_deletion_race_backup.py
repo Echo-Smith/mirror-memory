@@ -73,10 +73,16 @@ def _seed(db) -> None:
         s.close()
 
 
-def _race_round(db, round_no) -> None:
+def _race_round(db, round_no, *, deletion_log: FileDeletionLog | None = None,
+                database_url: str | None = None) -> None:
     """One deletion-vs-publish round (SQLite: writer serialisation; the
-    worker's publish and the deletion interleave through the file lock)."""
+    worker's publish and the deletion interleave through the file lock).
+    The PG leg passes its own deletion log (a non-SQLite URL never gets a
+    derived directory -- M4 patch task 2) and tolerates deadlock/
+    serialisation aborts as "did not land" outcomes with a bounded retry."""
     cfg = _config()
+    if deletion_log is not None:
+        cfg.deletion_log.directory = str(deletion_log.directory)
     F = sessionmaker(bind=db)
     with tenant_scope(*TENANT), fixture_write_scope("seed the round"):
         s = F()
@@ -86,8 +92,23 @@ def _race_round(db, round_no) -> None:
 
     outcomes: dict = {}
 
+    #: a PG deadlock/serialisation victim rolled back ENTIRELY: it "did
+    # not land" -- retry a bounded number of times before giving up
+    import time as _time
+
+    from sqlalchemy.exc import OperationalError
+
+    def _pg_retry(work, *, attempts: int = 3):
+        for attempt in range(attempts):
+            try:
+                return work(), None
+            except OperationalError as exc:
+                if attempt == attempts - 1:
+                    return None, repr(exc)
+                _time.sleep(0.05 * (attempt + 1))
+
     def run_publish():
-        try:
+        def work():
             with tenant_scope(*TENANT):
                 s = F()
                 try:
@@ -109,21 +130,36 @@ def _race_round(db, round_no) -> None:
                     outcomes["publish"] = ("deleted-or-cancelled", repr(exc))
                 finally:
                     s.close()
+        try:
+            _, err = _pg_retry(work)
+            if err is not None:
+                outcomes["publish"] = ("aborted", err)
         except Exception as exc:  # noqa: BLE001 -- recorded
             outcomes["publish"] = ("error", repr(exc))
 
     def run_delete():
+        # ONE engine for the whole round (retried attempts reuse it): a
+        # fresh engine per attempt leaks PG connection slots
         try:
-            with tenant_scope(*TENANT):
-                s = F()
-                try:
-                    me = MemoryEngine(config=cfg, database_url=str(db.url),
-                                      tenant_id=TENANT[0], app_id=TENANT[1],
-                                      llm_client=_FakeLLM())
-                    me.delete_memories(user_id=USER, purpose="api")
-                    outcomes["delete"] = "committed"
-                finally:
-                    s.close()
+            me = MemoryEngine(config=cfg,
+                              database_url=database_url or str(db.url),
+                              tenant_id=TENANT[0], app_id=TENANT[1],
+                              llm_client=_FakeLLM(),
+                              **({"deletion_log": deletion_log}
+                                 if deletion_log is not None else {}))
+            try:
+                def work():
+                    with tenant_scope(*TENANT):
+                        s = F()
+                        try:
+                            me.delete_memories(user_id=USER, purpose="api")
+                        finally:
+                            s.close()
+                _, err = _pg_retry(work)
+                outcomes["delete"] = ("committed" if err is None
+                                      else f"aborted: {err}")
+            finally:
+                me._engine.dispose()
         except Exception as exc:  # noqa: BLE001
             outcomes["delete"] = repr(exc)
 
@@ -173,6 +209,140 @@ def test_deletion_vs_publish_50_rounds_sqlite(tmp_path):
     for round_no in range(50):
         _race_round(db, round_no)
     db.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M4 batch-1 patch task 5: the SAME races as REAL PG concurrency, each on
+# its OWN database (never the shared mm_test -- its historical state
+# poisoned earlier attempts)
+# ---------------------------------------------------------------------------
+
+
+def _pg_own_database(main_db: str):
+    """An INDEPENDENT PG database for one test: dropped, recreated, and
+    brought up owner-side (schema + RLS + watermark + Step11 grants).
+    Returns (runtime_url, admin_url); the caller drops it again."""
+    admin_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/postgres"
+    main_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with no_audit_scope(), admin_engine.connect() as conn:
+        conn.exec_driver_sql(
+            f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+        conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+    admin_engine.dispose()
+    from mirror_memory.core.models import Base as _Base
+    from mirror_memory.core.schema_migration import (
+        Step11DeletionReplay,
+        install_row_level_security,
+    )
+
+    owner_engine = create_engine(main_url)
+    _Base.metadata.create_all(owner_engine)
+    sm.ensure_watermark(owner_engine)
+    install_row_level_security(owner_engine, verify=False)
+    Step11DeletionReplay().apply(owner_engine)
+    Step11DeletionReplay().verify(owner_engine)
+    owner_engine.dispose()
+    from sqlalchemy.engine import make_url
+
+    from tests.conftest import PG_TEST_ROLE_PASSWORDS
+
+    runtime_url = (
+        make_url(main_url)
+        .set(username="mm_app", password=PG_TEST_ROLE_PASSWORDS["app"])
+        .render_as_string(hide_password=False)
+    )
+    return runtime_url, admin_url
+
+
+def _pg_drop_database(main_db: str, admin_url: str) -> None:
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with contextlib.suppress(Exception), no_audit_scope(), admin_engine.connect() as conn:
+        conn.exec_driver_sql(
+            f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+    admin_engine.dispose()
+
+
+_pg_needs = pytest.mark.skipif(
+    not os.environ.get("MM_DATABASE_URL", "").startswith("postgresql"),
+    reason="needs MM_DATABASE_URL pointing at PostgreSQL",
+)
+
+
+@_pg_needs
+def test_generation_cas_concurrency_pg(tmp_path):
+    """The generation compare-and-swap under REAL PG concurrency: 8
+    threads x 25 bumps (200 total) on its own database -- every generation
+    exactly once, no duplicates, no gaps."""
+    from mirror_memory.core.repository import (
+        StaleDeletionGeneration,
+        bump_deletion_generation,
+    )
+
+    main_db = "mm_test_m4_cas"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    engine = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=engine)
+    results: list[int] = []
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        got: list[int] = []
+        try:
+            for _ in range(25):
+                while True:
+                    try:
+                        with tenant_scope(*TENANT):
+                            s = F()
+                            try:
+                                gen = bump_deletion_generation(
+                                    s, USER, scope="user")
+                                s.commit()
+                            finally:
+                                s.close()
+                        got.append(gen)
+                        break
+                    except StaleDeletionGeneration:
+                        continue  # the CAS lost the race: retry
+        except Exception as exc:  # noqa: BLE001 -- recorded
+            failures.append(repr(exc))
+        with lock:
+            results.extend(got)
+
+    try:
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not failures, failures
+        assert len(results) == 200, len(results)
+        assert sorted(results) == list(range(1, 201)), (
+            "generations must be exactly 1..200: no duplicates, no gaps")
+    finally:
+        engine.dispose()
+        _pg_drop_database(main_db, admin_url)
+
+
+@_pg_needs
+def test_deletion_vs_publish_50_rounds_pg(tmp_path):
+    """The 50-round deletion-vs-publish race on REAL PostgreSQL (its own
+    database): a publish that lands AFTER the deletion committed is the
+    failure -- whatever the publish wrote is gone once the deletion has
+    committed."""
+    main_db = "mm_test_m4_race"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    log = FileDeletionLog(tmp_path / "deletions")
+    engine = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    try:
+        _seed(engine)
+        for round_no in range(50):
+            _race_round(engine, round_no, deletion_log=log,
+                        database_url=runtime_url)
+    finally:
+        engine.dispose()
+        _pg_drop_database(main_db, admin_url)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +474,8 @@ def test_backup_restore_replay_end_to_end_pg(tmp_path):
 
         # the owner builds the schema + RLS + watermark (the app role never
         # runs DDL); the app role then serves
+        from mirror_memory.core.models import Base as _Base
+
         owner_engine = create_engine(main_url)
         _Base.metadata.create_all(owner_engine)
         from mirror_memory.core import schema_migration as _sm_mint
