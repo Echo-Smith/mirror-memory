@@ -66,6 +66,13 @@ class DeletionLogStale(RuntimeError):
     the log (or a newer backup of it) before starting."""
 
 
+class UnhandledDeletionTable(RuntimeError):
+    """A deletion-log entry names a table with no replay handler: the
+    coverage matrix and core.replay must be extended together.  Never
+    silently ignored -- the restored database would keep deleted
+    content."""
+
+
 class ReplayPending(RuntimeError):
     """Another instance is replaying the log onto this database; entries
     are refused until it finishes."""

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -41,7 +42,7 @@ from mirror_memory.core.models import (
     EvolutionJob,
     Snapshot,
 )
-from mirror_memory.core.replay import reconcile
+from mirror_memory.core.replay import _REPLAY_HANDLERS, reconcile
 from mirror_memory.core.repository import (
     forget_belief,
     set_memory_enabled,
@@ -388,8 +389,11 @@ def test_publish_cancels_when_the_generation_changed_during_compute(env):
 
 def test_revision_aba_is_caught_by_the_generation_check(env):
     """The ABA sequence: claim -> RESTORE the backup (the revision rewinds
-    to the claimed value!) -> replay raises the generation -> publish:
-    the revision alone would pass (ABA), the generation cancels."""
+    to the claimed value!) -> replay raises the generation.  The claimed
+    job is fingerprinted by the user-scope deletion, so the replay removes
+    the restored row outright (identical to the original deletion); zero
+    writes either way.  (The publish-time generation check for a job that
+    SURVIVES a restore is covered by the test above.)"""
     eng = env.engine
     cfg = env.cfg
     _observe(eng, "I like coffee and I live in Berlin.", purpose="api")
@@ -432,24 +436,283 @@ def test_revision_aba_is_caught_by_the_generation_check(env):
     with tenant_scope(*TENANT):
         s = sessionmaker(bind=env.db)()
         try:
+            # the claimed job is in the user-scope entry's fingerprints:
+            # the replay deletes the restored row (the original deletion
+            # deleted it too) -- an ABA publish is impossible
             row = s.get(EvolutionJob, job_id)
-            assert row is not None, "the restore brought the job back"
+            assert row is None, "the replay must remove the restored job"
             generation_now = s.execute(
                 select(DeletionGeneration.generation)
                 .where(DeletionGeneration.user_id == USER)
                 .order_by(DeletionGeneration.generation.desc())
             ).scalars().first()
             assert generation_now == 1, generation_now
-            _process_single_job(s, row, cfg, row.lease_token)
-            s.commit()
-            s.expire_all()
-            row = s.get(EvolutionJob, job_id)
             beliefs = s.query(Belief).filter(Belief.claim_text.contains("coffee")).count()
         finally:
             s.close()
-    # the restored job cannot publish: it was cancelled by the replay (or,
-    # had it survived, the publish-time generation check refuses) -- zero
-    # writes either way
-    assert row.status == "cancelled" and row.error_code in (
-        "deletion_replayed", "deletion_generation_changed"), (row.status, row.error_code)
     assert beliefs == 0
+
+
+# ---------------------------------------------------------------------------
+# M4 batch-1 patch task 3: the replay is FINGERPRINT-DRIVEN and verified
+# per table -- every fingerprint the log recorded must correspond to a row
+# that is GONE from the restored database (checked by table, not through
+# read entrances).
+# ---------------------------------------------------------------------------
+
+_TABLE_MODEL = {
+    m.class_.__tablename__: m.class_
+    for m in Base.registry.mappers
+    if m.class_.__tablename__ and m.class_.__tablename__.startswith("mm_")
+}
+
+
+def _seed_full_user_content(env):
+    """Rows in every table the coverage matrix deletes: observe produces
+    beliefs/events/links/evidence/versions/identities/summaries, the
+    published job adds proposals and a snapshot, and the compaction
+    digest / tier audit / telemetry / a second (pending) job are seeded
+    through their real write paths."""
+    from datetime import datetime
+
+    from mirror_memory.core.models import EvidenceDigest
+    from mirror_memory.core.repository import (
+        record_extraction_stats,
+        record_intervention_event,
+        set_belief_tier,
+    )
+    from mirror_memory.core.tenancy import engine_write_scope
+    from mirror_memory.worker.evolution import _claim_job, _process_single_job
+
+    eng = env.engine
+    eng.observe(user_id=USER, session_id="sa",
+                text="I like SENTINELCOV and coffee.", purpose="api")
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            belief = s.query(Belief).filter(
+                Belief.claim_text.contains("SENTINELCOV")).one()
+            now = datetime.utcnow()
+            with engine_write_scope():  # the digest is a Publisher write
+                s.add(EvidenceDigest(
+                    user_id=USER, belief_id=belief.id, support_count=1,
+                    contradict_count=0, verify_count=0, correct_count=0,
+                representative_ids="[]", summary="seed digest",
+                source_distribution="{}", authority_distribution="{}",
+                    created_at=now, updated_at=now))
+            set_belief_tier(s, belief.id,
+                            from_tier=belief.memory_tier or "hot",
+                            to_tier="warm", reason="seed", score=0.5,
+                            proposal_desc="seed")
+            record_intervention_event(s, USER, "sa", kind="question",
+                                      detail={"seed": True})
+            record_extraction_stats(s, USER, session_id="sa",
+                                    trigger="observe", model="fake")
+            job = enqueue_job(s, USER, env.cfg, purpose="api")
+            s.commit()
+            token = _claim_job(s, job.id, lease_seconds=60)
+            _process_single_job(s, job, env.cfg, token)  # proposal + snapshot
+            enqueue_job(s, USER, env.cfg, purpose="api")  # stays pending
+            s.commit()
+        finally:
+            s.close()
+
+
+def _backup_now(env, name: str) -> str:
+    backup_url = str(env.db.url).replace("main.db", name)
+    src = env.engine._engine.raw_connection()
+    dest = create_engine(backup_url).raw_connection()
+    src.connection.backup(dest.connection)  # the real sqlite3 backup API
+    dest.close()
+    src.close()
+    return backup_url
+
+
+def _restore_over_main(env, backup_url: str) -> None:
+    env.engine._engine.dispose()
+    env.db.dispose()
+    restored = create_engine(backup_url)
+    raw = restored.raw_connection()
+    dest2 = create_engine(str(env.db.url)).raw_connection()
+    raw.connection.backup(dest2.connection)
+    dest2.close()
+    raw.close()
+    restored.dispose()
+
+
+def _assert_every_logged_fingerprint_is_absent(env, since_seq: int):
+    """Read the entries the replay applied and check, PER TABLE, that no
+    row of the restored database still carries a logged fingerprint."""
+    from mirror_memory.core.deletion import fingerprint as fp_hash
+
+    db_id, _applied = sm.read_watermark(env.db)
+    entries = list(env.log.read_from(db_id, since_seq))
+    wanted: dict[str, set[str]] = {}
+    for e in entries:
+        for fp in e.fingerprints:
+            wanted.setdefault(fp["table"], set()).add(fp["_fp"])
+    assert wanted, "the deletion logged no fingerprints"
+    survivors = []
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            for table, hashes in wanted.items():
+                for row in s.query(_TABLE_MODEL[table]).all():
+                    if fp_hash(table, row.id,
+                               getattr(row, "created_at", None)) in hashes:
+                        survivors.append((table, row.id))
+        finally:
+            s.close()
+    assert survivors == [], (
+        f"rows the log deleted are still in the restored DB: {survivors}")
+    return entries
+
+
+def test_patch3_belief_scope_replay_deletes_every_fingerprinted_row(env):
+    """belief scope: backup -> forget both beliefs -> restore -> replay;
+    every fingerprinted row (incl. the ORPHAN EVIDENCE of the second
+    forget) is gone from its table; the restored pending job is
+    cancelled; jobs are CANCELLED, not fingerprinted (the matrix's belief
+    column)."""
+    eng = env.engine
+    _seed_full_user_content(env)
+    backup_url = _backup_now(env, "p3-belief.db")
+
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            beliefs = s.query(Belief).order_by(Belief.id).all()
+        finally:
+            s.close()
+    _db_id_before, applied_before = sm.read_watermark(env.db)
+    for b in beliefs:
+        assert eng.forget_belief(user_id=USER, belief_id=b.id, purpose="api")
+    _restore_over_main(env, backup_url)
+    assert reconcile(lambda: env.F(), env.log, tenant=TENANT) == "replayed"
+
+    entries = _assert_every_logged_fingerprint_is_absent(env, applied_before)
+    per_table: set[str] = set()
+    for e in entries:
+        for fp in e.fingerprints:
+            per_table.add(fp["table"])
+    assert "mm_evidence" in per_table, (
+        "the second forget must fingerprint the orphaned evidence")
+    assert "mm_evolution_jobs" not in per_table, (
+        "belief scope cancels jobs; it never fingerprints them")
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            jobs = s.query(EvolutionJob).filter_by(user_id=USER).all()
+            assert jobs and all(j.status == "cancelled" for j in jobs)
+        finally:
+            s.close()
+
+
+def test_patch3_session_scope_replay_deletes_every_fingerprinted_row(env):
+    """session scope: backup -> forget the session -> restore -> replay;
+    the fingerprinted summary rows are gone from mm_session_summaries."""
+    eng = env.engine
+    _seed_full_user_content(env)
+    backup_url = _backup_now(env, "p3-session.db")
+
+    _db_id_before, applied_before = sm.read_watermark(env.db)
+    eng.forget_session(user_id=USER, session_id="sa", purpose="api")
+    _restore_over_main(env, backup_url)
+    assert reconcile(lambda: env.F(), env.log, tenant=TENANT) == "replayed"
+
+    entries = _assert_every_logged_fingerprint_is_absent(env, applied_before)
+    assert entries, "the session forget must be logged"
+    from mirror_memory.core.models import SessionSummary
+
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            assert s.query(SessionSummary).filter_by(
+                user_id=USER, session_id="sa").count() == 0
+        finally:
+            s.close()
+
+
+def test_patch3_user_scope_replay_covers_all_handler_tables(env):
+    """user scope: the deletion fingerprints rows in ALL handler tables;
+    after backup -> delete -> restore -> replay every one of those rows is
+    gone (per-table check), and the pending job the restore brought back
+    is fingerprinted (deleted), not merely cancelled."""
+    from mirror_memory.core import replay as replay_mod
+
+    eng = env.engine
+    _seed_full_user_content(env)
+    backup_url = _backup_now(env, "p3-user.db")
+
+    _db_id_before, applied_before = sm.read_watermark(env.db)
+    eng.delete_memories(user_id=USER, purpose="api")
+    _restore_over_main(env, backup_url)
+    assert reconcile(lambda: env.F(), env.log, tenant=TENANT) == "replayed"
+
+    entries = _assert_every_logged_fingerprint_is_absent(env, applied_before)
+    entry = entries[-1]
+    tables_in_entry = {fp["table"] for fp in entry.fingerprints}
+    assert tables_in_entry == set(replay_mod._REPLAY_HANDLERS), (
+        "the user-scope deletion must fingerprint every handler table",
+        sorted(tables_in_entry))
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            assert s.query(EvolutionJob).filter_by(user_id=USER).count() == 0
+        finally:
+            s.close()
+
+
+def test_replay_refuses_an_entry_naming_a_table_without_a_handler(env):
+    """An entry naming a REAL table that has no replay handler (mm_users)
+    must fail loudly -- silently skipping a table would leave deleted
+    content in the restored database."""
+    from mirror_memory.core.deletion import (
+        UnhandledDeletionTable,
+        fingerprint,
+    )
+    from mirror_memory.core.replay import apply_entry
+
+    entry = DeletionEntry(
+        db_id="d" * 32, tenant_id=TENANT[0], app_id=TENANT[1], user_id=USER,
+        scope="user", scope_key="",
+        fingerprints=[{"table": "mm_users", "id": 1, "created_at": None,
+                       "_fp": fingerprint("mm_users", 1, None)}],
+        generation=1, purpose="api")
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            with pytest.raises(UnhandledDeletionTable, match="mm_users"):
+                apply_entry(s, entry)
+        finally:
+            s.close()
+
+
+def test_coverage_matrix_delete_tables_all_have_replay_handlers():
+    """守卫：覆盖面清单（docs/plans/2026-10-30-m4-deletion-coverage.md）
+    里任一范围标「删」的表，都必须在重放处理器表里；清单与处理器一起
+    演进，不允许静默漏重放。"""
+    doc = (Path(__file__).parents[1] / "docs" / "plans"
+           / "2026-10-30-m4-deletion-coverage.md")
+    delete_tables: set[str] = set()
+    for line in doc.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("| mm_"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        name_cell, scope_cells = cells[0], cells[1:4]
+        if not any("删" in c for c in scope_cells):
+            continue
+        parts = name_cell.split("/")
+        prefix = parts[0].strip()
+        for part in parts:
+            name = part.strip()
+            if not name.startswith("mm_"):
+                name = f"{prefix.rsplit('_', 1)[0]}_{name}"
+            delete_tables.add(name)
+    missing = delete_tables - _REPLAY_HANDLERS
+    assert not missing, (
+        f"the coverage matrix deletes {sorted(missing)} but the replay "
+        "handlers do not cover them")
+    # every handler names a REAL table (typo guard)
+    unknown = _REPLAY_HANDLERS - set(Base.metadata.tables)
+    assert not unknown, f"replay handlers name non-existent tables: {unknown}"

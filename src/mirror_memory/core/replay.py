@@ -39,6 +39,7 @@ from sqlalchemy.engine import Engine
 
 from mirror_memory.core import schema_migration as sm
 from mirror_memory.core.deletion import (
+    UnhandledDeletionTable,
     DeletionEntry,
     DeletionLog,
     DeletionLogStale,
@@ -138,82 +139,107 @@ def _delete_matching(session, model, criteria, wanted: set[str]) -> int:
     return len(matched)
 
 
+#: every table a deletion entry may name -- kept in lockstep with the
+#: coverage matrix (docs/plans/2026-10-30-m4-deletion-coverage.md): a
+#: table marked "delete" there MUST appear here (guarded by a test).
+_REPLAY_HANDLERS = frozenset({
+    "mm_beliefs", "mm_belief_events", "mm_evidence", "mm_evidence_digests",
+    "mm_memory_transitions", "mm_belief_versions", "mm_belief_identities",
+    "mm_proposal_log", "mm_snapshots", "mm_session_summaries",
+    "mm_extraction_stats", "mm_intervention_events",
+    "mm_belief_evidence_links", "mm_evolution_jobs",
+})
+
+
 def apply_entry(session, entry: DeletionEntry) -> dict[str, int]:
     """Re-apply ONE deletion entry inside the caller's transaction.
 
-    Only fingerprint-matching rows are deleted, the user's restored
-    pending jobs are cancelled, the user's generation is aligned to the
-    entry's (the log is the authority), and the caller advances the
-    watermark in the same transaction."""
+    FINGERPRINT-DRIVEN (M4 batch-1 patch task 3): the entry's fingerprints
+    name every table the original deletion touched, and apply_entry
+    dispatches on exactly those table names -- a fingerprint naming a
+    table WITHOUT a handler raises :class:`UnhandledDeletionTable`
+    (silently ignoring a table would leave deleted content in the
+    restored database).  Only fingerprint-MATCHING rows are deleted (the
+    hash covers id + created_at, so a recreated row with a reused id
+    does not match); the user's restored pending jobs are cancelled; the
+    user's generation is aligned to the entry's (the log is the
+    authority); the caller advances the watermark in the same
+    transaction."""
     from mirror_memory.core.models import (
         Belief, BeliefEvent, BeliefEvidenceLink, BeliefIdentity, BeliefVersion,
         DeletionGeneration, Evidence, EvidenceDigest, EvolutionJob,
         ExtractionStats, InterventionEvent, MemoryTransition, ProposalLog,
         SessionSummary, Snapshot,
     )
-    from mirror_memory.core.deletion import fingerprint
     from mirror_memory.core.tenancy import deletion_write_scope
 
-    wanted = _fp_set(entry)
-    tenant_id, app_id = entry.tenant_id, entry.app_id
-    tenant_criteria = (Belief.tenant_id == tenant_id, Belief.app_id == app_id)
+    tenant_id, app_id, user_id = (entry.tenant_id, entry.app_id,
+                                  entry.user_id)
+
+    # per-table fingerprint hashes: {table: {hash, ...}}
+    per_table: dict[str, set[str]] = {}
+    for fp in entry.fingerprints:
+        per_table.setdefault(fp["table"], set()).add(fp["_fp"])
+    unknown = sorted(set(per_table) - set(_REPLAY_HANDLERS))
+    if unknown:
+        raise UnhandledDeletionTable(
+            f"deletion entry seq {entry.seq} names table(s) {unknown} with "
+            "no replay handler -- extend core.replay together with the "
+            "deletion coverage matrix, never silently ignore them"
+        )
+
     counts: dict[str, int] = {}
-
-    def candidates(model, *extra):
-        criteria = [model.tenant_id == tenant_id, model.app_id == app_id,
-                    model.user_id == entry.user_id, *extra]
-        return _delete_matching(session, model, tuple(criteria), wanted)
-
     with deletion_write_scope():
-        if entry.scope == "session":
-            counts["summaries"] = candidates(SessionSummary,
-                                             SessionSummary.session_id == entry.scope_key)
-        else:
-            if entry.scope == "belief" and entry.scope_key:
-                counts["beliefs"] = _delete_matching(
+        def delete_user_rows(model, hashes: set[str]) -> int:
+            criteria = _user_criteria(model, tenant_id, app_id, user_id)
+            return _delete_matching(session, model, criteria, hashes)
+
+        for table, hashes in per_table.items():
+            if table == "mm_beliefs":
+                counts[table] = _delete_matching(
                     session, Belief,
-                    tuple(tenant_criteria) + (Belief.id == int(entry.scope_key),),
-                    wanted)
-            else:
-                counts["beliefs"] = candidates(Belief)
-            counts["events"] = candidates(BeliefEvent)
-            counts["digests"] = candidates(EvidenceDigest)
-            counts["transitions"] = candidates(MemoryTransition)
-            counts["versions"] = candidates(BeliefVersion)
-            counts["identities"] = candidates(BeliefIdentity)
-            counts["proposals"] = candidates(ProposalLog)
-            counts["snapshots"] = candidates(Snapshot)
-            if entry.scope == "user":
-                counts["evidence"] = candidates(Evidence)
-                counts["stats"] = candidates(ExtractionStats)
-                counts["interventions"] = candidates(InterventionEvent)
-                # the per-purpose summary split (M3 batch-3 patch) means a
-                # user has one row per (session, purpose) -- all of them go
-                counts["summaries"] = candidates(SessionSummary)
-                counts["links"] = _delete_matching(
+                    _user_criteria(Belief, tenant_id, app_id, user_id), hashes)
+            elif table == "mm_belief_events":
+                counts[table] = delete_user_rows(BeliefEvent, hashes)
+            elif table == "mm_evidence":
+                counts[table] = delete_user_rows(Evidence, hashes)
+            elif table == "mm_evidence_digests":
+                counts[table] = delete_user_rows(EvidenceDigest, hashes)
+            elif table == "mm_memory_transitions":
+                counts[table] = delete_user_rows(MemoryTransition, hashes)
+            elif table == "mm_belief_versions":
+                counts[table] = delete_user_rows(BeliefVersion, hashes)
+            elif table == "mm_belief_identities":
+                counts[table] = delete_user_rows(BeliefIdentity, hashes)
+            elif table == "mm_proposal_log":
+                counts[table] = delete_user_rows(ProposalLog, hashes)
+            elif table == "mm_snapshots":
+                counts[table] = delete_user_rows(Snapshot, hashes)
+            elif table == "mm_session_summaries":
+                counts[table] = delete_user_rows(SessionSummary, hashes)
+            elif table == "mm_extraction_stats":
+                counts[table] = delete_user_rows(ExtractionStats, hashes)
+            elif table == "mm_intervention_events":
+                counts[table] = delete_user_rows(InterventionEvent, hashes)
+            elif table == "mm_belief_evidence_links":
+                # links carry NO user_id and hang off rows this same entry
+                # may delete (beliefs, evidence): narrowing by those would
+                # make the result depend on the handler order.  The tenant
+                # scope + the fingerprint (hash of table:id:created_at --
+                # ids are table-global) select exactly the recorded rows.
+                counts[table] = _delete_matching(
                     session, BeliefEvidenceLink,
                     (BeliefEvidenceLink.tenant_id == tenant_id,
-                     BeliefEvidenceLink.app_id == app_id,
-                     BeliefEvidenceLink.belief_id.in_(
-                         select(Belief.id).where(
-                             Belief.tenant_id == tenant_id,
-                             Belief.app_id == app_id,
-                             Belief.user_id == entry.user_id))),
-                    wanted)
-            # links for belief scope hang off the (deleted) belief's
-            # evidence: match them among the user's remaining links
-            if entry.scope == "belief":
-                counts["links"] = _delete_matching(
-                    session, BeliefEvidenceLink,
-                    (BeliefEvidenceLink.tenant_id == tenant_id,
-                     BeliefEvidenceLink.app_id == app_id,
-                     BeliefEvidenceLink.evidence_id.in_(
-                         select(Evidence.id).where(
-                             Evidence.tenant_id == tenant_id,
-                             Evidence.app_id == app_id,
-                             Evidence.user_id == entry.user_id))),
-                    wanted)
-        # the restored pending jobs read memory the deletion removed
+                     BeliefEvidenceLink.app_id == app_id),
+                    hashes)
+            elif table == "mm_evolution_jobs":
+                counts[table] = delete_user_rows(EvolutionJob, hashes)
+            else:  # pragma: no cover -- guarded by the unknown check above
+                raise UnhandledDeletionTable(table)
+
+        # the restored pending jobs read memory the deletion removed: any
+        # in-flight synthesis for this user is cancelled (conservative --
+        # its input may have involved the deleted content)
         cancelled = (
             session.query(EvolutionJob)
             .filter(
@@ -235,6 +261,14 @@ def apply_entry(session, entry: DeletionEntry) -> dict[str, int]:
                 scope=entry.scope))
     session.flush()
     return counts
+
+
+def _user_criteria(model, tenant_id: str, app_id: str, user_id: str):
+    """Tenant+user criteria for *model*."""
+    return (model.tenant_id == tenant_id, model.app_id == app_id,
+            model.user_id == user_id)
+
+
 
 
 def reconcile(session_factory, log: DeletionLog | None, *,
