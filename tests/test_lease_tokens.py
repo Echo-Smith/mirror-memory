@@ -36,6 +36,8 @@ from mirror_memory.worker.evolution import (
 def session_at(url):
     engine = create_engine(url)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(engine)
     return sessionmaker(bind=engine)
 
 
@@ -48,6 +50,9 @@ def make_config(lease_seconds=60):
 
     cfg.llm_client = FakeLLM()
     cfg.worker.job_lease_seconds = lease_seconds
+    # these tests drive the worker WITHOUT a deletion log: an explicit
+    # backend=none deployment (M4 patch-4 semantics; nothing applied)
+    cfg.deletion_log.backend = "none"
     return cfg
 
 

@@ -1749,7 +1749,7 @@ def _main_db_has_data(engine: Engine) -> bool:
     return False
 
 
-def ensure_watermark(engine: Engine, *, allow_adopt: bool = False) -> tuple[str, int]:
+def ensure_watermark(engine: Engine, *, deploy_mint: bool = False) -> tuple[str, int]:
     """Create the watermark table and its single row on first use; returns
     ``(db_id, applied_seq)``.  The row lives in the main DB, so a restore
     brings back the backup's db_id and applied seq -- which is exactly how
@@ -1792,7 +1792,7 @@ def ensure_watermark(engine: Engine, *, allow_adopt: bool = False) -> tuple[str,
                                    .where(table.c.id == 1)).first()
                 if row is not None:
                     return str(row[0]), int(row[1])
-                if not allow_adopt and _main_db_has_data(engine):
+                if not deploy_mint and _main_db_has_data(engine):
                     raise WatermarkMissing(
                         "the main database holds tenant data but has no deletion "
                         "watermark row: it looks like a restore from a PRE-M4 backup "
@@ -1903,8 +1903,11 @@ class Step11DeletionReplay:
         # lazily on first start -- a pre-M4 backup restored after this deploy
         # then has no row and startup refuses with WatermarkMissing until the
         # operator adopts it (deploy-time backups taken BEFORE this step are
-        # pre-M4 by definition)
-        ensure_watermark(engine)
+        # pre-M4 by definition).  deploy_mint: the migration IS how a live
+        # pre-M4 database becomes M4-shaped -- minting its row here is the
+        # deployment, not an unclaimed restore (there is no pre-M4 log to
+        # adopt; deletions were never logged before M4).
+        ensure_watermark(engine, deploy_mint=True)
         if _is_postgres(engine):
             from mirror_memory.core import rls
 

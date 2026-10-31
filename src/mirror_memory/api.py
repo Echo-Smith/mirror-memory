@@ -172,11 +172,15 @@ class MemoryEngine:
             return PgDeletionLog(url)
         if settings.directory:
             directory = settings.directory
-        elif self._database_url.startswith("sqlite:///"):
-            # embedded single-tenant SQLite: the URL-derived directory is
-            # unambiguous (the file lives next to the database)
-            db_path = self._database_url[len("sqlite:///"):]
-            directory = str((Path(db_path).parent / "deletions").resolve())
+        elif not self._database_url.startswith(
+                ("postgresql", "mysql", "mssql", "oracle")):
+            # embedded single-tenant SQLite (file or in-memory) -- the
+            # URL-derived directory is unambiguous (a file database's log
+            # lives next to it).  Anything that is not a known SERVER
+            # scheme takes the derived default (in-memory test engines,
+            # injected-engine placeholders); only real server deployments
+            # must say where the log lives.
+            directory = default_directory(self._database_url)
         else:
             # a server / multi-tenant deployment must say where the log
             # lives -- a derived default could silently split the log

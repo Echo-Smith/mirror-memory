@@ -31,6 +31,8 @@ TENANT = ("default", "default")
 def db(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path}/prov.db")
     Base.metadata.create_all(eng)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng)
     yield eng
     eng.dispose()
 
@@ -169,6 +171,8 @@ def test_worker_publish_stamps_the_snapshot_with_the_job_purpose(db):
     snapshot.  It carries the JOB's purpose (the purpose of the observe
     that enqueued it), not whatever purpose later touched the user."""
     cfg = load_config("config/")
+    # worker tick without a deletion log: explicit backend=none (M4 patch-4)
+    cfg.deletion_log.backend = "none"
     F = sessionmaker(bind=db)
     with tenant_scope(*TENANT):
         s = F()
@@ -236,6 +240,8 @@ def test_authorized_entries_never_write_the_unknown_marker(tmp_path):
     d.mkdir()
     eng0 = create_engine(f"sqlite:///{d}/guard.db")
     Base.metadata.create_all(eng0)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng0)
 
     from mirror_memory.core import schema_migration as _sm_mint
     _sm_mint.ensure_watermark(eng0)

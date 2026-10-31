@@ -645,6 +645,11 @@ def db_session():
     if pg is None:
         engine = create_engine("sqlite://", echo=False)
         Base.metadata.create_all(engine)
+        # M4: deploy-time shape -- the watermark row exists before any
+        # content is seeded (matching the PG branch / Step 11)
+        from mirror_memory.core import schema_migration as _sm
+
+        _sm.ensure_watermark(engine)
         SessionFactory = sessionmaker(bind=engine)
         session = SessionFactory()
         yield session

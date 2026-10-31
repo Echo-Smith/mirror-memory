@@ -54,6 +54,9 @@ class MockLLM:
 
 def make_config(**overrides):
     cfg = load_config("config/")
+    # worker/background tests without a deletion log: an explicit
+    # backend=none deployment (M4 patch-4 semantics; nothing applied)
+    cfg.deletion_log.backend = "none"
     # Lower the compaction threshold so the metabolism cycle actually folds
     # evidence instead of scanning past everything.
     cfg.metabolism.compaction.min_support_links = 2

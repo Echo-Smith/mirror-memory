@@ -45,6 +45,8 @@ PURPOSE = "api"
 def db(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path}/audit.db")
     Base.metadata.create_all(eng)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng)
     yield eng
     eng.dispose()
 
@@ -441,6 +443,8 @@ def test_sqlite_concurrent_reads_complete_under_the_write_lock(tmp_path):
     url = f"sqlite:///{tmp_path}/audit-lock.db"
     eng0 = create_engine(url)
     Base.metadata.create_all(eng0)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng0)
 
     from mirror_memory.core import schema_migration as _sm_mint
     _sm_mint.ensure_watermark(eng0)

@@ -51,6 +51,8 @@ def server(tmp_path):
     url = f"sqlite:///{tmp_path}/purpose-server.db"
     engine = create_engine(url)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(engine)
     factory = sessionmaker(bind=engine)
     with tenant_scope("tA", "app"), fixture_write_scope("seed"):
         s = factory()
