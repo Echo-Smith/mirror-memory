@@ -83,7 +83,8 @@ def test_pg_log_chain_head_and_reads(log_db_url):
         db_id=db_id, tenant_id="t", app_id="a", user_id="u",
         scope="user", scope_key="", fingerprints=[], generation=2, purpose="api",
     ))
-    assert e1.prev_hash == GENESIS_HASH and e2.prev_hash == e1.hash
+    assert e1.seq == 1 and e1.prev_hash != GENESIS_HASH  # chains from genesis
+    assert e2.prev_hash == e1.hash
     # the seq is GLOBALLY monotonic (the task's spec) -- a fresh db life
     # continues the identity's counter, so only relative order is asserted
     assert e2.seq > e1.seq
@@ -158,6 +159,6 @@ def test_embedded_and_cloud_logs_share_the_entry_format(log_db_url, tmp_path):
     fe = file_log.append(entry)
     pe = pg_log.append(entry)
     assert fe.hash == pe.hash
-    assert pe.prev_hash == GENESIS_HASH  # a fresh db life starts the chain
+    assert pe.prev_hash != GENESIS_HASH  # chains from the written genesis
     file_log.verify_chain(entry.db_id)
     pg_log.verify_chain(entry.db_id)

@@ -118,8 +118,19 @@ class DeletionEntry:
         return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _genesis_entry(db_id: str) -> DeletionEntry:
+    """The birth certificate of one database life: seq 0, no deletion
+    content, hash-chained like every entry.  Its presence proves THIS log
+    belongs to THAT database -- a log without it was created elsewhere."""
+    return DeletionEntry(db_id=db_id, tenant_id="", app_id="", user_id="",
+                         scope="genesis", scope_key="", fingerprints=[],
+                         generation=0, purpose="",
+                         created_at=datetime.utcnow())
+
+
 class DeletionLog:
-    """The log interface: append / read_from / head, per database life."""
+    """The log interface: append / read_from / head / genesis, per
+    database life."""
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:  # pragma: no cover - interface
         raise NotImplementedError
@@ -131,10 +142,21 @@ class DeletionLog:
         """(last seq, last hash); (0, GENESIS) for an empty log."""
         raise NotImplementedError
 
+    def has_genesis(self, db_id: str) -> bool:  # pragma: no cover - interface
+        """Does this log carry the genesis entry (seq 0) for *db_id*?  Its
+        absence means the log was created for a DIFFERENT database."""
+        raise NotImplementedError
+
+    def ensure_genesis(self, db_id: str) -> None:  # pragma: no cover - interface
+        """Write the genesis entry if this log has none for *db_id*
+        (called when the watermark row is minted)."""
+        raise NotImplementedError
+
     def verify_chain(self, db_id: str) -> None:
-        """Walk the whole chain; raise LogChainBroken on any mismatch."""
+        """Walk the whole chain INCLUDING the genesis entry (after_seq = -1
+        reaches seq 0); raise LogChainBroken on any mismatch."""
         prev = GENESIS_HASH
-        for entry in self.read_from(db_id, 0):
+        for entry in self.read_from(db_id, -1):
             if entry.prev_hash != prev:
                 raise LogChainBroken(f"seq {entry.seq}: prev_hash mismatch")
             if entry.hash != entry.compute_hash():
@@ -173,13 +195,23 @@ class FileDeletionLog(DeletionLog):
     def _ensure_file(self, db_id: str) -> Path:
         path = self._path_for(db_id)
         if not path.exists():
+            # create the file under the lock, then write the GENESIS entry
+            # (seq 0): its presence is what binds this file to that database
+            # life.  The open("a+b") itself creates the file, so the
+            # emptiness check must happen INSIDE the lock.
             with self._locked(path) as fh:
-                if path.exists():
-                    return path
                 fh.seek(0)
-                fh.write((json.dumps({"db_id": db_id, "header": True}) + "\n").encode())
-                fh.flush()
-                os.fsync(fh.fileno())
+                existing = fh.read().strip()
+                if not existing:
+                    genesis = _genesis_entry(db_id)
+                    genesis.seq = 0
+                    genesis.prev_hash = GENESIS_HASH
+                    genesis.hash = genesis.compute_hash()
+                    fh.seek(0)
+                    fh.write((json.dumps(self._line(genesis), sort_keys=True,
+                                         ensure_ascii=False) + "\n").encode())
+                    fh.flush()
+                    os.fsync(fh.fileno())
         return path
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:
@@ -246,6 +278,15 @@ class FileDeletionLog(DeletionLog):
             if entry.seq > after_seq:
                 yield entry
 
+    def has_genesis(self, db_id: str) -> bool:
+        path = self._path_for(db_id)
+        if not path.exists():
+            return False
+        return any(e.scope == "genesis" for e in self._iter_entries(path))
+
+    def ensure_genesis(self, db_id: str) -> None:
+        self._ensure_file(db_id)
+
     def head(self, db_id: str) -> tuple[int, str]:
         path = self._path_for(db_id)
         if not path.exists():
@@ -305,8 +346,25 @@ class PgDeletionLog(DeletionLog):
                 " PRIMARY KEY (db_id, seq))"
             ))
 
+    def _insert(self, conn, entry: DeletionEntry) -> None:
+        conn.execute(text(
+            "INSERT INTO mm_deletion_log (db_id, tenant_id, app_id, user_id, "
+            "scope, scope_key, fingerprints_json, generation, purpose, "
+            "prev_hash, hash, created_at) VALUES (:db, :tenant, :app, :user, "
+            ":scope, :scope_key, :fp, :generation, :purpose, :prev, :hash, :created)"
+        ), {
+            "db": entry.db_id, "tenant": entry.tenant_id, "app": entry.app_id,
+            "user": entry.user_id, "scope": entry.scope,
+            "scope_key": entry.scope_key,
+            "fp": json.dumps(entry.fingerprints, ensure_ascii=False),
+            "generation": entry.generation, "purpose": entry.purpose,
+            "prev": entry.prev_hash, "hash": entry.hash,
+            "created": entry.created_at,
+        })
+
     def append(self, entry: DeletionEntry) -> DeletionEntry:
         self._ensure_schema()
+        self.ensure_genesis(entry.db_id)
         entry.created_at = entry.created_at or datetime.utcnow()
         with self._engine.begin() as conn:
             # serialise appends per database life so prev_hash is exact
@@ -319,20 +377,7 @@ class PgDeletionLog(DeletionLog):
             entry.seq = (row[0] if row else 0) + 1
             entry.prev_hash = row[1] if row else GENESIS_HASH
             entry.hash = entry.compute_hash()
-            conn.execute(text(
-                "INSERT INTO mm_deletion_log (db_id, tenant_id, app_id, user_id, "
-                "scope, scope_key, fingerprints_json, generation, purpose, "
-                "prev_hash, hash, created_at) VALUES (:db, :tenant, :app, :user, "
-                ":scope, :scope_key, :fp, :generation, :purpose, :prev, :hash, :created)"
-            ), {
-                "db": entry.db_id, "tenant": entry.tenant_id, "app": entry.app_id,
-                "user": entry.user_id, "scope": entry.scope,
-                "scope_key": entry.scope_key,
-                "fp": json.dumps(entry.fingerprints, ensure_ascii=False),
-                "generation": entry.generation, "purpose": entry.purpose,
-                "prev": entry.prev_hash, "hash": entry.hash,
-                "created": entry.created_at,
-            })
+            self._insert(conn, entry)
         return entry
 
     def read_from(self, db_id: str, after_seq: int) -> Iterator[DeletionEntry]:
@@ -362,6 +407,36 @@ class PgDeletionLog(DeletionLog):
         if row is None:
             return 0, GENESIS_HASH
         return int(row[0]), row[1]
+
+    def has_genesis(self, db_id: str) -> bool:
+        self._ensure_schema()
+        with self._engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT 1 FROM mm_deletion_log WHERE db_id = :db AND seq = 0"
+            ), {"db": db_id}).first()
+        return row is not None
+
+    def ensure_genesis(self, db_id: str) -> None:
+        if self.has_genesis(db_id):
+            return
+        genesis = _genesis_entry(db_id)
+        genesis.seq = 0
+        genesis.prev_hash = GENESIS_HASH
+        genesis.hash = genesis.compute_hash()
+        with self._engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                         {"k": f"deletion-log:{db_id}"})
+            if not self.has_genesis(db_id):
+                # explicit seq 0 (GENERATED BY DEFAULT allows it); the
+                # identity sequence continues from 1 for real entries
+                conn.execute(text(
+                    "INSERT INTO mm_deletion_log (db_id, seq, tenant_id, app_id, "
+                    "user_id, scope, scope_key, fingerprints_json, generation, "
+                    "purpose, prev_hash, hash, created_at) VALUES (:db, 0, :tenant, "
+                    ":app, :user, 'genesis', '', '[]', 0, '', :prev, :hash, :created)"
+                ), {"db": db_id, "tenant": genesis.tenant_id, "app": genesis.app_id,
+                    "user": genesis.user_id, "prev": genesis.prev_hash,
+                    "hash": genesis.hash, "created": genesis.created_at})
 
 
 def new_db_id() -> str:

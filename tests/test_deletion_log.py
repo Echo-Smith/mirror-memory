@@ -59,6 +59,9 @@ class _FakeLLM:
 def db(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path / 'm4.db'}")
     Base.metadata.create_all(eng)
+    from mirror_memory.core import schema_migration as _sm_mint
+
+    _sm_mint.ensure_watermark(eng)
     yield eng
     eng.dispose()
 
@@ -94,7 +97,7 @@ def test_file_log_chain_head_and_tamper_detection(tmp_path):
         db_id=db_id, tenant_id="t", app_id="a", user_id="u",
         scope="user", scope_key="", fingerprints=[], generation=2, purpose="api",
     ))
-    assert (e1.seq, e1.prev_hash) == (1, GENESIS_HASH)
+    assert e1.seq == 1 and e1.prev_hash != GENESIS_HASH  # chains from genesis
     assert e2.prev_hash == e1.hash and e2.seq == 2
     assert log.head(db_id) == (2, e2.hash)
     log.verify_chain(db_id)

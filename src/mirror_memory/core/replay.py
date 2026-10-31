@@ -42,6 +42,7 @@ from mirror_memory.core.deletion import (
     DeletionEntry,
     DeletionLog,
     DeletionLogStale,
+    DeletionLogUnavailable,
     ReplayPending,
 )
 
@@ -248,6 +249,23 @@ def reconcile(session_factory, log: DeletionLog | None, *,
     refused anyway); the check is skipped.  *tenant* scopes the whole
     reconciliation (the replayed deletions are tenant writes)."""
     if log is None:
+        # backend=none: deletions are refused anyway, but a database that
+        # already APPLIED entries before the config lost its log must not
+        # start as if nothing happened
+        session = session_factory() if callable(session_factory) else session_factory
+        bind = session.get_bind()
+        try:
+            _db_id, applied = sm.ensure_watermark(bind)
+            if applied > 0:
+                raise DeletionLogUnavailable(
+                    f"the deletion log is not configured, but the watermark "
+                    f"shows {applied} applied deletion entr"
+                    f"{'y' if applied == 1 else 'ies'}: deletions can no longer "
+                    "be verified or replayed after a restore.  Reconfigure the "
+                    "deletion log (and restore its files/database) before starting."
+                )
+        finally:
+            session.close()
         return "ok"
     if tenant is not None:
         from mirror_memory.core.tenancy import tenant_scope
@@ -262,6 +280,17 @@ def _reconcile_scoped(session_factory, log: DeletionLog) -> str:
     bind = session.get_bind()
     try:
         db_id, applied = sm.ensure_watermark(bind)
+        # the genesis entry (seq 0) is what binds this log to that database
+        # life: a log without it was created for a DIFFERENT database --
+        # "not found", distinct from the stale-log refusal below
+        if not log.has_genesis(db_id):
+            raise DeletionLogUnavailable(
+                f"no deletion log found for database {db_id[:8]}... "
+                "(the log has no genesis entry for this db_id): deletions "
+                "cannot be reconciled.  Point the deletion log config at the "
+                "log that was used when the deletions were made, or adopt "
+                "the database with the matching db_id."
+            )
         log.verify_chain(db_id)
         tail_seq, _tail_hash = log.head(db_id)
         if applied > tail_seq:

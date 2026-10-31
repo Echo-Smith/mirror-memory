@@ -58,6 +58,9 @@ class _FakeLLM:
 def db(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path}/vis.db")
     Base.metadata.create_all(eng)
+    from mirror_memory.core import schema_migration as _sm_mint
+
+    _sm_mint.ensure_watermark(eng)
     yield eng
     eng.dispose()
 

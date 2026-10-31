@@ -236,6 +236,9 @@ def test_authorized_entries_never_write_the_unknown_marker(tmp_path):
     d.mkdir()
     eng0 = create_engine(f"sqlite:///{d}/guard.db")
     Base.metadata.create_all(eng0)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(eng0)
     F = sessionmaker(bind=eng0)
     with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
         s = F()

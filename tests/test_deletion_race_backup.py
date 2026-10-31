@@ -62,6 +62,9 @@ def _config():
 
 def _seed(db) -> None:
     Base.metadata.create_all(db)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(db)
     F = sessionmaker(bind=db)
     with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
         s = F()
@@ -301,10 +304,11 @@ def test_backup_restore_replay_end_to_end_pg(tmp_path):
 
         # the owner builds the schema + RLS + watermark (the app role never
         # runs DDL); the app role then serves
-        from mirror_memory.core.models import Base as _Base
-
         owner_engine = create_engine(main_url)
         _Base.metadata.create_all(owner_engine)
+        from mirror_memory.core import schema_migration as _sm_mint
+
+        _sm_mint.ensure_watermark(owner_engine)
         from mirror_memory.core.schema_migration import (
             Step11DeletionReplay, install_row_level_security,
         )

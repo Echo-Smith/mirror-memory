@@ -1723,11 +1723,47 @@ def _watermark_table(metadata: MetaData) -> Table:
     )
 
 
-def ensure_watermark(engine: Engine) -> tuple[str, int]:
+class WatermarkMissing(RuntimeError):
+    """The main database holds tenant data but has no deletion-watermark
+    row: it was restored from a PRE-M4 backup (or migrated from a legacy
+    schema).  An unclaimed database cannot be reconciled against a
+    deletion log -- start with the ``adopt`` command."""
+
+
+#: The tenant tables whose non-emptiness makes a database "pre-existing"
+#: (the deletion-coverage matrix's content-bearing core).
+_DATA_TABLES_FOR_ADOPT = ("mm_beliefs", "mm_evidence", "mm_session_summaries", "mm_snapshots")
+
+
+def _main_db_has_data(engine: Engine) -> bool:
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    insp = inspect(engine)
+    for table in _DATA_TABLES_FOR_ADOPT:
+        if not insp.has_table(table):
+            continue
+        with no_audit_scope(), engine.connect() as conn:
+            if conn.execute(select(func.count()).select_from(
+                    Table(table, MetaData(), autoload_with=engine))).scalar_one() > 0:
+                return True
+    return False
+
+
+def ensure_watermark(engine: Engine, *, allow_adopt: bool = False) -> tuple[str, int]:
     """Create the watermark table and its single row on first use; returns
     ``(db_id, applied_seq)``.  The row lives in the main DB, so a restore
     brings back the backup's db_id and applied seq -- which is exactly how
-    a restore is detected (see core.replay)."""
+    a restore is detected (see core.replay).
+
+    A database that holds tenant data but has NO watermark row was
+    restored from a PRE-M4 backup (or migrated from a legacy schema): its
+    deletions cannot be reconciled against any log, so startup is refused
+    with :class:`WatermarkMissing` until an operator claims it with
+    ``adopt_watermark`` (which pairs it with an existing log).  A truly
+    fresh database (no tenant data) is minted normally.  M4's own
+    migration step creates the row at deploy time, so this refusal only
+    fires for pre-M4 restores.
+    """
     table = _watermark_table(MetaData())
     if not inspect(engine).has_table(WATERMARK_TABLE):
         # concurrent creators race on the DDL; the loser re-checks (the
@@ -1756,6 +1792,17 @@ def ensure_watermark(engine: Engine) -> tuple[str, int]:
                                    .where(table.c.id == 1)).first()
                 if row is not None:
                     return str(row[0]), int(row[1])
+                if not allow_adopt and _main_db_has_data(engine):
+                    raise WatermarkMissing(
+                        "the main database holds tenant data but has no deletion "
+                        "watermark row: it looks like a restore from a PRE-M4 backup "
+                        "(or a legacy migration).  Deletions cannot be reconciled "
+                        "against a deletion log until the database is CLAIMED -- run "
+                        "the adopt command with the db_id of the deletion log this "
+                        "database's history lives in "
+                        "(python -m mirror_memory.deletion_adopt --db-id <db_id>), "
+                        "then start again."
+                    )
                 import uuid as _uuid
 
                 db_id = _uuid.uuid4().hex
@@ -1773,6 +1820,30 @@ def ensure_watermark(engine: Engine) -> tuple[str, int]:
                     {"k": f"mm-watermark:{engine.url.render_as_string(hide_password=True)}"},
                 )
             lock_conn.close()
+
+
+def adopt_watermark(engine: Engine, db_id: str) -> tuple[str, int]:
+    """Operator command: claim a pre-M4-restored database for an EXISTING
+    deletion log.  Writes the watermark row (db_id, applied_seq = 0); the
+    startup reconciliation then replays every entry of that log -- the
+    fingerprint matching makes it safe to apply them onto whatever the
+    restored backup contains."""
+    import uuid as _uuid
+
+    if not db_id or any(c.isspace() for c in db_id):
+        raise ValueError("db_id must be a non-empty string without whitespace")
+    table = _watermark_table(MetaData())
+    table.create(engine, checkfirst=True)
+    with engine.begin() as conn:
+        row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                           .where(table.c.id == 1)).first()
+        if row is not None:
+            raise ValueError(
+                f"the watermark row already exists (db_id {str(row[0])[:8]}..., "
+                f"applied {row[1]}): nothing to adopt"
+            )
+        conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+    return db_id, 0
 
 
 def read_watermark(engine: Engine) -> tuple[str, int] | None:
@@ -1828,6 +1899,11 @@ class Step11DeletionReplay:
         Base.metadata.tables["mm_deletion_generations"].create(engine, checkfirst=True)
         if "source_generation" not in _table_columns(engine, "mm_snapshots"):
             _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
+        # M4 batch-1 patch: the watermark row is created AT DEPLOY TIME, not
+        # lazily on first start -- a pre-M4 backup restored after this deploy
+        # then has no row and startup refuses with WatermarkMissing until the
+        # operator adopts it (deploy-time backups taken BEFORE this step are
+        # pre-M4 by definition)
         ensure_watermark(engine)
         if _is_postgres(engine):
             from mirror_memory.core import rls

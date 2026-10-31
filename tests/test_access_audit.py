@@ -441,6 +441,9 @@ def test_sqlite_concurrent_reads_complete_under_the_write_lock(tmp_path):
     url = f"sqlite:///{tmp_path}/audit-lock.db"
     eng0 = create_engine(url)
     Base.metadata.create_all(eng0)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(eng0)
     eng0.dispose()
     db = create_engine(url)
     try:

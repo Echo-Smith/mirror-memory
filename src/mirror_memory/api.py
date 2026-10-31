@@ -170,7 +170,20 @@ class MemoryEngine:
             if not url:
                 raise ValueError("deletion_log.backend=postgres requires deletion_log.url")
             return PgDeletionLog(url)
-        directory = settings.directory or default_directory(self._database_url)
+        if settings.directory:
+            directory = settings.directory
+        elif self._database_url.startswith("sqlite:///"):
+            # embedded single-tenant SQLite: the URL-derived directory is
+            # unambiguous (the file lives next to the database)
+            db_path = self._database_url[len("sqlite:///"):]
+            directory = str((Path(db_path).parent / "deletions").resolve())
+        else:
+            # a server / multi-tenant deployment must say where the log
+            # lives -- a derived default could silently split the log
+            raise ValueError(
+                "deletion_log.backend=file with a non-SQLite database requires "
+                "deletion_log.directory (the URL-derived default is only for "
+                "embedded single-tenant SQLite)")
         return FileDeletionLog(directory)
 
     @staticmethod
@@ -223,6 +236,10 @@ class MemoryEngine:
         from mirror_memory.core import schema_migration
 
         self._db_id, self._applied_seq = schema_migration.ensure_watermark(self._engine)
+        # M4 batch-1 patch task 2: bind this log to the database life by
+        # writing the genesis entry if it is not there yet
+        if self._deletion_log is not None:
+            self._deletion_log.ensure_genesis(self._db_id)
         # M4: startup check against the deletion log.  Equal -> normal; the
         # main DB behind its log (a restored backup) -> replay now, in this
         # process, before any entry serves; the log behind the main DB ->

@@ -27,6 +27,7 @@ from mirror_memory.api import MemoryEngine
 from mirror_memory.config.loader import load_config
 from mirror_memory.core import schema_migration as sm
 from mirror_memory.core.deletion import (
+    DeletionLogUnavailable,
     DeletionEntry,
     DeletionLogStale,
     FileDeletionLog,
@@ -62,6 +63,9 @@ def env(tmp_path):
     """A database + its paired deletion log + an engine."""
     db = create_engine(f"sqlite:///{tmp_path / 'main.db'}")
     Base.metadata.create_all(db)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(db)
     log = FileDeletionLog(tmp_path / "deletions")
     F = sessionmaker(bind=db)
     with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
@@ -270,12 +274,18 @@ def test_log_older_than_main_db_refuses_startup(env):
     db_id, applied = sm.read_watermark(env.db)
     assert applied >= 1, "a committed deletion advances the watermark"
     # simulate a log that lost its entries (an operator restored an OLD
-    # log file): the tail falls behind the watermark
+    # log file): seed the stale log with a GENESIS for the same db_id (a
+    # real stale log would carry one) -- without genesis the refusal is
+    # "not found" (task 2), with genesis it is "older than the main DB"
     stale_log = FileDeletionLog(env.log.directory.parent / "stale")
+    stale_log.ensure_genesis(db_id)
     with pytest.raises(DeletionLogStale) as info:
-        # a log with NO entries for this db (tail 0) vs the watermark
         reconcile(lambda: sessionmaker(bind=env.db)(), stale_log, tenant=TENANT)
     assert "OLDER than the main database" in str(info.value)
+    # a log for a DIFFERENT db_id (no genesis for ours) -> "not found"
+    other_log = FileDeletionLog(env.log.directory.parent / "other")
+    with pytest.raises(DeletionLogUnavailable, match="genesis"):
+        reconcile(lambda: sessionmaker(bind=env.db)(), other_log, tenant=TENANT)
 
 
 # ---------------------------------------------------------------------------

@@ -77,6 +77,9 @@ def session_at(url):
     """Session factory against the shared database, tables ensured."""
     engine = create_engine(url)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_mint
+
+    _sm_mint.ensure_watermark(engine)
     return sessionmaker(bind=engine)
 
 
