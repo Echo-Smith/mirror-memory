@@ -154,6 +154,12 @@ class DeletionLog:
         absence means the log was created for a DIFFERENT database."""
         raise NotImplementedError
 
+    def genesis_entries(self) -> list[tuple[str, object]]:  # pragma: no cover - interface
+        """Every genesis entry in the log store as (db_id, created_at) --
+        the migration's lineage check (M4 patch 2): a log that holds ANY
+        genesis has already served a database life."""
+        raise NotImplementedError
+
     def ensure_genesis(self, db_id: str) -> None:  # pragma: no cover - interface
         """Write the genesis entry if this log has none for *db_id*
         (called when the watermark row is minted)."""
@@ -291,6 +297,17 @@ class FileDeletionLog(DeletionLog):
             return False
         return any(e.scope == "genesis" for e in self._iter_entries(path))
 
+    def genesis_entries(self) -> list[tuple[str, object]]:
+        out: list[tuple[str, object]] = []
+        if not self.directory.exists():
+            return out
+        for path in sorted(self.directory.glob("*.deletions.jsonl")):
+            for entry in self._iter_entries(path):
+                if entry.scope == "genesis":
+                    out.append((entry.db_id, entry.created_at))
+                    break
+        return out
+
     def ensure_genesis(self, db_id: str) -> None:
         self._ensure_file(db_id)
 
@@ -423,6 +440,14 @@ class PgDeletionLog(DeletionLog):
             ), {"db": db_id}).first()
         return row is not None
 
+    def genesis_entries(self) -> list[tuple[str, object]]:
+        self._ensure_schema()
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT db_id, created_at FROM mm_deletion_log "
+                "WHERE scope = 'genesis' ORDER BY created_at, db_id")).all()
+        return [(str(r[0]), r[1]) for r in rows]
+
     def ensure_genesis(self, db_id: str) -> None:
         if self.has_genesis(db_id):
             return
@@ -472,3 +497,36 @@ def default_directory(database_url: str) -> str:
         sanitized = database_url
     digest = hashlib.sha1(sanitized.encode()).hexdigest()[:12]
     return str(Path(tempfile.gettempdir()) / f"mm-deletions-{digest}")
+
+
+def deletion_log_from_config(settings, database_url: str) -> "DeletionLog | None":
+    """The deletion log from configuration -- the ONE derivation and
+    validation every component (engine, worker, migration, adopt) shares
+    (M4 patch 2), so a migration reads the SAME log the engines write.
+
+    *settings* is ``config.deletion_log``.  Raises ``ValueError`` on an
+    invalid configuration (missing url / missing directory for a server
+    database); returns ``None`` only for ``backend="none"``.
+    """
+    if settings.backend == "none":
+        return None
+    if settings.backend == "postgres":
+        url = settings.url
+        if not url:
+            raise ValueError("deletion_log.backend=postgres requires deletion_log.url")
+        return PgDeletionLog(url)
+    if settings.directory:
+        return FileDeletionLog(settings.directory)
+    if not database_url.startswith(
+            ("postgresql", "mysql", "mssql", "oracle")):
+        # embedded single-tenant SQLite (file or in-memory) -- the
+        # URL-derived directory is unambiguous (a file database's log
+        # lives next to it).  Anything that is not a known SERVER scheme
+        # takes the derived default (in-memory test engines, injected-
+        # engine placeholders); only real server deployments must say
+        # where the log lives.
+        return FileDeletionLog(default_directory(database_url))
+    raise ValueError(
+        "deletion_log.backend=file with a non-SQLite database requires "
+        "deletion_log.directory (the URL-derived default is only for "
+        "embedded single-tenant SQLite)")

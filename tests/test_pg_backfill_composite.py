@@ -24,6 +24,20 @@ from mirror_memory.core import schema_migration as sm
 from mirror_memory.core.schema_migration import upgrade_database
 from mirror_memory.core.sql_audit import no_audit_scope
 
+
+def _migration_cfg():
+    """A deletion-log config for step-11 migrations that don't exercise
+    the log itself (M4 patch 2: the migration refuses to mint a
+    data-bearing database without a log to consult)."""
+    import tempfile
+
+    from mirror_memory.config.loader import load_config
+
+    cfg = load_config("config/")
+    cfg.deletion_log.directory = tempfile.mkdtemp(prefix="mm-migration-log-")
+    return cfg
+
+
 IS_PG = os.environ.get("MM_DATABASE_URL", "").startswith("postgresql")
 
 pytestmark = [

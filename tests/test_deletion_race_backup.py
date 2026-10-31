@@ -654,3 +654,129 @@ def test_id_reuse_is_not_fooled_by_the_fingerprint(tmp_path):
             s.close()
     assert [(r.id, r.claim_text) for r in rows] == [(a_id, "belief B")], (
         "B (recreated) must survive; A must not resurrect")
+
+
+@_pg_needs
+def test_real_step10_backup_flow_pg(tmp_path):
+    """The lineage story on PostgreSQL with the real tools: strip a live
+    database to the step-10 shape, pg_dump it (the pre-M4 backup), deploy
+    M4 (FIRST mint -- the log is empty), delete the sentinel, restore the
+    step-10 backup, REFUSE the migration (the log holds the genesis),
+    adopt (migrates with minting suppressed), replay: sentinel gone."""
+    from sqlalchemy.orm import sessionmaker
+
+    from mirror_memory.core.repository import (
+        record_claim,
+        set_memory_enabled,
+    )
+    from mirror_memory.core.schema_migration import (
+        install_row_level_security,
+        upgrade_database,
+    )
+    from tests.conftest import strip_to_step10
+
+    main_db = "mm_test_m4_v10"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    owner_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    log = FileDeletionLog(tmp_path / "deletions")
+    cfg = _config()
+    cfg.deletion_log.directory = str(tmp_path / "deletions")
+
+    owner = create_engine(owner_url)
+    runtime = create_engine(runtime_url)
+    F = sessionmaker(bind=runtime)
+    try:
+        # seed through the app role WITHOUT starting an engine (no genesis)
+        with tenant_scope(*TENANT), fixture_write_scope("seed pre-M4 data"):
+            s = F()
+            set_memory_enabled(s, USER, True)
+            s.commit()
+            record_claim(s, USER, dimension="topic", key="k",
+                         claim_text="I like PGV10RESTORE and coffee.",
+                         confidence=0.9, session_id="s1")
+            s.commit()
+            s.close()
+
+        # strip to the REAL step-10 shape (owner-side)
+        strip_to_step10(owner)
+        assert sm.current_version(owner) == 10
+
+        # the REAL step-10 backup
+        dump_path = str(tmp_path / "v10.dump")
+        _pg_dump(main_db, dump_path, main_url=owner_url)
+
+        # deploy M4: first deployment (empty log) -> the migration MINTS
+        upgrade_database(owner, default_tenant="default",
+                         default_app="default", config=cfg,
+                         confirm_backup=True)
+        db_id, applied = sm.read_watermark(runtime)
+        assert db_id and applied == 0
+
+        # the engine binds the genesis to the minted db_id; delete
+        eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                           tenant_id=TENANT[0], app_id=TENANT[1],
+                           llm_client=_FakeLLM(), deletion_log=log)
+        with tenant_scope(*TENANT):
+            s = F()
+            belief = s.query(Belief).filter(
+                Belief.claim_text.contains("PGV10RESTORE")).one()
+            s.close()
+        assert eng.forget_belief(user_id=USER, belief_id=belief.id,
+                                 purpose="api")
+        eng._engine.dispose()
+        runtime.dispose()
+
+        # restore the step-10 backup (real tools)
+        _pg_restore(main_db, dump_path, main_url=owner_url)
+        owner = create_engine(owner_url)
+        runtime = create_engine(runtime_url)
+        assert sm.read_watermark(runtime) is None
+        assert sm.current_version(owner) == 10
+        # the restore bring-up re-applies the posture owner-side first
+        # (the e2e's lesson: the dumped grants ride the objects, the
+        # ownership/posture re-assertion is part of bring-up)
+        install_row_level_security(owner, verify=False)
+
+        # the migration REFUSES: the log proves the line ran M4 already
+        from mirror_memory.core.schema_migration import WatermarkMissing
+
+        with pytest.raises(WatermarkMissing) as info:
+            upgrade_database(owner, default_tenant="default",
+                             default_app="default", config=cfg,
+                             confirm_backup=True)
+        assert db_id[:8] in str(info.value)
+
+        # adopt: migrates first (mint suppressed), then the log's db_id
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "mirror_memory.deletion_adopt",
+             "--database-url", owner_url, "--db-id", db_id,
+             "--config-dir", "config/"],
+            capture_output=True, text=True, env=dict(os.environ))
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "minting suppressed" in result.stdout
+        assert "watermark adopted" in result.stdout
+
+        # belt and braces: the posture the app role serves under (the e2e's
+        # restore bring-up; step-11 grants came from the adopt migration)
+        install_row_level_security(owner, verify=False)
+
+        # the replay removes the sentinel
+        app2 = MemoryEngine(config=cfg, database_url=runtime_url,
+                            tenant_id=TENANT[0], app_id=TENANT[1],
+                            llm_client=_FakeLLM(), deletion_log=log)
+        app2.get_beliefs(user_id=USER, purpose="api")  # startup + replay
+        got_db_id, got_applied = sm.read_watermark(runtime)
+        assert got_db_id == db_id and got_applied >= 1
+        with tenant_scope(*TENANT):
+            s = F()
+            assert s.query(Belief).filter(
+                Belief.claim_text.contains("PGV10RESTORE")).count() == 0
+            s.close()
+        app2._engine.dispose()
+    finally:
+        owner.dispose()
+        runtime.dispose()
+        _pg_drop_database(main_db, admin_url)

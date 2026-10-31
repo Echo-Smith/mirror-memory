@@ -154,41 +154,13 @@ class MemoryEngine:
         self._db_id: str | None = None
 
     def _build_deletion_log(self) -> "DeletionLog | None":
-        """The deletion log from configuration (M4 task 1).  backend
-        "file" (default): an append-only JSONL file per database life
-        under ``deletion_log.directory`` -- fsynced, hash-chained, NEVER
-        the main database file.  backend "postgres": the log table in a
-        SEPARATE database at ``deletion_log.url`` (outside any pg_dump of
-        the main DB), where the app role holds INSERT/SELECT only."""
-        from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog, default_directory
+        """The deletion log from configuration (M4 task 1) -- the shared
+        derivation in core.deletion, so the migration and the adopt
+        command read the SAME log the engines write (M4 patch 2)."""
+        from mirror_memory.core.deletion import deletion_log_from_config
 
-        settings = self._config.deletion_log
-        if settings.backend == "none":
-            return None
-        if settings.backend == "postgres":
-            url = settings.url
-            if not url:
-                raise ValueError("deletion_log.backend=postgres requires deletion_log.url")
-            return PgDeletionLog(url)
-        if settings.directory:
-            directory = settings.directory
-        elif not self._database_url.startswith(
-                ("postgresql", "mysql", "mssql", "oracle")):
-            # embedded single-tenant SQLite (file or in-memory) -- the
-            # URL-derived directory is unambiguous (a file database's log
-            # lives next to it).  Anything that is not a known SERVER
-            # scheme takes the derived default (in-memory test engines,
-            # injected-engine placeholders); only real server deployments
-            # must say where the log lives.
-            directory = default_directory(self._database_url)
-        else:
-            # a server / multi-tenant deployment must say where the log
-            # lives -- a derived default could silently split the log
-            raise ValueError(
-                "deletion_log.backend=file with a non-SQLite database requires "
-                "deletion_log.directory (the URL-derived default is only for "
-                "embedded single-tenant SQLite)")
-        return FileDeletionLog(directory)
+        return deletion_log_from_config(self._config.deletion_log,
+                                        self._database_url)
 
     @staticmethod
     def _build_llm(api_key: str | None, model: str, base_url: str | None) -> Any:

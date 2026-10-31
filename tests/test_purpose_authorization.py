@@ -31,6 +31,20 @@ from mirror_memory.core.models import PurposeGrant, PurposeGrantEvent
 from mirror_memory.core.repository import set_feature_consent, set_memory_enabled
 from mirror_memory.core.tenancy import no_tenant_scope, system_scope, tenant_scope
 
+
+def _migration_cfg():
+    """A deletion-log config for step-11 migrations that don't exercise
+    the log itself (M4 patch 2: the migration refuses to mint a
+    data-bearing database without a log to consult)."""
+    import tempfile
+
+    from mirror_memory.config.loader import load_config
+
+    cfg = load_config("config/")
+    cfg.deletion_log.directory = tempfile.mkdtemp(prefix="mm-migration-log-")
+    return cfg
+
+
 PURPOSE = "api"
 
 
@@ -353,7 +367,7 @@ def test_step6_creates_tables_column_and_records_version(tmp_path):
     with eng.begin() as conn:
         conn.execute(vt.delete())
         conn.execute(vt.insert().values(version=5, note="simulated v5"))
-    sm.upgrade_database(eng, default_tenant="legacy", default_app="app")
+    sm.upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert sm.current_version(eng) == sm.LATEST_VERSION
     step = sm.Step6PurposeAuthorization()
     insp = inspect(eng)

@@ -732,3 +732,35 @@ def _load_config_with_log_directory(*args, **kwargs):
 
 
 _cfg_loader.load_config = _load_config_with_log_directory
+
+
+def strip_to_step10(engine) -> None:
+    """Roll a v11 database back to EXACTLY the step-10 shape (M4 patch 2
+    tests): drop every step-11 artifact and the version rows above 10.
+    The result is what a real pre-M4 backup looks like: tenant data, no
+    watermark, no generations table, no snapshot synthesis generation.
+    Run it owner-side on PostgreSQL."""
+    from sqlalchemy import MetaData, inspect, text
+
+    from mirror_memory.core.schema_migration import (
+        WATERMARK_TABLE,
+        _version_table,
+    )
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {WATERMARK_TABLE}")
+        conn.exec_driver_sql("DROP TABLE IF EXISTS mm_deletion_generations")
+        if "source_generation" in {
+                c["name"] for c in inspect(conn).get_columns("mm_snapshots")}:
+            conn.exec_driver_sql(
+                "ALTER TABLE mm_snapshots DROP COLUMN source_generation")
+        _version_table(MetaData()).create(engine, checkfirst=True)
+        conn.execute(text(
+            "DELETE FROM mm_schema_version WHERE version > 10"))
+        if conn.execute(text(
+                "SELECT max(version) FROM mm_schema_version")).scalar() is None:
+            for v, note in [(1, "tenancy"), (5, "pending-jobs index"),
+                            (10, "derived provenance")]:
+                conn.execute(text(
+                    "INSERT INTO mm_schema_version (version, note) "
+                    "VALUES (:v, :n)"), {"v": v, "n": note})

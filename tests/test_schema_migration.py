@@ -33,6 +33,20 @@ from mirror_memory.core.schema_migration import (
 
 REPO = Path(__file__).resolve().parents[1]
 
+
+def _migration_cfg():
+    """A deletion-log config for step-11 migrations that don't exercise
+    the log itself (M4 patch 2: the migration refuses to mint a
+    data-bearing database without a log to consult)."""
+    import tempfile
+
+    from mirror_memory.config.loader import load_config
+
+    cfg = load_config("config/")
+    cfg.deletion_log.directory = tempfile.mkdtemp(prefix="mm-migration-log-")
+    return cfg
+
+
 BASE_SEED_SCRIPT = r"""
 import json
 import sys
@@ -143,7 +157,7 @@ def test_upgrade_downgrade_upgrade_roundtrip(base_db):
     eng = _engine(base_db)
 
     # --- upgrade 1 -------------------------------------------------------
-    counts1 = upgrade_database(eng, default_tenant="legacy", default_app="app")
+    counts1 = upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert counts1  # tables were migrated
     parity = verify_schema_parity(eng)
     assert parity == [], parity
@@ -169,7 +183,7 @@ def test_upgrade_downgrade_upgrade_roundtrip(base_db):
         assert _read_claims(eng) == ["User has trouble sleeping"]
 
     # --- upgrade 2: same data again --------------------------------------
-    counts2 = upgrade_database(eng, default_tenant="legacy", default_app="app")
+    counts2 = upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert counts2 == counts1
     from mirror_memory.core.tenancy import tenant_scope
 
@@ -182,7 +196,7 @@ def test_upgrade_downgrade_upgrade_roundtrip(base_db):
 
 def test_migrated_database_runs_representative_flows(base_db):
     eng = _engine(base_db)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
 
     from mirror_memory.core.repository import (
         forget_belief,
@@ -225,7 +239,7 @@ def test_migrated_database_runs_representative_flows(base_db):
 def test_refuses_without_default_tenant(base_db):
     eng = _engine(base_db)
     with pytest.raises(MigrationRefused):
-        upgrade_database(eng, default_tenant="", default_app="app")
+        upgrade_database(eng, default_tenant="", default_app="app", config=_migration_cfg())
     # nothing was touched
     insp = inspect(eng)
     assert "tenant_id" not in {c["name"] for c in insp.get_columns("mm_beliefs")}
@@ -242,7 +256,7 @@ def test_mid_migration_failure_restores_backup(base_db, monkeypatch):
 
     monkeypatch.setattr(sm, "_verify_tenancy", boom)
     with pytest.raises(sm.MigrationError):
-        sm.upgrade_database(eng, default_tenant="legacy", default_app="app")
+        sm.upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     # backup restored: base schema, data intact, version not advanced
     insp = inspect(eng)
     assert "tenant_id" not in {c["name"] for c in insp.get_columns("mm_beliefs")}
@@ -253,7 +267,7 @@ def test_mid_migration_failure_restores_backup(base_db, monkeypatch):
 
 def test_schema_parity_by_construction(base_db):
     eng = _engine(base_db)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert verify_schema_parity(eng) == []
 
 
@@ -269,7 +283,7 @@ def test_upgrade_installs_the_tenant_primary_key(base_db):
     import os  # noqa: F401 -- kept for the fixture's dialect note
 
     eng = _engine(base_db)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     insp = inspect(eng)
     tenant_tables = [
         t.name for t in Base.metadata.sorted_tables if insp.has_table(t.name)
@@ -296,13 +310,13 @@ def test_upgrade_installs_the_tenant_primary_key(base_db):
 def test_upgrade_is_reentrant_on_the_primary_key_step(base_db):
     """A second upgrade must not re-run the conversion or fail on it."""
     eng = _engine(base_db)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     before = {
         t.name: inspect(eng).get_pk_constraint(t.name)["constrained_columns"]
         for t in Base.metadata.sorted_tables
         if inspect(eng).has_table(t.name)
     }
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     after = {
         t.name: inspect(eng).get_pk_constraint(t.name)["constrained_columns"]
         for t in Base.metadata.sorted_tables
@@ -346,7 +360,7 @@ def test_database_already_at_version_1_advances_to_step_2(base_db):
     assert before[:2] != ["tenant_id", "app_id"], before
 
     # The full plan now runs only the steps above version 1.
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert sm.current_version(eng) == sm.LATEST_VERSION
     after = inspect(eng).get_pk_constraint("mm_beliefs")["constrained_columns"]
     if eng.dialect.name == "postgresql":
@@ -397,7 +411,7 @@ def test_step4_adds_the_partial_index_to_an_older_database(base_db):
     from mirror_memory.core import schema_migration as sm
 
     eng = _engine(base_db)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert sm.current_version(eng) == sm.LATEST_VERSION
     assert sm._index_state(eng, "mm_evolution_jobs", sm.PENDING_JOBS_INDEX) == "valid"
     # re-entrant: a second apply is a no-op repair
@@ -441,7 +455,7 @@ def test_tenant_user_indexes_replace_the_single_column_ones(tmp_path):
     assert step2.needed(eng2)
     with pytest.raises(sm.MigrationError):
         step2.verify(eng2)
-    upgrade_database(eng2, default_tenant="t", default_app="a")
+    upgrade_database(eng2, default_tenant="t", default_app="a", config=_migration_cfg())
     insp2 = inspect(eng2)
     names = {ix["name"] for ix in insp2.get_indexes("mm_beliefs")}
     assert tenant_user_index_name("mm_beliefs") in names
@@ -459,7 +473,7 @@ def test_step6_legacy_job_purpose_backfills_and_counts(base_db, tmp_path):
 
     # WITHOUT legacy purpose: jobs keep '' and the count is returned
     eng = _engine(base_db)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert sm.current_version(eng) == sm.LATEST_VERSION
     # one completed pre-M3 job came with the base database
     insp = inspect(eng)
@@ -661,7 +675,7 @@ def test_step7_adds_source_purpose_to_a_version6_database(tmp_path):
     step = sm.Step7SourcePurpose()
     assert step.needed(eng)
 
-    counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
+    counts = upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert sm.current_version(eng) == sm.LATEST_VERSION
     assert "legacy_jobs_to_cancel" not in counts, "step 6 did not run: no stale count"
     insp = inspect(eng)
@@ -729,7 +743,7 @@ def test_upgrade_database_returns_the_step6_cancel_count(base_db):
     """The step-6 docstring promised the pre-M3 cancel count in
     ``upgrade_database``'s return value; batch 1 only logged it."""
     eng = _engine(base_db)
-    counts = upgrade_database(eng, default_tenant="legacy", default_app="app")
+    counts = upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert isinstance(counts.get("legacy_jobs_to_cancel"), int)
     eng.dispose()
 
@@ -753,7 +767,7 @@ def test_step8_creates_the_access_audit_table_on_a_version7_database(tmp_path):
         conn.execute(vt.insert().values(version=7, note="simulated v7"))
     step = sm.Step8AccessAudit()
     assert step.needed(eng)
-    upgrade_database(eng, default_tenant="legacy", default_app="app")
+    upgrade_database(eng, default_tenant="legacy", default_app="app", config=_migration_cfg())
     assert sm.current_version(eng) == sm.LATEST_VERSION
     insp = inspect(eng)
     assert insp.has_table("mm_access_audit")

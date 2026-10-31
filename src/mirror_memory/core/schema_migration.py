@@ -1749,7 +1749,7 @@ def _main_db_has_data(engine: Engine) -> bool:
     return False
 
 
-def ensure_watermark(engine: Engine, *, deploy_mint: bool = False) -> tuple[str, int]:
+def ensure_watermark(engine: Engine) -> tuple[str, int]:
     """Create the watermark table and its single row on first use; returns
     ``(db_id, applied_seq)``.  The row lives in the main DB, so a restore
     brings back the backup's db_id and applied seq -- which is exactly how
@@ -1762,7 +1762,8 @@ def ensure_watermark(engine: Engine, *, deploy_mint: bool = False) -> tuple[str,
     ``adopt_watermark`` (which pairs it with an existing log).  A truly
     fresh database (no tenant data) is minted normally.  M4's own
     migration step creates the row at deploy time, so this refusal only
-    fires for pre-M4 restores.
+    fires for pre-M4 restores.  MINTING AT MIGRATION TIME is decided by
+    the deletion log (Step11DeletionReplay, M4 patch 2) -- never here.
     """
     table = _watermark_table(MetaData())
     if not inspect(engine).has_table(WATERMARK_TABLE):
@@ -1792,7 +1793,7 @@ def ensure_watermark(engine: Engine, *, deploy_mint: bool = False) -> tuple[str,
                                    .where(table.c.id == 1)).first()
                 if row is not None:
                     return str(row[0]), int(row[1])
-                if not deploy_mint and _main_db_has_data(engine):
+                if _main_db_has_data(engine):
                     raise WatermarkMissing(
                         "the main database holds tenant data but has no deletion "
                         "watermark row: it looks like a restore from a PRE-M4 backup "
@@ -1887,13 +1888,33 @@ class Step11DeletionReplay:
     version: int = 11
     name: str = "deletion replay: generations, watermark, snapshot generation"
 
+    #: The lineage inputs (M4 patch 2), assigned by ``upgrade_database``:
+    #: the SAME config the engines load, so the migration reads the SAME
+    #: deletion log the engines write.
+    deletion_log_config: object = None
+    #: Explicit override: mint a fresh db_id even though the log already
+    #: holds earlier lives (their deletions will NOT be replayed).
+    new_lineage: bool = False
+    #: False for the adopt path: create the schema, let the operator's
+    #: db_id become the watermark row.
+    mint_watermark: bool = True
+
     def needed(self, engine: Engine) -> bool:
         insp = inspect(engine)
         if not insp.has_table("mm_deletion_generations"):
             return True
         if "source_generation" not in _table_columns(engine, "mm_snapshots"):
             return True
-        return not insp.has_table(WATERMARK_TABLE)
+        if not insp.has_table(WATERMARK_TABLE):
+            return True
+        # a v11-SHAPED database without the watermark row (a refused /
+        # half-applied migration, or a restored backup of one) must go
+        # through apply again: the lineage decision and the posture run
+        # there (M4 patch 2)
+        table = _watermark_table(MetaData())
+        with engine.connect() as conn:
+            return conn.execute(
+                select(table.c.id).where(table.c.id == 1)).first() is None
 
     def apply(self, engine: Engine) -> None:
         Base.metadata.tables["mm_deletion_generations"].create(engine, checkfirst=True)
@@ -1903,11 +1924,16 @@ class Step11DeletionReplay:
         # lazily on first start -- a pre-M4 backup restored after this deploy
         # then has no row and startup refuses with WatermarkMissing until the
         # operator adopts it (deploy-time backups taken BEFORE this step are
-        # pre-M4 by definition).  deploy_mint: the migration IS how a live
-        # pre-M4 database becomes M4-shaped -- minting its row here is the
-        # deployment, not an unclaimed restore (there is no pre-M4 log to
-        # adopt; deletions were never logged before M4).
-        ensure_watermark(engine, deploy_mint=True)
+        # pre-M4 by definition).
+        #
+        # M4 patch 2: whether the row may be MINTED is decided by the
+        # deletion log -- a log that already holds genesis entries has run
+        # M4 before, so a data-bearing database without a watermark row is
+        # a restore from that lineage and must be ADOPTED, not minted.
+        table = _watermark_table(MetaData())
+        table.create(engine, checkfirst=True)
+        if self.mint_watermark:
+            self._mint_watermark_row(engine, table)
         if _is_postgres(engine):
             from mirror_memory.core import rls
 
@@ -1934,6 +1960,85 @@ class Step11DeletionReplay:
             from mirror_memory.core import rls
 
             rls.verify_posture(engine, tables=["mm_deletion_generations"])
+
+    # -- the watermark row: mint, refuse, or adopt -------------------------
+
+    def _mint_watermark_row(self, engine: Engine, table) -> None:
+        with engine.begin() as conn:
+            row = conn.execute(
+                select(table.c.db_id, table.c.applied_seq)
+                .where(table.c.id == 1)).first()
+        if row is not None:
+            return
+        if not _main_db_has_data(engine):
+            self._insert_row(engine, table)  # a truly fresh database
+            return
+        # tenant data without a watermark row: only a genuine FIRST
+        # deployment may mint, and the deletion log decides (M4 patch 2)
+        self._mint_or_refuse(engine, table)
+
+    def _mint_or_refuse(self, engine: Engine, table) -> None:
+        config = self.deletion_log_config
+        if config is None:
+            raise WatermarkMissing(
+                "the migration must read the deletion log configuration to "
+                "decide whether a database that holds tenant data may be "
+                "minted: pass the engine's config to upgrade_database(..., "
+                "config=...).  Without the log the deployment lineage cannot "
+                "be verified, so no watermark row is created.")
+        from mirror_memory.core.deletion import deletion_log_from_config
+
+        try:
+            log = deletion_log_from_config(config.deletion_log,
+                                           str(engine.url))
+        except ValueError as exc:
+            raise WatermarkMissing(
+                f"the deletion log configuration is invalid: {exc}.  Fix the "
+                "configuration before migrating -- an unverifiable lineage "
+                "is never minted.")
+        if log is None:
+            raise WatermarkMissing(
+                "deletion_log.backend=none: the migration cannot verify the "
+                "deployment lineage without a log.  Configure the deletion "
+                "log the engines will use before migrating a database that "
+                "holds tenant data.")
+        try:
+            entries = log.genesis_entries()
+        except Exception as exc:
+            raise WatermarkMissing(
+                f"the deletion log is unreachable ({type(exc).__name__}: "
+                f"{exc}): refusing to mint -- the deployment lineage cannot "
+                "be verified.  Restore the log (or fix its configuration) "
+                "before migrating.")
+        if entries:
+            listing = "; ".join(
+                f"{db_id[:8]}... (genesis "
+                f"{created.isoformat() if created else 'at an unknown time'})"
+                for db_id, created in entries)
+            if not self.new_lineage:
+                raise WatermarkMissing(
+                    "the deletion log already holds genesis entries -- this "
+                    "deployment line has run M4 before: " + listing + ".  "
+                    "This database holds tenant data but has no watermark "
+                    "row, so it looks like a restore from that lineage: "
+                    "claim it with python -m mirror_memory.deletion_adopt "
+                    "--database-url <url> --db-id <db_id>.  To start a NEW "
+                    "deployment line instead, pass new_lineage=True (the old "
+                    "log's deletions will NOT be replayed).")
+            message = (
+                "NEW-LINEAGE: minting a fresh db_id while the deletion log "
+                "holds earlier database lives: " + listing + ".  The old "
+                "log's deletions will NOT be replayed onto this database.")
+            print(f"WARNING: {message}")
+            logger.warning(message)
+        self._insert_row(engine, table)
+
+    def _insert_row(self, engine: Engine, table) -> None:
+        import uuid as _uuid
+
+        with engine.begin() as conn:
+            conn.execute(table.insert().values(
+                id=1, db_id=_uuid.uuid4().hex, applied_seq=0))
 
 
 #: Ordered migration steps.  A database advances by running every step
@@ -1965,6 +2070,9 @@ def upgrade_database(
     steps: list | None = None,
     confirm_backup: bool = False,
     batch: int = DEFAULT_BACKFILL_BATCH,
+    config: object = None,
+    new_lineage: bool = False,
+    mint_watermark: bool = True,
 ) -> dict[str, int]:
     """Advance the schema to the latest version; returns pre-run row counts.
 
@@ -1999,6 +2107,12 @@ def upgrade_database(
                     continue
                 if hasattr(step, "default_tenant"):
                     step.default_tenant = (default_tenant, default_app)
+                if isinstance(step, Step11DeletionReplay):
+                    # the lineage inputs (M4 patch 2): the same config the
+                    # engines load, so the migration reads the SAME log
+                    step.deletion_log_config = config
+                    step.new_lineage = new_lineage
+                    step.mint_watermark = mint_watermark
                 applied = step.needed(engine)
                 if applied:
                     logger.info("migration: applying step %d (%s)", step.version, step.name)
@@ -2014,7 +2128,7 @@ def upgrade_database(
                     before["legacy_jobs_to_cancel"] = int(step.legacy_jobs_to_cancel)
         except Exception as exc:
             _restore_sqlite(engine, backup)
-            if isinstance(exc, MigrationError):
+            if isinstance(exc, (MigrationError, WatermarkMissing)):
                 raise
             raise MigrationError(
                 "migration step failed (" + type(exc).__name__ + ": " + str(exc) + ")"
