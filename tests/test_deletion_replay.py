@@ -87,6 +87,11 @@ def env(tmp_path):
     _Env.cfg.llm_client = _FakeLLM()
     _Env.cfg.worker.job_lease_seconds = 60
     _Env.cfg.session_summary_enabled = True
+    # the worker derives its log from the CONFIG: it must look at the SAME
+    # directory as the engine's explicit log (on the PG leg the harness
+    # default points elsewhere -- M4 patch task 2 removed the derived
+    # default for server URLs)
+    _Env.cfg.deletion_log.directory = str(tmp_path / "deletions")
     _Env.engine = MemoryEngine(config=_Env.cfg, database_url=str(db.url),
                                tenant_id=TENANT[0], app_id=TENANT[1],
                                llm_client=_FakeLLM(), deletion_log=log)
