@@ -521,7 +521,10 @@ def _visibility_race_round(eng, round_no) -> None:
 
     def revoke_loop():
         # wait until the reader is running, commit the revocation, then keep
-        # the reader running a grace window so post-commit recalls happen
+        # the reader running until it has STARTED a post-commit recall (a
+        # fixed 0.3s grace window flakes on loaded CI runners where one
+        # recall under SQLite lock contention can take longer than the
+        # window); capped so a wedged reader cannot hang the round
         reader_ready.wait(timeout=10)
         for _ in range(500):
             if observations:
@@ -529,7 +532,11 @@ def _visibility_race_round(eng, round_no) -> None:
             __import__("time").sleep(0.01)
         eng.revoke_purpose(user_id=USER, purpose=p_round, actor="user", reason=f"round{round_no}")
         commit_instant["t"] = __import__("time").monotonic()
-        __import__("time").sleep(0.3)
+        deadline = commit_instant["t"] + 10.0
+        while __import__("time").monotonic() < deadline:
+            if any(started > commit_instant["t"] for started, _seen in observations):
+                break
+            __import__("time").sleep(0.01)
         stop.set()
 
     threads = [threading.Thread(target=read_loop), threading.Thread(target=revoke_loop)]
