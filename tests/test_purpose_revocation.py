@@ -80,7 +80,11 @@ def _config(hook=None, seconds=0.0):
 
 @pytest.fixture
 def factory(pg_app_url):
-    engine = create_engine(pg_app_url)
+    # lock_timeout: the race's statements are ms-level; a contention wait
+    # must error fast (and be retried) instead of hanging the round -- a
+    # hung publisher outlives the join timeout and poisons the rebuild
+    engine = create_engine(
+        pg_app_url, connect_args={"options": "-c lock_timeout=5000"})
     yield sessionmaker(bind=engine)
     engine.dispose()
 
@@ -206,21 +210,46 @@ def test_revoke_racing_the_publish_never_lands_after_revocation(factory):
         outcome: dict = {}
 
         def run_publish():
+            # a lock-timeout abort (CI load) rolls back ENTIRELY: retry the
+            # round's publish instead of recording a half-finished attempt
+            import time as _time
+
+            from sqlalchemy.exc import OperationalError
+
             with tenant_scope(*TENANT):
-                s = factory()
-                try:
-                    barrier.wait(timeout=10)
-                    job_row = s.get(EvolutionJob, (*TENANT, job_id))
-                    _process_single_job(s, job_row, cfg, lease_token=token)
-                except Exception as exc:  # noqa: BLE001 - recorded, asserted below
-                    outcome["publish_error"] = repr(exc)
-                    s.rollback()
-                finally:
-                    s.close()
+                for attempt in range(5):
+                    s = factory()
+                    try:
+                        barrier.wait(timeout=10)
+                        job_row = s.get(EvolutionJob, (*TENANT, job_id))
+                        _process_single_job(s, job_row, cfg, lease_token=token)
+                        return
+                    except OperationalError:
+                        s.rollback()
+                        if attempt == 4:
+                            raise
+                        _time.sleep(0.05 * (attempt + 1))
+                    except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+                        outcome["publish_error"] = repr(exc)
+                        s.rollback()
+                        return
+                    finally:
+                        s.close()
 
         def run_revoke():
+            import time as _time
+
+            from sqlalchemy.exc import OperationalError
+
             barrier.wait(timeout=10)
-            _revoke(factory, revoke_done)
+            for attempt in range(5):
+                try:
+                    _revoke(factory, revoke_done)
+                    return
+                except OperationalError:
+                    if attempt == 4:
+                        raise
+                    _time.sleep(0.05 * (attempt + 1))
 
         tp = threading.Thread(target=run_publish, daemon=True)
         tr = threading.Thread(target=run_revoke, daemon=True)
