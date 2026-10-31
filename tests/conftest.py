@@ -543,7 +543,7 @@ def _pg_fresh_schema(admin_engine) -> None:
     with admin_engine.begin() as conn:
         conn.exec_driver_sql(
             f"GRANT SELECT, INSERT, UPDATE ON mm_deletion_watermark "
-            f"TO {_rls.app_role()}")
+            f"TO {_rls.app_role()}, {_rls.maintenance_role()}")
 
 
 
@@ -702,3 +702,33 @@ class MockLLM:
 def mock_llm():
     """Default mock LLM returning empty claims."""
     return MockLLM()
+
+
+# ---------------------------------------------------------------------------
+# M4 batch-1 patch task 2: on the PostgreSQL leg the default `file`
+# deletion-log backend needs an explicit directory for server URLs (the
+# URL-derived default is embedded-SQLite only).  The wrapper runs at
+# conftest import time, so every test module's `from ... import
+# load_config` binds it; tests that exercise the deletion log set their
+# own backend/directory after load_config and override this default.
+# ---------------------------------------------------------------------------
+import functools as _functools
+
+import mirror_memory.config.loader as _cfg_loader
+
+_original_load_config = _cfg_loader.load_config
+
+
+@_functools.wraps(_original_load_config)
+def _load_config_with_log_directory(*args, **kwargs):
+    cfg = _original_load_config(*args, **kwargs)
+    import os as _os
+
+    if _os.environ.get("MM_DATABASE_URL", "").startswith("postgres"):
+        cfg.deletion_log.directory = (
+            cfg.deletion_log.directory
+            or f"/tmp/mm-test-deletions-{_os.getpid()}")
+    return cfg
+
+
+_cfg_loader.load_config = _load_config_with_log_directory

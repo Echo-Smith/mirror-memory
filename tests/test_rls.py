@@ -267,6 +267,15 @@ def test_worker_scan_sees_every_tenant_via_the_maintenance_role(two_tenants, wor
     engine = create_engine(two_tenants)
     factory = sessionmaker(bind=engine)
     try:
+        # deploy shape (M4 patch task 2): this database life's genesis
+        # entry exists in the worker's log before the first reconcile
+        # (a real deployment writes it when the watermark row is created /
+        # at the first engine start)
+        from mirror_memory.core import schema_migration as _sm_wm
+        from mirror_memory.core.deletion import FileDeletionLog
+
+        _db_id, _applied = _sm_wm.ensure_watermark(engine)
+        FileDeletionLog(worker_config.deletion_log.directory).ensure_genesis(_db_id)
         process_pending(factory, worker_config)
         # Both tenants' jobs were scanned, claimed in their own tenant and
         # completed.  This final read runs under system_scope too, which

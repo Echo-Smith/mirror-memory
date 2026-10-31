@@ -1913,11 +1913,14 @@ class Step11DeletionReplay:
 
             _DDLPlan(rls.rls_plan(engine, tables=["mm_deletion_generations"])).run(engine)
             # the app role reads the watermark at startup and advances it in
-            # the deletion transaction (owner-created table, like every other)
+            # the deletion transaction; the MAINTENANCE role needs the same:
+            # the worker's tick reconcile runs under system_scope, which
+            # routes to the maintenance engine (owner-created table, like
+            # every other)
             with engine.begin() as conn:
                 conn.execute(text(
                     f"GRANT SELECT, INSERT, UPDATE ON {WATERMARK_TABLE} "
-                    f"TO {rls.app_role()}"))
+                    f"TO {rls.app_role()}, {rls.maintenance_role()}"))
 
     def verify(self, engine: Engine) -> None:
         cols = {c["name"] for c in inspect(engine).get_columns("mm_deletion_generations")}
