@@ -50,10 +50,13 @@ def _log_url() -> str:
 def log_db_url():
     admin = create_engine(_admin_url(), isolation_level="AUTOCOMMIT")
     try:
-        exists = admin.connect().execute(text(
-            "SELECT 1 FROM pg_database WHERE datname = :d"), {"d": LOG_DB}).first()
+        with admin.connect() as conn:
+            exists = conn.execute(text(
+                "SELECT 1 FROM pg_database WHERE datname = :d"), {"d": LOG_DB}).first()
         if not exists:
-            admin.connect().execute(text(f'CREATE DATABASE "{LOG_DB}"'))
+            with admin.connect() as conn:
+                conn.execute(text(f'CREATE DATABASE "{LOG_DB}"'))
+                conn.commit()
         # a fresh table per run: an earlier run's schema (or rows) must not
         # leak into this run's hash-chain assertions
         log_engine = create_engine(_log_url())
@@ -127,8 +130,10 @@ def test_pg_log_app_role_is_insert_select_only(log_db_url):
                     "prev_hash, hash) VALUES (:db, 't', 'a', 'u', 'belief', '1', "
                     "'[]', 1, 'p', :prev, :hash)"
                 ), {"db": db_id, "prev": GENESIS_HASH, "hash": "h" * 64})
-            rows = app.connect().execute(text(
-                "SELECT count(*) FROM mm_deletion_log WHERE db_id = :db"), {"db": db_id}).scalar()
+            with app.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT count(*) FROM mm_deletion_log WHERE db_id = :db"),
+                    {"db": db_id}).scalar()
             assert rows == 1
             with pytest.raises(Exception, match="permission denied"):
                 with app.begin() as conn:

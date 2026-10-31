@@ -484,7 +484,10 @@ def _pg_fresh_schema(admin_engine) -> None:
     def drop_bounded() -> None:
         from sqlalchemy import MetaData
 
-        from mirror_memory.core.schema_migration import _version_table
+        from mirror_memory.core.schema_migration import (
+            WATERMARK_TABLE,
+            _version_table,
+        )
 
         with admin_engine.connect() as conn:
             conn.execute(text("SET LOCAL lock_timeout = '2s'"))
@@ -493,6 +496,11 @@ def _pg_fresh_schema(admin_engine) -> None:
             # no migration history either (a leftover row would make the
             # next upgrade_database skip every step)
             _version_table(MetaData()).drop(conn, checkfirst=True)
+            # the deletion watermark is not in Base.metadata either; a
+            # leftover row pairs the fresh schema with a stale (db_id,
+            # applied_seq) the new test's log cannot match (M4)
+            conn.execute(text(
+                f"DROP TABLE IF EXISTS {WATERMARK_TABLE}"))
             conn.commit()
 
     try:
