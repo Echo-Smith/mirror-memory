@@ -19,6 +19,11 @@ _counters: dict[str, int] = {}
 #: A request (engine entry or worker job) was refused for having no purpose.
 MISSING_PURPOSE = "missing_purpose_refusals"
 
+#: The worker skipped a whole tick because its deletion-log reconciliation
+#: failed (broken chain, unavailable log, missing watermark, infrastructure
+#: error) -- no lease recovery, no claims, no publishes until it recovers.
+DELETION_RECONCILE_FAILURES = "deletion_reconcile_failures"
+
 
 def inc(name: str, n: int = 1) -> None:
     with _lock:

@@ -716,3 +716,152 @@ def test_coverage_matrix_delete_tables_all_have_replay_handlers():
     # every handler names a REAL table (typo guard)
     unknown = _REPLAY_HANDLERS - set(Base.metadata.tables)
     assert not unknown, f"replay handlers name non-existent tables: {unknown}"
+
+
+# ---------------------------------------------------------------------------
+# M4 batch-1 patch task 4: a failing reconcile stops the worker COLD
+# ---------------------------------------------------------------------------
+
+
+def test_patch4_worker_refuses_to_work_when_the_reconcile_fails(env, monkeypatch):
+    """A broken log chain skips the WHOLE tick: the expired lease is NOT
+    recovered, nothing is claimed, nothing is published, the alert metric
+    increments, and the next tick inside the backoff window does not even
+    re-attempt.  Once the log is healthy the worker proceeds normally."""
+    from datetime import UTC, datetime, timedelta
+
+    from mirror_memory.core import metrics
+    from mirror_memory.worker import evolution as evo
+
+    # a short backoff base keeps the heal leg fast; the window semantics
+    # are identical (the second tick inside the window must be suppressed)
+    monkeypatch.setattr(evo, "_RECONCILE_BACKOFF", {})
+    monkeypatch.setattr(evo, "_RECONCILE_BACKOFF_BASE_SECONDS", 0.05)
+    _observe(env.engine, "I like coffee and I live in Berlin.", purpose="api")
+
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            running = enqueue_job(s, USER, env.cfg, purpose="api")
+            s.commit()
+            _claim_job(s, running.id, lease_seconds=60)
+            # an expired lease the sweep WOULD recover on a healthy tick
+            from mirror_memory.core.tenancy import queue_write_scope
+
+            with queue_write_scope():
+                running.lease_expires_at = (datetime.now(UTC)
+                                            - timedelta(seconds=5))
+            # a SECOND pending job: enqueue_job would merge into the
+            # claimed one (same user + watermark), so insert it directly
+            # with its own idempotency key (the canonical creation shape)
+            import uuid as _uuid
+
+            with queue_write_scope():
+                pending = EvolutionJob(
+                    id=_uuid.uuid4().hex[:16],
+                    user_id=USER,
+                    purpose="api",
+                    evidence_watermark=json.dumps({"latest_update": "p4"}),
+                    prompt_version=env.cfg.worker.prompt_version,
+                    idempotency_key="p4-pending-job",
+                    status="pending",
+                )
+                s.add(pending)
+            s.commit()
+            running_id, pending_id = running.id, pending.id
+        finally:
+            s.close()
+
+    db_id, _applied = sm.read_watermark(env.db)
+    path = env.log._path_for(db_id)
+    original = path.read_text()
+
+    # tamper the first ENTRY's hash (line 0 is the file header): the
+    # chain no longer verifies
+    lines = original.splitlines()
+    first_entry = next(i for i, ln in enumerate(lines)
+                       if ln.strip() and '"header"' not in ln)
+    rec = json.loads(lines[first_entry])
+    rec["hash"] = "0" * 64
+    lines[first_entry] = json.dumps(rec)
+    path.write_text("\n".join(lines) + "\n")
+
+    failures_before = metrics.value(metrics.DELETION_RECONCILE_FAILURES)
+    evo.process_pending(lambda: env.F(), env.cfg)
+
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            assert s.get(EvolutionJob, running_id).status == "running", (
+                "the expired lease must NOT be recovered while the log is broken")
+            assert s.get(EvolutionJob, pending_id).status == "pending", (
+                "nothing may be claimed while the log is broken")
+        finally:
+            s.close()
+    assert metrics.value(metrics.DELETION_RECONCILE_FAILURES) >= failures_before + 1
+
+    # inside the backoff window the tick skips WITHOUT re-attempting
+    evo.process_pending(lambda: env.F(), env.cfg)
+    assert metrics.value(metrics.DELETION_RECONCILE_FAILURES) == failures_before + 1, (
+        "the backoff gate must suppress further reconcile attempts")
+
+    # heal: AFTER the backoff window the tick recovers the lease and
+    # processes the pending job again
+    import time as _time
+
+    path.write_text(original)
+    _time.sleep(0.06)
+    evo.process_pending(lambda: env.F(), env.cfg)
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            # the sweep recovered the expired lease and the scan claimed
+            # and COMPLETED it in the same (healthy) tick
+            assert s.get(EvolutionJob, running_id).status == "completed", (
+                "the healthy tick recovers the expired lease and works the job")
+            assert s.get(EvolutionJob, pending_id).status != "pending", (
+                "the healthy tick claims and processes the queue again")
+        finally:
+            s.close()
+
+
+def test_patch4_worker_skips_when_the_log_is_unreachable(env, monkeypatch):
+    """An UNREACHABLE log (infrastructure error) also stops the tick --
+    and an unreachable log must not be hammered: the backoff state
+    escalates."""
+    from mirror_memory.core import metrics
+    from mirror_memory.worker import evolution as evo
+
+    monkeypatch.setattr(evo, "_RECONCILE_BACKOFF", {})
+
+    def _boom(*a, **kw):
+        raise ConnectionError("the deletion log database is down")
+
+    _observe(env.engine, "I like tea and I live in Oslo.", purpose="api")
+    # the worker builds its OWN FileDeletionLog over the same directory --
+    # patch the CLASS, not the engine's instance
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    monkeypatch.setattr(FileDeletionLog, "has_genesis", _boom)
+
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            pending = enqueue_job(s, USER, env.cfg, purpose="api")
+            s.commit()
+            pending_id = pending.id
+        finally:
+            s.close()
+
+    failures_before = metrics.value(metrics.DELETION_RECONCILE_FAILURES)
+    evo.process_pending(lambda: env.F(), env.cfg)
+    assert metrics.value(metrics.DELETION_RECONCILE_FAILURES) >= failures_before + 1
+    with tenant_scope(*TENANT):
+        s = env.F()
+        try:
+            assert s.get(EvolutionJob, pending_id).status == "pending"
+        finally:
+            s.close()
+    # the failure was recorded: the state escalates (2nd window longer)
+    failures, deadline = evo._RECONCILE_BACKOFF[str(env.db.url)]
+    assert failures == 1 and deadline > 0

@@ -192,22 +192,39 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
             # otherwise skips this tick -- it must not process jobs while
             # the database is behind its log.
             from mirror_memory.core import replay as deletion_replay
-            from mirror_memory.core.deletion import DeletionLogStale, ReplayPending
+            from mirror_memory.core import metrics
 
             log = _deletion_log_for(config, str(session.get_bind().url))
             if log is not None:
+                # M4 batch-1 patch task 4: the worker only works on a main
+                # database that is IN SYNC with its deletion log.  Any
+                # reconcile outcome other than ok/replayed -- a broken log
+                # chain, an unavailable log, a missing watermark, a replay
+                # running elsewhere, an infrastructure error -- skips the
+                # WHOLE tick: no lease recovery, no claims, no publishes
+                # (working on a database that may be a pre-deletion restore
+                # would resurrect deleted content).  Failing reconciles
+                # back off exponentially instead of being hammered every
+                # tick, and the refusal raises the alert metric.
+                bind_url = str(session.get_bind().url)
+                if not _reconcile_gate(bind_url):
+                    logger.warning(
+                        "deletion reconcile is in backoff after a failure; "
+                        "skipping this tick -- no lease recovery, no claims, "
+                        "no publishes")
+                    return
                 try:
-                    deletion_replay.reconcile(session_factory, log)
-                except ReplayPending:
-                    logger.warning("deletion replay in progress elsewhere; skipping this tick")
+                    status = deletion_replay.reconcile(session_factory, log)
+                except Exception as exc:
+                    delay = _reconcile_record_failure(bind_url)
+                    metrics.inc(metrics.DELETION_RECONCILE_FAILURES)
+                    logger.error(
+                        "deletion reconcile failed (%s: %s); skipping this "
+                        "tick -- no lease recovery, no claims, no publishes; "
+                        "retrying in ~%.0fs", type(exc).__name__, exc, delay)
                     return
-                except DeletionLogStale as exc:
-                    logger.error("deletion log is older than the main DB: %s", exc)
-                    return
-                except Exception:
-                    # the reconciliation infrastructure must never wedge the
-                    # worker: log and continue (the sweep still runs)
-                    logger.warning("deletion reconcile failed; continuing", exc_info=True)
+                _reconcile_record_success(bind_url)
+                logger.debug("deletion reconcile: %s", status)
 
             # Crash recovery: expire leases whose holder is gone.  The
             # lease_token is deliberately NOT reset -- it is the monotonic
@@ -682,6 +699,37 @@ def _previous_snapshot_purposes(session: object, user_id: str) -> set[str]:
 #: How long the BUSY bookkeeping keeps retrying the fenced pending-update
 #: before giving up and surfacing the lock error (the sweep retries anyway).
 _BUSY_BOOKKEEPING_TIMEOUT = 6.0
+
+
+#: Per-database-URL reconcile backoff after a failure (M4 batch-1 patch
+#: task 4): url -> (consecutive failures, next-attempt time.monotonic()).
+#: A failing reconciliation must not be hammered every tick -- the worker
+#: skips whole ticks until the window elapses, then retries.
+_RECONCILE_BACKOFF: dict[str, tuple[int, float]] = {}
+_RECONCILE_BACKOFF_BASE_SECONDS = 2.0
+_RECONCILE_BACKOFF_CAP_SECONDS = 60.0
+
+
+def _reconcile_gate(database_url: str) -> bool:
+    """False while *database_url* is inside a backoff window."""
+    state = _RECONCILE_BACKOFF.get(database_url)
+    return state is None or time.monotonic() >= state[1]
+
+
+def _reconcile_record_failure(database_url: str) -> float:
+    """Record a failed reconcile: escalate the consecutive-failure count
+    and schedule the next attempt (exponential, capped).  Returns the
+    delay in seconds."""
+    failures, _ = _RECONCILE_BACKOFF.get(database_url, (0, 0.0))
+    failures += 1
+    delay = min(_RECONCILE_BACKOFF_BASE_SECONDS * 2 ** (failures - 1),
+                _RECONCILE_BACKOFF_CAP_SECONDS)
+    _RECONCILE_BACKOFF[database_url] = (failures, time.monotonic() + delay)
+    return delay
+
+
+def _reconcile_record_success(database_url: str) -> None:
+    _RECONCILE_BACKOFF.pop(database_url, None)
 
 
 def _deletion_log_for(config: MemoryConfig, database_url: str):
