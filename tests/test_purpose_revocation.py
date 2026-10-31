@@ -205,7 +205,14 @@ def test_revoke_racing_the_publish_never_lands_after_revocation(factory):
 
         revoke_done: list[datetime] = []
         barrier = threading.Barrier(2)
-        cfg = _config(hook=barrier.wait, seconds=0.02)
+        # NO mid-compute barrier hook: the waits per round are 3 when the
+        # publish reaches generate (init + hook) and 2 when it is
+        # cancelled early -- an odd count shifts the reusable barrier's
+        # pairing across rounds until a no-timeout wait strands forever
+        # (CI: rounds 24 / 40 / 47, publish outlived the 120s join).  The
+        # race is the round-start barrier plus the 20ms compute window;
+        # the invariant asserted below does not need a second sync.
+        cfg = _config(hook=None, seconds=0.02)
 
         outcome: dict = {}
 
