@@ -280,6 +280,94 @@ def test_reverse_direction_edge_to_cloud_and_no_echo(cloud, edge):
 
 
 # ---------------------------------------------------------------------------
+# task 1 order/integrity + task 2 tenant/identity: whole-batch refusal,
+# zero writes, both directions
+# ---------------------------------------------------------------------------
+
+
+def _forged(entry: TombstoneEntry, **changes) -> TombstoneEntry:
+    data = entry.to_dict()
+    data.update(changes)
+    forged = TombstoneEntry.from_dict(data)
+    return forged.seal() if "hash" not in changes else forged
+
+
+def _two_cloud_tombstones(cloud: _Device) -> list[TombstoneEntry]:
+    b = _belief_by_text(cloud, "Berlin")
+    assert cloud.engine.forget_belief(user_id=USER, belief_id=b.id, purpose="api")
+    assert cloud.engine.forget_session(user_id=USER, session_id="sa", purpose="api")
+    entries, _ = cloud.engine.export_tombstones(0, 100)
+    assert len(entries) == 2
+    return entries
+
+
+@pytest.mark.parametrize("direction", ["cloud_to_edge", "edge_to_cloud"])
+def test_forged_mixed_gap_and_tampered_batches_are_refused_with_zero_writes(
+        cloud, edge, direction):
+    _seed_both(cloud, edge)
+    sender, receiver = (cloud, edge) if direction == "cloud_to_edge" else (edge, cloud)
+    entries = _two_cloud_tombstones(sender)
+    kwargs = {"auth_tenant": TENANT} if receiver is cloud else {}
+
+    cases = {
+        # every entry from another tenant
+        "tenant": [_forged(e, tenant_id="other-tenant") for e in entries],
+        # ONE other-tenant entry mixed into a valid batch
+        "tenant-mixed": [entries[0], _forged(entries[1], app_id="other-app")],
+        # an origin_seq gap (seq 2 missing -> 1, 3)
+        "sequence": [entries[0], _forged(entries[1], origin_seq=3)],
+        # a tampered hash
+        "hash": [entries[0], _forged(entries[1], hash="0" * 64)],
+        # a content change behind a stale hash
+        "hash-content": [entries[0], _forged(entries[1], user_id="someone-else", hash=entries[1].hash)],
+        # malformed: a belief without a global_id
+        "format": [_forged(entries[0], scope_key="")],
+    }
+    expected_reason = {"tenant": "tenant", "tenant-mixed": "tenant", "sequence": "sequence",
+                       "hash": "hash", "hash-content": "hash", "format": "format"}
+    for name, batch in cases.items():
+        before = receiver.snapshot()
+        with pytest.raises(TombstoneBatchRejected) as info:
+            receiver.engine.apply_tombstones(batch, **kwargs)
+        assert info.value.reason == expected_reason[name], (name, str(info.value))
+        assert receiver.snapshot() == before, (name, "a refused batch must write nothing")
+
+    # the untouched valid batch still applies afterwards
+    ok = receiver.engine.apply_tombstones(entries, **kwargs)
+    assert ok.applied == 2
+
+
+def test_cloud_refuses_users_its_tenant_does_not_know(cloud, edge):
+    """The multi-tenant receiver takes the tenant from the authenticated
+    engine and refuses a tombstone for a user that tenant never saw --
+    the entry's own fields are not trusted."""
+    _seed_both(cloud, edge)
+    entries = _two_cloud_tombstones(edge)
+    unknown = [_forged(e, user_id="u-never-seen") for e in entries]
+    before = cloud.snapshot()
+    with pytest.raises(TombstoneBatchRejected) as info:
+        cloud.engine.apply_tombstones(unknown, auth_tenant=TENANT)
+    assert info.value.reason == "user"
+    assert cloud.snapshot() == before
+    # the authenticated tenant must be this engine's tenant: anything else
+    # is refused before any validation (no routing by entry fields)
+    with pytest.raises(TombstoneBatchRejected) as info2:
+        cloud.engine.apply_tombstones(entries, auth_tenant=("other", "app"))
+    assert info2.value.reason == "tenant"
+    assert cloud.snapshot() == before
+
+
+def test_edge_treats_unknown_users_as_noops(cloud, edge):
+    """The single-tenant edge may legitimately never have met the user
+    (a fresh install catching up): the tombstone is a no-op, recorded."""
+    _seed_both(cloud, edge)
+    entries = _two_cloud_tombstones(cloud)
+    unknown = [_forged(e, user_id="u-never-seen") for e in entries]
+    res = edge.engine.apply_tombstones(unknown)
+    assert (res.applied, res.noop) == (2, 2)
+
+
+# ---------------------------------------------------------------------------
 # task 1: applying a tombstone races the publish -- 50 rounds
 # ---------------------------------------------------------------------------
 
