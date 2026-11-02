@@ -32,6 +32,15 @@ class BeliefInfo:
     retention_class: str = ""
 
 
+@dataclass
+class TombstoneApplyResult:
+    """What apply_tombstones did with a batch (M4 batch 2)."""
+
+    applied: int
+    skipped: int
+    noop: int
+
+
 @dataclass(frozen=True)
 class DeleteResult:
     """Result of ``MemoryEngine.delete_memories()``."""

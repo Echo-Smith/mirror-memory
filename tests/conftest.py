@@ -752,26 +752,32 @@ def strip_to_step(engine, version: int) -> None:
         _version_table,
     )
 
-    assert version in (10, 11), version
+    assert version in (10, 11, 12), version
     with engine.begin() as conn:
+        # step 13 (sync bookkeeping tables)
+        conn.exec_driver_sql("DROP TABLE IF EXISTS mm_tombstones_applied")
+        conn.exec_driver_sql("DROP TABLE IF EXISTS mm_sync_peers")
+        if version >= 12:
+            pass  # keep step 12's column/index
         # step 12 (global_id).  PostgreSQL: drop the constraint/index and
         # the column.  SQLite cannot drop a column a table-level UNIQUE
         # constraint references (create_all's autoindex), so the table is
         # REBUILT without it (step 1's SQLite strategy: create, copy, drop,
         # rename) -- the genuine step-11 shape.
-        if engine.dialect.name == "postgresql":
-            # the constraint owns the index (create_all) -- drop it first;
-            # a migration-built bare index is dropped by name after
-            conn.exec_driver_sql(
-                "ALTER TABLE mm_beliefs DROP CONSTRAINT IF EXISTS "
-                "uq_mm_beliefs_global_id")
-        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_mm_beliefs_global_id")
-        if "global_id" in {
-                c["name"] for c in inspect(conn).get_columns("mm_beliefs")}:
+        if version <= 11:
             if engine.dialect.name == "postgresql":
-                conn.exec_driver_sql("ALTER TABLE mm_beliefs DROP COLUMN global_id")
-            else:
-                _rebuild_sqlite_beliefs_without(conn, "global_id")
+                # the constraint owns the index (create_all) -- drop it
+                # first; a migration-built bare index is dropped by name
+                conn.exec_driver_sql(
+                    "ALTER TABLE mm_beliefs DROP CONSTRAINT IF EXISTS "
+                    "uq_mm_beliefs_global_id")
+            conn.exec_driver_sql("DROP INDEX IF EXISTS uq_mm_beliefs_global_id")
+            if "global_id" in {
+                    c["name"] for c in inspect(conn).get_columns("mm_beliefs")}:
+                if engine.dialect.name == "postgresql":
+                    conn.exec_driver_sql("ALTER TABLE mm_beliefs DROP COLUMN global_id")
+                else:
+                    _rebuild_sqlite_beliefs_without(conn, "global_id")
         if version <= 10:
             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {WATERMARK_TABLE}")
             conn.exec_driver_sql("DROP TABLE IF EXISTS mm_deletion_generations")
@@ -787,6 +793,8 @@ def strip_to_step(engine, version: int) -> None:
             rows = [(1, "tenancy"), (5, "pending-jobs index"), (10, "derived provenance")]
             if version >= 11:
                 rows.append((11, "deletion replay"))
+            if version >= 12:
+                rows.append((12, "belief global_id"))
             for v, note in rows:
                 conn.execute(text(
                     "INSERT INTO mm_schema_version (version, note) "

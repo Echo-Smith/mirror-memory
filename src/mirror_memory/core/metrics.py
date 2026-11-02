@@ -24,6 +24,16 @@ MISSING_PURPOSE = "missing_purpose_refusals"
 #: error) -- no lease recovery, no claims, no publishes until it recovers.
 DELETION_RECONCILE_FAILURES = "deletion_reconcile_failures"
 
+#: Cross-device tombstones applied by this process (M4 batch 2).
+TOMBSTONES_APPLIED = "tombstones_applied"
+#: Tombstones skipped as already applied (idempotent re-delivery).
+TOMBSTONES_SKIPPED = "tombstones_skipped"
+#: Whole batches refused, by reason: tombstones_rejected_<reason>
+#: (format / hash / tenant / user / sequence / apply).
+TOMBSTONES_REJECTED_PREFIX = "tombstones_rejected_"
+#: Local log entries an export could not turn into tombstones.
+TOMBSTONES_EXPORT_SKIPPED = "tombstones_export_skipped"
+
 
 def inc(name: str, n: int = 1) -> None:
     with _lock:

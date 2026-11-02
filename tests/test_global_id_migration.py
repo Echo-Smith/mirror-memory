@@ -88,7 +88,7 @@ def test_step12_upgrades_a_step11_database_sqlite(tmp_path):
 
     _upgrade(eng, tmp_path)
 
-    assert sm.current_version(eng) == 12
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     ids = _global_ids(eng)
     assert len(ids) == 7 and all(HEX32.match(g) for g in ids)
     assert len(set(ids)) == 7, "one UUID per row, not one per batch"
@@ -136,7 +136,7 @@ def test_step12_resumes_after_an_interruption_sqlite(tmp_path):
     # (b) index missing with every row filled
     with eng.begin() as conn:
         conn.exec_driver_sql("DROP INDEX IF EXISTS uq_mm_beliefs_global_id")
-        conn.execute(text("DELETE FROM mm_schema_version WHERE version = 12"))
+        conn.execute(text("DELETE FROM mm_schema_version WHERE version >= 12"))
     assert step.needed(eng), "a missing index -> needed, not 'already done'"
     _upgrade(eng, tmp_path)
     assert sm._index_state(eng, "mm_beliefs", sm.GLOBAL_ID_INDEX) == "valid"

@@ -2218,6 +2218,48 @@ class Step12BeliefGlobalId:
                 "verification failed: unique index " + GLOBAL_ID_INDEX + " missing or invalid")
 
 
+
+# ---------------------------------------------------------------------------
+# Step 13: tombstone synchronization bookkeeping (M4 batch 2 tasks 1 & 3)
+# ---------------------------------------------------------------------------
+
+SYNC_TABLES = ("mm_tombstones_applied", "mm_sync_peers")
+
+
+class Step13SyncState:
+    """``mm_tombstones_applied`` (which cross-device tombstones this
+    database applied -- the idempotency key of the sync channel) and
+    ``mm_sync_peers`` (per-peer consumed cursor + last catch-up instant).
+    Both are tenant tables created FROM THE MODEL METADATA with the RLS
+    posture applied, write class ``sync``.  Re-entrant: each table is
+    created with checkfirst and the posture plan is idempotent."""
+
+    version: int = 13
+    name: str = "tombstone sync: applied record, peer state"
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        return any(not insp.has_table(name) for name in SYNC_TABLES)
+
+    def apply(self, engine: Engine) -> None:
+        for name in SYNC_TABLES:
+            Base.metadata.tables[name].create(engine, checkfirst=True)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=list(SYNC_TABLES))).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        insp = inspect(engine)
+        for name in SYNC_TABLES:
+            if not insp.has_table(name):
+                raise MigrationError("verification failed: " + name + " missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=list(SYNC_TABLES))
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -2234,6 +2276,7 @@ DEFAULT_STEPS: list = [
     Step10DerivedProvenance(),
     Step11DeletionReplay(),
     Step12BeliefGlobalId(),
+    Step13SyncState(),
 ]
 
 #: The version a freshly upgraded database records.

@@ -28,7 +28,7 @@ from typing import Any, Iterator, NamedTuple
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.exceptions import ValidationError
-from mirror_memory.models import BeliefInfo, DeleteResult, PanelData
+from mirror_memory.models import BeliefInfo, DeleteResult, PanelData, TombstoneApplyResult
 
 logger = logging.getLogger(__name__)
 
@@ -390,13 +390,21 @@ class MemoryEngine:
 
     def _append_deletion_log(self, session, user_id: str, *, scope: str,
                              scope_key: str, fingerprints: list[dict],
-                             generation: int, purpose: str | None) -> None:
+                             generation: int, purpose: str | None,
+                             global_key: str = "", origin: str = "",
+                             origin_seq: int = 0):
         """Write the deletion-log entry for a deletion that is about to
         commit.  The log write happens BEFORE the main-DB commit (the
         entry is part of the transaction's preconditions): a log failure
         raises and rolls the deletion back; the reverse window -- log
         written, commit fails -- is safe because replay matches
-        fingerprints that will never be found (core.deletion docstring)."""
+        fingerprints that will never be found (core.deletion docstring).
+
+        *global_key* is the cross-device scope key the entry exports as a
+        tombstone (a belief's global_id / the session_id); *origin* and
+        *origin_seq* mark a deletion produced by APPLYING a remote
+        tombstone, so the export never echoes it back (M4 batch 2).
+        Returns the appended entry (its seq is the local record)."""
         from mirror_memory.core.deletion import DeletionEntry
 
         if self._deletion_log is None:
@@ -411,6 +419,7 @@ class MemoryEngine:
             user_id=user_id, scope=scope, scope_key=scope_key,
             fingerprints=fingerprints, generation=generation,
             purpose=self._purpose_or_default(purpose),
+            global_key=global_key, origin=origin, origin_seq=origin_seq,
         ))
         # the entry is APPLIED by this very transaction: advance the
         # watermark here, so a committed deletion never needs a replay
@@ -421,6 +430,7 @@ class MemoryEngine:
         session.execute(
             wtable.update().where(wtable.c.id == 1).values(applied_seq=entry.seq))
         self._applied_seq = entry.seq
+        return entry
 
     def _current_deletion_generation(self, session, user_id: str) -> int:
         from sqlalchemy import func as _func, select as _select
@@ -1015,20 +1025,28 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.core.repository import delete_user_memories
-
         with self._session() as session:
-            self._record_forget_invocation(session, user_id, purpose)
-            fingerprints: list[dict] = []
-            counts = delete_user_memories(session, user_id, fingerprints=fingerprints)
-            self._append_deletion_log(
-                session, user_id, scope="user", scope_key="",
-                fingerprints=fingerprints, generation=counts["generation"],
-                purpose=purpose,
-            )
+            counts, _entry = self._delete_user_in(session, user_id, purpose)
             session.commit()
             counts.pop("generation", None)
             return DeleteResult(**counts)
+
+    def _delete_user_in(self, session, user_id: str, purpose: str | None, *,
+                        origin: str = "", origin_seq: int = 0):
+        """The user-scope deletion inside the caller's transaction: the
+        cascade, then the log entry (before the commit).  Shared by
+        delete_memories and the tombstone application (M4 batch 2)."""
+        from mirror_memory.core.repository import delete_user_memories
+
+        self._record_forget_invocation(session, user_id, purpose)
+        fingerprints: list[dict] = []
+        counts = delete_user_memories(session, user_id, fingerprints=fingerprints)
+        entry = self._append_deletion_log(
+            session, user_id, scope="user", scope_key="",
+            fingerprints=fingerprints, generation=counts["generation"],
+            purpose=purpose, origin=origin, origin_seq=origin_seq,
+        )
+        return counts, entry
 
     def forget_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Targeted forget: delete a single belief and everything derived from it.
@@ -1052,6 +1070,20 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        with self._session() as session:
+            committed, _entry = self._forget_belief_in(session, user_id, belief_id, purpose)
+            session.commit()
+            return committed
+
+    def _forget_belief_in(self, session, user_id: str, belief_id: int,
+                          purpose: str | None, *, origin: str = "",
+                          origin_seq: int = 0):
+        """The belief-scope deletion inside the caller's transaction
+        (Publisher FORGET), then the log entry carrying the belief's
+        global_id as the cross-device key.  Shared by forget_belief and
+        the tombstone application (M4 batch 2).  Returns (committed,
+        entry-or-None)."""
+        from mirror_memory.core.models import Belief
         from mirror_memory.core.proposal import (
             TRANSITION_FORGET,
             StateTransitionProposal,
@@ -1059,28 +1091,31 @@ class MemoryEngine:
         from mirror_memory.core.publisher import Publisher
         from mirror_memory.core.repository import get_state_revision
 
-        with self._session() as session:
-            self._record_forget_invocation(session, user_id, purpose)
-            collector: dict = {"fingerprints": [], "generation": None}
-            decision = Publisher(session, self._config).publish(
-                StateTransitionProposal(
-                    transition=TRANSITION_FORGET,
-                    user_id=user_id,
-                    target_belief_id=belief_id,
-                    expected_revision=get_state_revision(session, user_id),
-                    payload={"deletion_collector": collector},
-                )
+        self._record_forget_invocation(session, user_id, purpose)
+        # the cross-device key must be captured BEFORE the row is gone
+        belief = session.get(Belief, (*self._tenant, belief_id))
+        global_key = belief.global_id if belief is not None and belief.user_id == user_id else ""
+        collector: dict = {"fingerprints": [], "generation": None}
+        decision = Publisher(session, self._config).publish(
+            StateTransitionProposal(
+                transition=TRANSITION_FORGET,
+                user_id=user_id,
+                target_belief_id=belief_id,
+                expected_revision=get_state_revision(session, user_id),
+                payload={"deletion_collector": collector},
             )
-            if decision.committed and collector["generation"] is not None:
-                # the deletion log is written BEFORE the main-DB commit
-                # (fail-closed: a log failure rolls the deletion back)
-                self._append_deletion_log(
-                    session, user_id, scope="belief", scope_key=str(belief_id),
-                    fingerprints=collector["fingerprints"],
-                    generation=collector["generation"], purpose=purpose,
-                )
-            session.commit()
-            return decision.committed
+        )
+        entry = None
+        if decision.committed and collector["generation"] is not None:
+            # the deletion log is written BEFORE the main-DB commit
+            # (fail-closed: a log failure rolls the deletion back)
+            entry = self._append_deletion_log(
+                session, user_id, scope="belief", scope_key=str(belief_id),
+                fingerprints=collector["fingerprints"],
+                generation=collector["generation"], purpose=purpose,
+                global_key=global_key or "", origin=origin, origin_seq=origin_seq,
+            )
+        return decision.committed, entry
 
     def restore_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Restore an archived belief into the default retrieval scan.
@@ -1154,26 +1189,195 @@ class MemoryEngine:
             raise ValidationError("session_id must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.core.repository import forget_session_summary
-
         with self._session() as session:
-            self._record_forget_invocation(session, user_id, purpose)
-            fingerprints: list[dict] = []
-            result = forget_session_summary(session, user_id, session_id,
-                                            fingerprints=fingerprints)
-            if result:
-                # the summary rows were deleted: log before commit.  Session
-                # scope does not bump the generation (no belief content
-                # changed) -- M4's log entry records the deletion for replay
-                # with the user's CURRENT generation.
-                self._append_deletion_log(
-                    session, user_id, scope="session", scope_key=session_id,
-                    fingerprints=fingerprints,
-                    generation=self._current_deletion_generation(session, user_id),
-                    purpose=purpose,
-                )
+            result, _entry = self._forget_session_in(session, user_id, session_id, purpose)
             session.commit()
             return result
+
+    def _forget_session_in(self, session, user_id: str, session_id: str,
+                           purpose: str | None, *, origin: str = "",
+                           origin_seq: int = 0):
+        """The session-scope deletion inside the caller's transaction, then
+        the log entry (the session_id is its own cross-device key).  Shared
+        by forget_session and the tombstone application (M4 batch 2)."""
+        from mirror_memory.core.repository import forget_session_summary
+
+        self._record_forget_invocation(session, user_id, purpose)
+        fingerprints: list[dict] = []
+        result = forget_session_summary(session, user_id, session_id,
+                                        fingerprints=fingerprints)
+        entry = None
+        if result:
+            # the summary rows were deleted: log before commit.  Session
+            # scope does not bump the generation (no belief content
+            # changed) -- M4's log entry records the deletion for replay
+            # with the user's CURRENT generation.
+            entry = self._append_deletion_log(
+                session, user_id, scope="session", scope_key=session_id,
+                fingerprints=fingerprints,
+                generation=self._current_deletion_generation(session, user_id),
+                purpose=purpose, global_key=session_id,
+                origin=origin, origin_seq=origin_seq,
+            )
+        return result, entry
+
+    # ------------------------------------------------------------------
+    # Tombstone synchronization (M4 batch 2 tasks 1-2)
+    # ------------------------------------------------------------------
+
+    def export_tombstones(self, since_cursor: int = 0, limit: int = 500, *,
+                          peer_db_id: str | None = None):
+        """The next batch of cross-device tombstones from this database's
+        deletion log, after *since_cursor* (a local seq; 0 = from the
+        start).  Returns ``(entries, next_cursor)``; pass ``next_cursor``
+        back to continue.  With *peer_db_id*, entries that were applied
+        FROM that peer are not exported (no echo).  A cursor before the
+        log's compaction checkpoint raises TombstoneCursorPruned: the
+        peer must rebuild (task 4)."""
+        self._ensure_db()
+        from mirror_memory.core import metrics
+        from mirror_memory.core.tombstones import export_from_log
+
+        if self._deletion_log is None:
+            raise DeletionLogUnavailable(
+                "no deletion log is configured: there is nothing to export")
+        entries, cursor, skipped = export_from_log(
+            self._deletion_log, self._db_id, int(since_cursor), int(limit),
+            exclude_origin=peer_db_id)
+        if skipped:
+            metrics.inc(metrics.TOMBSTONES_EXPORT_SKIPPED, skipped)
+        return entries, cursor
+
+    def apply_tombstones(self, batch, *, auth_tenant: tuple[str, str] | None = None,
+                         purpose: str = "sync"):
+        """Apply a batch of cross-device tombstones: every entry runs the
+        normal local deletion for its scope (belief by global_id / session
+        / user -- fingerprints collected, local log written, local
+        generation advanced) and ``(origin, origin_seq)`` is recorded as
+        applied, all in ONE transaction.
+
+        The WHOLE batch is validated before anything is written and the
+        whole batch is refused on the first problem
+        (``TombstoneBatchRejected`` with ``reason``): malformed entry
+        (``format``), hash that does not verify (``hash``), tenant other
+        than this receiver's (``tenant`` -- the receiver's tenant is
+        *auth_tenant* when the caller authenticated the request, else this
+        engine's own; the entries' fields are never trusted for it), on a
+        multi-tenant receiver a user the tenant does not know (``user``),
+        an origin_seq gap (``sequence``).  Any failure while applying rolls
+        the whole batch back.  Duplicates (already applied) are skipped; a
+        scope that no longer exists locally is a no-op that is still
+        recorded as applied.
+
+        Returns ``TombstoneApplyResult(applied, skipped, noop)``.
+        """
+        self._ensure_db()
+        from mirror_memory.core import metrics
+        from mirror_memory.core.tombstones import (
+            TombstoneBatchRejected,
+            TombstoneEntry,
+            check_continuity,
+            validate_batch,
+        )
+
+        entries = [e if isinstance(e, TombstoneEntry) else TombstoneEntry.from_dict(e)
+                   for e in batch]
+        expected = tuple(auth_tenant) if auth_tenant is not None else tuple(self._tenant)
+        if expected != tuple(self._tenant):
+            # a receiver engine always IS its tenant: a mismatch here is a
+            # routing bug, not a data problem -- refuse rather than guess
+            raise TombstoneBatchRejected(
+                "tenant",
+                f"the authenticated tenant {expected!r} is not this engine's "
+                f"{tuple(self._tenant)!r}: the batch is refused")
+        try:
+            validate_batch(entries, expected_tenant=expected)
+        except TombstoneBatchRejected as exc:
+            metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
+            raise
+
+        from mirror_memory.core.models import TombstoneApplied
+        from mirror_memory.core.repository import (
+            record_tombstones_applied,
+            tenant_knows_user,
+        )
+        from sqlalchemy import func as _func, select as _select
+
+        with self._session() as session:
+            try:
+                origins = sorted({e.origin for e in entries})
+                applied_max: dict[str, int] = {}
+                for origin in origins:
+                    applied_max[origin] = int(session.scalar(
+                        _select(_func.max(TombstoneApplied.origin_seq))
+                        .where(TombstoneApplied.origin == origin)) or 0)
+                to_apply = check_continuity(entries, applied_max)
+                if not self._single_tenant:
+                    # a multi-tenant receiver (the cloud) only accepts
+                    # tombstones for users the authenticated tenant knows
+                    for entry in to_apply:
+                        if not tenant_knows_user(session, entry.user_id):
+                            raise TombstoneBatchRejected(
+                                "user",
+                                f"tombstone {entry.origin[:8]}.../{entry.origin_seq} names "
+                                f"user {entry.user_id!r}, unknown to tenant "
+                                f"{tuple(self._tenant)!r}: the whole batch is refused")
+            except TombstoneBatchRejected as exc:
+                metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
+                raise
+
+            rows: list[dict] = []
+            noop = 0
+            try:
+                for entry in to_apply:
+                    local_seq = self._apply_one_tombstone(session, entry, purpose)
+                    if local_seq is None:
+                        noop += 1
+                    rows.append({
+                        "origin": entry.origin, "origin_seq": entry.origin_seq,
+                        "user_id": entry.user_id, "scope": entry.scope,
+                        "scope_key": entry.scope_key, "local_seq": local_seq,
+                    })
+                if rows:
+                    record_tombstones_applied(session, rows)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + "apply")
+                raise TombstoneBatchRejected(
+                    "apply",
+                    f"applying tombstone batch failed ({type(exc).__name__}: {exc}); "
+                    "the whole batch was rolled back") from exc
+        applied = len(rows)
+        skipped = len(entries) - applied
+        metrics.inc(metrics.TOMBSTONES_APPLIED, applied)
+        if skipped:
+            metrics.inc(metrics.TOMBSTONES_SKIPPED, skipped)
+        return TombstoneApplyResult(applied=applied, skipped=skipped, noop=noop)
+
+    def _apply_one_tombstone(self, session, entry, purpose: str):
+        """One tombstone -> the local deletion of its scope through the
+        normal path.  Returns the local log seq, or None for a no-op (the
+        scope no longer exists here)."""
+        from mirror_memory.core.repository import belief_by_global_id
+
+        if entry.scope == "user":
+            _counts, log_entry = self._delete_user_in(
+                session, entry.user_id, purpose,
+                origin=entry.origin, origin_seq=entry.origin_seq)
+            return log_entry.seq if log_entry is not None else None
+        if entry.scope == "session":
+            found, log_entry = self._forget_session_in(
+                session, entry.user_id, entry.scope_key, purpose,
+                origin=entry.origin, origin_seq=entry.origin_seq)
+            return log_entry.seq if found and log_entry is not None else None
+        belief = belief_by_global_id(session, entry.user_id, entry.scope_key)
+        if belief is None:
+            return None
+        committed, log_entry = self._forget_belief_in(
+            session, entry.user_id, belief.id, purpose,
+            origin=entry.origin, origin_seq=entry.origin_seq)
+        return log_entry.seq if committed and log_entry is not None else None
 
     def correct(
         self,

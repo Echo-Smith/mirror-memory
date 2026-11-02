@@ -513,6 +513,48 @@ class DeletionGeneration(TenantScoped, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class TombstoneApplied(TenantScoped, Base):
+    """M4 batch 2: which cross-device tombstones THIS database has already
+    applied -- ``(origin, origin_seq)`` is the idempotency key, so a
+    re-delivered batch is skipped and a restore of this database rewinds
+    the record together with the data (the tombstones come back and are
+    re-applied, exactly like the local deletion log replays).  Scope that
+    no longer exists locally is recorded too (a no-op apply is still an
+    apply).  Written only by the tombstone-application transaction, in the
+    same commit as the deletions it bookkeeps (write class ``sync``)."""
+
+    __tablename__ = "mm_tombstones_applied"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "origin", "origin_seq"),
+    )
+
+    origin: Mapped[str] = mapped_column(String(32))
+    origin_seq: Mapped[int] = mapped_column(Integer)
+    user_id: Mapped[str] = mapped_column(String(64))
+    scope: Mapped[str] = mapped_column(String(16))
+    scope_key: Mapped[str] = mapped_column(String(128), default="")
+    local_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SyncPeer(TenantScoped, Base):
+    """M4 batch 2: one row per sync peer -- the cursor into the peer's
+    deletion log this database has consumed, and the instant of the last
+    successful catch-up.  The timestamp lives in the MAIN database on
+    purpose: a restored backup rewinds it, so the offline grace period
+    (measured from it) expires sooner -- which is correct, the restored
+    edge is further from the cloud than it believes."""
+
+    __tablename__ = "mm_sync_peers"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "peer_db_id"),
+    )
+
+    peer_db_id: Mapped[str] = mapped_column(String(32))
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    last_catchup_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class ProposalLog(TenantScoped, Base):
     """Append-only record of every *committed* proposal.
 

@@ -103,10 +103,19 @@ class DeletionEntry:
     prev_hash: str = GENESIS_HASH
     hash: str = ""
     created_at: datetime | None = None
+    # M4 batch 2 (tombstone sync): the cross-device scope key -- a
+    # belief's global_id / the session_id / "" -- and, for a deletion
+    # produced by APPLYING a remote tombstone, where that tombstone came
+    # from (the export never echoes it back to its origin)
+    global_key: str = ""
+    origin: str = ""
+    origin_seq: int = 0
 
     def payload(self) -> dict:
-        """The canonical, hashable form (everything except seq/hash)."""
-        return {
+        """The canonical, hashable form (everything except seq/hash).  The
+        batch-2 fields enter the payload only when set, so entries written
+        before them hash exactly as they did (the chain stays valid)."""
+        payload = {
             "db_id": self.db_id,
             "tenant_id": self.tenant_id,
             "app_id": self.app_id,
@@ -119,6 +128,12 @@ class DeletionEntry:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "prev_hash": self.prev_hash,
         }
+        if self.global_key:
+            payload["global_key"] = self.global_key
+        if self.origin:
+            payload["origin"] = self.origin
+            payload["origin_seq"] = self.origin_seq
+        return payload
 
     def compute_hash(self) -> str:
         canonical = json.dumps(self.payload(), sort_keys=True, ensure_ascii=False)
@@ -229,6 +244,9 @@ class FileDeletionLog(DeletionLog):
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:
         path = self._ensure_file(entry.db_id)
+        # the instant is part of the hashed payload (and travels in the
+        # tombstone): stamp it before the hash, like the PG backend does
+        entry.created_at = entry.created_at or datetime.utcnow()
         with self._locked(path) as fh:
             entries = list(self._iter_entries(path))
             entry.seq = (entries[-1].seq if entries else 0) + 1
@@ -256,6 +274,9 @@ class FileDeletionLog(DeletionLog):
             "created_at": entry.created_at.isoformat() if entry.created_at else None,
             "prev_hash": entry.prev_hash,
             "hash": entry.hash,
+            "global_key": entry.global_key,
+            "origin": entry.origin,
+            "origin_seq": entry.origin_seq,
         }
 
     def _iter_entries(self, path: Path) -> Iterator[DeletionEntry]:
@@ -281,6 +302,9 @@ class FileDeletionLog(DeletionLog):
                     created_at=datetime.fromisoformat(record["created_at"]) if record["created_at"] else None,
                     prev_hash=record["prev_hash"],
                     hash=record["hash"],
+                    global_key=record.get("global_key", ""),
+                    origin=record.get("origin", ""),
+                    origin_seq=int(record.get("origin_seq", 0) or 0),
                 )
 
     def read_from(self, db_id: str, after_seq: int) -> Iterator[DeletionEntry]:
@@ -367,15 +391,30 @@ class PgDeletionLog(DeletionLog):
                 " prev_hash CHAR(64) NOT NULL,"
                 " hash CHAR(64) NOT NULL,"
                 " created_at TIMESTAMP NOT NULL DEFAULT now(),"
+                " global_key VARCHAR(128) NOT NULL DEFAULT '',"
+                " origin CHAR(32) NOT NULL DEFAULT '',"
+                " origin_seq BIGINT NOT NULL DEFAULT 0,"
                 " PRIMARY KEY (db_id, seq))"
             ))
+            # a log database created before batch 2: add the sync columns
+            for ddl in (
+                "ALTER TABLE mm_deletion_log ADD COLUMN IF NOT EXISTS "
+                "global_key VARCHAR(128) NOT NULL DEFAULT ''",
+                "ALTER TABLE mm_deletion_log ADD COLUMN IF NOT EXISTS "
+                "origin CHAR(32) NOT NULL DEFAULT ''",
+                "ALTER TABLE mm_deletion_log ADD COLUMN IF NOT EXISTS "
+                "origin_seq BIGINT NOT NULL DEFAULT 0",
+            ):
+                conn.execute(text(ddl))
 
     def _insert(self, conn, entry: DeletionEntry) -> None:
         conn.execute(text(
             "INSERT INTO mm_deletion_log (db_id, tenant_id, app_id, user_id, "
             "scope, scope_key, fingerprints_json, generation, purpose, "
-            "prev_hash, hash, created_at) VALUES (:db, :tenant, :app, :user, "
-            ":scope, :scope_key, :fp, :generation, :purpose, :prev, :hash, :created)"
+            "prev_hash, hash, created_at, global_key, origin, origin_seq) "
+            "VALUES (:db, :tenant, :app, :user, "
+            ":scope, :scope_key, :fp, :generation, :purpose, :prev, :hash, "
+            ":created, :global_key, :origin, :origin_seq)"
         ), {
             "db": entry.db_id, "tenant": entry.tenant_id, "app": entry.app_id,
             "user": entry.user_id, "scope": entry.scope,
@@ -384,6 +423,8 @@ class PgDeletionLog(DeletionLog):
             "generation": entry.generation, "purpose": entry.purpose,
             "prev": entry.prev_hash, "hash": entry.hash,
             "created": entry.created_at,
+            "global_key": entry.global_key, "origin": entry.origin,
+            "origin_seq": entry.origin_seq,
         })
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:
@@ -409,7 +450,8 @@ class PgDeletionLog(DeletionLog):
         with self._engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT seq, tenant_id, app_id, user_id, scope, scope_key, "
-                "fingerprints_json, generation, purpose, prev_hash, hash, created_at "
+                "fingerprints_json, generation, purpose, prev_hash, hash, created_at, "
+                "global_key, origin, origin_seq "
                 "FROM mm_deletion_log WHERE db_id = :db AND seq > :after ORDER BY seq"
             ), {"db": db_id, "after": after_seq}).all()
         for row in rows:
@@ -419,6 +461,9 @@ class PgDeletionLog(DeletionLog):
                 fingerprints=json.loads(row[6]), generation=int(row[7]),
                 purpose=row[8], prev_hash=row[9], hash=row[10],
                 created_at=row[11],
+                global_key=(row[12] or "").strip(),
+                origin=(row[13] or "").strip(),
+                origin_seq=int(row[14] or 0),
             )
 
     def head(self, db_id: str) -> tuple[int, str]:

@@ -228,3 +228,15 @@ writers:
       session fallback summary alongside the structured claims.
     callers:
       - mirror_memory.extraction.pipeline
+
+  # ---- sync class: the tombstone-synchronization bookkeeping (M4 batch 2,
+  #  reviewer 待评审) ----
+  record_tombstones_applied:
+    reason: >
+      Records (origin, origin_seq) for every applied cross-device tombstone
+      -- the idempotency key of the sync channel -- inside the same
+      transaction as the deletions it bookkeeps; a rolled-back batch
+      leaves no record.  Called only by the engine's tombstone application
+      (MemoryEngine.apply_tombstones).
+    callers:
+      - mirror_memory.api

@@ -780,3 +780,104 @@ def test_real_step10_backup_flow_pg(tmp_path):
         owner.dispose()
         runtime.dispose()
         _pg_drop_database(main_db, admin_url)
+
+
+@_pg_needs
+def test_tombstone_apply_vs_publish_50_rounds_pg(tmp_path):
+    """M4 batch 2 task 1 on PostgreSQL: the cloud (PG, multi-tenant mode)
+    applies a user-scope tombstone uploaded by the edge (SQLite) while a
+    claimed job publishes.  The tombstone advances the generation; the
+    publish is cancelled or its writes are removed by the deletion --
+    memory never lands after the tombstone."""
+    from sqlalchemy.orm import sessionmaker
+
+    from mirror_memory.core.models import DeletionGeneration
+    from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqueue_job
+    from tests.test_tombstone_sync import USER as SYNC_USER, _Device, _cfg
+
+    main_db = "mm_test_m4_sync_race"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    log_dir = tmp_path / "cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    edge = _Device(tmp_path, "edge-pg-race", single_tenant=True)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+        for round_no in range(50):
+            cloud.observe(user_id=SYNC_USER, session_id=f"r{round_no}",
+                          text=f"round {round_no} content", purpose="api")
+            edge.observe(f"round {round_no} content", session_id=f"r{round_no}")
+            edge.engine.delete_memories(user_id=SYNC_USER, purpose="api")
+            entries, _ = edge.engine.export_tombstones(0, 1000)
+            batch = [e for e in entries if e.origin_seq == round_no + 1]
+            assert len(batch) == 1
+
+            outcomes: dict = {}
+
+            def run_publish():
+                try:
+                    with tenant_scope(*TENANT):
+                        s = F()
+                        try:
+                            job = enqueue_job(s, SYNC_USER, cfg, purpose="api")
+                            s.commit()
+                            token = _claim_job(s, job.id, lease_seconds=60)
+                            row = s.get(EvolutionJob, job.id)
+                            _process_single_job(s, row, cfg, token)
+                            s.commit()
+                            s.expire_all()
+                            final = s.get(EvolutionJob, job.id)
+                            outcomes["publish"] = (final.status if final else "deleted",
+                                                   final.error_code if final else "")
+                        except Exception as exc:  # noqa: BLE001
+                            s.rollback()
+                            outcomes["publish"] = ("deleted-or-cancelled", repr(exc))
+                        finally:
+                            s.close()
+                except Exception as exc:  # noqa: BLE001
+                    outcomes["publish"] = ("error", repr(exc))
+
+            def run_apply():
+                try:
+                    cloud.apply_tombstones(batch, auth_tenant=TENANT)
+                    outcomes["apply"] = "applied"
+                except Exception as exc:  # noqa: BLE001
+                    outcomes["apply"] = repr(exc)
+
+            tp = threading.Thread(target=run_publish)
+            ta = threading.Thread(target=run_apply)
+            ta.start()
+            tp.start()
+            ta.join(timeout=60)
+            tp.join(timeout=60)
+            assert "apply" in outcomes and "publish" in outcomes, outcomes
+            assert outcomes["apply"] == "applied", outcomes
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    left = s.query(Belief).filter(Belief.user_id == SYNC_USER).count()
+                    gen = s.execute(
+                        select(DeletionGeneration.generation)
+                        .where(DeletionGeneration.user_id == SYNC_USER)
+                        .order_by(DeletionGeneration.generation.desc())
+                    ).scalars().first()
+                finally:
+                    s.close()
+            assert left == 0, (round_no, outcomes, left)
+            assert gen is not None and gen >= round_no + 1
+        cloud._engine.dispose()
+    finally:
+        edge.dispose()
+        runtime.dispose()
+        _pg_drop_database(main_db, admin_url)

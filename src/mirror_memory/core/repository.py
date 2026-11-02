@@ -91,6 +91,7 @@ def _sanctioned_writer(write_class: str):
         consent_write_scope,
         deletion_write_scope,
         engine_write_scope,
+        sync_write_scope,
         telemetry_write_scope,
     )
 
@@ -100,6 +101,7 @@ def _sanctioned_writer(write_class: str):
         "telemetry": telemetry_write_scope,
         "audit": audit_write_scope,
         "deletion": deletion_write_scope,
+        "sync": sync_write_scope,
     }
     scope = scopes[write_class]
 
@@ -2897,6 +2899,57 @@ def _purge_belief_ledger(session: Session, belief: Belief,
     fingerprints and fingerprints.append(_fingerprint_row("mm_belief_identities", identity))
     session.delete(identity)
     return {"versions": 1, "identities": 1}
+
+
+@_sanctioned_writer("sync")
+def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
+    """Record which cross-device tombstones were applied -- the
+    idempotency key is (origin, origin_seq); rows whose scope no longer
+    exists locally are recorded too (a no-op apply is still an apply).
+    Called only inside the tombstone-application transaction (M4 batch 2
+    task 1): a rolled-back batch leaves no applied record behind."""
+    from mirror_memory.core.models import TombstoneApplied
+
+    for row in rows:
+        session.add(TombstoneApplied(
+            origin=row["origin"], origin_seq=row["origin_seq"],
+            user_id=row["user_id"], scope=row["scope"],
+            scope_key=row.get("scope_key", ""),
+            local_seq=row.get("local_seq"),
+        ))
+    session.flush()
+    return len(rows)
+
+
+def tenant_knows_user(session: Session, user_id: str) -> bool:
+    """Has THIS tenant ever seen *user_id*?  Any of: a memory preference
+    row, a purpose grant, a belief, a users row.  The cloud refuses
+    tombstones for users its authenticated tenant does not know (M4
+    batch 2 task 2); the check reads under the tenant scope, so another
+    tenant's rows for the same user id are invisible."""
+    from mirror_memory.core.models import PurposeGrant, User
+
+    if session.get(MemoryPreference, user_id) is not None:
+        return True
+    if session.scalar(select(Belief.id).where(Belief.user_id == user_id).limit(1)) is not None:
+        return True
+    if session.scalar(select(PurposeGrant.user_id).where(
+            PurposeGrant.user_id == user_id).limit(1)) is not None:
+        return True
+    return session.scalar(select(User.id).where(User.id == user_id).limit(1)) is not None
+
+
+def read_sync_peer(session: Session, peer_db_id: str) -> SyncPeer | None:
+    """The stored peer state (cursor, last catch-up).  A read."""
+    from mirror_memory.core.models import SyncPeer
+
+    return session.get(SyncPeer, (*_tenant_key(), peer_db_id))
+
+
+def _tenant_key() -> tuple[str, str]:
+    from mirror_memory.core.tenancy import current_tenant
+
+    return current_tenant()
 
 
 def belief_by_global_id(session: Session, user_id: str, global_id: str) -> Belief | None:
