@@ -327,6 +327,21 @@ def _reconcile_scoped(session_factory, log: DeletionLog) -> str:
             )
         log.verify_chain(db_id)
         tail_seq, _tail_hash = log.head(db_id)
+        # M4 batch 2 task 4: a restored backup whose watermark lies below
+        # the compaction checkpoint is OLDER than the log's retention --
+        # the pruned entries can never be replayed onto it, and replaying
+        # only the remainder would resurrect deleted content.  Refuse.
+        checkpoint = log.checkpoint_seq(db_id)
+        if applied < checkpoint:
+            from mirror_memory.core.deletion import DeletionLogPruned
+
+            raise DeletionLogPruned(
+                f"the deletion log was compacted through seq {checkpoint}, but "
+                f"this database's watermark is {applied}: the backup is older "
+                "than the log's retention and the pruned deletions can no "
+                "longer be replayed onto it.  Restore a backup taken AFTER "
+                "that checkpoint (and adopt it), or retire this history "
+                "deliberately with a new deployment line.")
         if applied > tail_seq:
             raise DeletionLogStale(
                 f"the deletion log is OLDER than the main database "
@@ -349,6 +364,8 @@ def _reconcile_scoped(session_factory, log: DeletionLog) -> str:
                 return "ok"
             watermark = sm._watermark_table(__import__("sqlalchemy").MetaData())
             for entry in log.read_from(db_id, applied):
+                if entry.scope in ("checkpoint", "genesis"):
+                    continue  # compaction markers carry no deletions
                 apply_entry(session, entry)
                 # the watermark advances in the SAME transaction as the
                 # applied entry: an interruption resumes from here

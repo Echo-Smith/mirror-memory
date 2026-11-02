@@ -73,6 +73,15 @@ class UnhandledDeletionTable(RuntimeError):
     content."""
 
 
+class DeletionLogPruned(RuntimeError):
+    """The main database's watermark lies below the deletion log's
+    compaction checkpoint: the restored backup is OLDER than the log's
+    retention -- the pruned entries can no longer be replayed, and
+    replaying only the remainder would resurrect deleted content.
+    Restore a newer backup (one taken after that checkpoint) and adopt it,
+    or retire the database's history deliberately (new-lineage)."""
+
+
 class ReplayPending(RuntimeError):
     """Another instance is replaying the log onto this database; entries
     are refused until it finishes."""
@@ -169,6 +178,12 @@ class DeletionLog:
         absence means the log was created for a DIFFERENT database."""
         raise NotImplementedError
 
+    def checkpoint_seq(self, db_id: str) -> int:  # pragma: no cover - interface
+        """The seq of the log's compaction checkpoint (0 = none): entries
+        at or below it have been pruned; the entry at that seq lives on
+        only as the checkpoint (its payload is the recorded chain hash)."""
+        raise NotImplementedError
+
     def genesis_entries(self) -> list[tuple[str, object]]:  # pragma: no cover - interface
         """Every genesis entry in the log store as (db_id, created_at) --
         the migration's lineage check (M4 patch 2): a log that holds ANY
@@ -182,9 +197,20 @@ class DeletionLog:
 
     def verify_chain(self, db_id: str) -> None:
         """Walk the whole chain INCLUDING the genesis entry (after_seq = -1
-        reaches seq 0); raise LogChainBroken on any mismatch."""
+        reaches seq 0); raise LogChainBroken on any mismatch.  A
+        checkpoint (compaction) entry carries the hash the chain had at
+        the pruned-through point and is verified as a recorded fact, not
+        recomputed -- the chain continues from its hash."""
         prev = GENESIS_HASH
         for entry in self.read_from(db_id, -1):
+            if entry.scope == "checkpoint":
+                # the link into the kept chain must hold; the checkpoint's
+                # own hash is a recorded fact (its payload was pruned)
+                if entry.prev_hash != prev:
+                    raise LogChainBroken(
+                        f"seq {entry.seq}: checkpoint does not continue the chain")
+                prev = entry.hash
+                continue
             if entry.prev_hash != prev:
                 raise LogChainBroken(f"seq {entry.seq}: prev_hash mismatch")
             if entry.hash != entry.compute_hash():
@@ -346,6 +372,75 @@ class FileDeletionLog(DeletionLog):
             return 0, GENESIS_HASH
         return last.seq, last.hash
 
+    def checkpoint_seq(self, db_id: str) -> int:
+        path = self._path_for(db_id)
+        if not path.exists():
+            return 0
+        best = 0
+        for entry in self._iter_entries(path):
+            if entry.scope == "checkpoint" and entry.seq > best:
+                best = entry.seq
+        return best
+
+    def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
+        """Rewrite the file: the header, the genesis, a CHECKPOINT entry
+        at *before_seq* carrying the chain hash of the last pruned entry,
+        then every entry above it.  The chain continues from the
+        checkpoint's recorded hash; startup verification stays whole.
+        Returns the number of entries removed."""
+        import os
+
+        path = self._path_for(db_id)
+        if not path.exists():
+            return 0
+        with self._locked(path) as fh:
+            entries = [e for e in self._iter_entries(path) if e.scope != "genesis"]
+            genesis_line = None
+            with open(path, "rb") as rf:
+                for line in rf:
+                    record = json.loads(line)
+                    if record.get("scope") == "genesis":
+                        genesis_line = line
+                        break
+            if genesis_line is None:
+                return 0  # no lineage record: never prune a foreign file
+            genesis_hash = json.loads(genesis_line)["hash"]
+            if any(e.scope == "checkpoint" and e.seq >= before_seq for e in entries):
+                return 0  # already compacted through this point (idempotent)
+            keep = [e for e in entries if e.seq > before_seq]
+            chain_at = next((e.hash for e in entries if e.seq == before_seq), None)
+            if chain_at is None:
+                return 0  # nothing at or below before_seq to prune through
+            # the count reports DELETED entries: a subsumed checkpoint is
+            # rewritten, not removed
+            removed = sum(1 for e in entries
+                          if e.seq <= before_seq and e.scope != "checkpoint")
+            if removed <= 0 and not any(e.scope == "checkpoint" for e in entries):
+                return 0
+            checkpoint = DeletionEntry(
+                db_id=db_id, seq=before_seq, tenant_id="", app_id="", user_id="",
+                scope="checkpoint", scope_key="", fingerprints=[],
+                generation=0, purpose=f"pruned through seq {before_seq}",
+                # prev continues the kept chain (the genesis); the hash is
+                # the chain hash AT the pruned-through point -- a recorded
+                # fact, not recomputable (its payload is gone)
+                prev_hash=genesis_hash, hash=chain_at,
+                created_at=datetime.utcnow(),
+            )
+            fh.seek(0)
+            fh.truncate()
+            fh.seek(0, os.SEEK_END)
+            for line in (genesis_line,
+                         (json.dumps(self._line(checkpoint), sort_keys=True,
+                                     ensure_ascii=False) + "\n").encode()):
+                fh.write(line)
+            for e in keep:
+                fh.write((json.dumps(self._line(e), sort_keys=True,
+                                     ensure_ascii=False) + "\n").encode())
+            fh.flush()
+            os.fsync(fh.fileno())
+        return removed
+
     def verify_chain(self, db_id: str) -> None:
         path = self._path_for(db_id)
         if not path.exists():
@@ -368,9 +463,14 @@ class PgDeletionLog(DeletionLog):
     advisory lock (in the LOG database) so the hash chain cannot
     interleave."""
 
-    def __init__(self, url: str | Engine):
+    def __init__(self, url: str | Engine, maintenance_url: str | None = None):
         self._engine: Engine = (
             url if isinstance(url, Engine) else create_engine(url)
+        )
+        # compaction (prune) DELETES rows: the app role holds INSERT/SELECT
+        # only, so the prune runs on a separate maintenance connection
+        self._maintenance_engine: Engine | None = (
+            create_engine(maintenance_url) if maintenance_url else None
         )
         self._verified: set[str] = set()
 
@@ -493,6 +593,62 @@ class PgDeletionLog(DeletionLog):
                 "WHERE scope = 'genesis' ORDER BY created_at, db_id")).all()
         return [(str(r[0]), r[1]) for r in rows]
 
+    def checkpoint_seq(self, db_id: str) -> int:
+        self._ensure_schema()
+        with self._engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT max(seq) FROM mm_deletion_log "
+                "WHERE db_id = :db AND scope = 'checkpoint'"), {"db": db_id}).first()
+        return int(row[0] or 0) if row and row[0] is not None else 0
+
+    def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
+        """Delete the entries at or below *before_seq* (never the genesis)
+        and write the checkpoint row that carries the chain hash at that
+        point.  The DELETE runs on the MAINTENANCE connection (the app role
+        has no DELETE -- the log is append-only for it); the checkpoint is
+        inserted there too, in the same transaction.  Returns the number
+        of entries removed."""
+        if self._maintenance_engine is None:
+            raise RuntimeError(
+                "the deletion log cannot be compacted: no maintenance "
+                "connection is configured (deletion_log.maintenance_url) -- "
+                "the app role has no DELETE on the log table")
+        if self.checkpoint_seq(db_id) >= before_seq:
+            return 0  # already compacted through this point (idempotent)
+        self._ensure_schema()
+        engine = self._maintenance_engine
+        with engine.begin() as conn:
+            chain = conn.execute(text(
+                "SELECT hash FROM mm_deletion_log "
+                "WHERE db_id = :db AND seq = :s"), {"db": db_id, "s": before_seq}).first()
+            if chain is None:
+                return 0
+            # the checkpoint's prev continues the KEPT chain (the genesis);
+            # its own hash is the recorded chain hash at the pruned point
+            genesis = conn.execute(text(
+                "SELECT hash FROM mm_deletion_log "
+                "WHERE db_id = :db AND seq = 0"), {"db": db_id}).first()
+            prev = genesis[0] if genesis else chain[0]
+            already = conn.execute(text(
+                "SELECT 1 FROM mm_deletion_log "
+                "WHERE db_id = :db AND seq = :s AND scope = 'checkpoint'"),
+                {"db": db_id, "s": before_seq}).first()
+            if already:
+                return 0
+            removed = conn.execute(text(
+                "DELETE FROM mm_deletion_log WHERE db_id = :db "
+                "AND seq BETWEEN 1 AND :s AND scope <> 'checkpoint'"),
+                {"db": db_id, "s": before_seq}).rowcount
+            conn.execute(text(
+                "INSERT INTO mm_deletion_log (db_id, seq, tenant_id, app_id, "
+                "user_id, scope, scope_key, fingerprints_json, generation, "
+                "purpose, prev_hash, hash) VALUES (:db, :s, '', '', '', "
+                "'checkpoint', '', '[]', 0, :purpose, :prev, :hash)"),
+                {"db": db_id, "s": before_seq,
+                 "purpose": f"pruned through seq {before_seq}",
+                 "prev": prev, "hash": chain[0]})
+        return int(removed or 0)
+
     def ensure_genesis(self, db_id: str) -> None:
         if self.has_genesis(db_id):
             return
@@ -553,13 +709,19 @@ def deletion_log_from_config(settings, database_url: str) -> "DeletionLog | None
     invalid configuration (missing url / missing directory for a server
     database); returns ``None`` only for ``backend="none"``.
     """
+    if settings.retention_days < settings.backup_retention_days:
+        raise ValueError(
+            f"deletion_log.retention_days ({settings.retention_days}) is "
+            f"shorter than backup_retention_days ({settings.backup_retention_days}): "
+            "a log pruned before the backups it protects can no longer replay "
+            "them -- raise the retention or lower the backup retention")
     if settings.backend == "none":
         return None
     if settings.backend == "postgres":
         url = settings.url
         if not url:
             raise ValueError("deletion_log.backend=postgres requires deletion_log.url")
-        return PgDeletionLog(url)
+        return PgDeletionLog(url, maintenance_url=settings.maintenance_url or None)
     if settings.directory:
         return FileDeletionLog(settings.directory)
     if not database_url.startswith(

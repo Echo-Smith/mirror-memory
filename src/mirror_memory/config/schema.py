@@ -442,10 +442,32 @@ class DeletionLogConfig(BaseModel):
     retention_days: int = Field(
         default=35, ge=1,
         description=(
-            "How long deletion entries must be kept.  Must not be shorter than "
-            "the backup retention (a log older than the backups it protects "
-            "cannot replay them).  Enforcement (pruning) lands with log "
-            "compaction in a later batch -- entries are never deleted now."
+            "How long deletion entries are kept before compaction prunes "
+            "them (a checkpoint entry carries the chain forward).  Must "
+            "not be shorter than backup_retention_days: a log pruned "
+            "before the backups it protects can no longer replay them."
+        ),
+    )
+    backup_retention_days: int = Field(
+        default=30, ge=1,
+        description=(
+            "How long backups of the main database are kept (M4 batch 2 "
+            "task 4): the deletion log's retention must cover the backup "
+            "retention, and startup refuses a configuration that prunes "
+            "the log before the oldest replayable backup."
+        ),
+    )
+    prune_interval_seconds: int = Field(
+        default=86_400, ge=1,
+        description="How often the background compaction pass runs.",
+    )
+    maintenance_url: str = Field(
+        default="",
+        description=(
+            'Connection string for compaction of the "postgres" log '
+            "backend: pruning DELETES rows, and the app role holds "
+            "INSERT/SELECT only, so the prune runs on this (maintenance) "
+            "connection.  Empty = compaction is not available."
         ),
     )
 

@@ -64,11 +64,75 @@ def purge_expired_audit(session_factory: Any, config: Any, *, now: float | None 
     return total
 
 
-def next_due(state: dict[str, float], config: Any, *, now: float | None = None) -> bool:
+def next_due(state: dict[str, float], config: Any, *, now: float | None = None,
+             interval_seconds: int | None = None) -> bool:
     """Is the maintenance pass due?  *state* is the worker loop's small
     dict (``{"next": monotonic}``); the first call is always due."""
+    if interval_seconds is None:
+        interval_seconds = config.access_audit.purge_interval_seconds
     current = time.monotonic() if now is None else now
     if current >= state.get("next", 0.0):
-        state["next"] = current + config.access_audit.purge_interval_seconds
+        state["next"] = current + interval_seconds
         return True
     return False
+
+
+def prune_deletion_log(config: Any, log, db_id: str) -> int:
+    """The deletion-log compaction pass (M4 batch 2 task 4): prune every
+    entry older than ``deletion_log.retention_days`` through a checkpoint,
+    so the hash chain stays verifiable and replay remains possible for
+    every backup within ``backup_retention_days``.  On the PostgreSQL
+    backend the DELETE executes on the log's maintenance connection (the
+    app role has no DELETE).  Returns the number of entries removed."""
+    from datetime import datetime, timedelta
+
+    retention = config.deletion_log.retention_days
+    cutoff = datetime.utcnow() - timedelta(days=retention)
+    head_seq, _hash = log.head(db_id)
+    if head_seq == 0:
+        return 0
+    # prune THROUGH the newest entry outside the retention window; entries
+    # carry created_at (the checkpoint and genesis never travel)
+    through = 0
+    for entry in log.read_from(db_id, 0):
+        if entry.scope in ("genesis", "checkpoint"):
+            continue
+        created = entry.created_at
+        if created is not None and created >= cutoff:
+            break
+        through = entry.seq
+    if through <= 0:
+        return 0
+    return int(log.prune(db_id, through) or 0)
+
+
+def prune_deletion_log(config: Any, log, db_id: str, *, now=None) -> int:
+    """The deletion-log compaction pass (M4 batch 2 task 4): prune every
+    entry older than ``deletion_log.retention_days`` through a checkpoint,
+    so the hash chain stays verifiable and replay remains possible for
+    every backup within ``backup_retention_days``.  Runs on the worker's
+    maintenance cadence; on the PostgreSQL backend the DELETE executes on
+    the log's maintenance connection (the app role has no DELETE)."""
+    from datetime import datetime, timedelta
+
+    from mirror_memory.core.deletion import DeletionEntry
+
+    retention = config.deletion_log.retention_days
+    cutoff = datetime.utcnow() - timedelta(days=retention)
+    head_seq, _hash = log.head(db_id)
+    if head_seq == 0:
+        return 0
+    # the newest entry still inside the retention window: prune THROUGH
+    # the seq before it (entries carry created_at; the checkpoint is not
+    # a deletion and is never re-pruned)
+    through = 0
+    for entry in log.read_from(db_id, 0):
+        if entry.scope in ("genesis", "checkpoint"):
+            continue
+        created = entry.created_at
+        if created is not None and created >= cutoff:
+            break
+        through = entry.seq
+    if through <= 0:
+        return 0
+    return int(log.prune(db_id, through) or 0)

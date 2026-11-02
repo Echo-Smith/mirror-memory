@@ -167,3 +167,36 @@ def test_embedded_and_cloud_logs_share_the_entry_format(log_db_url, tmp_path):
     assert pe.prev_hash != GENESIS_HASH  # chains from the written genesis
     file_log.verify_chain(entry.db_id)
     pg_log.verify_chain(entry.db_id)
+
+
+def test_prune_runs_on_the_maintenance_connection(log_db_url):
+    """Compaction DELETES rows: without a maintenance connection it
+    refuses (the app role has no DELETE); with one it prunes through the
+    checkpoint and the chain stays verifiable."""
+    from datetime import datetime
+
+    from mirror_memory.core.deletion import DeletionEntry, PgDeletionLog
+
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    for i in range(1, 5):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="api", created_at=datetime(2020, 1, i),
+        ))
+
+    app_only = PgDeletionLog(log_db_url)
+    with pytest.raises(RuntimeError, match="maintenance"):
+        app_only.prune(db_id, 2)
+
+    maint_url = log_db_url  # the test's server login IS the maintainer
+    with_maint = PgDeletionLog(log_db_url, maintenance_url=maint_url)
+    assert with_maint.prune(db_id, 2) == 2
+    assert with_maint.checkpoint_seq(db_id) == 2
+    assert with_maint.has_genesis(db_id)
+    assert [e.seq for e in with_maint.read_from(db_id, 2)] == [3, 4]
+    with_maint.verify_chain(db_id)
+    # idempotent: pruning through the same point again removes nothing
+    assert with_maint.prune(db_id, 2) == 0
+    with_maint.verify_chain(db_id)
