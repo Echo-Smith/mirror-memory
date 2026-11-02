@@ -450,6 +450,38 @@ class DeletionLogConfig(BaseModel):
     )
 
 
+class SyncConfig(BaseModel):
+    """Cross-device tombstone synchronization (M4 batch 2 task 3): the
+    edge pulls and applies the cloud's tombstones until the cloud's tail
+    before it serves.  The transport itself is injected by the host (this
+    batch is interface + application logic only)."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether this engine catches up against a sync peer at startup.",
+    )
+    offline_grace_days: int = Field(
+        default=7, ge=0,
+        description=(
+            "How long the edge keeps serving after it last caught up "
+            "successfully (a failed catch-up at startup is an offline "
+            "grace, not a refusal).  Past the grace, read entries refuse "
+            "with SyncCatchupRequired until the next successful catch-up.  "
+            "Measured from the last successful catch-up stored in the main "
+            "database -- a restored backup rewinds it, expiring the grace "
+            "sooner, which is correct."
+        ),
+    )
+    reminder_days: int = Field(
+        default=2, ge=0,
+        description=(
+            "sync_status() carries a reminder flag once the remaining "
+            "grace is at or below this many days, so the product can ask "
+            "the user to go online before the refusal hits."
+        ),
+    )
+
+
 class MemoryConfig(BaseModel):
     """Root configuration object assembled from multiple YAML files.
 
@@ -470,6 +502,7 @@ class MemoryConfig(BaseModel):
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     access_audit: AccessAuditConfig = Field(default_factory=AccessAuditConfig)
     deletion_log: DeletionLogConfig = Field(default_factory=DeletionLogConfig)
+    sync: SyncConfig = Field(default_factory=SyncConfig)
     question_value_tiers: dict[str, int] = Field(
         default_factory=dict,
         description="Dimension -> priority tier for verification question candidates "

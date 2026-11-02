@@ -240,3 +240,10 @@ writers:
       (MemoryEngine.apply_tombstones).
     callers:
       - mirror_memory.api
+  record_catchup:
+    reason: >
+      Advances the per-peer consumed cursor and stamps the last successful
+      catch-up instant (the offline grace period measures from it).  Called
+      only by the edge engine's catch-up path (MemoryEngine._catch_up).
+    callers:
+      - mirror_memory.api

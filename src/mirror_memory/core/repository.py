@@ -2921,6 +2921,24 @@ def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
     return len(rows)
 
 
+@_sanctioned_writer("sync")
+def record_catchup(session: Session, peer_db_id: str, cursor: int) -> None:
+    """Advance the peer's consumed cursor and stamp the catch-up instant
+    (the offline grace period measures from it).  Called from the edge's
+    catch-up path only (M4 batch 2 task 3)."""
+    from mirror_memory.core.tenancy import current_tenant
+    from mirror_memory.core.models import SyncPeer
+
+    tenant_id, app_id = current_tenant()
+    row = session.get(SyncPeer, (tenant_id, app_id, peer_db_id))
+    if row is None:
+        row = SyncPeer(peer_db_id=peer_db_id, cursor=cursor)
+        session.add(row)
+    row.cursor = cursor
+    row.last_catchup_at = datetime.utcnow()
+    session.flush()
+
+
 def tenant_knows_user(session: Session, user_id: str) -> bool:
     """Has THIS tenant ever seen *user_id*?  Any of: a memory preference
     row, a purpose grant, a belief, a users row.  The cloud refuses

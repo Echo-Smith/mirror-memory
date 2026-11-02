@@ -19,6 +19,8 @@ Usage::
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+import threading
 import tempfile
 import time
 from contextlib import contextmanager
@@ -63,6 +65,41 @@ class Authorized(NamedTuple):
     grant_version: int | None
 
 
+
+# ---------------------------------------------------------------------------
+# Sync channel errors (M4 batch 2 task 3) -- distinct from replay mode and
+# from the deletion-log errors, so the product can tell them apart
+# ---------------------------------------------------------------------------
+
+class SyncCatchingUp(RuntimeError):
+    """Entries are refused while the edge is catching up against its
+    peer (the tombstone application is in progress)."""
+
+    def __init__(self):
+        super().__init__(
+            "memory sync is catching up with the peer; entries are "
+            "refused until it finishes -- retry shortly")
+
+class SyncCatchupRequired(RuntimeError):
+    """Read entries are refused: the edge has not caught up with the
+    peer for longer than the offline grace period.  Carries the last
+    successful catch-up and a sentence the product can show the user."""
+
+    def __init__(self, last_catchup_at, message: str | None = None):
+        import datetime as _dt
+
+        shown = (last_catchup_at.isoformat(timespec="minutes")
+                 if last_catchup_at else "never")
+        user_friendly = message or (
+            "此设备已超过允许的离线时间，需要联网同步后才能继续查看记忆。")
+        super().__init__(
+            f"the last successful sync catch-up was at {shown}: the "
+            "offline grace period has expired, read entries are refused "
+            "until a catch-up succeeds")
+        self.last_catchup_at = last_catchup_at
+        self.user_message = user_friendly
+
+
 class MemoryEngine:
     """Structured memory engine for AI agents.
 
@@ -105,6 +142,7 @@ class MemoryEngine:
         schema_ready: bool = False,
         default_purpose: str | None = None,
         deletion_log: "DeletionLog | None | object" = _DELETION_LOG_DEFAULT,
+        sync_transport: Any | None = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -114,6 +152,13 @@ class MemoryEngine:
             raise ValueError("Provide either config_path or config")
 
         self._database_url = database_url
+        # M4 batch 2 task 3: the in-process transport to the sync peer (an
+        # object with .db_id and .export_tombstones(cursor, limit,
+        # peer_db_id)); the network is the host's business
+        self._sync_transport = sync_transport
+        self._sync_state = "normal"  # normal / catching_up / offline_grace / expired
+        self._sync_attempt_failed = False
+        self._sync_lock = threading.Lock()
         self._llm_client = llm_client or self._build_llm(llm_api_key, llm_model, llm_base_url)
         # M1 tenancy: the engine entry point pins an explicit tenant; every
         # session it opens is created inside that scope and therefore bound
@@ -237,6 +282,9 @@ class MemoryEngine:
 
             set_single_tenant_mode(True)
         self._initialized = True
+        # M4 batch 2 task 3: an edge with sync enabled catches up against
+        # its peer BEFORE any entry serves (entries are gated meanwhile)
+        self._catch_up_at_startup()
 
     def _verify_single_tenant_startup(self) -> None:
         """Fail-closed startup checks for end-side single-tenant mode.
@@ -491,6 +539,7 @@ class MemoryEngine:
             raise ValidationError("text exceeds maximum length of 50000 characters")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         pipeline = self._get_pipeline()
         started = time.monotonic()
         with self._session() as session:
@@ -560,6 +609,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.render.renderer import render_memory_block_with_ids
 
         started = time.monotonic()
@@ -664,6 +714,7 @@ class MemoryEngine:
             raise ValidationError(f"language must be 'zh' or 'en', got '{language}'")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.render.panel import build_panel
 
         with self._session() as session:
@@ -705,6 +756,7 @@ class MemoryEngine:
             raise ValidationError("limit must be between 1 and 200")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.core.repository import list_active_beliefs
 
         with self._session() as session:
@@ -1025,6 +1077,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         with self._session() as session:
             counts, _entry = self._delete_user_in(session, user_id, purpose)
             session.commit()
@@ -1070,6 +1123,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         with self._session() as session:
             committed, _entry = self._forget_belief_in(session, user_id, belief_id, purpose)
             session.commit()
@@ -1137,6 +1191,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         from mirror_memory.core.models import Belief
         from mirror_memory.core.proposal import (
             TRANSITION_TIER_TRANSITION,
@@ -1189,6 +1244,7 @@ class MemoryEngine:
             raise ValidationError("session_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         with self._session() as session:
             result, _entry = self._forget_session_in(session, user_id, session_id, purpose)
             session.commit()
@@ -1379,6 +1435,140 @@ class MemoryEngine:
             origin=entry.origin, origin_seq=entry.origin_seq)
         return log_entry.seq if committed and log_entry is not None else None
 
+    # ------------------------------------------------------------------
+    # Edge catch-up against the sync peer (M4 batch 2 task 3)
+    # ------------------------------------------------------------------
+
+    def _catch_up(self) -> None:
+        """Pull and apply the peer's tombstones until the peer's tail.
+        State transitions: catching_up -> normal on success;
+        catching_up -> offline_grace / expired on a transport failure,
+        measured from the last successful catch-up (stored in the main
+        database -- a restored backup rewinds it and expires the grace
+        sooner).  Re-entrant and cursor-resumable: the peer cursor lives
+        in mm_sync_peers, applied tombstones are skipped idempotently."""
+        from mirror_memory.core import metrics
+        from mirror_memory.core.repository import read_sync_peer, record_catchup
+
+        if self._sync_transport is None:
+            return
+        with self._sync_lock:
+            previous = self._sync_state
+            self._sync_state = "catching_up"
+            try:
+                peer_db_id = getattr(self._sync_transport, "db_id", "")
+                with self._session() as session:
+                    peer = read_sync_peer(session, peer_db_id)
+                    cursor = peer.cursor if peer is not None else 0
+                while True:
+                    entries, next_cursor = self._sync_transport.export_tombstones(
+                        cursor, 500, peer_db_id=self._db_id)
+                    if not entries:
+                        break
+                    self.apply_tombstones(entries, purpose="sync")
+                    cursor = next_cursor
+                    # the cursor is durable after EVERY applied batch: an
+                    # interrupted catch-up resumes where this one got to
+                    with self._session() as session:
+                        record_catchup(session, peer_db_id, cursor)
+                        session.commit()
+                # reaching the peer's tail IS a successful catch-up even
+                # when nothing was pending: stamp the instant
+                with self._session() as session:
+                    record_catchup(session, peer_db_id, cursor)
+                    session.commit()
+                self._sync_state = "normal"
+                self._sync_attempt_failed = False
+            except (ConnectionError, TimeoutError) as exc:
+                self._sync_attempt_failed = True
+                self._sync_state = self._grace_state()
+                logger.warning(
+                    "sync catch-up failed (%s); state=%s", exc, self._sync_state)
+            # any other exception propagates (a bad batch is a real problem,
+            # not an offline condition) with the state left at catching_up
+            # -- entries refuse until it is resolved
+
+    def _grace_status(self) -> dict:
+        """The offline-grace arithmetic from the stored last catch-up."""
+        from mirror_memory.core.repository import read_sync_peer
+
+        grace_days = self._config.sync.offline_grace_days
+        reminder_days = self._config.sync.reminder_days
+        with self._session() as session:
+            peer = read_sync_peer(session, getattr(self._sync_transport, "db_id", ""))
+            last = peer.last_catchup_at if peer is not None else None
+        now = datetime.utcnow()
+        if last is None:
+            return {"state": "expired", "last_catchup_at": None,
+                    "remaining_grace_days": 0.0, "reminder": True}
+        remaining = grace_days - (now - last).total_seconds() / 86400.0
+        expired = remaining <= 0
+        return {"state": "expired" if expired else "normal",
+                "last_catchup_at": last,
+                "remaining_grace_days": max(0.0, round(remaining, 3)),
+                "reminder": remaining <= reminder_days,
+                "expired": expired}
+
+    def _grace_state(self) -> str:
+        """The service state after a FAILED catch-up attempt: expired when
+        the grace is out (or was never earned), offline_grace while within
+        it, and expired sticks when it already was."""
+        status = self._grace_status()
+        if status["state"] == "expired" or self._sync_state == "expired":
+            return "expired"
+        return "offline_grace"
+
+    def sync_status(self) -> dict:
+        """The user-facing synchronization state (M4 batch 2 task 3):
+        last successful catch-up, remaining grace days, the state (normal
+        / catching_up / offline_grace / expired) and a reminder flag once
+        the remaining grace is at or below sync.reminder_days."""
+        self._ensure_db()
+        if self._config.sync.enabled and self._sync_transport is not None:
+            status = self._grace_status()
+            if self._sync_state == "catching_up":
+                status["state"] = "catching_up"
+            elif self._sync_attempt_failed and self._sync_state in ("offline_grace", "expired"):
+                status["state"] = self._sync_state
+            return status
+        return {"state": "disabled", "last_catchup_at": None,
+                "remaining_grace_days": None, "reminder": False}
+
+    def _sync_gate(self, *, read: bool) -> None:
+        """Entry-point gate (M4 batch 2 task 3): refuse while catching up
+        (all entries, like replay mode), refuse reads when the offline
+        grace has expired -- and RE-ATTEMPT the catch-up first, so coming
+        back online restores service without a restart."""
+        if not (self._config.sync.enabled and self._sync_transport is not None):
+            return
+        if self._sync_state == "catching_up":
+            raise SyncCatchingUp()
+        if self._sync_state in ("expired", "offline_grace") and self._sync_attempt_failed:
+            # one re-attempt per entry: a working link heals immediately,
+            # no restart needed
+            try:
+                self._catch_up()
+            except (ConnectionError, TimeoutError):
+                pass
+        if self._sync_state == "expired" and read:
+            with self._session() as session:
+                from mirror_memory.core.repository import read_sync_peer
+
+                peer = read_sync_peer(session, getattr(self._sync_transport, "db_id", ""))
+                last = peer.last_catchup_at if peer is not None else None
+            raise SyncCatchupRequired(last)
+
+    def _catch_up_at_startup(self) -> None:
+        """The startup catch-up: before any entry serves, the edge pulls
+        and applies the peer's tombstones until the peer's tail."""
+        if not (self._config.sync.enabled and self._sync_transport is not None):
+            return
+        try:
+            self._catch_up()
+        except (ConnectionError, TimeoutError):
+            pass  # the grace arithmetic decided the state; entries are gated
+
+
     def correct(
         self,
         *,
@@ -1410,6 +1600,7 @@ class MemoryEngine:
             raise ValidationError("new_claim_text must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         from mirror_memory.core.proposal import (
             TRANSITION_CORRECT,
             StateTransitionProposal,
@@ -1483,6 +1674,7 @@ class MemoryEngine:
         if not user_id or not user_id.strip():
             raise ValidationError("user_id must be a non-empty string")
         self._ensure_db()
+        self._sync_gate(read=True)
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "export", audit_entry=ENTRY_EXPORT_PAGE)
             rule = provenance.visibility(session, user_id, authorized.purpose)
@@ -1568,6 +1760,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.core.repository import explain_belief
 
         with self._session() as session:
