@@ -69,13 +69,22 @@ writers:
       - mirror_memory.api
       - mirror_memory.worker.maintenance
 
-  # ---- deletion class: the deletion-generation counter (M4, reviewer 待评审) ----
+  # ---- deletion class: the deletion-generation counter (M4; reviewed
+  # 2026-11-02 by Echo-Smith) ----
+  # Reviewed 2026-11-02 by Echo-Smith: the write class "deletion" covers
+  # mm_deletion_generations only.  Two openers: this sanctioned writer
+  # (the forget paths) and the replayer's inline deletion_write_scope in
+  # core/replay.py (generation alignment to the log) -- the latter is
+  # registered in the inline-scope inventory (tests/test_writer_callers.py).
   bump_deletion_generation:
     reason: >
       Advances the user's deletion generation by inserting the next value;
       the composite primary key is the compare-and-swap.  Called by the
-      forget paths inside their deletion transaction and by the replayer
-      (generation alignment to the log).
+      forget paths (forget_belief / delete_user_memories) inside their
+      deletion transaction.  The replayer does NOT call it: it aligns the
+      generation to the log through its own inline deletion_write_scope.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-11-02"
     callers:
       - mirror_memory.core.repository
 
