@@ -342,6 +342,13 @@ def _reconcile_scoped(session_factory, log: DeletionLog) -> str:
                 "longer be replayed onto it.  Restore a backup taken AFTER "
                 "that checkpoint (and adopt it), or retire this history "
                 "deliberately with a new deployment line.")
+        # M4 batch 2 task 5: the operational gauges -- where the replay
+        # stands and whether one is in progress (exported by the
+        # maintenance endpoint / scraped from core.metrics.gauges())
+        from mirror_memory.core import metrics
+
+        metrics.set_gauge(metrics.REPLAY_TAIL_SEQ, tail_seq)
+        metrics.set_gauge(metrics.REPLAY_ACTIVE, 0.0)
         if applied > tail_seq:
             raise DeletionLogStale(
                 f"the deletion log is OLDER than the main database "
@@ -363,16 +370,21 @@ def _reconcile_scoped(session_factory, log: DeletionLog) -> str:
             if applied >= tail_seq:
                 return "ok"
             watermark = sm._watermark_table(__import__("sqlalchemy").MetaData())
+            from mirror_memory.core import metrics as _m
+
+            _m.set_gauge(_m.REPLAY_ACTIVE, 1.0)
             for entry in log.read_from(db_id, applied):
                 if entry.scope in ("checkpoint", "genesis"):
                     continue  # compaction markers carry no deletions
                 apply_entry(session, entry)
+                _m.set_gauge(_m.REPLAY_CURRENT_SEQ, entry.seq)
                 # the watermark advances in the SAME transaction as the
                 # applied entry: an interruption resumes from here
                 session.execute(
                     watermark.update().where(watermark.c.id == 1)
                     .values(applied_seq=entry.seq))
                 session.commit()
+        _m.set_gauge(_m.REPLAY_ACTIVE, 0.0)
         logger.warning(
             "deletion replay: applied entries up to seq %d (watermark was %d)",
             tail_seq, applied)

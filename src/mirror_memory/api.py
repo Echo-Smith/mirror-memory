@@ -1455,6 +1455,9 @@ class MemoryEngine:
         with self._sync_lock:
             previous = self._sync_state
             self._sync_state = "catching_up"
+            from mirror_memory.core import metrics
+
+            metrics.set_gauge(metrics.SYNC_CATCHING_UP, 1.0)
             try:
                 peer_db_id = getattr(self._sync_transport, "db_id", "")
                 with self._session() as session:
@@ -1479,6 +1482,7 @@ class MemoryEngine:
                     session.commit()
                 self._sync_state = "normal"
                 self._sync_attempt_failed = False
+                metrics.set_gauge(metrics.SYNC_CATCHING_UP, 0.0)
             except (ConnectionError, TimeoutError) as exc:
                 self._sync_attempt_failed = True
                 self._sync_state = self._grace_state()
@@ -1503,6 +1507,13 @@ class MemoryEngine:
                     "remaining_grace_days": 0.0, "reminder": True}
         remaining = grace_days - (now - last).total_seconds() / 86400.0
         expired = remaining <= 0
+        from mirror_memory.core import metrics
+
+        metrics.set_gauge(
+            metrics.SYNC_SINCE_LAST_CATCHUP_SECONDS,
+            (now - last).total_seconds())
+        metrics.set_gauge(metrics.SYNC_CATCHING_UP,
+                          1.0 if self._sync_state == "catching_up" else 0.0)
         return {"state": "expired" if expired else "normal",
                 "last_catchup_at": last,
                 "remaining_grace_days": max(0.0, round(remaining, 3)),

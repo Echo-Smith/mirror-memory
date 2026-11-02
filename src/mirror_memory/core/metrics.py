@@ -15,6 +15,7 @@ import threading
 
 _lock = threading.Lock()
 _counters: dict[str, int] = {}
+_gauges: dict[str, float] = {}
 
 #: A request (engine entry or worker job) was refused for having no purpose.
 MISSING_PURPOSE = "missing_purpose_refusals"
@@ -45,6 +46,31 @@ def value(name: str) -> int:
         return _counters.get(name, 0)
 
 
+#: Gauges (M4 batch 2 task 5): the current VALUE of a state -- the replay
+#: progress, the sync mode, the age of the last catch-up -- as opposed to
+#: the monotone counters above.
+REPLAY_CURRENT_SEQ = "deletion_replay_current_seq"
+REPLAY_TAIL_SEQ = "deletion_replay_tail_seq"
+REPLAY_ACTIVE = "deletion_replay_active"  # 1 while a replay is in progress
+SYNC_CATCHING_UP = "sync_catching_up"  # 1 while the edge is catching up
+SYNC_SINCE_LAST_CATCHUP_SECONDS = "sync_since_last_catchup_seconds"
+
+
+def set_gauge(name: str, value: float) -> None:
+    with _lock:
+        _gauges[name] = float(value)
+
+
+def gauge(name: str) -> float | None:
+    with _lock:
+        return _gauges.get(name)
+
+
 def snapshot() -> dict[str, int]:
     with _lock:
         return dict(_counters)
+
+
+def gauges() -> dict[str, float]:
+    with _lock:
+        return dict(_gauges)
