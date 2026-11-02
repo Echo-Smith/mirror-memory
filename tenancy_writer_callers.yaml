@@ -70,8 +70,8 @@ writers:
       - mirror_memory.worker.maintenance
 
   # ---- deletion class: the deletion-generation counter (M4; reviewed
-  # 2026-11-02 by Echo-Smith) ----
-  # Reviewed 2026-11-02 by Echo-Smith: the write class "deletion" covers
+  # 2026-11-01 by Echo-Smith) ----
+  # Reviewed 2026-11-01 by Echo-Smith: the write class "deletion" covers
   # mm_deletion_generations only.  Two openers: this sanctioned writer
   # (the forget paths) and the replayer's inline deletion_write_scope in
   # core/replay.py (generation alignment to the log) -- the latter is
@@ -84,7 +84,7 @@ writers:
       deletion transaction.  The replayer does NOT call it: it aligns the
       generation to the log through its own inline deletion_write_scope.
     reviewed_by: Echo-Smith
-    reviewed_at: "2026-11-02"
+    reviewed_at: "2026-11-01"
     callers:
       - mirror_memory.core.repository
 
