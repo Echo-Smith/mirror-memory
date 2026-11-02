@@ -101,3 +101,29 @@
     batched.  Reached from the worker loop's periodic maintenance pass.
   reviewer: Echo-Smith
   reviewed_at: "2026-10-30"
+
+- module: mirror_memory.core.schema_migration
+  function: _count_unfilled_global_ids
+  reason: >
+    M4 batch 2 step 12: counts beliefs without a global_id across all
+    tenants -- the step's needed()/verify() probe.  Called only from
+    upgrade_database (Step12BeliefGlobalId).
+  reviewer: 待评审
+
+- module: mirror_memory.core.schema_migration
+  function: _backfill_global_ids
+  reason: >
+    M4 batch 2 step 12: batched backfill of mm_beliefs.global_id with a
+    database-minted UUID per row (NULL or the '' marker), composite keys
+    matched as a row value, one transaction per batch.  Called only from
+    Step12BeliefGlobalId.apply.
+  reviewer: 待评审
+
+- module: mirror_memory.core.schema_migration
+  function: _build_global_id_index
+  reason: >
+    M4 batch 2 step 12: CREATE UNIQUE INDEX CONCURRENTLY on
+    mm_beliefs(tenant_id, app_id, global_id) -- catalog DDL over the whole
+    table, no tenant to scope it to (the step-5 index pattern).  Called
+    only from Step12BeliefGlobalId.apply on PostgreSQL.
+  reviewer: 待评审

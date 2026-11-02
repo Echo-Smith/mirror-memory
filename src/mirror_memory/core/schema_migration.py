@@ -2041,6 +2041,183 @@ class Step11DeletionReplay:
                 id=1, db_id=_uuid.uuid4().hex, applied_seq=0))
 
 
+
+# ---------------------------------------------------------------------------
+# Step 12: the belief's global identity (M4 batch 2 task 0)
+# ---------------------------------------------------------------------------
+
+GLOBAL_ID_INDEX = "uq_mm_beliefs_global_id"
+
+
+def _global_id_index(concurrently: bool) -> Index:
+    """The unique (tenant, app, global_id) index -- the migration builds
+    exactly the model's constraint by name, so schema parity holds; built
+    on a detached table copy for the same reason as _pkey_build_index."""
+    table = Base.metadata.tables["mm_beliefs"].to_metadata(MetaData())
+    return Index(
+        GLOBAL_ID_INDEX,
+        table.c.tenant_id, table.c.app_id, table.c.global_id,
+        unique=True,
+        postgresql_concurrently=concurrently,
+    )
+
+
+def _count_unfilled_global_ids(engine: Engine) -> int:
+    """Beliefs without a global_id (NULL or the '' marker), across all
+    tenants -- the step's needed()/verify() probe (migration scope)."""
+    table = _live_table(engine, "mm_beliefs")
+    if table is None:
+        return 0
+    with system_scope(reason=_MIGRATION_REASON):
+        with engine.connect() as conn:
+            return conn.execute(
+                select(func.count()).select_from(table).where(
+                    table.c.global_id.is_(None) | (table.c.global_id == ""))
+            ).scalar_one()
+
+
+def _build_global_id_index(engine: Engine, state: str | None) -> None:
+    """CREATE UNIQUE INDEX CONCURRENTLY on PostgreSQL (outside any
+    transaction; an INVALID leftover is dropped first).  Catalog DDL over
+    the whole table -- no tenant to scope it to (migration scope)."""
+    index = _global_id_index(concurrently=True)
+    elements: list = [_lock_timeout_element()]
+    if state == "invalid":
+        elements.append(DropIndex(index, if_exists=True))
+    elements.append(CreateIndex(index))
+    with system_scope(reason=_MIGRATION_REASON):
+        _DDLPlan(elements, autocommit=True).run(engine)
+
+
+def _backfill_global_ids(engine: Engine, batch: int) -> int:
+    """Batched, re-entrant: every row whose global_id is NULL or '' gets a
+    fresh UUID minted BY THE DATABASE (one per row -- a bound literal would
+    stamp the same value on the whole batch).  One transaction per batch,
+    composite keys matched as a row value, like _backfill_column."""
+    from sqlalchemy import literal_column
+
+    table = _live_table(engine, "mm_beliefs")
+    if table is None:
+        return 0
+    pk = list(table.primary_key.columns)
+    key = pk[0] if len(pk) == 1 else tuple_(*pk)
+    if _is_postgres(engine):
+        fresh = literal_column("replace(gen_random_uuid()::text, '-', '')")
+    else:
+        fresh = literal_column("lower(hex(randomblob(16)))")
+    missing = table.c.global_id.is_(None) | (table.c.global_id == "")
+    total = 0
+    while True:
+        batch_keys = select(*pk).where(missing).limit(batch)
+        stmt = update(table).where(key.in_(batch_keys)).values(global_id=fresh)
+        with system_scope(reason=_MIGRATION_REASON):
+            with engine.begin() as conn:
+                result = conn.execute(stmt)
+                if result.rowcount == 0:
+                    return total
+                total += result.rowcount
+
+
+class Step12BeliefGlobalId:
+    """``mm_beliefs.global_id``: a UUID minted at creation, unique per
+    (tenant, app) -- the identity a tombstone carries across devices
+    (the integer id is local: restores and other devices reuse it).
+
+    The M2 big-table strategy, re-entrant at every stage (step 11's
+    lesson: ``needed()`` looks at the FULL set of artifacts, so an
+    interrupted run resumes instead of being skipped):
+
+    PostgreSQL: ADD COLUMN nullable -> batched backfill (``gen_random_uuid``
+    per row, one transaction per batch) -> NOT NULL proven without a
+    blocking scan (NOT VALID CHECK, VALIDATE, SET NOT NULL, drop the
+    helper) -> ``CREATE UNIQUE INDEX CONCURRENTLY`` (an INVALID leftover
+    of a failed build is dropped first).
+
+    SQLite (no SET NOT NULL, no CONCURRENTLY): ADD COLUMN ``NOT NULL
+    DEFAULT ''`` (allowed with a non-null default), backfill the ''
+    marker with ``randomblob`` UUIDs, plain unique index with checkfirst.
+    """
+
+    version: int = 12
+    name: str = "belief global_id: column, backfill, NOT NULL, unique index"
+
+    def _column_state(self, engine: Engine) -> dict | None:
+        for col in inspect(engine).get_columns("mm_beliefs"):
+            if col["name"] == "global_id":
+                return col
+        return None
+
+    def needed(self, engine: Engine) -> bool:
+        if not inspect(engine).has_table("mm_beliefs"):
+            return False
+        col = self._column_state(engine)
+        if col is None:
+            return True
+        if _count_unfilled_global_ids(engine):
+            return True
+        if _is_postgres(engine) and col.get("nullable", True):
+            return True
+        return _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX) != "valid"
+
+    def apply(self, engine: Engine, batch: int = DEFAULT_BACKFILL_BATCH) -> None:
+        if not inspect(engine).has_table("mm_beliefs"):
+            return
+        if _is_postgres(engine):
+            self._apply_postgres(engine, batch)
+        else:
+            self._apply_sqlite(engine, batch)
+
+    def _apply_postgres(self, engine: Engine, batch: int) -> None:
+        col = self._column_state(engine)
+        if col is None:
+            _DDLPlan([_lock_timeout_element(),
+                      AddColumn("mm_beliefs", "global_id", "VARCHAR(32)")]).run(engine)
+        _backfill_global_ids(engine, batch)
+        col = self._column_state(engine)
+        if col is not None and col.get("nullable", True):
+            live_checks = {
+                c["name"] for c in inspect(engine).get_check_constraints("mm_beliefs")}
+            check = AddNotNullCheck("mm_beliefs", "global_id")
+            plan: list = [_lock_timeout_element()]
+            if check.constraint_name not in live_checks:
+                plan.append(check)  # re-entry: the constraint survived a retry
+            plan.append(ValidateConstraint("mm_beliefs", check.constraint_name))
+            plan.append(AlterColumnClause("mm_beliefs", "global_id", "SET NOT NULL"))
+            plan.append(DropConstraintByName("mm_beliefs", check.constraint_name))
+            _DDLPlan(plan).run(engine)
+        state = _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX)
+        if state != "valid":
+            _build_global_id_index(engine, state)
+
+    def _apply_sqlite(self, engine: Engine, batch: int) -> None:
+        if self._column_state(engine) is None:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE mm_beliefs ADD COLUMN global_id VARCHAR(32) "
+                    "NOT NULL DEFAULT ''")
+        _backfill_global_ids(engine, batch)
+        if _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX) != "valid":
+            index = _global_id_index(concurrently=False)
+            with engine.begin() as conn:
+                conn.execute(CreateIndex(index))
+
+    def verify(self, engine: Engine) -> None:
+        if not inspect(engine).has_table("mm_beliefs"):
+            return
+        col = self._column_state(engine)
+        if col is None:
+            raise MigrationError("verification failed: mm_beliefs.global_id missing")
+        unfilled = _count_unfilled_global_ids(engine)
+        if unfilled:
+            raise MigrationError(
+                "verification failed: " + str(unfilled) + " beliefs without a global_id")
+        if _is_postgres(engine) and col.get("nullable", True):
+            raise MigrationError("verification failed: mm_beliefs.global_id is nullable")
+        if _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX) != "valid":
+            raise MigrationError(
+                "verification failed: unique index " + GLOBAL_ID_INDEX + " missing or invalid")
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -2056,6 +2233,7 @@ DEFAULT_STEPS: list = [
     Step9RecallVisibility(),
     Step10DerivedProvenance(),
     Step11DeletionReplay(),
+    Step12BeliefGlobalId(),
 ]
 
 #: The version a freshly upgraded database records.

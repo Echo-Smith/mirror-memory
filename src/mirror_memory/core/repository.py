@@ -2899,6 +2899,20 @@ def _purge_belief_ledger(session: Session, belief: Belief,
     return {"versions": 1, "identities": 1}
 
 
+def belief_by_global_id(session: Session, user_id: str, global_id: str) -> Belief | None:
+    """The user's belief with this cross-device identity (M4 batch 2):
+    tombstones name beliefs by global_id, never by the local integer id
+    (restores and other devices reuse those)."""
+    if not global_id:
+        return None
+    return session.scalar(
+        select(Belief).where(
+            Belief.user_id == user_id,
+            Belief.global_id == global_id,
+        )
+    )
+
+
 def forget_session_summary(session: Session, user_id: str, session_id: str,
                            *, fingerprints: list | None = None) -> bool:
     """Targeted forget: delete EVERY session summary for (user, session).

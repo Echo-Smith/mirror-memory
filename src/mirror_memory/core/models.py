@@ -8,6 +8,8 @@ generic and ships with the engine.
 
 from __future__ import annotations
 
+import uuid
+
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -121,9 +123,18 @@ class Belief(TenantScoped, Base):
             "tenant_id", "app_id", "user_id", "key",
             name="uq_mm_beliefs_user_key",
         ),
+        # M4 batch 2 task 0: the cross-device identity of a belief.  The
+        # integer id is local (restores and other devices reuse it); the
+        # global_id is minted once at creation and travels in tombstones.
+        UniqueConstraint(
+            "tenant_id", "app_id", "global_id",
+            name="uq_mm_beliefs_global_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    global_id: Mapped[str] = mapped_column(
+        String(32), default=lambda: uuid.uuid4().hex)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     dimension: Mapped[str] = mapped_column(String(64), index=True)
     key: Mapped[str] = mapped_column(String(128))

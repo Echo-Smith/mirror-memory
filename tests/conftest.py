@@ -735,11 +735,16 @@ _cfg_loader.load_config = _load_config_with_log_directory
 
 
 def strip_to_step10(engine) -> None:
-    """Roll a v11 database back to EXACTLY the step-10 shape (M4 patch 2
-    tests): drop every step-11 artifact and the version rows above 10.
-    The result is what a real pre-M4 backup looks like: tenant data, no
-    watermark, no generations table, no snapshot synthesis generation.
-    Run it owner-side on PostgreSQL."""
+    """Roll a current database back to EXACTLY the step-10 shape (M4 patch
+    2 tests): see strip_to_step."""
+    strip_to_step(engine, 10)
+
+
+def strip_to_step(engine, version: int) -> None:
+    """Roll a current database back to the shape of *version* (10 or 11):
+    drop every artifact of the later steps and the version rows above it.
+    The result is what a real backup from that era looks like.  Run it
+    owner-side on PostgreSQL."""
     from sqlalchemy import MetaData, inspect, text
 
     from mirror_memory.core.schema_migration import (
@@ -747,20 +752,74 @@ def strip_to_step10(engine) -> None:
         _version_table,
     )
 
+    assert version in (10, 11), version
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {WATERMARK_TABLE}")
-        conn.exec_driver_sql("DROP TABLE IF EXISTS mm_deletion_generations")
-        if "source_generation" in {
-                c["name"] for c in inspect(conn).get_columns("mm_snapshots")}:
+        # step 12 (global_id).  PostgreSQL: drop the constraint/index and
+        # the column.  SQLite cannot drop a column a table-level UNIQUE
+        # constraint references (create_all's autoindex), so the table is
+        # REBUILT without it (step 1's SQLite strategy: create, copy, drop,
+        # rename) -- the genuine step-11 shape.
+        if engine.dialect.name == "postgresql":
+            # the constraint owns the index (create_all) -- drop it first;
+            # a migration-built bare index is dropped by name after
             conn.exec_driver_sql(
-                "ALTER TABLE mm_snapshots DROP COLUMN source_generation")
-        _version_table(MetaData()).create(engine, checkfirst=True)
+                "ALTER TABLE mm_beliefs DROP CONSTRAINT IF EXISTS "
+                "uq_mm_beliefs_global_id")
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_mm_beliefs_global_id")
+        if "global_id" in {
+                c["name"] for c in inspect(conn).get_columns("mm_beliefs")}:
+            if engine.dialect.name == "postgresql":
+                conn.exec_driver_sql("ALTER TABLE mm_beliefs DROP COLUMN global_id")
+            else:
+                _rebuild_sqlite_beliefs_without(conn, "global_id")
+        if version <= 10:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {WATERMARK_TABLE}")
+            conn.exec_driver_sql("DROP TABLE IF EXISTS mm_deletion_generations")
+            if "source_generation" in {
+                    c["name"] for c in inspect(conn).get_columns("mm_snapshots")}:
+                conn.exec_driver_sql(
+                    "ALTER TABLE mm_snapshots DROP COLUMN source_generation")
+        _version_table(MetaData()).create(conn, checkfirst=True)  # same connection: SQLite holds the write lock
         conn.execute(text(
-            "DELETE FROM mm_schema_version WHERE version > 10"))
+            "DELETE FROM mm_schema_version WHERE version > :v"), {"v": version})
         if conn.execute(text(
                 "SELECT max(version) FROM mm_schema_version")).scalar() is None:
-            for v, note in [(1, "tenancy"), (5, "pending-jobs index"),
-                            (10, "derived provenance")]:
+            rows = [(1, "tenancy"), (5, "pending-jobs index"), (10, "derived provenance")]
+            if version >= 11:
+                rows.append((11, "deletion replay"))
+            for v, note in rows:
                 conn.execute(text(
                     "INSERT INTO mm_schema_version (version, note) "
                     "VALUES (:v, :n)"), {"v": v, "n": note})
+    # pooled SQLite connections cache the pre-rebuild schema: drop them so
+    # the next statement reads the rebuilt table (engines reconnect lazily)
+    engine.dispose()
+
+
+def _rebuild_sqlite_beliefs_without(conn, dropped: str) -> None:
+    """SQLite: recreate mm_beliefs without *dropped* (and any constraint /
+    index naming it) -- rename the old table away, drop its named indexes
+    (SQLite index names are database-global), create the model's table
+    minus the column under the real name, copy the rows, drop the old."""
+    from sqlalchemy import MetaData, inspect
+
+    old_indexes = [
+        ix["name"] for ix in inspect(conn).get_indexes("mm_beliefs")
+        if ix.get("name") and not ix["name"].startswith("sqlite_autoindex")]
+    conn.exec_driver_sql("ALTER TABLE mm_beliefs RENAME TO mm_beliefs__old")
+    for name in old_indexes:
+        conn.exec_driver_sql(f'DROP INDEX IF EXISTS "{name}"')
+    rebuilt = Base.metadata.tables["mm_beliefs"].to_metadata(MetaData())
+    col = rebuilt.c[dropped]
+    for constraint in list(rebuilt.constraints):
+        if any(c.name == dropped for c in getattr(constraint, "columns", [])):
+            rebuilt.constraints.discard(constraint)
+    for ix in list(rebuilt.indexes):
+        if any(c.name == dropped for c in ix.columns):
+            rebuilt.indexes.discard(ix)
+    rebuilt._columns.remove(col)
+    rebuilt.create(conn)
+    cols = ", ".join(c.name for c in rebuilt.columns)
+    conn.exec_driver_sql(
+        f"INSERT INTO mm_beliefs ({cols}) SELECT {cols} FROM mm_beliefs__old")
+    conn.exec_driver_sql("DROP TABLE mm_beliefs__old")

@@ -816,7 +816,7 @@ def test_step9_swaps_belief_indexes_and_stamps_summaries(tmp_path):
     assert step.needed(eng)
     upgrade_database(eng, default_tenant="legacy", default_app="app",
                      steps=[step])
-    assert sm.current_version(eng) == sm.LATEST_VERSION - 2
+    assert sm.current_version(eng) == 9  # step 9 applied
     insp = inspect(eng)
     for table, composite in sm.TENANT_BELIEF_INDEXES.items():
         names = {ix["name"] for ix in insp.get_indexes(table)}

@@ -339,7 +339,7 @@ def test_migration_mints_on_the_first_deployment(tmp_path):
     log_dir = tmp_path / "log-first"
     upgrade_database(eng, default_tenant="default", default_app="default",
                      config=_log_config(log_dir))
-    assert sm.current_version(eng) == 11
+    assert sm.current_version(eng) == sm.LATEST_VERSION
     db_id, applied = sm.read_watermark(eng)
     assert db_id and applied == 0
     eng.dispose()
