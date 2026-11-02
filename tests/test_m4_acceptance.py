@@ -44,6 +44,17 @@ from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
 
 TENANT = ("default", "default")
 
+
+@pytest.fixture(autouse=True)
+def _single_tenant_mode_off():
+    """The acceptance devices run single_tenant_mode=True (a contextvar):
+    reset it after every test so later tests keep tenant filtering."""
+    from mirror_memory.core.tenancy import set_single_tenant_mode
+
+    set_single_tenant_mode(False)
+    yield
+    set_single_tenant_mode(False)
+
 #: The I2 table above, machine-checked: (module, test name) pairs the M4
 #: acceptance relies on.  A renamed or deleted test fails HERE, before it
 #: can silently leave an I2 surface uncovered.

@@ -37,6 +37,18 @@ from tests.test_tombstone_sync import USER, _cfg
 TENANT = ("default", "default")
 
 
+@pytest.fixture(autouse=True)
+def _single_tenant_mode_off():
+    """The edge engines run single_tenant_mode=True, which flips the
+    process-wide contextvar in _ensure_db; reset it so the leak does not
+    disable tenant filtering in the tests that follow (any order)."""
+    from mirror_memory.core.tenancy import set_single_tenant_mode
+
+    set_single_tenant_mode(False)
+    yield
+    set_single_tenant_mode(False)
+
+
 class _FakeLLM:
     def generate(self, **kw):
         return '{"patterns": [], "support_policy": {}}'

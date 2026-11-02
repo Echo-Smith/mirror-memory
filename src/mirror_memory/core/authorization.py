@@ -581,4 +581,12 @@ UNGATED_ENGINE_METHODS: dict[str, str] = {
     "grant_purpose": "authorization administration (issuance)",
     "revoke_purpose": "authorization administration (revocation)",
     "purge_access_audit": "maintenance: access-audit retention purge (reads no memory; ids only)",
+    # M4 batch 2: the synchronization plane.  export_tombstones reads the
+    # deletion log only (ids + scope keys -- content-free by construction,
+    # the tombstone format carries no payload); apply_tombstones performs
+    # DELETIONS (forget is allowed regardless of authorization state, the
+    # M3 rule) and sync_status is pure bookkeeping state.
+    "export_tombstones": "sync plane: content-free deletion identifiers out of the local log (no memory content)",
+    "apply_tombstones": "sync plane: deletions only -- the forget paths run regardless of authorization state (M3)",
+    "sync_status": "sync plane: bookkeeping state (cursor, grace, mode); no memory touched",
 }

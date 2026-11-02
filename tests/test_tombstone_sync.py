@@ -50,6 +50,17 @@ TENANT = ("default", "default")
 USER = "u-sync"
 
 
+@pytest.fixture(autouse=True)
+def _single_tenant_mode_off():
+    """The edge device runs single_tenant_mode=True (a contextvar): reset
+    it after every test so later tests keep tenant filtering."""
+    from mirror_memory.core.tenancy import set_single_tenant_mode
+
+    set_single_tenant_mode(False)
+    yield
+    set_single_tenant_mode(False)
+
+
 class _FakeLLM:
     def generate(self, **kw):
         return '{"patterns": [], "support_policy": {}}'
