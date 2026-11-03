@@ -1415,11 +1415,15 @@ class MemoryEngine:
                 metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
                 raise
 
-            applied_keys: set[tuple[str, str]] = set()
+            # NOTE: NOT filtered by batch.sender -- a hub relays entries
+            # whose origin is another device, so the dedup set must cover
+            # every origin this tenant has applied, not just the sender's.
+            # The table is already tenant-scoped (composite PK).
+            applied_keys: set[tuple[str, int, str]] = set()
             for row_key in session.query(
-                    TombstoneApplied.origin, TombstoneApplied.origin_hash).filter(
-                    TombstoneApplied.origin == batch.sender).all():
-                applied_keys.add((row_key[0], row_key[1]))
+                    TombstoneApplied.origin, TombstoneApplied.origin_seq,
+                    TombstoneApplied.origin_hash).all():
+                applied_keys.add((row_key[0], row_key[1], row_key[2]))
 
             rows: list[dict] = []
             noop = 0
@@ -1427,7 +1431,7 @@ class MemoryEngine:
             applied = 0
             try:
                 for entry in batch.entries:
-                    key = (entry.origin, entry.origin_hash)
+                    key = (entry.origin, entry.origin_seq, entry.origin_hash)
                     if key in applied_keys:
                         skipped += 1
                         continue  # already applied: idempotent skip
@@ -1435,10 +1439,13 @@ class MemoryEngine:
                     # ECHO CHECK: a tombstone ORIGINATING from this device
                     # is re-applied only when the entry is absent from the
                     # local log -- a full restore lost it (re-delete);
-                    # a device that still holds it skips (true echo)
+                    # a device that still holds it skips (true echo).  The
+                    # lookup is by (origin_seq, origin_hash): the tombstone
+                    # names the sender's log position it was exported from
                     if entry.origin == self._db_id and self._deletion_log is not None:
-                        if self._deletion_log.has_entry_with_hash(
-                                self._db_id, entry.origin_hash):
+                        if self._deletion_log.has_tombstone(
+                                self._db_id, entry.origin_seq,
+                                entry.origin_hash):
                             skipped += 1
                             continue
                     applied += 1

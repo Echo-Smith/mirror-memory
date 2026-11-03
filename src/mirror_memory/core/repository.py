@@ -2904,7 +2904,10 @@ def _purge_belief_ledger(session: Session, belief: Belief,
 @_sanctioned_writer("sync")
 def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
     """Record which cross-device tombstones were applied -- the
-    idempotency key is (origin, origin_hash), the ORIGIN's log-entry hash
+    idempotency key is (origin, origin_seq, origin_hash) -- the origin's
+    log position AND its entry hash: a rolled-back sender re-issuing a
+    deletion at a reused seq has a different entry hash, so it applies
+    instead of colliding
     the tombstone was exported with: a rolled-back sender reuses
     origin_seq for a different deletion whose hash differs, so seq-based
     keys would misfile it as a duplicate.  Rows whose scope no longer

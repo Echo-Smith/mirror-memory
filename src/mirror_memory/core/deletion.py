@@ -190,10 +190,11 @@ class DeletionLog:
         anchor (M4 batch-2 patch 2)."""
         raise NotImplementedError
 
-    def has_entry_with_hash(self, db_id: str, entry_hash: str) -> bool:  # pragma: no cover - interface
-        """Does this log contain an entry whose hash is *entry_hash*?  The
-        echo check: a device receiving its OWN tombstone re-applies it
-        only when the entry is absent from its restored log."""
+    def has_tombstone(self, db_id: str, seq: int, entry_hash: str) -> bool:  # pragma: no cover - interface
+        """True when the log still holds the entry the tombstone names:
+        (seq, entry_hash) -- the sender's log position and entry hash the
+        tombstone was exported from.  Absent means the deletion was lost
+        in a restore and must re-apply."""
         raise NotImplementedError
 
     def checkpoint_seq(self, db_id: str) -> int:  # pragma: no cover - interface
@@ -413,11 +414,13 @@ class FileDeletionLog(DeletionLog):
                 return entry.hash
         return GENESIS_HASH
 
-    def has_entry_with_hash(self, db_id: str, entry_hash: str) -> bool:
+    def has_tombstone(self, db_id: str, seq: int, entry_hash: str) -> bool:
         path = self._path_for(db_id)
         if not path.exists():
             return False
-        return any(e.hash == entry_hash for e in self._iter_entries(path))
+        return any(e.seq == seq and (e.hash == entry_hash
+                                     or e.origin_hash == entry_hash)
+                   for e in self._iter_entries(path))
 
     def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
         """Rewrite the file: the header, the genesis, a CHECKPOINT entry
@@ -652,13 +655,13 @@ class PgDeletionLog(DeletionLog):
                 "WHERE db_id = :db AND seq = :s"), {"db": db_id, "s": seq}).first()
         return str(row[0]) if row else GENESIS_HASH
 
-    def has_entry_with_hash(self, db_id: str, entry_hash: str) -> bool:
+    def has_tombstone(self, db_id: str, seq: int, entry_hash: str) -> bool:
         self._ensure_schema()
         with self._engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT 1 FROM mm_deletion_log "
-                "WHERE db_id = :db AND hash = :h LIMIT 1"),
-                {"db": db_id, "h": entry_hash}).first()
+                "SELECT 1 FROM mm_deletion_log WHERE db_id = :db "
+                "AND seq = :s AND (hash = :h OR origin_hash = :h) LIMIT 1"),
+                {"db": db_id, "s": seq, "h": entry_hash}).first()
         return row is not None
 
     def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:

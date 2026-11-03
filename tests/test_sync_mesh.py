@@ -40,7 +40,11 @@ from mirror_memory.core.deletion import DeletionEntry, FileDeletionLog
 from mirror_memory.core.models import Base, Belief, SessionSummary
 from mirror_memory.core.repository import read_sync_peer, set_memory_enabled
 from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
-from mirror_memory.core.tombstones import TombstoneBatch, TombstoneBatchRejected
+from mirror_memory.core.tombstones import (
+    TombstoneBatch,
+    TombstoneBatchRejected,
+    TombstoneEntry,
+)
 
 TENANT = ("default", "default")
 
@@ -462,9 +466,12 @@ def test_untravelable_entry_does_not_wedge_the_channel(tmp_path):
 def test_forged_batches_trigger_rescan_and_apply_with_dedup(tmp_path):
     """A fabricated from_cursor (honestly re-sealed) does not continue
     the stored channel: the receiver RESCANS -- the channel re-anchors
-    to 0, the sender's log is re-fetched from the start, and the
-    (origin, origin_hash) applied records deduplicate the re-delivery.
-    A tampered entry hash is still refused outright (integrity)."""
+    to 0 so the sender's log is re-fetched from the start, where the
+    (origin, origin_seq, origin_hash) applied records deduplicate the
+    re-delivery to skips.  The entries in the forged envelope are
+    honest, so they apply on first sight; the FABRICATION is punished
+    at the channel, not the data.  A tampered entry hash is still
+    refused outright (integrity)."""
     root = tmp_path
     devices = {
         "C": _Device(root, "c", single_tenant=False),
@@ -480,11 +487,12 @@ def test_forged_batches_trigger_rescan_and_apply_with_dedup(tmp_path):
                                belief_id=A.beliefs()[0].id, purpose="api")
         batch, _ = A.engine.export_tombstones(0, 100)
         honest_tail = batch.to_cursor
-        before = C.visible_state()
 
         # a FABRICATED continuation (from_cursor beyond the tail, sealed
-        # honestly): the receiver detects the non-continuation, rescans
-        # from 0, and the entries dedup to no-ops
+        # honestly): the receiver detects the non-continuation and RESCANS
+        # -- the channel re-anchors to 0.  The entries themselves are
+        # honest (A's real tombstone), so they apply; the re-fetch from 0
+        # then deduplicates the re-delivery at entry level.
         forged_from = honest_tail + 5
         forged = TombstoneBatch(sender=A.db_id,
                                 from_cursor=forged_from,
@@ -493,13 +501,14 @@ def test_forged_batches_trigger_rescan_and_apply_with_dedup(tmp_path):
                                 to_chain_hash=batch.to_chain_hash,
                                 entries=batch.entries).seal()
         r = C.engine.apply_tombstones(forged)
-        assert (r.applied, r.skipped) == (0, len(batch.entries))
-        assert C.visible_state() == before
+        assert (r.applied, r.skipped) == (len(batch.entries), 0)
+        assert all("forged" not in b.claim_text for b in C.beliefs())
         assert C.peer_cursor(A.db_id) == 0, "the rescan re-anchors to 0"
 
-        # the honest batch (from 0) then applies through the re-fetch
-        C.engine.apply_tombstones(batch)
-        assert all("forged" not in b.claim_text for b in C.beliefs())
+        # the honest batch (from 0) re-delivers through the re-fetch:
+        # the (origin, origin_seq, origin_hash) applied records dedup it
+        r2 = C.engine.apply_tombstones(batch)
+        assert (r2.applied, r2.skipped) == (0, len(batch.entries))
         assert C.peer_cursor(A.db_id) == honest_tail
 
         # a tampered ENTRY hash is refused outright (integrity, not a
@@ -511,7 +520,6 @@ def test_forged_batches_trigger_rescan_and_apply_with_dedup(tmp_path):
             from_chain_hash=batch.from_chain_hash,
             to_chain_hash=batch.to_chain_hash,
             entries=[TombstoneEntry.from_dict(forged_entry)]).seal()
-        from mirror_memory.core.tombstones import TombstoneBatchRejected
 
         with pytest.raises(TombstoneBatchRejected) as info:
             C.engine.apply_tombstones(forged_batch)

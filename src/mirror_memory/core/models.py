@@ -529,11 +529,16 @@ class TombstoneApplied(TenantScoped, Base):
 
     __tablename__ = "mm_tombstones_applied"
     __table_args__ = (
-        PrimaryKeyConstraint("tenant_id", "app_id", "origin", "origin_hash"),
+        # (origin, origin_seq, origin_hash): the origin's log position AND
+        # its entry hash -- a rolled-back sender re-issuing a deletion at
+        # a reused seq produces a different origin_hash, so it applies
+        # instead of colliding
+        PrimaryKeyConstraint("tenant_id", "app_id", "origin", "origin_seq",
+                             "origin_hash"),
     )
 
     origin: Mapped[str] = mapped_column(String(32))
-    origin_seq: Mapped[int] = mapped_column(Integer, default=0)
+    origin_seq: Mapped[int] = mapped_column(Integer)
     origin_hash: Mapped[str] = mapped_column(String(64))
     user_id: Mapped[str] = mapped_column(String(64))
     scope: Mapped[str] = mapped_column(String(16))
