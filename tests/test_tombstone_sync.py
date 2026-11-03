@@ -824,11 +824,26 @@ def test_apply_scale_report_by_batch_kind(tmp_path):
     cold = FileDeletionLog(scaled._deletion_log.directory)
     assert cold.head(scaled._db_id) == scaled._deletion_log.head(scaled._db_id)
 
-    # the scale-sensitive piece is the applied-table lookup: noop/real on
-    # the scaled receiver must not grow ~linearly with the 10k rows (the
-    # old full-table preload did); generous bound, numbers reported above
+    # The scale-sensitive property is STATEMENT-COUNT-based and therefore
+    # deterministic: the dedup lookup must not add statements as the
+    # applied table grows (the old full-table preload's cost would show
+    # up as extra work per batch, and its timing ratio is load-noisy).
+    # noop/real do identical work on both receivers -> identical counts:
+    for kind in ("noop", "real"):
+        s_empty = results[(kind, "empty")][1]
+        s_scaled = results[(kind, "scaled")][1]
+        assert s_scaled == s_empty, \
+            f"{kind}: the dedup lookup's statement count grew with the " \
+            f"table ({s_empty} -> {s_scaled})"
+    # echo on the scaled receiver issues a HANDFUL of statements (the
+    # echo lookups are file-index hits, not SQL); on the empty receiver
+    # the same batch applies as no-ops (hundreds of INSERTs) -- the
+    # asymmetry is the measured path, reported above
+    assert results[("echo", "scaled")][1] <= 20
+    # a loose timing guard for pathological regressions only (load-noisy)
     for kind in ("noop", "real"):
         t_empty = results[(kind, "empty")][0]
         t_scaled = results[(kind, "scaled")][0]
-        assert t_scaled < max(4.0 * t_empty, 1.0), \
-            f"{kind} apply grew with the table: {t_empty:.4g}s -> {t_scaled:.4g}s"
+        assert t_scaled < max(6.0 * t_empty, 3.0), \
+            f"{kind} apply grew pathologically with the table: " \
+            f"{t_empty:.4g}s -> {t_scaled:.4g}s"

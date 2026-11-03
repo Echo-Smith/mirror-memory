@@ -404,12 +404,13 @@ def test_index_agrees_with_a_cold_parse_after_append_and_prune(tmp_path):
     assert not log.has_tombstone(db, 3, entries[2].hash)
 
 
-def test_index_sees_another_process_writes_and_restores(tmp_path):
-    """Another FileDeletionLog instance (another process) appends or
+def test_index_sees_another_instance_writes_and_restores(tmp_path):
+    """Another FileDeletionLog INSTANCE in this process appends or
     RESTORES the file behind our back: the next lookup reflects the file
-    on disk -- new entries visible, rolled-back entries gone -- including
-    the paranoid case of a rewrite with preserved size and mtime
-    (cp -p style)."""
+    on disk -- new entries visible, rolled-back entries gone.  (Two
+    instances, one process; the cross-process variant with a real
+    subprocess and a barrier file is
+    test_index_sees_a_real_other_process below.)"""
     import os as _os
     import time as _time
 
@@ -452,3 +453,94 @@ def test_index_sees_another_process_writes_and_restores(tmp_path):
     assert not log.has_tombstone(db, 11, e11.hash)
     assert log.has_tombstone(db, 10, entries[-1].hash)
     assert log.chain_hash_at(db, 11) == GENESIS_HASH
+
+
+def test_index_sees_a_real_other_process(tmp_path):
+    """The cross-process claim, proven with a REAL independent process
+    and an explicit filesystem barrier: a subprocess appends to the log
+    (barrier 1) and then rolls the file back to the 10-entry restore
+    point (barrier 2); the parent's cached index must reflect BOTH
+    transitions on its next lookup."""
+    import json as _json
+    import subprocess
+    import sys
+    from pathlib import Path as _Path
+
+    log = FileDeletionLog(tmp_path)
+    db = "c" * 32
+    entries = _seed_file(log, db, 10)
+    path = log._path_for(db)
+    restore_point = path.read_bytes()
+
+    child = _Path(tmp_path) / "child_script.py"
+    barrier1 = _Path(tmp_path) / "barrier1"
+    barrier2 = _Path(tmp_path) / "barrier2"
+    child.write_text(
+        "import json, os, sys\n"
+        "from mirror_memory.core.deletion import DeletionEntry, FileDeletionLog\n"
+        f"log = FileDeletionLog({str(tmp_path)!r})\n"
+        f"path = log._path_for({db!r})\n"
+        "prev = open(path, 'rb').read().splitlines()[-1]\n"
+        "prev_hash = json.loads(prev)['hash']\n"
+        "e = DeletionEntry(db_id=" + repr(db) + ", seq=11, tenant_id='default',\n"
+        "    app_id='default', user_id='u-child', scope='user', scope_key='',\n"
+        "    fingerprints=[], generation=0, purpose='child', created_at=None,\n"
+        "    prev_hash=prev_hash)\n"
+        "e.hash = e.compute_hash()\n"
+        "log.append(e)\n"
+        f"open({str(barrier1)!r}, 'w').write('1')\n"
+        f"open({str(barrier2)!r}, 'w').write('wait')\n"
+        "# wait for the parent to observe the append\n"
+        f"while open({str(barrier1)!r}).read() != 'go':\n"
+        "    pass\n"
+        "open(path, 'wb').write(" + repr(restore_point) + ")\n"
+        f"open({str(barrier2)!r}, 'w').write('1')\n",
+        encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, str(child)],
+                            cwd=str(_Path.cwd()),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        # wait for the child's append (barrier 1)
+        for _ in range(300):
+            if barrier1.exists():
+                break
+            _time_sleep(0.1)
+        assert barrier1.exists(), "the child never appended"
+
+        # the parent's cached index must see the OTHER process's append
+        assert log.head(db) == (11, _compute_child_hash(path, 11)), \
+            "the index must reflect a real other process's append"
+        assert log.has_tombstone(db, 11, _last_hash(path))
+
+        # release the child; it rolls the file back to the restore point
+        barrier1.write_text("go")
+        for _ in range(300):
+            if barrier2.read_text() == "1":
+                break
+            _time_sleep(0.1)
+
+        # and the rollback must be visible too
+        assert log.head(db) == (10, entries[-1].hash), \
+            "the index must reflect the other process's rollback"
+        assert not log.has_tombstone(db, 11, _last_hash(path))
+    finally:
+        proc.wait(timeout=30)
+        if proc.returncode != 0:
+            print(proc.stdout.read().decode(), proc.stderr.read().decode())
+            assert False, f"the child failed: {proc.returncode}"
+
+
+def _time_sleep(seconds: float) -> None:
+    import time
+    time.sleep(seconds)
+
+
+def _last_hash(path) -> str:
+    import json
+    return json.loads(path.read_bytes().splitlines()[-1])["hash"]
+
+
+def _compute_child_hash(path, seq: int) -> str:
+    """The hash the child's seq-11 entry carries (the parent reads the
+    file the child wrote -- the identity check, not a recomputation)."""
+    return _last_hash(path)
