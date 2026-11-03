@@ -51,11 +51,19 @@ def main() -> None:
         cfg.llm_client = _FakeLLM()
         cfg.worker.job_lease_seconds = 60
         cfg.session_summary_enabled = True
-        cfg.deletion_log.directory = str(tmp / "deletions")
+        # deletion_log arrived with M4: the baseline predates it
+        engine_kwargs = {}
+        if hasattr(cfg, "deletion_log"):
+            cfg.deletion_log.directory = str(tmp / "deletions")
+            (tmp / "deletions").mkdir(parents=True, exist_ok=True)
+            from mirror_memory.core.deletion import FileDeletionLog
+
+            engine_kwargs["deletion_log"] = FileDeletionLog(
+                tmp / "deletions")
         engine = MemoryEngine(
             config=cfg, database_url=f"sqlite:///{tmp / 'micro.db'}",
             tenant_id="default", app_id="default", llm_client=_FakeLLM(),
-            single_tenant_mode=True)
+            single_tenant_mode=True, **engine_kwargs)
         engine._ensure_db()
         with tenant_scope("default", "default"), \
                 fixture_write_scope("microbenchmark: enable memory"):
