@@ -102,14 +102,22 @@ def main() -> None:
             s = _sm(bind=_ce(f"sqlite:///{tmp / 'micro.db'}"))()
             written = s.query(Belief).filter(
                 Belief.user_id == args.user).count()
-            with_global = s.query(Belief).filter(
-                Belief.user_id == args.user,
-                Belief.global_id != "").count()
+            with_global = 0
+            if hasattr(Belief, "global_id"):
+                with_global = s.query(Belief).filter(
+                    Belief.user_id == args.user,
+                    Belief.global_id != "").count()
             s.close()
         assert written > 0, "no beliefs written -- no global_id writes: " \
             "the run is invalid"
-        assert with_global == written, \
-            f"{written - with_global} beliefs without a global_id"
+        if hasattr(Belief, "global_id"):
+            assert with_global == written, \
+                f"{written - with_global} beliefs without a global_id"
+        else:
+            # the pre-M4 baseline (aed0639) has no global_id column: the
+            # micro there measures the observe path itself; HEAD adds the
+            # global_id write per belief mint
+            print("note: this revision predates mm_beliefs.global_id")
 
         total_ms = elapsed * 1000.0
         per_ms = total_ms / args.observes
