@@ -34,6 +34,9 @@ and by tools/skip_report.py on the CI junit):
 | sender full restore | A restores (DB+log) after its deletions synced out -> its OWN deletions re-apply (echo check); a later OFFLINE deletion reaches cloud and B, no duplicate, no cursor skip | tests/test_sync_mesh.py::test_sender_full_restore_then_offline_redelete_reaches_everyone, tests/test_deletion_race_backup.py::test_sender_full_restore_then_offline_redelete_pg |
 | sender full restore | the mesh with a mid-stream full restore of an edge: auto-rescan (never a refusal), zero refusals, convergence | tests/test_sync_mesh.py::test_mesh_survives_a_midstream_full_restore, tests/test_deletion_race_backup.py::test_tombstone_mesh_with_full_restore_pg |
 | identity | a belief's global_id survives the v11 -> v12 migration on both databases | tests/test_global_id_migration.py::test_step12_upgrades_a_step11_database_sqlite, tests/test_global_id_migration.py::test_step12_upgrades_a_step11_database_pg |
+| sync gate | ENTRY_REGISTRY reads_memory entrances (+ run_verification / run_metabolism) all refuse when expired / catching up; the fail-open paths never swallow the refusal; after the healed catch-up the deleted sentinel is visible nowhere | tests/test_sync_gate_coverage.py::test_registry_covers_every_read, tests/test_sync_gate_coverage.py::test_expired_and_catching_up_refuse_every_read |
+| sync gate | the grace expires by the CLOCK in normal state (no manual catch-up); a healed link resumes on the next read | tests/test_sync_gate_coverage.py::test_normal_state_expires_by_the_clock |
+| sync gate | sync.enabled with NO transport: the stored channel history decides (never-completed / within grace / expired / ambiguous); disabled sync unchanged; the schema_ready wrapper does not bypass the gate | tests/test_sync_gate_coverage.py::test_enabled_without_transport_uses_stored_grace |
 """
 
 from __future__ import annotations
@@ -93,6 +96,13 @@ I2_TARGETS: list[tuple[str, str]] = [
      "test_tombstone_mesh_with_full_restore_pg"),
     ("tests.test_global_id_migration", "test_step12_upgrades_a_step11_database_sqlite"),
     ("tests.test_global_id_migration", "test_step12_upgrades_a_step11_database_pg"),
+    ("tests.test_sync_gate_coverage", "test_registry_covers_every_read"),
+    ("tests.test_sync_gate_coverage",
+     "test_expired_and_catching_up_refuse_every_read"),
+    ("tests.test_sync_gate_coverage",
+     "test_normal_state_expires_by_the_clock"),
+    ("tests.test_sync_gate_coverage",
+     "test_enabled_without_transport_uses_stored_grace"),
 ]
 
 

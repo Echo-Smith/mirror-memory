@@ -694,6 +694,10 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: the cycle reads memory and proposes
+        # tier transitions -- gated like a read (expired / catching up
+        # refuse; offline deletions are untouched)
+        self._sync_gate(read=True)
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
 
         with self._session() as session:
@@ -844,6 +848,10 @@ class MemoryEngine:
             return []
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: gated BEFORE the fail-open selection
+        # below -- a refusal (expired / catching up) must reach the caller,
+        # never be swallowed into an empty list
+        self._sync_gate(read=True)
         from mirror_memory.extraction.verification import (
             build_verification_question,
             get_question_candidates,
@@ -918,6 +926,10 @@ class MemoryEngine:
             return False
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: the judgment reads memory state and
+        # derives transitions -- gated like a read, and BEFORE the
+        # fail-open try so a refusal is never swallowed into "not consumed"
+        self._sync_gate(read=True)
         from mirror_memory.extraction.verification import run_verification_judgment
 
         with self._session() as session:
@@ -1685,20 +1697,103 @@ class MemoryEngine:
             if self._sync_state == "catching_up":
                 status["state"] = "catching_up"
             elif self._sync_attempt_failed and self._sync_state in ("offline_grace", "expired"):
-                status["state"] = self._sync_state
+                # live arithmetic: the anchor ages while the state variable
+                # waits for the next attempt -- report the clock's verdict
+                status["state"] = self._grace_state()
+            status["transport_injected"] = True
             return status
+        if self._config.sync.enabled:
+            # enabled but no transport: the stored channel history decides
+            # (batch-2 patch 5, task 3) -- never reported as "disabled"
+            row, ambiguous = self._stored_channel_history()
+            last = row.last_catchup_at if row is not None else None
+            remaining = None
+            expired = True
+            if row is not None and not ambiguous:
+                remaining = self._config.sync.offline_grace_days - (
+                    datetime.utcnow() - last).total_seconds() / 86400.0
+                expired = remaining <= 0
+            return {"state": "expired" if expired else "normal",
+                    "last_catchup_at": last,
+                    "remaining_grace_days": (max(0.0, round(remaining, 3))
+                                             if remaining is not None else None),
+                    "reminder": (remaining is not None
+                                 and remaining <= self._config.sync.reminder_days),
+                    "transport_injected": False}
         return {"state": "disabled", "last_catchup_at": None,
                 "remaining_grace_days": None, "reminder": False}
+
+    def _stored_channel_history(self):
+        """The stored channel history for the no-transport mode (batch-2
+        patch 5, task 3): the peer rows THIS engine stamped complete -- its
+        own record of its trusted peer(s) and their last complete
+        catch-up.  Returns ``(row, ambiguous)``: the single completed peer
+        (None when there is none) and whether more than one exists (the
+        trusted peer cannot then be located unambiguously)."""
+        from mirror_memory.core.models import SyncPeer
+
+        with self._session() as session:
+            rows = session.query(SyncPeer).filter(
+                SyncPeer.last_catchup_at.isnot(None)).order_by(
+                SyncPeer.last_catchup_at.desc()).all()
+            rows = list(rows)
+        if len(rows) == 1:
+            return rows[0], False
+        return (rows[0] if rows else None), len(rows) > 1
+
+    def _gate_without_transport(self, *, read: bool) -> None:
+        """sync.enabled=True but the host injected no transport (batch-2
+        patch 5, task 3): NOT the disabled behavior.  The channel history
+        in THIS database is the only trustworthy source -- reads serve
+        under the standard offline grace measured from the stored
+        completion, refuse when it is out (or when there is none, or when
+        the completed peer cannot be located unambiguously).  No catch-up
+        can run and the stored instant is never refreshed or invented;
+        writes stay available (offline deletions)."""
+        if not read:
+            return  # offline deletions stay available
+        row, ambiguous = self._stored_channel_history()
+        if row is None:
+            raise SyncCatchupRequired(None)
+        if ambiguous:
+            raise SyncCatchupRequired(row.last_catchup_at)
+        remaining = self._config.sync.offline_grace_days - (
+            datetime.utcnow() - row.last_catchup_at).total_seconds() / 86400.0
+        if remaining <= 0:
+            raise SyncCatchupRequired(row.last_catchup_at)
+        # within the grace measured from the stored completion: serve
 
     def _sync_gate(self, *, read: bool) -> None:
         """Entry-point gate (M4 batch 2 task 3): refuse while catching up
         (all entries, like replay mode), refuse reads when the offline
         grace has expired -- and RE-ATTEMPT the catch-up first, so coming
-        back online restores service without a restart."""
-        if not (self._config.sync.enabled and self._sync_transport is not None):
+        back online restores service without a restart.
+
+        Batch-2 patch 5, task 1: the clock runs in NORMAL state too -- a
+        long-lived engine whose last COMPLETE catch-up ages past the grace
+        stops serving reads even if no attempt has failed yet; the gate
+        attempts one catch-up on the spot (a working link heals with no
+        restart, middle batches still never refresh the instant) and a
+        failed attempt leaves the reads refused."""
+        if not self._config.sync.enabled:
+            return
+        if self._sync_transport is None:
+            self._gate_without_transport(read=read)
             return
         if self._sync_state == "catching_up":
             raise SyncCatchingUp()
+        if self._sync_state == "normal":
+            status = self._grace_status()
+            if status["state"] == "expired":
+                # the grace ran out without a failed attempt: try once now
+                try:
+                    self._catch_up()
+                except (ConnectionError, TimeoutError):
+                    pass
+                if self._sync_state != "normal":
+                    if read:
+                        raise SyncCatchupRequired(status["last_catchup_at"])
+                    return
         if self._sync_state in ("expired", "offline_grace") and self._sync_attempt_failed:
             # one re-attempt per entry: a working link heals immediately,
             # no restart needed
@@ -1717,7 +1812,16 @@ class MemoryEngine:
     def _catch_up_at_startup(self) -> None:
         """The startup catch-up: before any entry serves, the edge pulls
         and applies the peer's tombstones until the peer's tail."""
-        if not (self._config.sync.enabled and self._sync_transport is not None):
+        if not self._config.sync.enabled:
+            return
+        if self._sync_transport is None:
+            # enabled but no transport (batch-2 patch 5, task 3): entries
+            # serve under the stored grace via the gate -- the operator
+            # must know the channel is NOT syncing
+            logger.warning(
+                "sync.enabled=true but no sync transport was injected: "
+                "no catch-up can run; entries serve under the stored "
+                "offline grace and refuse once it is out")
             return
         try:
             self._catch_up()
@@ -1890,6 +1994,9 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: a version chain is memory content --
+        # the sync gate applies like every other read entrance
+        self._sync_gate(read=True)
         from mirror_memory.core.repository import belief_history
 
         with self._session() as session:
