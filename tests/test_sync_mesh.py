@@ -83,6 +83,7 @@ class _FakeLLM:
 class _Device:
     def __init__(self, root: Path, name: str, *, single_tenant: bool):
         self.name = name
+        self.single_tenant = single_tenant
         self.url = f"sqlite:///{root / f'{name}.db'}"
         self.db = create_engine(self.url)
         Base.metadata.create_all(self.db)
@@ -232,8 +233,6 @@ class _Device:
                   max_batches: int = 200) -> None:
         """Pull from *peer* batch-at-a-time until the tail, applying each
         batch.  A refusal is RECORDED, never swallowed."""
-        import os as _os
-
         for _ in range(max_batches):
             cursor = self.peer_cursor(peer.db_id)
             try:
@@ -242,25 +241,11 @@ class _Device:
             except Exception as exc:  # noqa: BLE001 -- recorded
                 refusals.append(f"export from {peer.name}: {exc!r}")
                 return
-            if _os.environ.get("MESH_TRACE"):
-                with open("/tmp/mesh_trace.txt", "a") as _fh:
-                    _fh.write(f"{self.name}<-{peer.name}: from={batch.from_cursor} "
-                              f"to={batch.to_cursor} entries={len(batch.entries)}\n")
-            import os as _os
-
-            if _os.environ.get("MESH_TRACE"):
-                with open("/tmp/mesh_trace.txt", "a") as _fh:
-                    _fh.write(f"{self.name}<-{peer.name}: from={batch.from_cursor} "
-                              f"to={batch.to_cursor} entries={len(batch.entries)}\n")
             try:
                 self.engine.apply_tombstones(batch)
             except TombstoneBatchRejected as exc:
                 refusals.append(f"apply from {peer.name}: {exc}")
                 return
-            if _os.environ.get("MESH_TRACE"):
-                with open("/tmp/mesh_trace.txt", "a") as _fh:
-                    _fh.write(f"  {self.name} stored cursor for {peer.name} = "
-                              f"{self.peer_cursor(peer.db_id)}\n")
             if batch.to_cursor == batch.from_cursor:
                 return
 
@@ -335,27 +320,11 @@ def test_three_devices_alternate_deletes_and_stay_consistent(tmp_path):
             tag = f"r{round_no}"
             for d in devices.values():
                 if d.sees(tag, scope):
-                    diag = []
-                    from mirror_memory.core.repository import read_sync_peer as _rsp
-
-                    for other in devices.values():
-                        diag.append((other.name, d.peer_cursor(other.db_id),
-                                     other.log.head(other.db_id)[0]))
-                    probe = d.engine.export_tombstones(
-                        d.peer_cursor(devices["C"].db_id), 500,
-                        peer_db_id=devices["C"].db_id)[0]
-                    full, _fc = devices["C"].engine.export_tombstones(
-                        0, 500)
-                    log_lines = [f"C log seq={e.seq} origin={e.origin[:6]} "
-                                 f"scope={e.scope} key={e.scope_key[:12]}"
-                                 for e in devices["C"].log.read_from(
-                                     devices["C"].db_id, 0)]
+                    cursors = {n: d.peer_cursor(o.db_id)
+                               for n, o in devices.items()}
                     raise AssertionError(
-                        (round_no, d.name, tag, scope, diag, d.visible_state(),
-                         refusals, "probe@4:", probe.to_dict(),
-                         "full-from-0:", [(e.origin[:6], e.origin_seq)
-                                          for e in full.entries],
-                         log_lines))
+                        (round_no, d.name, tag, scope, cursors,
+                         d.visible_state(), refusals))
 
             states = {name: d.visible_state() for name, d in devices.items()}
             assert len(set(states.values())) == 1, (round_no, states)
@@ -592,6 +561,247 @@ def test_receiver_restore_repulls_to_the_same_state(tmp_path):
         # survives on BOTH (only forget_belief ran -- session text is its
         # own layer), so recall legitimately still carries the text
         assert A.visible_state() == C.visible_state()
+    finally:
+        for d in devices.values():
+            d.dispose()
+
+
+# --- M4 batch-2 patch 2, task 2: full-machine restore of a SENDER -----
+
+def _backup_device(d: "_Device", backup_db: str, backup_log_dir) -> None:
+    """Full-machine backup: the main DB (SQLite backup API) AND the
+    deletion-log directory together."""
+    src = d.engine._engine.raw_connection()
+    dest = create_engine(f"sqlite:///{backup_db}").raw_connection()
+    src.connection.backup(dest.connection)
+    dest.close()
+    src.close()
+    shutil.copytree(d.log_dir, backup_log_dir, dirs_exist_ok=True)
+
+
+def _restore_device(d: "_Device", backup_db: str, backup_log_dir) -> None:
+    """The restore half: both halves go back, then the device reboots in
+    place (same db_id -- the watermark travels in the main DB)."""
+    d.engine._engine.dispose()
+    d.db.dispose()
+    shutil.copyfile(backup_db, str(d.url).replace("sqlite:///", ""))
+    shutil.rmtree(d.log_dir, ignore_errors=True)
+    shutil.copytree(backup_log_dir, d.log_dir)
+    d.db = create_engine(d.url)
+    d.F = sessionmaker(bind=d.db)
+    d.engine = MemoryEngine(
+        config=d.cfg, database_url=d.url, tenant_id=TENANT[0],
+        app_id=TENANT[1], llm_client=_FakeLLM(),
+        deletion_log=d.log, single_tenant_mode=d.single_tenant)
+
+
+def _sender_restore_and_offline_redelete(devices, refusals):
+    """Batch-2 patch 2, task 2, both legs: A backs up, deletes in all
+    three scopes, syncs out, then FULLY restores (main DB + log dir).
+
+    Phase 1: the catch-up brings A's OWN tombstones back through the
+    cloud -- the restored log no longer holds them, so the echo check
+    re-applies them -- and every read entrance on A is sentinel-free.
+
+    Phase 2: A deletes again, one of the deletions composed while the
+    channel is idle (offline); the cloud and B end up clean -- the
+    deletions were neither misfiled as duplicates (the applied keys are
+    (origin, origin_seq, origin_hash); the re-issued ones carry new
+    hashes) nor skipped by a cursor (the cloud RESCANS the sender's
+    rolled-back log and re-anchors to 0).  Returns the rescans seen.
+    """
+    from mirror_memory.core import metrics
+
+    C, A, B = devices["C"], devices["A"], devices["B"]
+    rescans_before = metrics.value(metrics.TOMBSTONES_RESCANS)
+
+    # seed: the same content everywhere, identities aligned with C
+    for d in devices.values():
+        d.observe("I like SEN1 and coffee.", session_id="sa")
+        d.observe("I live in SEN2.", session_id="sb")
+    _align_all(devices, C)
+    for d in devices.values():
+        assert d.sees("SEN1", "user")
+
+    # A backs up (main DB + log dir) BEFORE any deletion
+    backup_db = str(A.url).replace("sqlite:///", "").replace(
+        "a.db", "a-backup.db")
+    backup_logs = A.log_dir.parent / "a-log-backup"
+    _backup_device(A, backup_db, backup_logs)
+
+    # A deletes all three scopes and the deletions sync out
+    a_sen1 = next(b for b in A.beliefs() if "SEN1" in b.claim_text)
+    A.engine.forget_belief(user_id=USER, belief_id=a_sen1.id,
+                           purpose="api")
+    A.engine.forget_session(user_id=USER, session_id="sb", purpose="api")
+    A.engine.delete_memories(user_id=USER, purpose="api")
+    _sync_star(devices, refusals, random.Random(1))
+    assert refusals == [], refusals
+    for d in devices.values():
+        assert not d.sees("SEN1", "user")
+    assert C.peer_cursor(A.db_id) >= 3, "the cloud consumed A's log"
+
+    # FULL MACHINE RESTORE of A: main DB + log dir go back
+    _restore_device(A, backup_db, backup_logs)
+    assert A.sees("SEN1", "user"), "the restore resurrected A's data"
+
+    # the catch-up: A re-pulls the cloud, its OWN tombstones come
+    # back, the echo check finds them missing from the restored log
+    # and re-applies them
+    refusals2: list[str] = []
+    A.pull_from(C, refusals2)
+    assert refusals2 == [], refusals2
+    assert not A.sees("SEN1", "user"), \
+        "A's own pre-restore deletions must re-apply after the restore"
+    assert A.summaries() == 0
+
+    # the rest of the star syncs: the cloud PULLS from the restored
+    # A -- its stored cursor points past A's rewound log, which must
+    # trigger the automatic rescan (never a refusal, never silent)
+    _sync_star(devices, refusals, random.Random(2))
+    assert refusals == [], refusals
+    rescans = metrics.value(metrics.TOMBSTONES_RESCANS)
+    assert rescans > rescans_before, \
+        "the cloud must detect the sender's rollback (rescan metric)"
+
+    # phase 2: new shared content; A deletes a belief (synced), then
+    # wipes the whole user while OFFLINE
+    for d in devices.values():
+        d.observe("I like SEN3 and tea.", session_id="sc")
+        d.observe("I work in SEN4.", session_id="sd")
+    _align_all(devices, C)
+    for d in devices.values():
+        assert d.sees("SEN4", "user")
+
+    a_sen3 = next(b for b in A.beliefs() if "SEN3" in b.claim_text)
+    A.engine.forget_belief(user_id=USER, belief_id=a_sen3.id,
+                           purpose="api")
+    _sync_star(devices, refusals, random.Random(3))
+    assert refusals == [], refusals
+    for d in devices.values():
+        assert not d.sees("SEN3", "belief")
+
+    # the OFFLINE deletion: it lands in A's log and NOTHING syncs
+    A.engine.delete_memories(user_id=USER, purpose="api")
+
+    # back online: the deletion must reach everyone -- not filed as a
+    # duplicate, not jumped over by a cursor
+    _sync_star(devices, refusals, random.Random(4))
+    assert refusals == [], refusals
+    for d in (C, B):
+        assert not d.sees("SEN3", "user")
+        assert not d.sees("SEN4", "user"), \
+            "the offline deletion did not propagate"
+        assert d.visible_state() == ((), 0)
+    assert A.visible_state() == ((), 0)
+    assert C.peer_cursor(A.db_id) == A.log.head(A.db_id)[0]
+    return (metrics.value(metrics.TOMBSTONES_RESCANS) - rescans_before)
+
+
+def test_sender_full_restore_then_offline_redelete_reaches_everyone(tmp_path):
+    """The SQLite leg of :func:`_sender_restore_and_offline_redelete`:
+    three SQLite devices -- the sender-restore and the offline re-delete
+    must reach everyone (see the helper's docstring)."""
+    refusals: list[str] = []
+    root = tmp_path
+    devices = {
+        "C": _Device(root, "c", single_tenant=False),
+        "A": _Device(root, "a", single_tenant=True),
+        "B": _Device(root, "b", single_tenant=True),
+    }
+    try:
+        rescans = _sender_restore_and_offline_redelete(devices, refusals)
+        assert rescans >= 1, "the sender's rollback must be DETECTED"
+    finally:
+        for d in devices.values():
+            d.dispose()
+
+def _mesh_rounds_with_restore(devices, refusals, rng, *, restore_name,
+                              restore_round, rounds=20):
+    """The alternating-delete mesh, with a mid-stream FULL MACHINE
+    RESTORE of *restore_name* (main DB + log dir from its round-0
+    backup) at *restore_round*.  Per round the deleted tag is invisible
+    on every device and the never-restored devices agree; before the
+    restore all three agree.  Returns the number of channel rescans the
+    restore produced (automatic, never a refusal)."""
+    from mirror_memory.core import metrics
+
+    C = devices["C"]
+    others = [n for n in devices if n != "C"]
+    assert restore_name in others
+
+    backups = {}
+    for name in others:
+        d = devices[name]
+        bdb = str(d.url).replace("sqlite:///", "") + "-backup"
+        blog = d.log_dir.parent / (d.log_dir.name + "-backup")
+        _backup_device(d, bdb, blog)
+        backups[name] = (bdb, blog)
+
+    rescans_before = metrics.value(metrics.TOMBSTONES_RESCANS)
+    restored = False
+    for round_no in range(rounds):
+        if round_no == restore_round:
+            d = devices[restore_name]
+            _restore_device(d, *backups[restore_name])
+            restored = True
+
+        for d in devices.values():
+            d.observe(f"I like r{round_no} and coffee.",
+                      session_id=f"s{round_no}")
+            d.observe(f"I live in city{round_no}.",
+                      session_id=f"s{round_no}")
+        _align_all(devices, C)
+
+        actor_name = ("A", "B", "C")[round_no % 3]
+        scope = SCOPES[round_no % 3]
+        devices[actor_name].delete(scope, round_no)
+        _sync_star(devices, refusals, rng)
+
+        assert refusals == [], (round_no, refusals)
+        tag = f"r{round_no}"
+        for name, d in devices.items():
+            assert not d.sees(tag, scope), (round_no, name, tag, scope)
+        # the never-restored devices agree every round; ALL three agree
+        # only until the restore (the restored device loses the content
+        # its backup predates -- the channel carries deletions, not
+        # content, and a replayed user-scope tombstone legitimately
+        # wipes what it finds; the final wipe below equalises everyone)
+        states = {n: devices[n].visible_state()
+                  for n in others if n != restore_name}
+        states["C"] = C.visible_state()
+        assert len(set(states.values())) == 1, (round_no, states)
+        if not restored:
+            assert devices[restore_name].visible_state() \
+                == C.visible_state(), (round_no, restore_name)
+
+    # the channel carries deletions, not content: the restored device
+    # never regains the pre-restore content -- a final user-scope wipe
+    # equalises everyone, which is the three-way consistency claim
+    C.engine.delete_memories(user_id=USER, purpose="api")
+    _sync_star(devices, refusals, rng)
+    assert refusals == [], refusals
+    for d in devices.values():
+        assert d.visible_state() == ((), 0)
+    return metrics.value(metrics.TOMBSTONES_RESCANS) - rescans_before
+
+
+def test_mesh_survives_a_midstream_full_restore(tmp_path):
+    """Batch-2 patch 2, task 2 mesh variant (SQLite): one edge fully
+    restores mid-stream; the channel auto-rescans the rolled-back log,
+    nothing wedges, zero refusals, and the mesh converges."""
+    rng = random.Random(23)
+    refusals: list[str] = []
+    root = tmp_path
+    devices = {
+        "C": _Device(root, "c", single_tenant=False),
+        "A": _Device(root, "a", single_tenant=True),
+        "B": _Device(root, "b", single_tenant=True),
+    }
+    try:
+        rescans = _mesh_rounds_with_restore(
+            devices, refusals, rng, restore_name="A", restore_round=7)
+        assert rescans >= 1, "the restore must be DETECTED (rescan metric)"
     finally:
         for d in devices.values():
             d.dispose()

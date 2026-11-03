@@ -31,6 +31,8 @@ and by tools/skip_report.py on the CI junit):
 | edge full restore | main DB + log dir restored -> startup catch-up -> every read entrance sentinel-free | tests/test_edge_sync.py::test_full_restore_then_catchup_cleans_every_read_entrance |
 | edge full restore | a dead link mid-catch-up resumes from the durable cursor | tests/test_edge_sync.py::test_catchup_resumes_after_a_dead_link |
 | edge full restore | the four sync states and the offline-grace refusal/heal | tests/test_edge_sync.py::test_four_states_and_the_reminder_threshold |
+| sender full restore | A restores (DB+log) after its deletions synced out -> its OWN deletions re-apply (echo check); a later OFFLINE deletion reaches cloud and B, no duplicate, no cursor skip | tests/test_sync_mesh.py::test_sender_full_restore_then_offline_redelete_reaches_everyone, tests/test_deletion_race_backup.py::test_sender_full_restore_then_offline_redelete_pg |
+| sender full restore | the mesh with a mid-stream full restore of an edge: auto-rescan (never a refusal), zero refusals, convergence | tests/test_sync_mesh.py::test_mesh_survives_a_midstream_full_restore, tests/test_deletion_race_backup.py::test_tombstone_mesh_with_full_restore_pg |
 | identity | a belief's global_id survives the v11 -> v12 migration on both databases | tests/test_global_id_migration.py::test_step12_upgrades_a_step11_database_sqlite, tests/test_global_id_migration.py::test_step12_upgrades_a_step11_database_pg |
 """
 
@@ -82,6 +84,13 @@ I2_TARGETS: list[tuple[str, str]] = [
     ("tests.test_edge_sync", "test_full_restore_then_catchup_cleans_every_read_entrance"),
     ("tests.test_edge_sync", "test_catchup_resumes_after_a_dead_link"),
     ("tests.test_edge_sync", "test_four_states_and_the_reminder_threshold"),
+    ("tests.test_sync_mesh",
+     "test_sender_full_restore_then_offline_redelete_reaches_everyone"),
+    ("tests.test_deletion_race_backup",
+     "test_sender_full_restore_then_offline_redelete_pg"),
+    ("tests.test_sync_mesh", "test_mesh_survives_a_midstream_full_restore"),
+    ("tests.test_deletion_race_backup",
+     "test_tombstone_mesh_with_full_restore_pg"),
     ("tests.test_global_id_migration", "test_step12_upgrades_a_step11_database_sqlite"),
     ("tests.test_global_id_migration", "test_step12_upgrades_a_step11_database_pg"),
 ]

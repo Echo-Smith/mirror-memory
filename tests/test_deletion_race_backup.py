@@ -45,6 +45,9 @@ from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
 from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqueue_job
 
 USER = "u-race"
+# the mesh/sync plane runs under the mesh file's user (the two constants
+# exist side by side on purpose: USER belongs to the local-restore tests)
+from tests.test_sync_mesh import USER as SYNC_USER  # noqa: E402
 TENANT = ("default", "default")
 
 
@@ -1019,10 +1022,12 @@ def test_tombstone_mesh_three_devices_pg(tmp_path):
                 else:
                     d.observe(f"I like r{round_no} and coffee.",
                               session_id=f"s{round_no}")
-            # adopt the cloud's global_ids on the edges
+            # adopt the cloud's global_ids on the edges (the CLOUD's
+            # user, SYNC_USER -- not this module's USER)
             with tenant_scope(*TENANT):
                 s = F()
-                cloud_rows = s.query(Belief).filter(Belief.user_id == USER).all()
+                cloud_rows = s.query(Belief).filter(
+                    Belief.user_id == SYNC_USER).all()
                 ids = {b.key: b.global_id for b in cloud_rows}
                 s.close()
             for e in edges.values():
@@ -1051,23 +1056,11 @@ def test_tombstone_mesh_three_devices_pg(tmp_path):
                         bels = [(b.key, b.claim_text[:40]) for b in s2.query(
                             Belief).filter(Belief.user_id == SYNC_USER).all()]
                         s2.close()
-                    c_log = [f"C seq={e.seq} origin={e.origin[:6]} "
-                             f"scope={e.scope} key={e.scope_key[:12]}"
-                             for e in cloud_log.read_from(cloud._db_id, 0)]
-                    a_log = [f"A seq={e.seq} origin={e.origin[:6]} "
-                             f"scope={e.scope} key={e.scope_key[:12]}"
-                             for e in edges["A"].log.read_from(
-                                 edges["A"].db_id, 0)]
-                    c_cursors = {n: devices["C"].peer_cursor(dd.db_id)
-                                 for n, dd in devices.items()}
-                    a_cursors = {n: edges["A"].peer_cursor(dd.db_id)
-                                 for n, dd in devices.items()}
-                    with open("/tmp/mesh_fail_state.txt", "w") as _fh:
-                        _fh.write(f"round {round_no} {name} tag={tag} scope={scope}\n"
-                                  f"c_cursors={c_cursors}\na_cursors={a_cursors}\n"
-                                  f"c_log={c_log}\na_log={a_log}\n"
-                                  f"rows={rows}\nbels={bels}\n")
-                    pytest.fail(f"round {round_no} {name} {tag} {scope}")
+                    cursors = {n: d.peer_cursor(dd.db_id)
+                               for n, dd in devices.items()}
+                    pytest.fail(
+                        f"round {round_no} {name} {tag} {scope} "
+                        f"cursors={cursors} summaries={rows} beliefs={bels}")
 
         for e in edges.values():
             e.dispose()
@@ -1075,3 +1068,228 @@ def test_tombstone_mesh_three_devices_pg(tmp_path):
     finally:
         runtime.dispose()
         _pg_drop_database("mm_test_m4_mesh", admin_url)
+
+
+# --- M4 batch-2 patch 2, task 2: full-machine restore, PG cloud leg ---
+
+def _pg_cloud_device(cloud, F, cloud_db_id):
+    """Adapts a PG cloud engine to the mesh's _Device shape: everything
+    the sync helpers (_sync_star, _align_all, the restore helpers) touch
+    -- observe, beliefs, visible_state, sees, cursors, pulls."""
+
+    class _PgCloud:
+        name = "C"
+        db_id = cloud_db_id
+        engine = cloud
+
+        @staticmethod
+        def observe(text, session_id):
+            cloud.observe(user_id=SYNC_USER, session_id=session_id,
+                          text=text, purpose="api")
+
+        @staticmethod
+        def beliefs():
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    return s.query(Belief).filter(
+                        Belief.user_id == SYNC_USER).all()
+                finally:
+                    s.close()
+
+        @staticmethod
+        def summaries():
+            from mirror_memory.core.models import SessionSummary as _SS
+
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    return s.query(_SS).filter(
+                        _SS.user_id == SYNC_USER).count()
+                finally:
+                    s.close()
+
+        @classmethod
+        def visible_state(cls):
+            return (tuple(sorted(b.key for b in cls.beliefs())),
+                    cls.summaries())
+
+        @staticmethod
+        def peer_cursor(peer_db_id):
+            from mirror_memory.core.repository import read_sync_peer
+
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    row = read_sync_peer(s, peer_db_id)
+                    return row.cursor if row is not None else 0
+                finally:
+                    s.close()
+
+        @staticmethod
+        def pull_from(peer, refusals, *, max_batches=200):
+            from mirror_memory.core.tombstones import TombstoneBatchRejected
+
+            for _ in range(max_batches):
+                cursor = _PgCloud.peer_cursor(peer.db_id)
+                try:
+                    batch, _next = peer.engine.export_tombstones(
+                        cursor, 500)
+                except Exception as exc:  # noqa: BLE001 -- recorded
+                    refusals.append(f"export from {peer.name}: {exc!r}")
+                    return
+                try:
+                    cloud.apply_tombstones(batch)
+                except TombstoneBatchRejected as exc:
+                    refusals.append(f"apply from {peer.name}: {exc}")
+                    return
+                if batch.to_cursor == batch.from_cursor:
+                    return
+
+        @staticmethod
+        def sees(tag, scope):
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    if scope in ("belief", "user") and any(
+                            tag in b.claim_text for b in s.query(
+                                Belief).filter(
+                                Belief.user_id == SYNC_USER).all()):
+                        return True
+                    from mirror_memory.core.models import SessionSummary as _SS
+
+                    if scope in ("session", "user") and any(
+                            tag in r.summary_text for r in s.query(
+                                _SS).filter(
+                                _SS.user_id == SYNC_USER).all()):
+                        return True
+                    return False
+                finally:
+                    s.close()
+
+        @classmethod
+        def delete(cls, scope, round_no):
+            """One deletion of *scope* (the _Device.delete contract)."""
+            tag = f"r{round_no}"
+            session_id = f"s{round_no}"
+            cls.observe(f"I like {tag} and coffee.", session_id=session_id)
+            if scope == "belief":
+                belief = next(b for b in cls.beliefs() if tag in b.claim_text)
+                assert cloud.forget_belief(user_id=SYNC_USER,
+                                           belief_id=belief.id,
+                                           purpose="api")
+                return tag
+            if scope == "session":
+                assert cloud.forget_session(user_id=SYNC_USER,
+                                            session_id=session_id,
+                                            purpose="api")
+                return tag
+            cloud.delete_memories(user_id=SYNC_USER, purpose="api")
+            return tag
+
+        @staticmethod
+        def dispose():
+            cloud._engine.dispose()
+
+    return _PgCloud
+
+
+@_pg_needs
+def test_sender_full_restore_then_offline_redelete_pg(tmp_path):
+    """Batch-2 patch 2, task 2 on PostgreSQL: the sender-restore and the
+    offline re-delete (see
+    tests.test_sync_mesh._sender_restore_and_offline_redelete) with the
+    PG cloud as the hub."""
+    from tests.test_sync_mesh import (
+        _Device,
+        _cfg,
+        _sender_restore_and_offline_redelete,
+    )
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    refusals: list[str] = []
+    runtime_url, admin_url = _pg_own_database("mm_test_m4_sender_pg")
+    log_dir = tmp_path / "sender-cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+        from mirror_memory.core import schema_migration as sm
+
+        C = _pg_cloud_device(cloud, F, sm.read_watermark(runtime)[0])
+        devices = {
+            "C": C,
+            "A": _Device(tmp_path, "sr-a", single_tenant=True),
+            "B": _Device(tmp_path, "sr-b", single_tenant=True),
+        }
+        try:
+            rescans = _sender_restore_and_offline_redelete(devices, refusals)
+            assert rescans >= 1, "the sender's rollback must be DETECTED"
+        finally:
+            for d in devices.values():
+                d.dispose()
+    finally:
+        runtime.dispose()
+        _pg_drop_database("mm_test_m4_sender_pg", admin_url)
+
+
+@_pg_needs
+def test_tombstone_mesh_with_full_restore_pg(tmp_path):
+    """Batch-2 patch 2, task 2 mesh variant on PostgreSQL: the PG cloud
+    is the hub, one edge fully restores mid-stream, the channel
+    auto-rescans, zero refusals, three-way convergence."""
+    from tests.test_sync_mesh import (
+        _Device,
+        _cfg,
+        _mesh_rounds_with_restore,
+    )
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    rng = random.Random(31)
+    refusals: list[str] = []
+    runtime_url, admin_url = _pg_own_database("mm_test_m4_mesh_restore_pg")
+    log_dir = tmp_path / "mesh-restore-cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+        from mirror_memory.core import schema_migration as sm
+
+        C = _pg_cloud_device(cloud, F, sm.read_watermark(runtime)[0])
+        devices = {
+            "C": C,
+            "A": _Device(tmp_path, "mr-a", single_tenant=True),
+            "B": _Device(tmp_path, "mr-b", single_tenant=True),
+        }
+        try:
+            rescans = _mesh_rounds_with_restore(
+                devices, refusals, rng, restore_name="B", restore_round=9)
+            assert rescans >= 1, "the restore must be DETECTED (rescan)"
+        finally:
+            for d in devices.values():
+                d.dispose()
+    finally:
+        runtime.dispose()
+        _pg_drop_database("mm_test_m4_mesh_restore_pg", admin_url)
