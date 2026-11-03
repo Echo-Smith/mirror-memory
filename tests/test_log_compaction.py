@@ -168,5 +168,5 @@ def test_export_refuses_a_cursor_before_the_checkpoint(tmp_path):
         export_from_log(log, db_id, 0, 100)
     assert "checkpoint" in str(info.value) and "rebuild" in str(info.value)
     # a cursor at or after the checkpoint exports normally
-    entries, cursor, _skipped = export_from_log(log, db_id, 2, 100)
-    assert [e.origin_seq for e in entries] == [3, 4] or cursor >= 2
+    batch, cursor, _skipped = export_from_log(log, db_id, 2, 100)
+    assert [e.origin_seq for e in batch.entries] == [3, 4] and cursor == 4
