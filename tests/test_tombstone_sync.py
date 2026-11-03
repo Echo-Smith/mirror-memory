@@ -412,10 +412,14 @@ def test_forged_mixed_gap_and_tampered_batches_are_refused_with_zero_writes(
         "hash-content": resend([entries[0], _forged(entries[1], user_id="someone-else", hash=entries[1].hash)]),
         # malformed: a belief without a global_id
         "format": resend([_forged(entries[0], scope_key="")]),
-        # a tampered ENVELOPE: from_cursor edited after sealing
+        # a tampered ENVELOPE: from_cursor edited after sealing (the
+        # continuation is plausible, the stored cursor disagrees)
         "envelope": TombstoneBatch(sender=sender.db_id, from_cursor=cursor + 1,
-                                   to_cursor=cursor, entries=entries,
-                                   hash=_batch_of(sender.db_id, 0, entries).hash),
+                                   to_cursor=cursor + 1 + len(entries),
+                                   entries=entries,
+                                   hash=_batch_of(sender.db_id, cursor + 1,
+                                                  entries,
+                                                  cursor + 1 + len(entries)).hash),
     }
     expected_reason = {"tenant": "tenant", "tenant-mixed": "tenant", "sequence": "sequence",
                        "hash": "hash", "hash-content": "hash", "format": "format",

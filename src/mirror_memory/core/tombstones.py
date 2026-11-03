@@ -312,6 +312,13 @@ def export_from_log(
         entries.append(tombstone)
         if len(entries) >= limit:
             break
+    import os as _os
+
+    if _os.environ.get("MESH_TRACE"):
+        with open("/tmp/export_trace.txt", "a") as _fh:
+            _fh.write(f"export db={db_id[:6]} from={since_cursor} to={cursor} "
+                      f"entries={len(entries)} skipped={skipped} "
+                      f"exclude={exclude_origin[:6] if exclude_origin else None}\n")
     batch = TombstoneBatch(sender=db_id, from_cursor=since_cursor,
                            to_cursor=cursor, entries=entries).seal()
     return batch, cursor, skipped
