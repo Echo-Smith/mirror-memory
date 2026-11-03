@@ -559,3 +559,173 @@ def test_tombstone_apply_vs_publish_50_rounds_sqlite(tmp_path):
     finally:
         cloud.dispose()
         edge.dispose()
+
+
+# --- M4 batch-2 patch 3, task 2: apply cost does not follow table size ---
+
+def _scale_receiver(root: Path, name: str):
+    """A single-tenant receiver with its own SQLite DB and file log."""
+    log_dir = root / f"{name}-deletions"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    engine = MemoryEngine(
+        config=_cfg(log_dir),
+        database_url=f"sqlite:///{root / name}.db",
+        tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+        deletion_log=FileDeletionLog(log_dir), single_tenant_mode=True)
+    engine._ensure_db()
+    return engine
+
+
+def _scale_batch(n: int, *, seq_from: int = 1) -> TombstoneBatch:
+    """`n` belief-scope tombstones of one sender; the beliefs never exist
+    locally, so every apply is a recorded no-op -- identical work in both
+    phases of the scale test."""
+    origin = "d" * 32
+    entries = [
+        TombstoneEntry(
+            origin=origin, origin_seq=seq_from + i,
+            tenant_id=TENANT[0], app_id=TENANT[1], user_id="u-scale",
+            scope="belief", scope_key=f"{seq_from + i:032x}",
+            generation=0, created_at="2026-01-01T00:00:00",
+            origin_hash=f"{seq_from + i:064x}").seal()
+        for i in range(n)
+    ]
+    batch = TombstoneBatch(sender=origin, from_cursor=seq_from,
+                           to_cursor=seq_from + n - 1,
+                           from_chain_hash=f"{seq_from:064x}",
+                           to_chain_hash=f"{seq_from + n - 1:064x}",
+                           entries=entries).seal()
+    return batch
+
+
+def _measure_apply(engine, batch) -> tuple[float, int]:
+    """One apply, timed, with the SQL statement count taken from a
+    before_cursor_execute listener on the engine's own bind."""
+    import time as _time
+    from sqlalchemy import event as _sa_event
+
+    counter = {"n": 0}
+
+    def _count(conn, cursor, statement, parameters, context, executemany):
+        counter["n"] += 1
+
+    _sa_event.listen(engine._engine, "before_cursor_execute", _count)
+    try:
+        t0 = _time.perf_counter()
+        engine.apply_tombstones(batch, purpose="sync")
+        elapsed = _time.perf_counter() - t0
+    finally:
+        _sa_event.remove(engine._engine, "before_cursor_execute", _count)
+    return elapsed, counter["n"]
+
+
+def _seed_applied(engine, n: int) -> None:
+    """`n` applied rows of one foreign origin, bulk-inserted."""
+    from mirror_memory.core.models import TombstoneApplied
+
+    rows = [dict(tenant_id=TENANT[0], app_id=TENANT[1], origin="b" * 32,
+                 origin_seq=i, origin_hash=f"{i:064x}", user_id="u-seed",
+                 scope="user", scope_key="", local_seq=None)
+            for i in range(1, n + 1)]
+    with tenant_scope(*TENANT), fixture_write_scope("scale test seeding"):
+        from mirror_memory.core.repository import record_tombstones_applied
+
+        s = sessionmaker(bind=engine._engine)()
+        try:
+            s.bulk_insert_mappings(TombstoneApplied, rows)
+            s.commit()
+        finally:
+            s.close()
+
+
+def _seed_log(log: FileDeletionLog, db_id: str, n: int) -> None:
+    """`n` chained log entries for the fake sender db, written raw (one
+    fsync) -- seeding, not measurement."""
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt
+
+    from mirror_memory.core.deletion import DeletionEntry, GENESIS_HASH
+
+    log.ensure_genesis(db_id)
+    path = log._path_for(db_id)
+    lines = []
+    prev = GENESIS_HASH
+    for i in range(1, n + 1):
+        e = DeletionEntry(
+            db_id=db_id, seq=i, tenant_id=TENANT[0], app_id=TENANT[1],
+            user_id="u-seed", scope="user", scope_key="", fingerprints=[],
+            generation=0, purpose="seed", created_at=_dt(2026, 1, 1),
+            prev_hash=prev)
+        e.hash = e.compute_hash()
+        prev = e.hash
+        lines.append(_json.dumps(log._line(e), sort_keys=True,
+                                 ensure_ascii=False))
+    with open(path, "a+b") as fh:
+        fh.seek(0, _os.SEEK_END)
+        fh.write(("\n".join(lines) + "\n").encode())
+        fh.flush()
+        _os.fsync(fh.fileno())
+    log._index_invalidate(db_id)
+
+
+def test_apply_scale_does_not_follow_the_table_size(tmp_path):
+    """Batch-2 patch 3, task 2: one 500-entry apply costs the same on an
+    empty receiver as on one holding 10,000 applied records and a
+    10,000-entry log -- the dedup lookup queries the batch's own triples
+    (chunked row-value IN), and the file log answers per-entry lookups
+    (chain_hash_at / has_tombstone / head) from the position index.  The
+    number pairs are printed for the report; the assertions refuse
+    linear growth."""
+    import time as _time
+
+    LOG_DB = "c" * 32
+    n = 500
+    scale = 10_000
+
+    empty = _scale_receiver(tmp_path, "rx-empty")
+    t_empty, stmt_empty = _measure_apply(empty, _scale_batch(n))
+
+    scaled = _scale_receiver(tmp_path, "rx-scaled")
+    _seed_applied(scaled, scale)
+    _seed_log(scaled._deletion_log, LOG_DB, scale)
+    t_scaled, stmt_scaled = _measure_apply(scaled, _scale_batch(n))
+
+    print(f"\nSCALE apply empty   : {t_empty * 1000:.4g} ms, "
+          f"{stmt_empty} statements")
+    print(f"SCALE apply 10k-seed: {t_scaled * 1000:.4g} ms, "
+          f"{stmt_scaled} statements")
+
+    assert stmt_scaled - stmt_empty <= 5, \
+        "the dedup lookup must not add statements as the table grows"
+    assert t_scaled < max(3.0 * t_empty, 0.5), \
+        f"apply time grew with the table: {t_empty:.4g}s -> {t_scaled:.4g}s"
+
+    # the file log's per-entry lookups: 200 (chain_hash_at + has_tombstone
+    # + head) rounds on the 10k-entry log vs the empty log -- the index
+    # keeps them flat
+    log_empty = empty._deletion_log
+    log_scaled = scaled._deletion_log
+
+    def _lookups(log, db_id, rounds):
+        t0 = _time.perf_counter()
+        for i in range(1, rounds + 1):
+            log.chain_hash_at(db_id, i)
+            log.has_tombstone(db_id, i, f"{i:064x}")
+            log.head(db_id)
+        return _time.perf_counter() - t0
+
+    # steady state: the first lookup on the scaled log builds the index
+    # once (one linear parse, unavoidable), the timed rounds must be flat
+    t_build0 = _time.perf_counter()
+    log_scaled.chain_hash_at(LOG_DB, 1)
+    t_build = _time.perf_counter() - t_build0
+    print(f"SCALE index build (once, 10k entries): {t_build * 1000:.4g} ms")
+
+    t_look_empty = _lookups(log_empty, LOG_DB, 200)
+    t_look_scaled = _lookups(log_scaled, LOG_DB, 200)
+    print(f"SCALE lookups empty   : {t_look_empty * 1000:.4g} ms")
+    print(f"SCALE lookups 10k-seed: {t_look_scaled * 1000:.4g} ms")
+    assert t_look_scaled < max(3.0 * t_look_empty, 0.2), \
+        f"log lookups grew with the log: {t_look_empty:.4g}s -> " \
+        f"{t_look_scaled:.4g}s"

@@ -1415,27 +1415,40 @@ class MemoryEngine:
                 metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
                 raise
 
-            # NOTE: NOT filtered by batch.sender -- a hub relays entries
-            # whose origin is another device, so the dedup set must cover
-            # every origin this tenant has applied, not just the sender's.
-            # The table is already tenant-scoped (composite PK).
-            applied_keys: set[tuple[str, int, str]] = set()
-            for row_key in session.query(
-                    TombstoneApplied.origin, TombstoneApplied.origin_seq,
-                    TombstoneApplied.origin_hash).all():
-                applied_keys.add((row_key[0], row_key[1], row_key[2]))
+            # NOTE: the dedup lookup covers EVERY origin (a hub relays
+            # entries whose origin is another device) but queries ONLY the
+            # triples this batch actually carries -- chunked row-value IN
+            # lists -- so its cost follows the batch size, not the size of
+            # the applied table (batch-2 patch 3, task 2).
+            from sqlalchemy import tuple_ as _sa_tuple
+
+            existing: set[tuple[str, int, str]] = set()
+            batch_keys = sorted({(e.origin, int(e.origin_seq),
+                                  e.origin_hash or "")
+                                 for e in batch.entries})
+            for _i in range(0, len(batch_keys), 250):
+                _chunk = batch_keys[_i:_i + 250]
+                for row_key in session.query(
+                        TombstoneApplied.origin, TombstoneApplied.origin_seq,
+                        TombstoneApplied.origin_hash).filter(
+                        _sa_tuple(
+                            TombstoneApplied.origin,
+                            TombstoneApplied.origin_seq,
+                            TombstoneApplied.origin_hash).in_(_chunk)).all():
+                    existing.add((row_key[0], row_key[1], row_key[2]))
 
             rows: list[dict] = []
             noop = 0
             skipped = 0
             applied = 0
+            seen_in_batch: set[tuple[str, int, str]] = set()
             try:
                 for entry in batch.entries:
                     key = (entry.origin, entry.origin_seq, entry.origin_hash)
-                    if key in applied_keys:
+                    if key in existing or key in seen_in_batch:
                         skipped += 1
                         continue  # already applied: idempotent skip
-                    applied_keys.add(key)
+                    seen_in_batch.add(key)
                     # ECHO CHECK: a tombstone ORIGINATING from this device
                     # is re-applied only when the entry is absent from the
                     # local log -- a full restore lost it (re-delete);

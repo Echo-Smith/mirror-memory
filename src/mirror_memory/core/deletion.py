@@ -251,6 +251,64 @@ class FileDeletionLog(DeletionLog):
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
         self._verified: set[str] = set()
+        # Per-db_id position index: seq -> (hash, origin_hash, scope).
+        # Built on first use and refreshed whenever the file's
+        # (size, mtime_ns) changes, so the per-entry lookups
+        # (chain_hash_at / has_tombstone / head / checkpoint_seq /
+        # append's tail) stop rescanning the whole file (batch-2 patch 3,
+        # task 2).  Any external rewrite -- a device restore, a prune in
+        # another process -- changes size or mtime, which invalidates the
+        # cache; our own writes refresh it under the append lock.
+        self._index: dict[str, dict[int, tuple[str, str, str]]] = {}
+        self._index_stat: dict[str, tuple[int, int]] = {}
+        # (last_seq, last_hash) per db_id -- head() without a max() scan
+        self._index_tail: dict[str, tuple[int, str]] = {}
+
+    def _index_for(self, db_id: str) -> dict[int, tuple[str, str, str]]:
+        """The db_id's position index, rebuilt when the file changed on
+        disk (a restore rewrites the file behind our back)."""
+        path = self._path_for(db_id)
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            self._index_invalidate(db_id)
+            return {}
+        stat_key = (st.st_size, st.st_mtime_ns)
+        cached = self._index.get(db_id)
+        if cached is not None and self._index_stat.get(db_id) == stat_key:
+            return cached
+        idx: dict[int, tuple[str, str, str]] = {}
+        for e in self._iter_entries(path):
+            idx[e.seq] = (e.hash, e.origin_hash, e.scope)
+        self._index[db_id] = idx
+        self._index_stat[db_id] = stat_key
+        if idx:
+            last = max(idx)
+            self._index_tail[db_id] = (last, idx[last][0])
+        else:
+            self._index_tail.pop(db_id, None)
+        return idx
+
+    def _index_record_write(self, db_id: str, seq: int, entry_hash: str,
+                            origin_hash: str, scope: str) -> None:
+        """Fold OUR OWN append into the index and refresh the cached stat
+        -- called while the append lock is still held, so the stat cannot
+        race another writer."""
+        path = self._path_for(db_id)
+        idx = self._index.setdefault(db_id, {})
+        idx[seq] = (entry_hash, origin_hash, scope)
+        self._index_tail[db_id] = (seq, entry_hash)
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            self._index_invalidate(db_id)
+            return
+        self._index_stat[db_id] = (st.st_size, st.st_mtime_ns)
+
+    def _index_invalidate(self, db_id: str) -> None:
+        self._index.pop(db_id, None)
+        self._index_stat.pop(db_id, None)
+        self._index_tail.pop(db_id, None)
 
     def _path_for(self, db_id: str) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -293,14 +351,19 @@ class FileDeletionLog(DeletionLog):
         # tombstone): stamp it before the hash, like the PG backend does
         entry.created_at = entry.created_at or datetime.utcnow()
         with self._locked(path) as fh:
-            entries = list(self._iter_entries(path))
-            entry.seq = (entries[-1].seq if entries else 0) + 1
-            entry.prev_hash = entries[-1].hash if entries else GENESIS_HASH
+            # the tail comes from the position index (refreshed under the
+            # lock), not from a full-file parse
+            idx = self._index_for(entry.db_id)
+            last_seq = max(idx) if idx else 0
+            entry.seq = last_seq + 1
+            entry.prev_hash = idx[last_seq][0] if idx else GENESIS_HASH
             entry.hash = entry.compute_hash()
             fh.seek(0, os.SEEK_END)
             fh.write((json.dumps(self._line(entry), sort_keys=True, ensure_ascii=False) + "\n").encode())
             fh.flush()
             os.fsync(fh.fileno())
+            self._index_record_write(entry.db_id, entry.seq, entry.hash,
+                                     entry.origin_hash, entry.scope)
         return entry
 
     @staticmethod
@@ -383,44 +446,26 @@ class FileDeletionLog(DeletionLog):
         self._ensure_file(db_id)
 
     def head(self, db_id: str) -> tuple[int, str]:
-        path = self._path_for(db_id)
-        if not path.exists():
-            return 0, GENESIS_HASH
-        last: DeletionEntry | None = None
-        for entry in self._iter_entries(path):
-            last = entry
-        if last is None:
-            return 0, GENESIS_HASH
-        return last.seq, last.hash
+        self._index_for(db_id)  # refresh if the file changed on disk
+        tail = self._index_tail.get(db_id)
+        return tail if tail is not None else (0, GENESIS_HASH)
 
     def checkpoint_seq(self, db_id: str) -> int:
-        path = self._path_for(db_id)
-        if not path.exists():
-            return 0
         best = 0
-        for entry in self._iter_entries(path):
-            if entry.scope == "checkpoint" and entry.seq > best:
-                best = entry.seq
+        for _seq, (_h, _oh, scope) in self._index_for(db_id).items():
+            if scope == "checkpoint" and _seq > best:
+                best = _seq
         return best
 
     def chain_hash_at(self, db_id: str, seq: int) -> str:
         if seq <= 0:
             return GENESIS_HASH
-        path = self._path_for(db_id)
-        if not path.exists():
-            return GENESIS_HASH
-        for entry in self._iter_entries(path):
-            if entry.seq == seq:
-                return entry.hash
-        return GENESIS_HASH
+        entry = self._index_for(db_id).get(seq)
+        return entry[0] if entry is not None else GENESIS_HASH
 
     def has_tombstone(self, db_id: str, seq: int, entry_hash: str) -> bool:
-        path = self._path_for(db_id)
-        if not path.exists():
-            return False
-        return any(e.seq == seq and (e.hash == entry_hash
-                                     or e.origin_hash == entry_hash)
-                   for e in self._iter_entries(path))
+        entry = self._index_for(db_id).get(seq)
+        return entry is not None and entry_hash in (entry[0], entry[1])
 
     def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
         """Rewrite the file: the header, the genesis, a CHECKPOINT entry
@@ -429,6 +474,8 @@ class FileDeletionLog(DeletionLog):
         checkpoint's recorded hash; startup verification stays whole.
         Returns the number of entries removed."""
         import os
+
+        self._index_invalidate(db_id)  # the file is about to be rewritten
 
         path = self._path_for(db_id)
         if not path.exists():
