@@ -2931,11 +2931,16 @@ def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
 @_sanctioned_writer("sync")
 def record_catchup(session: Session, peer_db_id: str, cursor: int,
                    chain_hash: str = "") -> None:
-    """Advance the peer's consumed cursor + chain hash and stamp the
-    catch-up instant (the offline grace period measures from it).  The
-    chain hash anchors the channel-continuity check: a next batch whose
-    from_chain_hash differs means the peer rolled back.  Called from the
-    edge's catch-up path and the tombstone application (M4 batch 2)."""
+    """Advance the peer's consumed cursor + chain hash.  The chain hash
+    anchors the channel-continuity check: a next batch whose
+    from_chain_hash differs means the peer rolled back.
+
+    This is PER-BATCH PROGRESS only -- it deliberately does NOT touch
+    ``last_catchup_at``: a partial catch-up (or a rescan re-anchor, or a
+    bare apply call) must never be recorded as a complete one, or the
+    offline grace would restart on progress the peer never finished
+    (batch-2 patch 4, task 1).  Only :func:`mark_catchup_complete`, called
+    by the catch-up loop after it CONFIRMS the tail, stamps the instant."""
     from mirror_memory.core.tenancy import current_tenant
     from mirror_memory.core.models import SyncPeer
 
@@ -2947,6 +2952,24 @@ def record_catchup(session: Session, peer_db_id: str, cursor: int,
     row.cursor = cursor
     if chain_hash:
         row.chain_hash = chain_hash
+
+
+@_sanctioned_writer("sync")
+def mark_catchup_complete(session: Session, peer_db_id: str) -> None:
+    """Stamp ``last_catchup_at`` -- the instant the catch-up loop reached
+    the peer's tail (an empty batch that did not rescan).  This is the
+    ONLY writer of the offline grace period's anchor: intermediate
+    batches, rescan re-anchors and bare ``apply_tombstones`` calls record
+    progress, never completion.  Called only by the engine's catch-up
+    loop (MemoryEngine._catch_up), after its exit condition."""
+    from mirror_memory.core.tenancy import current_tenant
+    from mirror_memory.core.models import SyncPeer
+
+    tenant_id, app_id = current_tenant()
+    row = session.get(SyncPeer, (tenant_id, app_id, peer_db_id))
+    if row is None:
+        row = SyncPeer(peer_db_id=peer_db_id, cursor=0)
+        session.add(row)
     row.last_catchup_at = datetime.utcnow()
     session.flush()
 

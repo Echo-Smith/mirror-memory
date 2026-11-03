@@ -26,7 +26,12 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from mirror_memory.api import MemoryEngine, SyncCatchupRequired, SyncCatchingUp
+from mirror_memory.api import (
+    MemoryEngine,
+    SyncCatchupRequired,
+    SyncCatchingUp,
+    SyncTransportIdentityMissing,
+)
 from mirror_memory.config.loader import load_config
 from mirror_memory.core import schema_migration as sm
 from mirror_memory.core.deletion import FileDeletionLog
@@ -56,12 +61,14 @@ class _FakeLLM:
 
 class _Transport:
     """The in-process link to the cloud engine (no network in this batch):
-    the peer's export, optionally failing from call N on."""
+    the peer's export, optionally failing from call N on and optionally
+    capping the batch size (to drive multi-batch catch-ups)."""
 
-    def __init__(self, peer, *, fail_after=None):
+    def __init__(self, peer, *, fail_after=None, batch_limit=None):
         self.peer = peer
         self.calls = 0
         self.fail_after = fail_after
+        self.batch_limit = batch_limit
 
     @property
     def db_id(self):
@@ -71,7 +78,30 @@ class _Transport:
         self.calls += 1
         if self.fail_after is not None and self.calls > self.fail_after:
             raise ConnectionError("the link is down")
-        return self.peer.export_tombstones(cursor, limit)
+        return self.peer.export_tombstones(
+            cursor, min(limit, self.batch_limit) if self.batch_limit
+            else limit)
+
+
+class _LyingTransport(_Transport):
+    """A transport that declares a DIFFERENT peer than the one it dials
+    (the envelope's sender will disagree with the declared db_id)."""
+
+    def __init__(self, peer, *, declared_db_id):
+        super().__init__(peer)
+        self._declared = declared_db_id
+
+    @property
+    def db_id(self):
+        return self._declared
+
+
+class _NoIdentityTransport(_Transport):
+    """A transport that cannot name its peer at all (no db_id)."""
+
+    @property
+    def db_id(self):
+        return None
 
 
 def _edge(root: Path, transport=None, *, grace_days=7, reminder_days=2):
@@ -202,6 +232,53 @@ def test_catchup_resumes_after_a_dead_link(tmp_path):
     cloud._engine.dispose()
 
 
+def _align_belief(cloud, edge, tag: str) -> None:
+    """The edge's copy of the belief carrying *tag* adopts the cloud's
+    global_id (what a shared history implies once sync is on)."""
+    from mirror_memory.core.models import Belief as _B
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    cb = next(b for b in _beliefs(cloud) if tag in b.claim_text)
+    with tenant_scope(*TENANT), fixture_write_scope("align identity"):
+        s = sessionmaker(bind=create_engine(str(edge._database_url)))()
+        row = s.get(_B, (*TENANT,
+                       next(b.id for b in _beliefs(edge)
+                            if tag in b.claim_text)))
+        row.global_id = cb.global_id
+        s.commit()
+        s.close()
+
+
+def _beliefs(engine) -> list:
+    from mirror_memory.core.tenancy import tenant_scope
+
+    with tenant_scope(*TENANT):
+        s = sessionmaker(bind=create_engine(str(engine._database_url)))()
+        try:
+            return list(s.query(Belief).filter(
+                Belief.user_id == USER).all())
+        finally:
+            s.close()
+
+
+def _peer_state(engine, peer_db_id):
+    """(cursor, chain_hash, last_catchup_at) of the engine's channel row
+    for *peer_db_id*."""
+    from mirror_memory.core.repository import read_sync_peer
+    from mirror_memory.core.tenancy import tenant_scope
+
+    with tenant_scope(*TENANT):
+        s = sessionmaker(bind=create_engine(
+            str(engine._database_url)))()
+        try:
+            row = read_sync_peer(s, peer_db_id)
+            return (row.cursor if row else None,
+                    row.chain_hash if row else None,
+                    row.last_catchup_at if row else None)
+        finally:
+            s.close()
+
+
 def _age_last_catchup(engine, days: float) -> None:
     """Rewind the stored last catch-up: the grace arithmetic then sees an
     edge that has not synced for *days*."""
@@ -267,3 +344,298 @@ def test_four_states_and_the_reminder_threshold(tmp_path):
     edge._sync_state = "normal"
     edge._engine.dispose()
     cloud._engine.dispose()
+
+
+# --- M4 batch-2 patch 4, task 1: only a COMPLETE catch-up refreshes the
+# --- offline grace; task 2: one trusted peer identity, fail-closed.
+
+def _seed_pair(cloud, edge, tags):
+    """Both engines observe the tagged texts; the edge's copies adopt the
+    cloud's global_ids; the cloud then deletes every tagged scope (one
+    log entry each)."""
+    for tag in tags:
+        for eng in (cloud, edge):
+            eng.observe(user_id=USER, session_id=f"s-{tag}",
+                        text=f"I like {tag} and coffee.", purpose="api")
+            _align_belief(cloud, eng, tag)
+    for tag in tags:
+        b = next(b for b in _beliefs(cloud) if tag in b.claim_text)
+        assert cloud.forget_belief(user_id=USER, belief_id=b.id,
+                                   purpose="api")
+
+
+def test_partial_catchup_never_earns_grace(tmp_path):
+    """Task 1, case A: the edge has NEVER completed a catch-up.  Batch 1
+    commits, the link dies before batch 2 -- the state is expired (a
+    partial catch-up is not a complete one), every read entrance refuses,
+    and the not-yet-synced sentinels surface nowhere.  A process restart
+    keeps the committed cursor and the expired state; a healed link
+    finishes the job and service resumes with a fresh completion
+    instant."""
+    root = tmp_path
+    cloud_root = root / "cloud"
+    cloud_root.mkdir()
+    cloud = _edge(cloud_root, transport=None)  # a plain engine as the cloud
+    tags = [f"g{i}" for i in range(5)]
+    edge_root = root / "edge"
+    edge_root.mkdir()
+    # seed both sides FIRST (the edge without a transport), then the
+    # cloud deletes all five scopes
+    e0 = _edge(edge_root, transport=None)
+    _seed_pair(cloud, e0, tags)
+    e0._engine.dispose()
+
+    # batch cap 2: 5 tombstones need 3 data batches + the empty tail
+    broken = _Transport(cloud, fail_after=1, batch_limit=2)
+    e1 = _edge(edge_root, transport=broken)
+    assert e1.sync_status()["state"] == "expired"
+    assert e1.sync_status()["last_catchup_at"] is None, \
+        "no complete catch-up has ever happened"
+    cursor, _chain, _last = _peer_state(e1, cloud._db_id)
+    assert cursor == 2, "batch 1's progress is durable"
+    for call in (lambda: e1.recall(user_id=USER, query="g3", purpose="api"),
+                 lambda: e1.get_beliefs(user_id=USER, purpose="api"),
+                 lambda: e1.export_page(user_id=USER, purpose="api")):
+        with pytest.raises(SyncCatchupRequired):
+            call()
+
+    # the process restarts: the same link, the cursor resumes (batch 2),
+    # still never completed -> still expired
+    e1._engine.dispose()
+    e2 = _edge(edge_root, transport=_Transport(cloud, fail_after=1,
+                                               batch_limit=2))
+    assert e2.sync_status()["state"] == "expired"
+    cursor, _chain, _last = _peer_state(e2, cloud._db_id)
+    assert cursor == 4, "the restart resumed from the committed cursor"
+
+    # the link heals: the catch-up runs to the tail, service resumes and
+    # the completion instant is stamped
+    e2._engine.dispose()
+    e3 = _edge(edge_root, transport=_Transport(cloud, batch_limit=2))
+    assert e3.sync_status()["state"] == "normal"
+    cursor, _chain, last = _peer_state(e3, cloud._db_id)
+    assert last is not None
+    assert cursor == 5, "the tail is reached"
+    for tag in tags:
+        assert all(tag not in b.claim_text for b in _beliefs(e3)), tag
+    assert "g4" not in (e3.recall(user_id=USER, query="g4", purpose="api") or "")
+    e3._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_partial_progress_does_not_extend_the_grace(tmp_path):
+    """Task 1, case B: a COMPLETE catch-up earns the grace at T0; later
+    partial progress (a batch applied, then the link dies) must leave the
+    anchor at T0 -- the remaining grace keeps shrinking with real time
+    and never restarts.  Healing completes the catch-up, resumes service
+    and stamps a fresh instant."""
+    from datetime import UTC, datetime
+
+    root = tmp_path
+    cloud_root = root / "cloud"
+    cloud_root.mkdir()
+    cloud = _edge(cloud_root, transport=None)
+    edge_root = root / "edge"
+    edge_root.mkdir()
+    e = _edge(edge_root, transport=_Transport(cloud), grace_days=7,
+              reminder_days=2)
+    assert e.sync_status()["state"] == "normal"
+    t0 = _peer_state(e, cloud._db_id)[2]
+    assert t0 is not None
+
+    # the cloud gains tombstones; the edge ages to 6.5 days of its grace
+    _seed_pair(cloud, e, ["h1", "h2", "h3", "h4"])
+    _age_last_catchup(e, days=6.5)
+    # one batch applies, then the link dies
+    e._sync_transport = _Transport(cloud, fail_after=1, batch_limit=1)
+    e._catch_up()
+    assert e.sync_status()["state"] == "offline_grace"
+    st = e.sync_status()
+    assert st["remaining_grace_days"] == pytest.approx(0.5, abs=0.1), \
+        "the partial catch-up must NOT have restarted the 7-day grace"
+    assert _peer_state(e, cloud._db_id)[0] == 1, "batch 1 still committed"
+    last_after_partial = _peer_state(e, cloud._db_id)[2]
+    assert last_after_partial is not None
+    assert last_after_partial < datetime.utcnow() - timedelta(days=6), \
+        "the partial catch-up did not refresh the completion instant"
+
+    # aged past the grace, the same partial attempt leaves it expired
+    _age_last_catchup(e, days=8.0)
+    e._sync_transport = _Transport(cloud, fail_after=1, batch_limit=1)
+    e._catch_up()
+    assert e.sync_status()["state"] == "expired"
+    with pytest.raises(SyncCatchupRequired):
+        e.recall(user_id=USER, query="h4", purpose="api")
+
+    # healed: the catch-up finishes, service resumes, the instant is fresh
+    e._sync_transport = _Transport(cloud, batch_limit=1)
+    e._catch_up()
+    assert e.sync_status()["state"] == "normal"
+    st = e.sync_status()
+    assert st["remaining_grace_days"] == pytest.approx(7.0, abs=0.1)
+    for tag in ("h1", "h4"):
+        assert all(tag not in b.claim_text for b in _beliefs(e)), tag
+    e._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_rescan_then_offline_keeps_the_old_grace(tmp_path):
+    """Task 1, rescan coverage: the edge's stored cursor overshoots the
+    cloud's rewound log -- the rescan re-anchors to 0 and commits, then
+    the link dies BEFORE the tail.  The state is not normal, the
+    completion instant is untouched, the committed re-anchor is not lost,
+    and the next catch-up finishes the job."""
+    root = tmp_path
+    cloud_root = root / "cloud"
+    cloud_root.mkdir()
+    cloud = _edge(cloud_root, transport=None)
+    edge_root = root / "edge"
+    edge_root.mkdir()
+    e = _edge(edge_root, transport=_Transport(cloud))
+    assert e.sync_status()["state"] == "normal"
+    t0 = _peer_state(e, cloud._db_id)[2]
+
+    _seed_pair(cloud, e, ["r1", "r2", "r3", "r4", "r5"])
+    _age_last_catchup(e, days=1.0)
+    # simulate a restored cloud: the edge's stored cursor overshoots
+    from mirror_memory.core.models import SyncPeer as _SP
+    from mirror_memory.core.tenancy import fixture_write_scope
+
+    with tenant_scope(*TENANT), fixture_write_scope("simulate restored peer"):
+        s = sessionmaker(bind=create_engine(str(e._database_url)))()
+        s.query(_SP).update({"cursor": 7}, synchronize_session=False)
+        s.commit()
+        s.close()
+
+    # the rescan batch applies (all 5 re-delivered, deduped/applied) and
+    # re-anchors to 0; the link then dies before the tail
+    e._sync_transport = _Transport(cloud, fail_after=1, batch_limit=2)
+    e._catch_up()
+    cursor, _chain, last = _peer_state(e, cloud._db_id)
+    assert cursor == 0, \
+        "the rescan re-anchor is committed; the link died on the next export"
+    assert e.sync_status()["state"] in ("offline_grace", "expired")
+    assert last is not None \
+        and last < datetime.utcnow() - timedelta(hours=12), \
+        "the rescan must not count as a complete catch-up"
+
+    # healed: the pull resumes from the committed cursor and completes
+    e._sync_transport = _Transport(cloud, batch_limit=2)
+    e._catch_up()
+    assert e.sync_status()["state"] == "normal"
+    cursor, _chain, last = _peer_state(e, cloud._db_id)
+    assert cursor == 5
+    for tag in ("r1", "r5"):
+        assert all(tag not in b.claim_text for b in _beliefs(e)), tag
+    e._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_transport_without_identity_refuses(tmp_path):
+    """Task 2: a transport that cannot name its peer is fail-closed --
+    _catch_up raises SyncTransportIdentityMissing, no channel row is
+    written, and a proper transport afterwards works normally."""
+    root = tmp_path
+    cloud_root = root / "cloud"
+    cloud_root.mkdir()
+    cloud = _edge(cloud_root, transport=None)
+    edge_root = root / "edge"
+    edge_root.mkdir()
+    e = _edge(edge_root, transport=None)  # starts without any transport
+    e._sync_transport = _NoIdentityTransport(cloud)
+    with pytest.raises(SyncTransportIdentityMissing) as info:
+        e._catch_up()
+    assert "db_id" in str(info.value)
+    from mirror_memory.core.models import SyncPeer as _SP2
+
+    with tenant_scope(*TENANT):
+        s = sessionmaker(bind=create_engine(str(e._database_url)))()
+        assert s.query(_SP2).count() == 0, "no channel state was written"
+        s.close()
+
+    # a transport WITH an identity works and completes
+    e._sync_transport = _Transport(cloud)
+    e._catch_up()
+    assert e.sync_status()["state"] == "normal"
+    e._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_sender_mismatch_refuses(tmp_path):
+    """Task 2: the transport declares one peer but the envelope claims
+    another -- the batch is refused before any write and no channel row
+    appears under either identity."""
+    from mirror_memory.core import metrics
+    from mirror_memory.core.models import SyncPeer as _SP3
+    from mirror_memory.core.tombstones import TombstoneBatchRejected
+
+    root = tmp_path
+    cloud_root = root / "cloud"
+    cloud_root.mkdir()
+    cloud = _edge(cloud_root, transport=None)
+    edge_root = root / "edge"
+    edge_root.mkdir()
+    e = _edge(edge_root, transport=None)
+    before = metrics.value(metrics.TOMBSTONES_REJECTED_PREFIX + "sender")
+    e._sync_transport = _LyingTransport(cloud, declared_db_id="f" * 32)
+    with pytest.raises(TombstoneBatchRejected) as info:
+        e._catch_up()
+    assert info.value.reason == "sender"
+    with tenant_scope(*TENANT):
+        s = sessionmaker(bind=create_engine(str(e._database_url)))()
+        assert s.query(_SP3).count() == 0, \
+            "no channel state under a surprise identity"
+        s.close()
+    assert metrics.value(metrics.TOMBSTONES_REJECTED_PREFIX + "sender") \
+        > before
+
+    # the truthful transport completes normally
+    e._sync_transport = _Transport(cloud)
+    e._catch_up()
+    assert e.sync_status()["state"] == "normal"
+    e._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_consecutive_catchups_and_repointed_transport(tmp_path):
+    """Task 2: with one identity, a second catch-up neither rescans nor
+    applies anything and still refreshes the completion instant;
+    re-pointing the transport at a DIFFERENT peer opens its own channel
+    row and leaves the first peer's row untouched."""
+    from mirror_memory.core import metrics
+
+    root = tmp_path
+    c1_root = root / "cloud1"
+    c1_root.mkdir()
+    c1 = _edge(c1_root, transport=None)
+    c2_root = root / "cloud2"
+    c2_root.mkdir()
+    c2 = _edge(c2_root, transport=None)
+    edge_root = root / "edge"
+    edge_root.mkdir()
+    e = _edge(edge_root, transport=_Transport(c1))
+
+    assert e.sync_status()["state"] == "normal"
+    first_last = _peer_state(e, c1._db_id)[2]
+    rescans = metrics.value(metrics.TOMBSTONES_RESCANS)
+
+    # a second catch-up against the same peer: nothing to apply, no rescan
+    e._catch_up()
+    assert metrics.value(metrics.TOMBSTONES_RESCANS) == rescans
+    cursor, _chain, last = _peer_state(e, c1._db_id)
+    assert cursor == 0 and last is not None
+    assert last >= first_last, "the completion instant refreshes"
+
+    # re-point at a different peer: its OWN channel row, from cursor 0
+    _seed_pair(c2, e, ["p1"])  # c2 gains a tombstone
+    e._sync_transport = _Transport(c2)
+    e._catch_up()
+    assert e.sync_status()["state"] == "normal"
+    c2_cursor, _chain2, _last2 = _peer_state(e, c2._db_id)
+    assert c2_cursor == 1
+    assert _peer_state(e, c1._db_id)[0] == 0, \
+        "the first peer's channel row is untouched"
+    assert all("p1" not in b.claim_text for b in _beliefs(e))
+    e._engine.dispose()
+    c1._engine.dispose()
+    c2._engine.dispose()

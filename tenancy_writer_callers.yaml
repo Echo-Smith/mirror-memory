@@ -242,8 +242,18 @@ writers:
       - mirror_memory.api
   record_catchup:
     reason: >
-      Advances the per-peer consumed cursor and stamps the last successful
-      catch-up instant (the offline grace period measures from it).  Called
-      only by the edge engine's catch-up path (MemoryEngine._catch_up).
+      Advances the per-peer consumed cursor + chain hash (per-batch sync
+      progress only -- deliberately does NOT touch last_catchup_at: a
+      partial catch-up or rescan re-anchor is never recorded as a
+      complete one, batch-2 patch 4 task 1).  Called only inside the
+      engine's tombstone application (MemoryEngine.apply_tombstones).
+    callers:
+      - mirror_memory.api
+  mark_catchup_complete:   # 待评审 (batch-2 patch 4, task 1 -- new writer)
+    reason: >
+      Stamps last_catchup_at, the offline grace period's anchor, and is
+      the ONLY writer of that instant -- called exclusively by the
+      catch-up loop (MemoryEngine._catch_up) after it confirms the peer's
+      tail with an empty batch that did not rescan.
     callers:
       - mirror_memory.api

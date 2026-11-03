@@ -80,6 +80,18 @@ class SyncCatchingUp(RuntimeError):
             "memory sync is catching up with the peer; entries are "
             "refused until it finishes -- retry shortly")
 
+
+class SyncTransportIdentityMissing(RuntimeError):
+    """The sync transport does not declare its peer's db_id.
+
+    Fail-closed (batch-2 patch 4, task 2): every artifact of the channel
+    -- the cursor rows, the last-complete-catchup instant, sync_status
+    and the expiry errors -- is keyed by ONE peer identity.  A transport
+    that cannot name its peer could mix identities (read key vs the
+    envelope's self-claimed sender) and the envelope's identity must
+    never substitute for a transport that the network layer has
+    authenticated.  Configure the transport with its peer's db_id."""
+
 class SyncCatchupRequired(RuntimeError):
     """Read entries are refused: the edge has not caught up with the
     peer for longer than the offline grace period.  Carries the last
@@ -1543,6 +1555,7 @@ class MemoryEngine:
         in mm_sync_peers, applied tombstones are skipped idempotently."""
         from mirror_memory.core import metrics
         from mirror_memory.core.repository import read_sync_peer, record_catchup
+        from mirror_memory.core.tombstones import TombstoneBatchRejected
 
         if self._sync_transport is None:
             return
@@ -1553,7 +1566,18 @@ class MemoryEngine:
 
             metrics.set_gauge(metrics.SYNC_CATCHING_UP, 1.0)
             try:
-                peer_db_id = getattr(self._sync_transport, "db_id", "") or ""
+                # ONE trusted peer identity for the whole channel: the
+                # transport must DECLARE its peer.  A falsy db_id is
+                # fail-closed (SyncTransportIdentityMissing) -- the
+                # envelope's self-claimed sender never substitutes for it.
+                peer_db_id = getattr(self._sync_transport, "db_id", None)
+                if not peer_db_id:
+                    raise SyncTransportIdentityMissing(
+                        "the sync transport does not declare its peer's "
+                        "db_id: the channel's cursors, the last-complete "
+                        "catchup instant and every status/error must be "
+                        "keyed by one identity -- configure the transport "
+                        "with its peer's db_id")
                 with self._session() as session:
                     peer = read_sync_peer(session, peer_db_id)
                     cursor = peer.cursor if peer is not None else 0
@@ -1566,14 +1590,18 @@ class MemoryEngine:
                         cursor = peer.cursor if peer is not None else 0
                     batch, _next_cursor = self._sync_transport.export_tombstones(
                         cursor, 500)
-                    if not peer_db_id:
-                        # the transport did not identify its peer: key the
-                        # channel on the envelope's sender -- the SAME
-                        # identity apply_tombstones already trusts when it
-                        # records the cursor.  Without this the read key
-                        # ("") and the write key (batch.sender) disagree
-                        # and the loop would rescan forever.
-                        peer_db_id = batch.sender
+                    if batch.sender != peer_db_id:
+                        # the transport dialed one peer but the envelope
+                        # claims another: refuse instead of writing the
+                        # channel state into a surprise identity's row
+                        metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX
+                                    + "sender")
+                        raise TombstoneBatchRejected(
+                            "sender",
+                            f"the sync transport declares peer "
+                            f"{str(peer_db_id)[:8]}... but the batch "
+                            f"envelope says {batch.sender[:8]}...: the "
+                            "channel identity must be one -- refused")
                     # apply advances the peer cursor + chain hash to the
                     # batch's to_cursor/to_chain_hash in its own
                     # transaction (even for an empty batch) -- the
@@ -1588,6 +1616,15 @@ class MemoryEngine:
                     if (batch.to_cursor == batch.from_cursor
                             and not result.rescan):
                         break  # the peer's tail is reached
+                # the tail is CONFIRMED (an empty batch that did not
+                # rescan): only now is the offline grace's anchor stamped
+                # -- intermediate batches and rescan re-anchors recorded
+                # progress above, never completion (batch-2 patch 4, task 1)
+                from mirror_memory.core.repository import mark_catchup_complete
+
+                with self._session() as session:
+                    mark_catchup_complete(session, peer_db_id)
+                    session.commit()
                 self._sync_state = "normal"
                 self._sync_attempt_failed = False
                 metrics.set_gauge(metrics.SYNC_CATCHING_UP, 0.0)
