@@ -123,6 +123,63 @@ class TombstoneEntry:
             raise TombstoneBatchRejected("format", f"tombstone entry has a mistyped field: {exc}")
 
 
+@dataclass
+class TombstoneBatch:
+    """A transport batch of tombstones (M4 batch-2 patch): the sender's
+    identity, the sender-local cursor range the entries came from, the
+    entries, and a hash over all of it.  The receiver stores the cursor
+    PER SENDER (mm_sync_peers) and refuses a batch whose from_cursor does
+    not continue its stored cursor -- a dropped or reordered batch is a
+    gap and is refused; re-delivery of the SAME batch is idempotent
+    (applied entries are skipped) rather than refused.  An empty batch
+    (everything excluded/skipped) still advances the cursor."""
+
+    sender: str
+    from_cursor: int
+    to_cursor: int
+    entries: list[TombstoneEntry]
+    hash: str = ""
+
+    def payload(self) -> dict:
+        return {
+            "sender": self.sender,
+            "from_cursor": self.from_cursor,
+            "to_cursor": self.to_cursor,
+            "entry_hashes": [e.hash for e in self.entries],
+        }
+
+    def compute_hash(self) -> str:
+        canonical = json.dumps(self.payload(), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def seal(self) -> "TombstoneBatch":
+        self.hash = self.compute_hash()
+        return self
+
+    def to_dict(self) -> dict:
+        data = self.payload()
+        data["entries"] = [e.to_dict() for e in self.entries]
+        data["hash"] = self.hash
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TombstoneBatch":
+        if not isinstance(data, dict) or not all(
+                k in data for k in ("sender", "from_cursor", "to_cursor",
+                                    "entries", "hash")):
+            raise TombstoneBatchRejected("format", "batch envelope is missing fields")
+        entries = [TombstoneEntry.from_dict(e) for e in data["entries"]]
+        batch = cls(sender=str(data["sender"]),
+                    from_cursor=int(data["from_cursor"]),
+                    to_cursor=int(data["to_cursor"]),
+                    entries=entries, hash=str(data["hash"]))
+        if batch.compute_hash() != batch.hash:
+            raise TombstoneBatchRejected(
+                "hash", "batch hash does not verify: the envelope or the entry "
+                "list was altered in transit")
+        return batch
+
+
 def validate_entry_format(entry: TombstoneEntry) -> None:
     """Shape and value constraints of ONE entry (reason ``format``)."""
     if not _HEX32.match(entry.origin or ""):
@@ -152,11 +209,23 @@ def validate_entry_format(entry: TombstoneEntry) -> None:
         raise TombstoneBatchRejected("format", "hash must be a 64-hex SHA-256")
 
 
-def validate_batch(entries: list[TombstoneEntry], *, expected_tenant: tuple[str, str]) -> None:
-    """Everything that can be checked WITHOUT the database, for the whole
-    batch: format, hash, tenant.  The first failure rejects the batch."""
+def validate_batch(batch: TombstoneBatch, *, expected_tenant: tuple[str, str]) -> None:
+    """Everything that can be checked WITHOUT the database: the envelope
+    hash, per-entry format and hash, tenant, and in-batch duplicates.
+    The per-sender cursor check needs the receiver's stored state and
+    runs inside the apply transaction."""
+    if not _HEX32.match(batch.sender or ""):
+        raise TombstoneBatchRejected("format", f"sender {batch.sender!r} is not a 32-hex db_id")
+    if batch.from_cursor < 0 or batch.to_cursor < batch.from_cursor:
+        raise TombstoneBatchRejected(
+            "sequence",
+            f"batch cursors are inverted (from {batch.from_cursor} to {batch.to_cursor})")
+    if batch.compute_hash() != batch.hash:
+        raise TombstoneBatchRejected(
+            "hash", "batch hash does not verify: the envelope or the entry "
+            "list was altered in transit")
     seen: set[tuple[str, int]] = set()
-    for entry in entries:
+    for entry in batch.entries:
         validate_entry_format(entry)
         if entry.compute_hash() != entry.hash:
             raise TombstoneBatchRejected(
@@ -172,32 +241,6 @@ def validate_batch(entries: list[TombstoneEntry], *, expected_tenant: tuple[str,
             raise TombstoneBatchRejected(
                 "sequence", f"tombstone {entry.origin[:8]}.../{entry.origin_seq} appears twice in the batch")
         seen.add(key)
-
-
-def check_continuity(entries: list[TombstoneEntry], applied_max: dict[str, int]) -> list[TombstoneEntry]:
-    """Per origin, the batch must continue EXACTLY from what this database
-    has applied: entries at or below the applied maximum are duplicates
-    (skipped, idempotent); the rest must be ``max+1, max+2, ...`` with no
-    gap -- a gap means a tombstone is missing and the batch is refused.
-    Returns the entries to apply, in origin-seq order per origin."""
-    by_origin: dict[str, list[TombstoneEntry]] = {}
-    for entry in entries:
-        by_origin.setdefault(entry.origin, []).append(entry)
-    to_apply: list[TombstoneEntry] = []
-    for origin, group in by_origin.items():
-        group.sort(key=lambda e: e.origin_seq)
-        expected = applied_max.get(origin, 0) + 1
-        for entry in group:
-            if entry.origin_seq < expected:
-                continue  # already applied: idempotent skip
-            if entry.origin_seq != expected:
-                raise TombstoneBatchRejected(
-                    "sequence",
-                    f"origin {origin[:8]}...: expected origin_seq {expected} next, got "
-                    f"{entry.origin_seq} -- a tombstone is missing; the whole batch is refused")
-            to_apply.append(entry)
-            expected += 1
-    return to_apply
 
 
 def from_deletion_entry(entry: DeletionEntry) -> TombstoneEntry | None:
@@ -227,15 +270,17 @@ def from_deletion_entry(entry: DeletionEntry) -> TombstoneEntry | None:
 def export_from_log(
     log: DeletionLog, db_id: str, since_cursor: int, limit: int, *,
     exclude_origin: str | None = None,
-) -> tuple[list[TombstoneEntry], int, int]:
-    """Read the local log after *since_cursor* and build the next batch of
-    tombstones.  Returns ``(entries, next_cursor, skipped)``:
+) -> tuple[TombstoneBatch, int, int]:
+    """Read the local log after *since_cursor* and seal the next batch of
+    tombstones.  Returns ``(batch, next_cursor, skipped)``:
 
-    - ``next_cursor`` is the LOCAL seq of the last entry read (passed back
-      on the next call) -- it advances past excluded/skipped entries too;
+    - the batch carries sender=db_id, from_cursor=since_cursor,
+      to_cursor=the LOCAL seq of the last entry read (it advances past
+      excluded/skipped entries too), the entries, and the envelope hash;
     - entries whose origin is *exclude_origin* are NOT exported (they were
       applied FROM that peer; echoing them back would re-deliver its own
-      deletions);
+      deletions) -- an all-excluded read still yields a batch that
+      advances the receiver's cursor;
     - ``skipped`` counts entries that cannot travel (pre-batch-2 belief
       deletions without a global_id).
 
@@ -267,4 +312,6 @@ def export_from_log(
         entries.append(tombstone)
         if len(entries) >= limit:
             break
-    return entries, cursor, skipped
+    batch = TombstoneBatch(sender=db_id, from_cursor=since_cursor,
+                           to_cursor=cursor, entries=entries).seal()
+    return batch, cursor, skipped

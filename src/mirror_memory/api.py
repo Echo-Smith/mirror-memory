@@ -1297,47 +1297,58 @@ class MemoryEngine:
         if self._deletion_log is None:
             raise DeletionLogUnavailable(
                 "no deletion log is configured: there is nothing to export")
-        entries, cursor, skipped = export_from_log(
+        batch, cursor, skipped = export_from_log(
             self._deletion_log, self._db_id, int(since_cursor), int(limit),
             exclude_origin=peer_db_id)
         if skipped:
             metrics.inc(metrics.TOMBSTONES_EXPORT_SKIPPED, skipped)
-        return entries, cursor
+        return batch, cursor
 
     def apply_tombstones(self, batch, *, auth_tenant: tuple[str, str] | None = None,
                          purpose: str = "sync"):
-        """Apply a batch of cross-device tombstones: every entry runs the
-        normal local deletion for its scope (belief by global_id / session
-        / user -- fingerprints collected, local log written, local
-        generation advanced) and ``(origin, origin_seq)`` is recorded as
-        applied, all in ONE transaction.
+        """Apply a transport batch of cross-device tombstones: every entry
+        runs the normal local deletion for its scope (belief by global_id
+        / session / user -- fingerprints collected, local log written,
+        local generation advanced) and ``(origin, origin_seq)`` is
+        recorded as applied, all in ONE transaction; the SENDER's cursor
+        (mm_sync_peers) advances to ``batch.to_cursor`` in the same
+        transaction -- an all-excluded/empty batch still advances it, so
+        the channel never wedges on entries that cannot travel.
 
-        The WHOLE batch is validated before anything is written and the
-        whole batch is refused on the first problem
-        (``TombstoneBatchRejected`` with ``reason``): malformed entry
-        (``format``), hash that does not verify (``hash``), tenant other
-        than this receiver's (``tenant`` -- the receiver's tenant is
-        *auth_tenant* when the caller authenticated the request, else this
-        engine's own; the entries' fields are never trusted for it), on a
-        multi-tenant receiver a user the tenant does not know (``user``),
-        an origin_seq gap (``sequence``).  Any failure while applying rolls
-        the whole batch back.  Duplicates (already applied) are skipped; a
-        scope that no longer exists locally is a no-op that is still
-        recorded as applied.
+        The batch is a :class:`~mirror_memory.core.tombstones.TombstoneBatch`
+        (or its dict form): sender, from_cursor/to_cursor (the sender's
+        local log seq range), the entries and the envelope hash.  The
+        WHOLE batch is validated before anything is written and refused on
+        the first problem (``TombstoneBatchRejected`` with ``reason``):
+        malformed envelope or entry (``format``), hash that does not
+        verify (``hash``), tenant other than this receiver's (``tenant``
+        -- the receiver's tenant is *auth_tenant* when the caller
+        authenticated the request, else this engine's own; the entries'
+        fields are never trusted for it), on a multi-tenant receiver a
+        user the tenant does not know (``user``), and -- the continuity
+        rule -- ``batch.from_cursor`` does not equal THIS receiver's
+        stored cursor for that sender (``sequence``): a dropped, reordered
+        or fabricated batch is a gap and is refused.  Re-delivering the
+        SAME batch is idempotent (applied entries are skipped).  Any
+        failure while applying rolls the whole batch back.
 
         Returns ``TombstoneApplyResult(applied, skipped, noop)``.
         """
         self._ensure_db()
         from mirror_memory.core import metrics
+        from mirror_memory.core.repository import read_sync_peer, record_catchup
         from mirror_memory.core.tombstones import (
+            TombstoneBatch,
             TombstoneBatchRejected,
             TombstoneEntry,
-            check_continuity,
             validate_batch,
         )
 
-        entries = [e if isinstance(e, TombstoneEntry) else TombstoneEntry.from_dict(e)
-                   for e in batch]
+        if isinstance(batch, dict):
+            batch = TombstoneBatch.from_dict(batch)
+        if not isinstance(batch, TombstoneBatch):
+            raise TombstoneBatchRejected(
+                "format", "apply_tombstones takes a TombstoneBatch (or its dict form)")
         expected = tuple(auth_tenant) if auth_tenant is not None else tuple(self._tenant)
         if expected != tuple(self._tenant):
             # a receiver engine always IS its tenant: a mismatch here is a
@@ -1347,7 +1358,7 @@ class MemoryEngine:
                 f"the authenticated tenant {expected!r} is not this engine's "
                 f"{tuple(self._tenant)!r}: the batch is refused")
         try:
-            validate_batch(entries, expected_tenant=expected)
+            validate_batch(batch, expected_tenant=expected)
         except TombstoneBatchRejected as exc:
             metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
             raise
@@ -1361,17 +1372,25 @@ class MemoryEngine:
 
         with self._session() as session:
             try:
-                origins = sorted({e.origin for e in entries})
+                peer = read_sync_peer(session, batch.sender)
+                stored_cursor = peer.cursor if peer is not None else 0
+                if batch.from_cursor != stored_cursor:
+                    raise TombstoneBatchRejected(
+                        "sequence",
+                        f"sender {batch.sender[:8]}...: the batch continues from "
+                        f"from_cursor {batch.from_cursor}, but this receiver's stored "
+                        f"cursor is {stored_cursor} -- a batch was dropped or "
+                        "reordered; the whole batch is refused")
                 applied_max: dict[str, int] = {}
+                origins = sorted({e.origin for e in batch.entries})
                 for origin in origins:
                     applied_max[origin] = int(session.scalar(
                         _select(_func.max(TombstoneApplied.origin_seq))
                         .where(TombstoneApplied.origin == origin)) or 0)
-                to_apply = check_continuity(entries, applied_max)
                 if not self._single_tenant:
                     # a multi-tenant receiver (the cloud) only accepts
                     # tombstones for users the authenticated tenant knows
-                    for entry in to_apply:
+                    for entry in batch.entries:
                         if not tenant_knows_user(session, entry.user_id):
                             raise TombstoneBatchRejected(
                                 "user",
@@ -1385,7 +1404,11 @@ class MemoryEngine:
             rows: list[dict] = []
             noop = 0
             try:
-                for entry in to_apply:
+                for entry in batch.entries:
+                    applied = applied_max.get(entry.origin, 0)
+                    if entry.origin_seq <= applied:
+                        continue  # already applied: idempotent skip
+                    applied_max[entry.origin] = entry.origin_seq
                     local_seq = self._apply_one_tombstone(session, entry, purpose)
                     if local_seq is None:
                         noop += 1
@@ -1396,6 +1419,10 @@ class MemoryEngine:
                     })
                 if rows:
                     record_tombstones_applied(session, rows)
+                # the channel cursor advances to to_cursor in the SAME
+                # transaction -- even for an all-excluded/empty batch, so
+                # entries that cannot travel never wedge the channel
+                record_catchup(session, batch.sender, batch.to_cursor)
                 session.commit()
             except Exception as exc:
                 session.rollback()
@@ -1405,7 +1432,7 @@ class MemoryEngine:
                     f"applying tombstone batch failed ({type(exc).__name__}: {exc}); "
                     "the whole batch was rolled back") from exc
         applied = len(rows)
-        skipped = len(entries) - applied
+        skipped = len(batch.entries) - applied
         metrics.inc(metrics.TOMBSTONES_APPLIED, applied)
         if skipped:
             metrics.inc(metrics.TOMBSTONES_SKIPPED, skipped)
@@ -1464,22 +1491,16 @@ class MemoryEngine:
                     peer = read_sync_peer(session, peer_db_id)
                     cursor = peer.cursor if peer is not None else 0
                 while True:
-                    entries, next_cursor = self._sync_transport.export_tombstones(
+                    batch, _next_cursor = self._sync_transport.export_tombstones(
                         cursor, 500, peer_db_id=self._db_id)
-                    if not entries:
-                        break
-                    self.apply_tombstones(entries, purpose="sync")
-                    cursor = next_cursor
-                    # the cursor is durable after EVERY applied batch: an
-                    # interrupted catch-up resumes where this one got to
-                    with self._session() as session:
-                        record_catchup(session, peer_db_id, cursor)
-                        session.commit()
-                # reaching the peer's tail IS a successful catch-up even
-                # when nothing was pending: stamp the instant
-                with self._session() as session:
-                    record_catchup(session, peer_db_id, cursor)
-                    session.commit()
+                    # apply advances the peer cursor to batch.to_cursor in
+                    # its own transaction (even for an empty batch) -- the
+                    # catch-up is durable after every batch and resumes
+                    # where it got to
+                    self.apply_tombstones(batch, purpose="sync")
+                    cursor = batch.to_cursor
+                    if batch.to_cursor == batch.from_cursor:
+                        break  # the peer's tail is reached
                 self._sync_state = "normal"
                 self._sync_attempt_failed = False
                 metrics.set_gauge(metrics.SYNC_CATCHING_UP, 0.0)

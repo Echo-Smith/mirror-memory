@@ -144,8 +144,8 @@ def test_edge_catchup_and_local_replay_together(tmp_path):
         assert cloud.engine.forget_belief(user_id=USER, belief_id=cloud_b.id, purpose="api")
         assert cloud.engine.forget_session(user_id=USER, session_id="sa", purpose="api")
         cloud.engine.delete_memories(user_id=USER, purpose="api")
-        entries, cursor = cloud.engine.export_tombstones(0, 100, peer_db_id=edge.db_id)
-        edge.engine.apply_tombstones(entries)
+        batch, cursor = cloud.engine.export_tombstones(0, 100, peer_db_id=edge.db_id)
+        edge.engine.apply_tombstones(batch)
         assert edge.beliefs() == [], "cross-device propagation cleaned the edge"
 
         # LOCAL restore: the backup brings the deletions back...

@@ -819,9 +819,9 @@ def test_tombstone_apply_vs_publish_50_rounds_pg(tmp_path):
                           text=f"round {round_no} content", purpose="api")
             edge.observe(f"round {round_no} content", session_id=f"r{round_no}")
             edge.engine.delete_memories(user_id=SYNC_USER, purpose="api")
-            entries, _ = edge.engine.export_tombstones(0, 1000)
-            batch = [e for e in entries if e.origin_seq == round_no + 1]
-            assert len(batch) == 1
+            batch, _ = edge.engine.export_tombstones(round_no, 1000)
+            assert len(batch.entries) == 1
+            assert batch.from_cursor == round_no
 
             outcomes: dict = {}
 

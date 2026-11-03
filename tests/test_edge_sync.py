@@ -139,8 +139,8 @@ def test_full_restore_then_catchup_cleans_every_read_entrance(tmp_path):
 
     # the old edge applies the tombstones (it is still online)
     edge = _edge(edge_root, transport=None)
-    entries, _ = cloud.export_tombstones(0, 100, peer_db_id=edge._db_id)
-    edge.apply_tombstones(entries)
+    batch, _ = cloud.export_tombstones(0, 100, peer_db_id=edge._db_id)
+    edge.apply_tombstones(batch)
     edge._engine.dispose()
 
     # FULL MACHINE RESTORE: the main DB and the log directory go back
