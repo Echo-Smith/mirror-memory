@@ -36,7 +36,9 @@ and by tools/skip_report.py on the CI junit):
 | identity | a belief's global_id survives the v11 -> v12 migration on both databases | tests/test_global_id_migration.py::test_step12_upgrades_a_step11_database_sqlite, tests/test_global_id_migration.py::test_step12_upgrades_a_step11_database_pg |
 | sync gate | ENTRY_REGISTRY reads_memory entrances (+ run_verification / run_metabolism) all refuse when expired / catching up; the fail-open paths never swallow the refusal; after the healed catch-up the deleted sentinel is visible nowhere | tests/test_sync_gate_coverage.py::test_registry_covers_every_read, tests/test_sync_gate_coverage.py::test_expired_and_catching_up_refuse_every_read |
 | sync gate | the grace expires by the CLOCK in normal state (no manual catch-up); a healed link resumes on the next read | tests/test_sync_gate_coverage.py::test_normal_state_expires_by_the_clock |
-| sync gate | sync.enabled with NO transport: the stored channel history decides (never-completed / within grace / expired / ambiguous); disabled sync unchanged; the schema_ready wrapper does not bypass the gate | tests/test_sync_gate_coverage.py::test_enabled_without_transport_uses_stored_grace |
+| sync gate | sync.enabled with NO transport: the stored channel history decides (never-completed / offline_grace within grace / expired / ambiguous); disabled sync unchanged; the schema_ready wrapper does not bypass the gate | tests/test_sync_gate_coverage.py::test_enabled_without_transport_uses_stored_grace |
+| sync gate | every server reads_memory route refuses over real HTTP when expired / catching up, never leaks the un-caught-up sentinel, serves clean after the healed catch-up; /belief/{id} and /stats covered directly with unchanged cross-tenant 404 / purpose 403 | tests/test_server_sync_gate.py::test_server_registry_covers_every_read, tests/test_server_sync_gate.py::test_http_gate_matrix_sqlite, tests/test_server_sync_gate.py::test_http_gate_matrix_real_pg |
+| sync gate | the schema_ready shared-engine wrapper with a transport runs the startup catch-up before the first read; offline it falls back to the stored grace; no duplicate catch-up | tests/test_sync_gate_coverage.py::test_shared_wrapper_startup_catchup |
 """
 
 from __future__ import annotations
@@ -103,6 +105,10 @@ I2_TARGETS: list[tuple[str, str]] = [
      "test_normal_state_expires_by_the_clock"),
     ("tests.test_sync_gate_coverage",
      "test_enabled_without_transport_uses_stored_grace"),
+    ("tests.test_server_sync_gate", "test_server_registry_covers_every_read"),
+    ("tests.test_server_sync_gate", "test_http_gate_matrix_sqlite"),
+    ("tests.test_server_sync_gate", "test_http_gate_matrix_real_pg"),
+    ("tests.test_sync_gate_coverage", "test_shared_wrapper_startup_catchup"),
 ]
 
 

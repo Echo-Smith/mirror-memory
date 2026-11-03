@@ -377,7 +377,9 @@ def test_enabled_without_transport_uses_stored_grace(tmp_path):
         _drv_recall(e)
     _observe(e, "I like offline-write and coffee.")  # a write still works
 
-    # (b) a completed catch-up in the stored history, within grace
+    # (b) a completed catch-up in the stored history, within grace:
+    # the honest label without a transport is offline_grace (patch 6
+    # task 3) -- the engine IS offline, the stored grace still serves
     root_b = tmp_path / "b"
     root_b.mkdir()
     e2 = _engine(root_b, "gc-b", transport=_Transport(cloud))
@@ -387,7 +389,11 @@ def test_enabled_without_transport_uses_stored_grace(tmp_path):
     # reboot WITHOUT the transport: the stored completion serves the grace
     e2 = _engine(root_b, "gc-b", transport=None)
     st = e2.sync_status()
-    assert st["state"] == "normal" and st["transport_injected"] is False
+    assert st["state"] == "offline_grace", st
+    assert st["transport_injected"] is False
+    assert st["last_catchup_at"] is not None
+    assert st["remaining_grace_days"] == pytest.approx(7.0, abs=0.1)
+    assert st["reminder"] is False
     assert _drv_recall(e2) is not None
     # aged past the grace: refuse
     _age(e2, days=8.0)
@@ -439,3 +445,78 @@ def test_enabled_without_transport_uses_stored_grace(tmp_path):
         _drv_recall(wrapper)
     base._engine.dispose()
     cloud._engine.dispose()
+
+
+# --- M4 batch-2 patch 6, task 2: the schema_ready shared-engine wrapper
+# --- runs the startup catch-up too
+
+def test_shared_wrapper_startup_catchup(tmp_path):
+    """A schema_ready wrapper WITH a transport must not silently skip the
+    startup catch-up: the cloud's new deletions are applied before the
+    first read, a second _ensure_db does not re-run it, and offline the
+    wrapper falls back to the stored grace (expired refuses, catching up
+    refuses)."""
+    cloud = _engine(tmp_path / "cl", "gc-cl")
+    base = _engine(tmp_path / "b", "gc-b", transport=_Transport(cloud))
+    _observe(base, "I like sharedwrap and coffee.")
+    _align(base, cloud)
+    assert base.sync_status()["state"] == "normal"
+    base._engine.dispose()
+
+    # the cloud holds its own copy of the sentinel memory
+    _observe(cloud, "I like sharedwrap and coffee.")
+    # the cloud deletes the sentinel AFTER the base engine's catch-up:
+    # the cloud's OWN copy of the belief adopts the base's global_id
+    # (matched by content -- the two extractors mint different keys), so
+    # the tombstone travels to the wrapper by it
+    from mirror_memory.core.tenancy import fixture_write_scope as _fws
+
+    gid = next(b.global_id for b in _beliefs(base)
+               if "sharedwrap" in b.claim_text)
+    with tenant_scope(*TENANT), _fws("align wrapper cloud"):
+        s = sessionmaker(bind=cloud._engine)()
+        for b in s.query(Belief).filter(Belief.user_id == USER).all():
+            if "sharedwrap" in b.claim_text:
+                b.global_id = gid
+        s.commit()
+        s.close()
+    cb = next(b for b in _beliefs(cloud) if "sharedwrap" in b.claim_text)
+    assert cloud.forget_belief(user_id=USER, belief_id=cb.id, purpose="api")
+
+    # the wrapper binds the SAME (already-prepared) database with
+    # schema_ready=True and a live transport: its startup catch-up must
+    # apply the deletion before anything serves
+    transport = _Transport(cloud)
+    wrapper = MemoryEngine(
+        config=base._config, database_url=base._database_url,
+        tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+        deletion_log=base._deletion_log, single_tenant_mode=True,
+        engine=base._engine, schema_ready=True, sync_transport=transport)
+    wrapper._ensure_db()
+    calls_after_startup = transport.calls
+    assert calls_after_startup >= 1, "the startup catch-up must run"
+    assert not any("sharedwrap" in b.claim_text
+                   for b in _beliefs(wrapper)), \
+        "the cloud's deletion must be applied before the first read"
+
+    # a second _ensure_db: idempotent, no duplicate catch-up
+    wrapper._ensure_db()
+    assert transport.calls == calls_after_startup
+    assert wrapper.sync_status()["state"] == "normal"
+
+    # offline: the link dies -- reads fall back to the stored grace; the
+    # anchor is the wrapper's OWN fresh completion, so reads serve within
+    # it and refuse once it is out; catching up refuses outright
+    wrapper._sync_transport = _Transport(cloud, fail_after=0)
+    wrapper._catch_up()  # a failing attempt puts the state machine offline
+    assert wrapper.sync_status()["state"] in ("offline_grace", "expired")
+    wrapper._sync_state = "catching_up"
+    with pytest.raises(SyncCatchingUp):
+        _drv_recall(wrapper)
+    wrapper._sync_state = "normal"
+    wrapper._engine.dispose()
+    cloud._engine.dispose()
+
+
+def _session_of(engine):
+    return sessionmaker(bind=engine._engine)()

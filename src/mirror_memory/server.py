@@ -29,10 +29,25 @@ from sqlalchemy import text
 from mirror_memory import __version__
 from mirror_memory.core.authorization import PurposeDenied
 from mirror_memory.core import access_audit
-from mirror_memory.api import MemoryEngine
+from mirror_memory.api import (
+    MemoryEngine,
+    SyncCatchingUp,
+    SyncCatchupRequired,
+)
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.exceptions import LLMError, ValidationError
+
+def _sync_http_error(exc: Exception) -> "HTTPException":
+    """A sync-gate refusal as a user-safe, distinguishable HTTP error
+    (batch-2 patch 6, task 1): 503 with the product-facing sentence --
+    never a generic 500, never internals.  Expired and catching-up carry
+    different details."""
+    from mirror_memory.api import SyncCatchingUp, SyncCatchupRequired
+
+    detail = getattr(exc, "user_message", None) or str(exc)
+    return HTTPException(status_code=503, detail=detail)
+
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +444,7 @@ def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
 
     def _create() -> MemoryEngine:
         shared = _app_state.get("sa_engine")
+        factory = _app_state.get("sync_transport_factory")
         engine = MemoryEngine(
             config=_app_state["config"],
             database_url=_app_state["database_url"],
@@ -438,6 +454,8 @@ def _engine_for(tenant: tuple[str, str]) -> MemoryEngine:
             engine=shared,
             schema_ready=shared is not None,
         )
+        if factory:
+            engine._sync_transport = factory(engine)
         engine._ensure_db()
         return engine
 
@@ -456,6 +474,7 @@ def create_app(
     llm_api_key: str | None = None,
     llm_model: str = "gpt-4o-mini",
     llm_base_url: str | None = None,
+    sync_transport_factory: Any | None = None,
 ) -> FastAPI:
     """Create a FastAPI app with mirror-memory endpoints.
 
@@ -506,6 +525,12 @@ def create_app(
             llm_model=os.environ.get("MM_LLM_MODEL", llm_model),
             llm_base_url=llm_base_url or os.environ.get("MM_LLM_BASE_URL"),
         )
+        # NOTE: the LIFESPAN engine is the owner/infra engine (default
+        # tenant) and deliberately gets NO sync transport -- tombstones
+        # are tenant-scoped, so only the per-tenant wrappers (each bound
+        # to its key's tenant) may pull a channel.  Without a transport
+        # the lifespan engine sits in the no-transport gate mode, which
+        # never serves user entries anyway.
         _engine._ensure_db()
         # Task 5: per-tenant engine factory state + optional key file.
         # PostgreSQL: the lifespan engine's SQLAlchemy engine is THE shared
@@ -518,6 +543,7 @@ def create_app(
             database_url=_engine._database_url,
             llm_client=_engine._llm_client,
             sa_engine=_engine._engine if is_postgres(_engine._engine) else None,
+            sync_transport_factory=sync_transport_factory,
         )
         if getattr(_engine, "_single_tenant", False) and _tenant_key_registry:
             raise RuntimeError(
@@ -598,6 +624,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
             raise HTTPException(status_code=503, detail="LLM service unavailable")
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("observe failed for user %s: %s", req.user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -629,6 +657,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
             raise HTTPException(status_code=503, detail="LLM service unavailable")
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("recall failed for user %s: %s", req.user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -655,6 +685,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
             raise HTTPException(status_code=503, detail="LLM service unavailable")
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("panel failed for user %s: %s", user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -686,6 +718,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
             raise HTTPException(status_code=503, detail="LLM service unavailable")
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("beliefs failed for user %s: %s", user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -707,6 +741,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         except LLMError as e:
             raise HTTPException(status_code=503, detail="LLM service unavailable")
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("delete failed for user %s: %s", req.user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -726,6 +762,10 @@ def create_app(
         """
         engine = _get_engine(tenant)
         try:
+            # batch-2 patch 6, task 1: the sync gate BEFORE any content
+            # query and before the audit write -- a refused channel serves
+            # nothing (inside the try so the refusal maps to 503, not 500)
+            engine._sync_gate(read=True)
             with engine._session() as session:
                 authorized = engine._authorize(
                     session, user_id, purpose, "explain",
@@ -762,6 +802,8 @@ def create_app(
             raise
         except PurposeDenied as e:
             raise HTTPException(status_code=403, detail=str(e))
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("belief fetch failed: %s", e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -790,6 +832,8 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(e))
         except (InvalidCursor, ValidationError, ValueError) as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("export failed for user %s: %s", user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
@@ -804,6 +848,12 @@ def create_app(
         """Get extraction statistics for a user."""
         engine = _get_engine(tenant)
         try:
+            # batch-2 patch 6, task 1: gated like every read route -- the
+            # extraction rows carry the user's content-flow metadata
+            # (errors, latencies); the earlier "telemetry, skip it"
+            # decision is reversed.  Inside the try so the refusal maps
+            # to 503 rather than a raw error.
+            engine._sync_gate(read=True)
             with engine._session() as session:
                 authorized = engine._authorize(
                     session, user_id, purpose, "explain", audit_entry="mirror_memory.server.stats",
@@ -839,6 +889,8 @@ def create_app(
                 }
         except PurposeDenied as e:
             raise HTTPException(status_code=403, detail=str(e))
+        except (SyncCatchupRequired, SyncCatchingUp) as e:
+            raise _sync_http_error(e)
         except Exception as e:
             logger.warning("stats failed for user %s: %s", user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")

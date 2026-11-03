@@ -79,6 +79,8 @@ class SyncCatchingUp(RuntimeError):
         super().__init__(
             "memory sync is catching up with the peer; entries are "
             "refused until it finishes -- retry shortly")
+        self.user_message = (
+            "记忆正在同步，请稍后重试。")
 
 
 class SyncTransportIdentityMissing(RuntimeError):
@@ -249,6 +251,13 @@ class MemoryEngine:
                     self._engine
                 ) or (None, 0)
                 self._initialized = True
+                # batch-2 patch 6, task 2: binding is NOT the whole story --
+                # the sync channel is per-engine, so a sync-enabled wrapper
+                # runs the same startup catch-up the normal path does
+                # BEFORE any entry serves (entries are gated meanwhile).
+                # No transport: the no-transport gate mode decides (the
+                # warning below says so once).
+                self._catch_up_at_startup()
                 return
         else:
             self._engine = build_engine(self._database_url)
@@ -1713,7 +1722,10 @@ class MemoryEngine:
                 remaining = self._config.sync.offline_grace_days - (
                     datetime.utcnow() - last).total_seconds() / 86400.0
                 expired = remaining <= 0
-            return {"state": "expired" if expired else "normal",
+            # batch-2 patch 6, task 3: without a transport the engine IS
+            # offline -- within the stored grace the honest label is
+            # offline_grace, never normal (nothing can catch up)
+            return {"state": "expired" if expired else "offline_grace",
                     "last_catchup_at": last,
                     "remaining_grace_days": (max(0.0, round(remaining, 3))
                                              if remaining is not None else None),
@@ -1729,7 +1741,15 @@ class MemoryEngine:
         own record of its trusted peer(s) and their last complete
         catch-up.  Returns ``(row, ambiguous)``: the single completed peer
         (None when there is none) and whether more than one exists (the
-        trusted peer cannot then be located unambiguously)."""
+        trusted peer cannot then be located unambiguously).
+
+        Boundary of the single-history inference (batch-2 patch 6,
+        task 3): it ASSUMES the one completed peer is the peer a future
+        transport would dial.  That holds for a single-peer edge whose
+        history this engine wrote itself; a future NETWORK transport must
+        bind the peer's db_id to the AUTHENTICATED peer at the protocol
+        layer -- the envelope's self-claimed sender and a stored row are
+        history, not authentication."""
         from mirror_memory.core.models import SyncPeer
 
         with self._session() as session:
