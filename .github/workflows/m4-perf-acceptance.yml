@@ -115,6 +115,8 @@ jobs:
       - name: PostgreSQL longrun (mode A), interleaved x3 (auditor off, guards on)
         run: |
           set -u -o pipefail
+          # ONE definition: the second shadowed the first and the PG leg
+          # silently measured HEAD twice (batch-2 patch 2 defect, fixed)
           use_rev() {
             local rev="$1"
             git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
@@ -125,10 +127,7 @@ jobs:
               grep -qx "$f" /tmp/keep.txt || rm -f "$f"
             done
             git checkout -f -q "$rev" -- src tests pyproject.toml
-          }
-          use_rev() {
-            local rev="$1"
-            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
+            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml
           }
           measure() {
             local rev="$1" round="$2" tag="$3"
@@ -149,6 +148,42 @@ jobs:
               echo "longrun round $round VALID" | tee -a "$GITHUB_STEP_SUMMARY"
             fi
           done
+
+      - name: observe() microbenchmark, interleaved x3 (>=2000 observes, global_id writes)
+        run: |
+          set -u -o pipefail
+          micro() {
+            local rev="$1" round="$2" tag="$3"
+            git ls-tree -r --name-only "$rev" -- src > /tmp/keep_micro.txt
+            for f in $(git ls-files -- src); do
+              grep -qx "$f" /tmp/keep_micro.txt || rm -f "$f"
+            done
+            for f in $(find src -name '*.py' 2>/dev/null); do
+              grep -qx "$f" /tmp/keep_micro.txt || rm -f "$f"
+            done
+            git checkout -f -q "$rev" -- src
+            # the harness (tools/) stays at HEAD: it measures, it is not measured
+            export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
+            python tools/perf_observe_micro.py --observes 2000 \
+              | tee -a "$GITHUB_STEP_SUMMARY" | sed "s/^/micro-$tag($rev) round$round /"
+          }
+          for round in 1 2 3; do
+            micro aed0639 "$round" main
+            micro HEAD "$round" head
+          done
+          git checkout -f -q HEAD -- src
+
+      - name: Upload the per-round junit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ github.run_id }}
+          path: |
+            /tmp/sql_main_*.xml
+            /tmp/sql_head_*.xml
+            /tmp/lr_main_*.xml
+            /tmp/lr_head_*.xml
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Final sanity (HEAD, SQLite, auditor + guards on)
         run: |
