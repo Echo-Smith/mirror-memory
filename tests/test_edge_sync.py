@@ -71,7 +71,7 @@ class _Transport:
         self.calls += 1
         if self.fail_after is not None and self.calls > self.fail_after:
             raise ConnectionError("the link is down")
-        return self.peer.export_tombstones(cursor, limit, peer_db_id=peer_db_id)
+        return self.peer.export_tombstones(cursor, limit)
 
 
 def _edge(root: Path, transport=None, *, grace_days=7, reminder_days=2):
@@ -139,7 +139,7 @@ def test_full_restore_then_catchup_cleans_every_read_entrance(tmp_path):
 
     # the old edge applies the tombstones (it is still online)
     edge = _edge(edge_root, transport=None)
-    batch, _ = cloud.export_tombstones(0, 100, peer_db_id=edge._db_id)
+    batch, _ = cloud.export_tombstones(0, 100)
     edge.apply_tombstones(batch)
     edge._engine.dispose()
 

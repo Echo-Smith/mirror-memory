@@ -514,22 +514,27 @@ class DeletionGeneration(TenantScoped, Base):
 
 
 class TombstoneApplied(TenantScoped, Base):
-    """M4 batch 2: which cross-device tombstones THIS database has already
-    applied -- ``(origin, origin_seq)`` is the idempotency key, so a
-    re-delivered batch is skipped and a restore of this database rewinds
-    the record together with the data (the tombstones come back and are
-    re-applied, exactly like the local deletion log replays).  Scope that
-    no longer exists locally is recorded too (a no-op apply is still an
-    apply).  Written only by the tombstone-application transaction, in the
-    same commit as the deletions it bookkeeps (write class ``sync``)."""
+    """M4 batch 2 (patch 2): which cross-device tombstones THIS database
+    has already applied -- ``(origin, origin_hash)`` is the idempotency
+    key, where origin_hash identifies the ORIGIN's log entry the
+    tombstone was exported from.  A rolled-back sender reuses origin_seq
+    for a different deletion whose entry hash differs, so seq-based keys
+    would misfile the new deletion as a duplicate; the entry hash does
+    not.  A restore of this database rewinds the record together with the
+    data (the tombstones come back and are re-applied, exactly like the
+    local deletion log replays).  Scope that no longer exists locally is
+    recorded too (a no-op apply is still an apply).  Written only by the
+    tombstone-application transaction, in the same commit as the
+    deletions it bookkeeps (write class ``sync``)."""
 
     __tablename__ = "mm_tombstones_applied"
     __table_args__ = (
-        PrimaryKeyConstraint("tenant_id", "app_id", "origin", "origin_seq"),
+        PrimaryKeyConstraint("tenant_id", "app_id", "origin", "origin_hash"),
     )
 
     origin: Mapped[str] = mapped_column(String(32))
-    origin_seq: Mapped[int] = mapped_column(Integer)
+    origin_seq: Mapped[int] = mapped_column(Integer, default=0)
+    origin_hash: Mapped[str] = mapped_column(String(64))
     user_id: Mapped[str] = mapped_column(String(64))
     scope: Mapped[str] = mapped_column(String(16))
     scope_key: Mapped[str] = mapped_column(String(128), default="")
@@ -538,12 +543,14 @@ class TombstoneApplied(TenantScoped, Base):
 
 
 class SyncPeer(TenantScoped, Base):
-    """M4 batch 2: one row per sync peer -- the cursor into the peer's
-    deletion log this database has consumed, and the instant of the last
-    successful catch-up.  The timestamp lives in the MAIN database on
-    purpose: a restored backup rewinds it, so the offline grace period
-    (measured from it) expires sooner -- which is correct, the restored
-    edge is further from the cloud than it believes."""
+    """M4 batch 2 (patch 2): one row per sync peer -- the cursor into the
+    peer's deletion log this database has consumed, the peer's CHAIN HASH
+    at that cursor (a mismatch on the next batch means the peer rolled
+    back and the channel rescans from 0), and the instant of the last
+    successful catch-up.  They live in the MAIN database on purpose: a
+    restored backup rewinds them, so the offline grace period expires
+    sooner and the catch-up re-pulls the peer's log from before the
+    restore point -- both correct for a restored edge."""
 
     __tablename__ = "mm_sync_peers"
     __table_args__ = (
@@ -552,6 +559,7 @@ class SyncPeer(TenantScoped, Base):
 
     peer_db_id: Mapped[str] = mapped_column(String(32))
     cursor: Mapped[int] = mapped_column(Integer, default=0)
+    chain_hash: Mapped[str] = mapped_column(String(64), default="")
     last_catchup_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 

@@ -967,7 +967,7 @@ def test_tombstone_mesh_three_devices_pg(tmp_path):
                             s.close()
                     try:
                         batch, _next = peer.engine.export_tombstones(
-                            cursor, 500, peer_db_id=cloud._db_id)
+                            cursor, 500)
                     except Exception as exc:  # noqa: BLE001
                         refusals.append(f"export from {peer.name}: {exc!r}")
                         return

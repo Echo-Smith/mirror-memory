@@ -440,7 +440,7 @@ class MemoryEngine:
                              scope_key: str, fingerprints: list[dict],
                              generation: int, purpose: str | None,
                              global_key: str = "", origin: str = "",
-                             origin_seq: int = 0):
+                             origin_seq: int = 0, origin_hash: str = ""):
         """Write the deletion-log entry for a deletion that is about to
         commit.  The log write happens BEFORE the main-DB commit (the
         entry is part of the transaction's preconditions): a log failure
@@ -468,6 +468,7 @@ class MemoryEngine:
             fingerprints=fingerprints, generation=generation,
             purpose=self._purpose_or_default(purpose),
             global_key=global_key, origin=origin, origin_seq=origin_seq,
+            origin_hash=origin_hash,
         ))
         # the entry is APPLIED by this very transaction: advance the
         # watermark here, so a committed deletion never needs a replay
@@ -1085,7 +1086,8 @@ class MemoryEngine:
             return DeleteResult(**counts)
 
     def _delete_user_in(self, session, user_id: str, purpose: str | None, *,
-                        origin: str = "", origin_seq: int = 0):
+                        origin: str = "", origin_seq: int = 0,
+                        origin_hash: str = ""):
         """The user-scope deletion inside the caller's transaction: the
         cascade, then the log entry (before the commit).  Shared by
         delete_memories and the tombstone application (M4 batch 2)."""
@@ -1098,6 +1100,7 @@ class MemoryEngine:
             session, user_id, scope="user", scope_key="",
             fingerprints=fingerprints, generation=counts["generation"],
             purpose=purpose, origin=origin, origin_seq=origin_seq,
+            origin_hash=origin_hash,
         )
         return counts, entry
 
@@ -1131,7 +1134,7 @@ class MemoryEngine:
 
     def _forget_belief_in(self, session, user_id: str, belief_id: int,
                           purpose: str | None, *, origin: str = "",
-                          origin_seq: int = 0):
+                          origin_seq: int = 0, origin_hash: str = ""):
         """The belief-scope deletion inside the caller's transaction
         (Publisher FORGET), then the log entry carrying the belief's
         global_id as the cross-device key.  Shared by forget_belief and
@@ -1167,7 +1170,8 @@ class MemoryEngine:
                 session, user_id, scope="belief", scope_key=str(belief_id),
                 fingerprints=collector["fingerprints"],
                 generation=collector["generation"], purpose=purpose,
-                global_key=global_key or "", origin=origin, origin_seq=origin_seq,
+                global_key=global_key or "", origin=origin,
+                origin_seq=origin_seq, origin_hash=origin_hash,
             )
         return decision.committed, entry
 
@@ -1252,7 +1256,7 @@ class MemoryEngine:
 
     def _forget_session_in(self, session, user_id: str, session_id: str,
                            purpose: str | None, *, origin: str = "",
-                           origin_seq: int = 0):
+                           origin_seq: int = 0, origin_hash: str = ""):
         """The session-scope deletion inside the caller's transaction, then
         the log entry (the session_id is its own cross-device key).  Shared
         by forget_session and the tombstone application (M4 batch 2)."""
@@ -1273,7 +1277,7 @@ class MemoryEngine:
                 fingerprints=fingerprints,
                 generation=self._current_deletion_generation(session, user_id),
                 purpose=purpose, global_key=session_id,
-                origin=origin, origin_seq=origin_seq,
+                origin=origin, origin_seq=origin_seq, origin_hash=origin_hash,
             )
         return result, entry
 
@@ -1281,15 +1285,17 @@ class MemoryEngine:
     # Tombstone synchronization (M4 batch 2 tasks 1-2)
     # ------------------------------------------------------------------
 
-    def export_tombstones(self, since_cursor: int = 0, limit: int = 500, *,
-                          peer_db_id: str | None = None):
+    def export_tombstones(self, since_cursor: int = 0, limit: int = 500):
         """The next batch of cross-device tombstones from this database's
         deletion log, after *since_cursor* (a local seq; 0 = from the
-        start).  Returns ``(entries, next_cursor)``; pass ``next_cursor``
-        back to continue.  With *peer_db_id*, entries that were applied
-        FROM that peer are not exported (no echo).  A cursor before the
-        log's compaction checkpoint raises TombstoneCursorPruned: the
-        peer must rebuild (task 4)."""
+        start).  Returns ``(batch, next_cursor)``; pass ``next_cursor``
+        back to continue.  Echoes are handled RECEIVER-side (an entry
+        originating from the receiver is re-applied only when its log
+        lost the entry in a restore), so no exclusion is needed here.  A
+        cursor above the log's head rewinds the batch to 0 (the caller's
+        cursor overshoots a rolled-back log).  A cursor before the log's
+        compaction checkpoint raises TombstoneCursorPruned: the peer
+        must rebuild (task 4)."""
         self._ensure_db()
         from mirror_memory.core import metrics
         from mirror_memory.core.tombstones import export_from_log
@@ -1298,8 +1304,7 @@ class MemoryEngine:
             raise DeletionLogUnavailable(
                 "no deletion log is configured: there is nothing to export")
         batch, cursor, skipped = export_from_log(
-            self._deletion_log, self._db_id, int(since_cursor), int(limit),
-            exclude_origin=peer_db_id)
+            self._deletion_log, self._db_id, int(since_cursor), int(limit))
         if skipped:
             metrics.inc(metrics.TOMBSTONES_EXPORT_SKIPPED, skipped)
         return batch, cursor
@@ -1309,28 +1314,26 @@ class MemoryEngine:
         """Apply a transport batch of cross-device tombstones: every entry
         runs the normal local deletion for its scope (belief by global_id
         / session / user -- fingerprints collected, local log written,
-        local generation advanced) and ``(origin, origin_seq)`` is
-        recorded as applied, all in ONE transaction; the SENDER's cursor
-        (mm_sync_peers) advances to ``batch.to_cursor`` in the same
-        transaction -- an all-excluded/empty batch still advances it, so
-        the channel never wedges on entries that cannot travel.
+        local generation advanced) and ``(origin, origin_hash)`` is
+        recorded as applied, all in ONE transaction.
 
         The batch is a :class:`~mirror_memory.core.tombstones.TombstoneBatch`
         (or its dict form): sender, from_cursor/to_cursor (the sender's
-        local log seq range), the entries and the envelope hash.  The
-        WHOLE batch is validated before anything is written and refused on
-        the first problem (``TombstoneBatchRejected`` with ``reason``):
-        malformed envelope or entry (``format``), hash that does not
-        verify (``hash``), tenant other than this receiver's (``tenant``
-        -- the receiver's tenant is *auth_tenant* when the caller
-        authenticated the request, else this engine's own; the entries'
-        fields are never trusted for it), on a multi-tenant receiver a
-        user the tenant does not know (``user``), and -- the continuity
-        rule -- ``batch.from_cursor`` does not equal THIS receiver's
-        stored cursor for that sender (``sequence``): a dropped, reordered
-        or fabricated batch is a gap and is refused.  Re-delivering the
-        SAME batch is idempotent (applied entries are skipped).  Any
-        failure while applying rolls the whole batch back.
+        local log seq range), from_chain_hash/to_chain_hash (the sender's
+        chain hashes at those seqs), the entries and the envelope hash.
+
+        Channel continuity (patch 2): batch.from_cursor must equal THIS
+        receiver's stored cursor for that sender, AND
+        batch.from_chain_hash must equal the stored chain hash.  On a
+        mismatch the sender's log was RESTORED/REWRITTEN under seqs this
+        receiver already consumed -- the channel RESCANS: it re-anchors
+        to (0, GENESIS) so the caller's pull loop re-fetches the sender's
+        whole log, while the (origin, origin_hash) applied records
+        deduplicate the re-delivery.  Not silent: warning + the
+        tombstones_rescans metric.  Any failure while applying rolls the
+        whole batch back.  Already-applied entries are skipped
+        idempotently; a scope that no longer exists locally is a no-op
+        that is still recorded as applied.
 
         Returns ``TombstoneApplyResult(applied, skipped, noop)``.
         """
@@ -1363,30 +1366,41 @@ class MemoryEngine:
             metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
             raise
 
+        from mirror_memory.core.deletion import GENESIS_HASH
         from mirror_memory.core.models import TombstoneApplied
         from mirror_memory.core.repository import (
             record_tombstones_applied,
             tenant_knows_user,
         )
-        from sqlalchemy import func as _func, select as _select
 
         with self._session() as session:
             try:
                 peer = read_sync_peer(session, batch.sender)
                 stored_cursor = peer.cursor if peer is not None else 0
-                if batch.from_cursor != stored_cursor:
-                    raise TombstoneBatchRejected(
-                        "sequence",
-                        f"sender {batch.sender[:8]}...: the batch continues from "
-                        f"from_cursor {batch.from_cursor}, but this receiver's stored "
-                        f"cursor is {stored_cursor} -- a batch was dropped or "
-                        "reordered; the whole batch is refused")
-                applied_max: dict[str, int] = {}
-                origins = sorted({e.origin for e in batch.entries})
-                for origin in origins:
-                    applied_max[origin] = int(session.scalar(
-                        _select(_func.max(TombstoneApplied.origin_seq))
-                        .where(TombstoneApplied.origin == origin)) or 0)
+                stored_chain = (peer.chain_hash if peer is not None
+                                else GENESIS_HASH) or GENESIS_HASH
+                rescan = (batch.from_cursor != stored_cursor
+                          or batch.from_chain_hash != stored_chain)
+                if rescan:
+                    # SENDER ROLLBACK (a restored log rewrote the seqs the
+                    # receiver already consumed) or a first contact after
+                    # a prune.  NOT silent: warn + rescan metric.  The
+                    # channel re-anchors to (0, GENESIS) so the caller's
+                    # pull loop re-fetches the sender's whole log, while
+                    # the (origin, origin_hash) applied records
+                    # deduplicate the re-delivery -- deletions that
+                    # survived on this receiver are kept, the sender's
+                    # re-issued deletions re-apply onto its restored
+                    # data, and genuinely NEW deletions (new entry hashes
+                    # at reused seqs) are never misfiled as duplicates.
+                    metrics.inc(metrics.TOMBSTONES_RESCANS)
+                    logger.warning(
+                        "tombstone channel rescan: sender %s sent from_cursor=%d "
+                        "from_chain_hash=%s but stored (cursor=%d, chain=%s); "
+                        "re-fetching the sender's log from 0 with entry-level dedup",
+                        batch.sender[:8], batch.from_cursor,
+                        batch.from_chain_hash[:8], stored_cursor,
+                        stored_chain[:8])
                 if not self._single_tenant:
                     # a multi-tenant receiver (the cloud) only accepts
                     # tombstones for users the authenticated tenant knows
@@ -1401,28 +1415,58 @@ class MemoryEngine:
                 metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
                 raise
 
+            applied_keys: set[tuple[str, str]] = set()
+            for row_key in session.query(
+                    TombstoneApplied.origin, TombstoneApplied.origin_hash).filter(
+                    TombstoneApplied.origin == batch.sender).all():
+                applied_keys.add((row_key[0], row_key[1]))
+
             rows: list[dict] = []
             noop = 0
+            skipped = 0
+            applied = 0
             try:
                 for entry in batch.entries:
-                    applied = applied_max.get(entry.origin, 0)
-                    if entry.origin_seq <= applied:
+                    key = (entry.origin, entry.origin_hash)
+                    if key in applied_keys:
+                        skipped += 1
                         continue  # already applied: idempotent skip
-                    applied_max[entry.origin] = entry.origin_seq
+                    applied_keys.add(key)
+                    # ECHO CHECK: a tombstone ORIGINATING from this device
+                    # is re-applied only when the entry is absent from the
+                    # local log -- a full restore lost it (re-delete);
+                    # a device that still holds it skips (true echo)
+                    if entry.origin == self._db_id and self._deletion_log is not None:
+                        if self._deletion_log.has_entry_with_hash(
+                                self._db_id, entry.origin_hash):
+                            skipped += 1
+                            continue
+                    applied += 1
                     local_seq = self._apply_one_tombstone(session, entry, purpose)
                     if local_seq is None:
                         noop += 1
                     rows.append({
                         "origin": entry.origin, "origin_seq": entry.origin_seq,
+                        "origin_hash": entry.origin_hash,
                         "user_id": entry.user_id, "scope": entry.scope,
                         "scope_key": entry.scope_key, "local_seq": local_seq,
                     })
                 if rows:
                     record_tombstones_applied(session, rows)
-                # the channel cursor advances to to_cursor in the SAME
-                # transaction -- even for an all-excluded/empty batch, so
-                # entries that cannot travel never wedge the channel
-                record_catchup(session, batch.sender, batch.to_cursor)
+                if rescan:
+                    # the rescan re-anchors the channel to (0, GENESIS):
+                    # the caller's pull loop re-reads this cursor and
+                    # re-fetches the sender's whole log, deduplicating
+                    record_catchup(session, batch.sender, 0,
+                                   chain_hash=GENESIS_HASH)
+                else:
+                    # the channel cursor + chain hash advance to the
+                    # batch's to_cursor/to_chain_hash in the SAME
+                    # transaction -- even for an all-excluded/empty batch,
+                    # so entries that cannot travel never wedge the
+                    # channel
+                    record_catchup(session, batch.sender, batch.to_cursor,
+                                   chain_hash=batch.to_chain_hash)
                 session.commit()
             except Exception as exc:
                 session.rollback()
@@ -1431,8 +1475,7 @@ class MemoryEngine:
                     "apply",
                     f"applying tombstone batch failed ({type(exc).__name__}: {exc}); "
                     "the whole batch was rolled back") from exc
-        applied = len(rows)
-        skipped = len(batch.entries) - applied
+        applied = len(rows)  # recorded applications (incl. no-ops)
         metrics.inc(metrics.TOMBSTONES_APPLIED, applied)
         if skipped:
             metrics.inc(metrics.TOMBSTONES_SKIPPED, skipped)
@@ -1447,19 +1490,22 @@ class MemoryEngine:
         if entry.scope == "user":
             _counts, log_entry = self._delete_user_in(
                 session, entry.user_id, purpose,
-                origin=entry.origin, origin_seq=entry.origin_seq)
+                origin=entry.origin, origin_seq=entry.origin_seq,
+                origin_hash=entry.origin_hash)
             return log_entry.seq if log_entry is not None else None
         if entry.scope == "session":
             found, log_entry = self._forget_session_in(
                 session, entry.user_id, entry.scope_key, purpose,
-                origin=entry.origin, origin_seq=entry.origin_seq)
+                origin=entry.origin, origin_seq=entry.origin_seq,
+                origin_hash=entry.origin_hash)
             return log_entry.seq if found and log_entry is not None else None
         belief = belief_by_global_id(session, entry.user_id, entry.scope_key)
         if belief is None:
             return None
         committed, log_entry = self._forget_belief_in(
             session, entry.user_id, belief.id, purpose,
-            origin=entry.origin, origin_seq=entry.origin_seq)
+            origin=entry.origin, origin_seq=entry.origin_seq,
+            origin_hash=entry.origin_hash)
         return log_entry.seq if committed and log_entry is not None else None
 
     # ------------------------------------------------------------------
@@ -1491,14 +1537,20 @@ class MemoryEngine:
                     peer = read_sync_peer(session, peer_db_id)
                     cursor = peer.cursor if peer is not None else 0
                 while True:
+                    # the stored cursor is RE-READ every iteration: a
+                    # channel rescan (sender rollback) resets it to 0, so
+                    # the loop re-fetches the peer's log from the start
+                    with self._session() as session:
+                        peer = read_sync_peer(session, peer_db_id)
+                        cursor = peer.cursor if peer is not None else 0
                     batch, _next_cursor = self._sync_transport.export_tombstones(
-                        cursor, 500, peer_db_id=self._db_id)
-                    # apply advances the peer cursor to batch.to_cursor in
-                    # its own transaction (even for an empty batch) -- the
+                        cursor, 500)
+                    # apply advances the peer cursor + chain hash to the
+                    # batch's to_cursor/to_chain_hash in its own
+                    # transaction (even for an empty batch) -- the
                     # catch-up is durable after every batch and resumes
                     # where it got to
                     self.apply_tombstones(batch, purpose="sync")
-                    cursor = batch.to_cursor
                     if batch.to_cursor == batch.from_cursor:
                         break  # the peer's tail is reached
                 self._sync_state = "normal"

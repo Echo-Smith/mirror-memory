@@ -234,7 +234,7 @@ class _Device:
             cursor = self.peer_cursor(peer.db_id)
             try:
                 batch, _next = peer.engine.export_tombstones(
-                    cursor, 500, peer_db_id=self.db_id)
+                    cursor, 500)
             except Exception as exc:  # noqa: BLE001 -- recorded
                 refusals.append(f"export from {peer.name}: {exc!r}")
                 return
@@ -341,7 +341,7 @@ def test_three_devices_alternate_deletes_and_stay_consistent(tmp_path):
                         d.peer_cursor(devices["C"].db_id), 500,
                         peer_db_id=devices["C"].db_id)[0]
                     full, _fc = devices["C"].engine.export_tombstones(
-                        0, 500, peer_db_id=d.db_id)
+                        0, 500)
                     log_lines = [f"C log seq={e.seq} origin={e.origin[:6]} "
                                  f"scope={e.scope} key={e.scope_key[:12]}"
                                  for e in devices["C"].log.read_from(
@@ -459,14 +459,18 @@ def test_untravelable_entry_does_not_wedge_the_channel(tmp_path):
             d.dispose()
 
 
-def test_forged_batches_are_refused_with_zero_writes(tmp_path):
-    rng = random.Random(3)
-    refusals: list[str] = []
+def test_forged_batches_trigger_rescan_and_apply_with_dedup(tmp_path):
+    """A fabricated from_cursor (honestly re-sealed) does not continue
+    the stored channel: the receiver RESCANS -- the channel re-anchors
+    to 0, the sender's log is re-fetched from the start, and the
+    (origin, origin_hash) applied records deduplicate the re-delivery.
+    A tampered entry hash is still refused outright (integrity)."""
     root = tmp_path
     devices = {
         "C": _Device(root, "c", single_tenant=False),
         "A": _Device(root, "a", single_tenant=True),
     }
+    refusals: list[str] = []
     try:
         C, A = devices["C"], devices["A"]
         C.observe("I like forged and coffee.", session_id="s")
@@ -474,67 +478,45 @@ def test_forged_batches_are_refused_with_zero_writes(tmp_path):
         A.adopt_global_ids(C)
         A.engine.forget_belief(user_id=USER,
                                belief_id=A.beliefs()[0].id, purpose="api")
-        # A -> C: the honest batch exists; capture its envelope
-        cursor_before = C.peer_cursor(A.db_id)
-        batch, _ = A.engine.export_tombstones(0, 100, peer_db_id=C.db_id)
+        batch, _ = A.engine.export_tombstones(0, 100)
         honest_tail = batch.to_cursor
-
         before = C.visible_state()
-        log_tail_before = C.log.head(C.db_id)[0]
 
-        # 1. a batch with a FABRICATED from_cursor (re-sealed around it --
-        #    the envelope hash is honest, the continuation is a lie)
-        forged = TombstoneBatch(sender=A.db_id, from_cursor=cursor_before + 5,
-                                to_cursor=cursor_before + 5 + len(batch.entries),
+        # a FABRICATED continuation (from_cursor beyond the tail, sealed
+        # honestly): the receiver detects the non-continuation, rescans
+        # from 0, and the entries dedup to no-ops
+        forged_from = honest_tail + 5
+        forged = TombstoneBatch(sender=A.db_id,
+                                from_cursor=forged_from,
+                                to_cursor=forged_from + len(batch.entries),
+                                from_chain_hash=batch.to_chain_hash,
+                                to_chain_hash=batch.to_chain_hash,
                                 entries=batch.entries).seal()
-        with pytest.raises(TombstoneBatchRejected) as info:
-            C.engine.apply_tombstones(forged)
-        assert info.value.reason == "sequence"
-        assert str(cursor_before) in str(info.value)
+        r = C.engine.apply_tombstones(forged)
+        assert (r.applied, r.skipped) == (0, len(batch.entries))
         assert C.visible_state() == before
-        assert C.log.head(C.db_id)[0] == log_tail_before
+        assert C.peer_cursor(A.db_id) == 0, "the rescan re-anchors to 0"
 
-        # 2. a DROPPED batch: the honest batch is withheld and a later
-        #    batch (continuing further ahead) arrives instead
-        # 2. a DROPPED batch: A deletes again and exports the next batch
-        #    (continuing from honest_tail); C receives it while STILL
-        #    withholding the first -- from_cursor(1) != stored(0): refused
-        A.observe("I like post-gap and tea.", session_id="s")
-        post = next(b for b in A.beliefs() if "post-gap" in b.claim_text)
-        A.engine.forget_belief(user_id=USER, belief_id=post.id, purpose="api")
-        later, _ = A.engine.export_tombstones(honest_tail, 100,
-                                              peer_db_id=C.db_id)
-        assert later.from_cursor == honest_tail
-        assert later.to_cursor > honest_tail
-        with pytest.raises(TombstoneBatchRejected) as info:
-            C.engine.apply_tombstones(later)
-        assert info.value.reason == "sequence"
-        assert str(0) in str(info.value), "the refusal names the stored cursor"
-        assert C.visible_state() == before
-        # the honest batch (from 0) is refused too while the stored
-        # cursor is 0?  NO: stored is 0 and batch.from_cursor is 0 -- it
-        # applies; the follow-up batch (from honest_tail) then applies.
-        # Re-export from the CURRENT stored cursor instead, so the pull
-        # protocol's "resume from stored" keeps working after a refusal.
-        # resume from the STORED cursor: the pull protocol re-exports
-        # from what the receiver acked, so a refused batch is retried
-        # and eventually applied
+        # the honest batch (from 0) then applies through the re-fetch
         C.engine.apply_tombstones(batch)
-        stored_now = C.peer_cursor(A.db_id)
-        later2, _ = A.engine.export_tombstones(stored_now, 100,
-                                               peer_db_id=C.db_id)
-        C.engine.apply_tombstones(later2)
-        # the A-origin belief was never on C (no shared history for it):
-        # the durable trace is the applied record + the advanced channel
-        assert C.peer_cursor(A.db_id) == later2.to_cursor
+        assert all("forged" not in b.claim_text for b in C.beliefs())
+        assert C.peer_cursor(A.db_id) == honest_tail
 
-        # re-delivering the ACKED envelope (from=0) is refused now: the
-        # channel cursor moved past it -- at-least-once is the sender's
-        # discipline (it re-sends only unacked batches)
+        # a tampered ENTRY hash is refused outright (integrity, not a
+        # continuity issue)
+        forged_entry = batch.entries[0].to_dict()
+        forged_entry["hash"] = "0" * 64
+        forged_batch = TombstoneBatch(
+            sender=A.db_id, from_cursor=0, to_cursor=honest_tail,
+            from_chain_hash=batch.from_chain_hash,
+            to_chain_hash=batch.to_chain_hash,
+            entries=[TombstoneEntry.from_dict(forged_entry)]).seal()
+        from mirror_memory.core.tombstones import TombstoneBatchRejected
+
         with pytest.raises(TombstoneBatchRejected) as info:
-            C.engine.apply_tombstones(batch)
-        assert info.value.reason == "sequence"
-        assert refusals == []  # the mesh harness saw no refusals
+            C.engine.apply_tombstones(forged_batch)
+        assert info.value.reason == "hash"
+        assert refusals == []
     finally:
         for d in devices.values():
             d.dispose()

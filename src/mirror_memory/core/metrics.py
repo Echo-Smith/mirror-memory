@@ -35,6 +35,11 @@ TOMBSTONES_REJECTED_PREFIX = "tombstones_rejected_"
 #: Local log entries an export could not turn into tombstones.
 TOMBSTONES_EXPORT_SKIPPED = "tombstones_export_skipped"
 
+#: The tombstone channel was rescanned (sender rollback detected: the
+#: batch's from_cursor/from_chain_hash did not continue the stored
+#: channel) -- the whole sender log is re-fetched with entry-level dedup.
+TOMBSTONES_RESCANS = "tombstones_rescans"
+
 
 def inc(name: str, n: int = 1) -> None:
     with _lock:

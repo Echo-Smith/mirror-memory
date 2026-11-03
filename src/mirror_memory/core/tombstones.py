@@ -70,6 +70,11 @@ class TombstoneEntry:
     scope_key: str
     generation: int
     created_at: str  # ISO 8601; a string so the hash is stable across transports
+    # the hash of the ORIGIN's log entry this tombstone was exported from:
+    # the stable identity that survives relays and sender rollbacks (a
+    # rolled-back sender reuses origin_seq for a DIFFERENT deletion whose
+    # entry hash differs)
+    origin_hash: str = ""
     hash: str = ""
 
     def payload(self) -> dict:
@@ -83,6 +88,7 @@ class TombstoneEntry:
             "scope_key": self.scope_key,
             "generation": self.generation,
             "created_at": self.created_at,
+            "origin_hash": self.origin_hash,
         }
 
     def compute_hash(self) -> str:
@@ -105,7 +111,8 @@ class TombstoneEntry:
         if not isinstance(data, dict):
             raise TombstoneBatchRejected("format", "tombstone entry is not an object")
         required = ("origin", "origin_seq", "tenant_id", "app_id", "user_id",
-                    "scope", "scope_key", "generation", "created_at", "hash")
+                    "scope", "scope_key", "generation", "created_at", "hash",
+                    "origin_hash")
         missing = [k for k in required if k not in data]
         if missing:
             raise TombstoneBatchRejected(
@@ -118,6 +125,7 @@ class TombstoneEntry:
                 scope_key=str(data["scope_key"] or ""),
                 generation=int(data["generation"]),
                 created_at=str(data["created_at"]), hash=str(data["hash"]),
+                origin_hash=str(data.get("origin_hash", "")),
             )
         except (TypeError, ValueError) as exc:
             raise TombstoneBatchRejected("format", f"tombstone entry has a mistyped field: {exc}")
@@ -125,18 +133,25 @@ class TombstoneEntry:
 
 @dataclass
 class TombstoneBatch:
-    """A transport batch of tombstones (M4 batch-2 patch): the sender's
+    """A transport batch of tombstones (M4 batch-2 patch 2): the sender's
     identity, the sender-local cursor range the entries came from, the
-    entries, and a hash over all of it.  The receiver stores the cursor
-    PER SENDER (mm_sync_peers) and refuses a batch whose from_cursor does
-    not continue its stored cursor -- a dropped or reordered batch is a
-    gap and is refused; re-delivery of the SAME batch is idempotent
-    (applied entries are skipped) rather than refused.  An empty batch
-    (everything excluded/skipped) still advances the cursor."""
+    CHAIN HASHES at both ends of that range, the entries, and a hash over
+    all of it.
+
+    The receiver stores (cursor, chain_hash) per sender.  A batch whose
+    from_cursor continues the stored cursor but whose from_chain_hash
+    differs means the SENDER ROLLED BACK (its log was restored/rewritten
+    under the same seqs): the receiver rescans from 0, deduplicating via
+    (origin, origin_hash) applied records, so deletions that survived on
+    the receiver are kept and the sender's re-issued deletions re-apply
+    onto its restored data.  An empty batch (everything excluded/skipped)
+    still advances the cursor."""
 
     sender: str
     from_cursor: int
     to_cursor: int
+    from_chain_hash: str
+    to_chain_hash: str
     entries: list[TombstoneEntry]
     hash: str = ""
 
@@ -145,6 +160,8 @@ class TombstoneBatch:
             "sender": self.sender,
             "from_cursor": self.from_cursor,
             "to_cursor": self.to_cursor,
+            "from_chain_hash": self.from_chain_hash,
+            "to_chain_hash": self.to_chain_hash,
             "entry_hashes": [e.hash for e in self.entries],
         }
 
@@ -155,6 +172,32 @@ class TombstoneBatch:
     def seal(self) -> "TombstoneBatch":
         self.hash = self.compute_hash()
         return self
+
+    def to_dict(self) -> dict:
+        data = self.payload()
+        data["entries"] = [e.to_dict() for e in self.entries]
+        data["hash"] = self.hash
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TombstoneBatch":
+        if not isinstance(data, dict) or not all(
+                k in data for k in ("sender", "from_cursor", "to_cursor",
+                                    "from_chain_hash", "to_chain_hash",
+                                    "entries", "hash")):
+            raise TombstoneBatchRejected("format", "batch envelope is missing fields")
+        entries = [TombstoneEntry.from_dict(e) for e in data["entries"]]
+        batch = cls(sender=str(data["sender"]),
+                    from_cursor=int(data["from_cursor"]),
+                    to_cursor=int(data["to_cursor"]),
+                    from_chain_hash=str(data["from_chain_hash"]),
+                    to_chain_hash=str(data["to_chain_hash"]),
+                    entries=entries, hash=str(data["hash"]))
+        if batch.compute_hash() != batch.hash:
+            raise TombstoneBatchRejected(
+                "hash", "batch hash does not verify: the envelope or the entry "
+                "list was altered in transit")
+        return batch
 
     def to_dict(self) -> dict:
         data = self.payload()
@@ -220,11 +263,13 @@ def validate_batch(batch: TombstoneBatch, *, expected_tenant: tuple[str, str]) -
         raise TombstoneBatchRejected(
             "sequence",
             f"batch cursors are inverted (from {batch.from_cursor} to {batch.to_cursor})")
+    if not _HEX64.match(batch.from_chain_hash or "") or not _HEX64.match(batch.to_chain_hash or ""):
+        raise TombstoneBatchRejected("format", "batch chain hashes must be 64-hex SHA-256")
     if batch.compute_hash() != batch.hash:
         raise TombstoneBatchRejected(
             "hash", "batch hash does not verify: the envelope or the entry "
             "list was altered in transit")
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str]] = set()
     for entry in batch.entries:
         validate_entry_format(entry)
         if entry.compute_hash() != entry.hash:
@@ -236,7 +281,7 @@ def validate_batch(batch: TombstoneBatch, *, expected_tenant: tuple[str, str]) -
                 f"tombstone {entry.origin[:8]}.../{entry.origin_seq} belongs to tenant "
                 f"({entry.tenant_id!r}, {entry.app_id!r}), not to this receiver's "
                 f"({expected_tenant[0]!r}, {expected_tenant[1]!r}): the whole batch is refused")
-        key = (entry.origin, entry.origin_seq)
+        key = (entry.origin, entry.origin_hash)
         if key in seen:
             raise TombstoneBatchRejected(
                 "sequence", f"tombstone {entry.origin[:8]}.../{entry.origin_seq} appears twice in the batch")
@@ -264,23 +309,26 @@ def from_deletion_entry(entry: DeletionEntry) -> TombstoneEntry | None:
         tenant_id=entry.tenant_id, app_id=entry.app_id, user_id=entry.user_id,
         scope=entry.scope, scope_key=scope_key, generation=entry.generation,
         created_at=created,
+        origin_hash=entry.origin_hash or entry.hash,
     ).seal()
 
 
 def export_from_log(
-    log: DeletionLog, db_id: str, since_cursor: int, limit: int, *,
-    exclude_origin: str | None = None,
+    log: DeletionLog, db_id: str, since_cursor: int, limit: int,
 ) -> tuple[TombstoneBatch, int, int]:
     """Read the local log after *since_cursor* and seal the next batch of
     tombstones.  Returns ``(batch, next_cursor, skipped)``:
 
-    - the batch carries sender=db_id, from_cursor=since_cursor,
-      to_cursor=the LOCAL seq of the last entry read (it advances past
-      excluded/skipped entries too), the entries, and the envelope hash;
-    - entries whose origin is *exclude_origin* are NOT exported (they were
-      applied FROM that peer; echoing them back would re-deliver its own
-      deletions) -- an all-excluded read still yields a batch that
-      advances the receiver's cursor;
+    - the batch carries sender=db_id, from_cursor=the ACTUAL served start,
+      to_cursor=the LOCAL seq of the last entry read, the chain hashes at
+      both ends, the entries, and the envelope hash.  The receiver stores
+      (to_cursor, to_chain_hash) for the next batch's continuity check;
+    - a cursor ABOVE the log's head means the CALLER's cursor overshoots
+      (the sender rolled back and its log rewound below what the receiver
+      already consumed): the export REWINDS to 0 and serves everything --
+      the receiver's (origin, origin_hash) applied records deduplicate
+      the re-delivery, so a rollback is healed automatically instead of
+      silently skipped;
     - ``skipped`` counts entries that cannot travel (pre-batch-2 belief
       deletions without a global_id).
 
@@ -296,14 +344,16 @@ def export_from_log(
                 f"checkpoint {cp} for db {db_id[:8]}...: the entries between were "
                 "pruned and cannot be exported.  The peer must rebuild from a "
                 "full state instead of catching up.")
+    head_seq, _head_hash = log.head(db_id)
+    rescan = since_cursor > head_seq
+    if rescan:
+        since_cursor = 0  # the caller's cursor overshoots a rewound log
     entries: list[TombstoneEntry] = []
     cursor = since_cursor
     skipped = 0
     for raw in log.read_from(db_id, since_cursor):
         cursor = raw.seq
         if raw.scope in _LOCAL_ONLY_SCOPES:
-            continue
-        if exclude_origin and raw.origin == exclude_origin:
             continue
         tombstone = from_deletion_entry(raw)
         if tombstone is None:
@@ -312,13 +362,9 @@ def export_from_log(
         entries.append(tombstone)
         if len(entries) >= limit:
             break
-    import os as _os
-
-    if _os.environ.get("MESH_TRACE"):
-        with open("/tmp/export_trace.txt", "a") as _fh:
-            _fh.write(f"export db={db_id[:6]} from={since_cursor} to={cursor} "
-                      f"entries={len(entries)} skipped={skipped} "
-                      f"exclude={exclude_origin[:6] if exclude_origin else None}\n")
+    from_chain = log.chain_hash_at(db_id, since_cursor)
+    to_chain = log.chain_hash_at(db_id, cursor)
     batch = TombstoneBatch(sender=db_id, from_cursor=since_cursor,
-                           to_cursor=cursor, entries=entries).seal()
+                           to_cursor=cursor, from_chain_hash=from_chain,
+                           to_chain_hash=to_chain, entries=entries).seal()
     return batch, cursor, skipped

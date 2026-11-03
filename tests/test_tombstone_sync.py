@@ -22,6 +22,7 @@ database and deletion log, exchange tombstone batches directly.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from pathlib import Path
@@ -33,7 +34,7 @@ from sqlalchemy.orm import sessionmaker
 from mirror_memory.api import MemoryEngine
 from mirror_memory.config.loader import load_config
 from mirror_memory.core import schema_migration as sm
-from mirror_memory.core.deletion import FileDeletionLog
+from mirror_memory.core.deletion import GENESIS_HASH, FileDeletionLog
 from mirror_memory.core.models import (
     Base,
     Belief,
@@ -209,7 +210,7 @@ def test_three_scopes_travel_from_the_cloud_to_the_edge(cloud, edge):
     assert cloud.engine.forget_session(user_id=USER, session_id="sb", purpose="api")
     assert len(edge.beliefs()) >= 1
 
-    batch, cursor = cloud.engine.export_tombstones(0, 100, peer_db_id=edge.db_id)
+    batch, cursor = cloud.engine.export_tombstones(0, 100)
     assert [e.scope for e in batch.entries] == ["belief", "session"]
     assert batch.entries[0].scope_key == cloud_b.global_id and batch.entries[1].scope_key == "sb"
     assert all(e.origin == cloud.db_id for e in batch.entries)
@@ -220,7 +221,7 @@ def test_three_scopes_travel_from_the_cloud_to_the_edge(cloud, edge):
     # the tombstone format carries no content and no fingerprints
     assert set(batch.entries[0].to_dict()) == {
         "origin", "origin_seq", "tenant_id", "app_id", "user_id", "scope",
-        "scope_key", "generation", "created_at", "hash"}
+        "scope_key", "generation", "created_at", "hash", "origin_hash"}
 
     result = edge.engine.apply_tombstones(batch)
     assert (result.applied, result.skipped, result.noop) == (2, 0, 0)
@@ -234,25 +235,27 @@ def test_three_scopes_travel_from_the_cloud_to_the_edge(cloud, edge):
 
     # user scope: the whole user
     cloud.engine.delete_memories(user_id=USER, purpose="api")
-    batch2, cursor2 = cloud.engine.export_tombstones(cursor, 100, peer_db_id=edge.db_id)
+    batch2, cursor2 = cloud.engine.export_tombstones(cursor, 100)
     assert [e.scope for e in batch2.entries] == ["user"] and batch2.entries[0].scope_key == ""
     edge.engine.apply_tombstones(batch2)
     assert edge.beliefs() == [] and edge.summaries() == 0
     assert "SYNCSENTINEL" not in (edge.engine.recall(user_id=USER, query="SYNCSENTINEL", purpose="api") or "")
 
-    # NO ECHO: exporting the edge's log back to the cloud yields no
-    # entries -- every edge entry originated at the cloud; the envelope
-    # still advances the cloud's stored edge-cursor
-    back, _ = edge.engine.export_tombstones(0, 100, peer_db_id=cloud.db_id)
-    assert back.entries == [] and back.to_cursor == 3, (back.to_dict(),)
+    # NO ECHO (receiver-side now): the edge's log re-exported to the
+    # cloud carries the C-origin tombstones back, and the cloud SKIPS
+    # them at apply time -- its own log still holds every one of them
+    back, _ = edge.engine.export_tombstones(0, 100)
+    assert back.entries and all(e.origin == cloud.db_id for e in back.entries)
+    r_back = cloud.engine.apply_tombstones(back)
+    assert r_back.applied == 0
     # ... while a THIRD device would receive them with the ORIGINAL origin
-    third, _ = edge.engine.export_tombstones(0, 100, peer_db_id="f" * 32)
+    third, _ = edge.engine.export_tombstones(0, 100)
     assert [(e.origin, e.origin_seq) for e in third.entries] == [
         (cloud.db_id, 1), (cloud.db_id, 2), (cloud.db_id, 3)], third.to_dict()
 
     # the empty continuation batch (everything already applied/excluded)
     # advances the channel cursor without touching data
-    empty, empty_cursor = cloud.engine.export_tombstones(cursor2, 100, peer_db_id=edge.db_id)
+    empty, empty_cursor = cloud.engine.export_tombstones(cursor2, 100)
     assert empty.entries == [] and empty.from_cursor == empty_cursor == cursor2
     r3 = edge.engine.apply_tombstones(empty)
     assert (r3.applied, r3.skipped, r3.noop) == (0, 0, 0)
@@ -300,7 +303,7 @@ def test_apply_is_idempotent_and_noop_scopes_are_recorded(cloud, edge):
     # entry-level idempotency: a CONTINUING batch (from == stored) that
     # repeats already-applied (origin, origin_seq) skips them and applies
     # only the new one
-    dup = _batch_of(cloud.db_id, tail_cursor,
+    dup = _batch_of(cloud, tail_cursor,
                     [batch.entries[0], batch2.entries[0]],
                     to_cursor=batch2.to_cursor)
     r2 = edge.engine.apply_tombstones(dup)
@@ -310,11 +313,19 @@ def test_apply_is_idempotent_and_noop_scopes_are_recorded(cloud, edge):
     # record is the durable trace
     assert edge.applied() == [(cloud.db_id, 1), (cloud.db_id, 2)]
 
-    # re-delivering a batch the receiver has ALREADY ACKED (from behind
-    # the stored cursor) is a channel violation and is refused
-    with pytest.raises(TombstoneBatchRejected) as info:
-        edge.engine.apply_tombstones(batch)
-    assert info.value.reason == "sequence"
+    # re-delivering a batch the receiver has ALREADY ACKED: the envelope
+    # no longer continues the stored channel (stored cursor 2, chain
+    # X vs batch from_cursor 0, chain GENESIS) -- the channel RESCANS:
+    # it re-anchors to 0, re-fetches the whole sender log, and the
+    # (origin, origin_hash) applied records deduplicate the re-delivery
+    r3 = edge.engine.apply_tombstones(batch)
+    assert (r3.applied, r3.skipped) == (0, 1)
+    assert edge.applied() == [(cloud.db_id, 1), (cloud.db_id, 2)]
+    # the rescan re-anchored the channel to 0: the re-fetch from 0
+    # re-delivers BOTH tombstones and the applied records deduplicate
+    refetch, _ = cloud.engine.export_tombstones(0, 100)
+    r4 = edge.engine.apply_tombstones(refetch)
+    assert (r4.applied, r4.skipped) == (0, 2)
     assert edge.applied() == [(cloud.db_id, 1), (cloud.db_id, 2)]
 
 
@@ -331,7 +342,7 @@ def test_reverse_direction_edge_to_cloud_and_no_echo(cloud, edge):
         s.commit()
         s.close()
     assert edge.engine.forget_belief(user_id=USER, belief_id=edge_b.id, purpose="api")
-    up, _ = edge.engine.export_tombstones(0, 100, peer_db_id=cloud.db_id)
+    up, _ = edge.engine.export_tombstones(0, 100)
     assert len(up.entries) == 1 and up.entries[0].origin == edge.db_id
     res = cloud.engine.apply_tombstones(up, auth_tenant=TENANT)
     assert res.applied == 1 and res.noop == 0
@@ -350,7 +361,7 @@ def test_reverse_direction_edge_to_cloud_and_no_echo(cloud, edge):
         peer = _rsp(s, edge.db_id)
         stored = peer.cursor if peer is not None else 0
         s.close()
-    down, _ = cloud.engine.export_tombstones(stored, 100, peer_db_id=edge.db_id)
+    down, _ = cloud.engine.export_tombstones(stored, 100)
     assert down.entries == [] and down.sender == cloud.db_id
 
 
@@ -368,12 +379,19 @@ def _forged(entry: TombstoneEntry, **changes) -> TombstoneEntry:
 
 
 
-def _batch_of(sender: str, from_cursor: int, entries: list[TombstoneEntry],
+def _batch_of(sender_device, from_cursor: int,
+              entries: list[TombstoneEntry],
               to_cursor: int | None = None) -> TombstoneBatch:
-    return TombstoneBatch(sender=sender, from_cursor=from_cursor,
-                          to_cursor=to_cursor if to_cursor is not None
-                          else from_cursor + len(entries),
-                          entries=entries).seal()
+    """Seal a batch continuing the sender's REAL channel: the chain
+    hashes come from the sender's log at both cursor ends (tests that
+    need a MISMATCH pass explicit wrong hashes instead)."""
+    tail = sender_device.log.head(sender_device.db_id)[0]
+    to = to_cursor if to_cursor is not None else max(tail, from_cursor + len(entries))
+    return TombstoneBatch(
+        sender=sender_device.db_id, from_cursor=from_cursor, to_cursor=to,
+        from_chain_hash=sender_device.log.chain_hash_at(sender_device.db_id, from_cursor),
+        to_chain_hash=sender_device.log.chain_hash_at(sender_device.db_id, to),
+        entries=entries).seal()
 
 
 def _two_cloud_tombstones(cloud: _Device) -> list[TombstoneEntry]:
@@ -388,65 +406,62 @@ def _two_cloud_tombstones(cloud: _Device) -> list[TombstoneEntry]:
 @pytest.mark.parametrize("direction", ["cloud_to_edge", "edge_to_cloud"])
 def test_forged_mixed_gap_and_tampered_batches_are_refused_with_zero_writes(
         cloud, edge, direction):
+    """Integrity failures (tampered hash / malformed entry) are refused
+    outright with zero writes.  A fabricated continuation that does not
+    carry the stored chain hash triggers a RESCAN: the channel re-anchors
+    to 0, the sender's log is re-fetched from the start, and the
+    (origin, origin_hash) applied records deduplicate the re-delivery --
+    visible in the rescan metric, never silent."""
     _seed_both(cloud, edge)
     sender, receiver = (cloud, edge) if direction == "cloud_to_edge" else (edge, cloud)
     entries = _two_cloud_tombstones(sender)
-    _, cursor = sender.engine.export_tombstones(0, 100)
     kwargs = {"auth_tenant": TENANT} if receiver is cloud else {}
 
     def resend(entries, from_cursor=0):
-        return _batch_of(sender.db_id, from_cursor, entries,
+        return _batch_of(sender, from_cursor, entries,
                          from_cursor + len(entries))
 
-    cases = {
-        # every entry from another tenant
-        "tenant": resend([_forged(e, tenant_id="other-tenant") for e in entries]),
-        # ONE other-tenant entry mixed into a valid batch
-        "tenant-mixed": resend([entries[0], _forged(entries[1], app_id="other-app")]),
-        # a batch continuing from a cursor the receiver never reached (a
-        # dropped prior batch / a fabricated continuation)
-        "sequence": resend(entries, from_cursor=cursor + 5),
-        # a tampered entry hash (the envelope resealed around it)
+    from mirror_memory.core import metrics
+
+    before = receiver.snapshot()
+    integrity_cases = {
         "hash": resend([entries[0], _forged(entries[1], hash="0" * 64)]),
-        # a content change behind a stale entry hash
         "hash-content": resend([entries[0], _forged(entries[1], user_id="someone-else", hash=entries[1].hash)]),
-        # malformed: a belief without a global_id
         "format": resend([_forged(entries[0], scope_key="")]),
-        # a tampered ENVELOPE: from_cursor edited after sealing (the
-        # continuation is plausible, the stored cursor disagrees)
-        "envelope": TombstoneBatch(sender=sender.db_id, from_cursor=cursor + 1,
-                                   to_cursor=cursor + 1 + len(entries),
-                                   entries=entries,
-                                   hash=_batch_of(sender.db_id, cursor + 1,
-                                                  entries,
-                                                  cursor + 1 + len(entries)).hash),
     }
-    expected_reason = {"tenant": "tenant", "tenant-mixed": "tenant", "sequence": "sequence",
-                       "hash": "hash", "hash-content": "hash", "format": "format",
-                       "envelope": "sequence"}
-    for name, batch in cases.items():
-        before = receiver.snapshot()
+    for name, batch in integrity_cases.items():
         with pytest.raises(TombstoneBatchRejected) as info:
             receiver.engine.apply_tombstones(batch, **kwargs)
-        assert info.value.reason == expected_reason[name], (name, str(info.value))
-        if name == "sequence":
-            # the refusal names BOTH cursors: the forged continuation and
-            # what the receiver actually stored
-            assert str(cursor + 5) in str(info.value) and "stored cursor is 0" in str(info.value), str(info.value)
+        assert info.value.reason in ("hash", "format"), (name, str(info.value))
         assert receiver.snapshot() == before, (name, "a refused batch must write nothing")
 
-    # the untouched valid batch still applies afterwards
-    ok = receiver.engine.apply_tombstones(resend(entries), **kwargs)
-    assert ok.applied == 2
+    # continuity failures RESCAN (not refuse): the channel re-anchors to
+    # 0, the whole sender log is re-fetched, and the applied records
+    # deduplicate the re-delivery.  First the honest batch applies (2
+    # entries); then a FABRICATED batch continuing beyond the tail
+    # triggers the rescan -- the re-fetched log re-delivers the same two
+    # tombstones and they dedup to zero re-applications.
+    rescans_before = metrics.snapshot().get("tombstones_rescans", 0)
+    receiver.engine.apply_tombstones(resend(entries), **kwargs)
+    after_honest = receiver.snapshot()
 
-
+    fabricated_from = sender.log.head(sender.db_id)[0] + 5
+    fabricated = _batch_of(sender, fabricated_from, entries,
+                           to_cursor=fabricated_from + len(entries))
+    r = receiver.engine.apply_tombstones(fabricated, **kwargs)
+    assert (r.applied, r.skipped) == (0, len(entries)), (
+        "the rescan re-delivery must dedup to zero applications")
+    rescans = metrics.snapshot().get("tombstones_rescans", 0)
+    assert rescans > rescans_before, "the rescan was counted (not silent)"
+    assert receiver.snapshot() == after_honest, (
+        "the rescan re-delivery must not change the receiver's state")
 def test_cloud_refuses_users_its_tenant_does_not_know(cloud, edge):
     """The multi-tenant receiver takes the tenant from the authenticated
     engine and refuses a tombstone for a user that tenant never saw --
     the entry's own fields are not trusted."""
     _seed_both(cloud, edge)
     entries = _two_cloud_tombstones(edge)
-    unknown = _batch_of(edge.db_id, 0,
+    unknown = _batch_of(edge, 0,
                         [_forged(e, user_id="u-never-seen") for e in entries])
     before = cloud.snapshot()
     with pytest.raises(TombstoneBatchRejected) as info:
@@ -456,7 +471,7 @@ def test_cloud_refuses_users_its_tenant_does_not_know(cloud, edge):
     # the authenticated tenant must be this engine's tenant: anything else
     # is refused before any validation (no routing by entry fields)
     with pytest.raises(TombstoneBatchRejected) as info2:
-        cloud.engine.apply_tombstones(_batch_of(edge.db_id, 0, entries),
+        cloud.engine.apply_tombstones(_batch_of(edge, 0, entries),
                                       auth_tenant=("other", "app"))
     assert info2.value.reason == "tenant"
     assert cloud.snapshot() == before
@@ -467,7 +482,7 @@ def test_edge_treats_unknown_users_as_noops(cloud, edge):
     (a fresh install catching up): the tombstone is a no-op, recorded."""
     _seed_both(cloud, edge)
     entries = _two_cloud_tombstones(cloud)
-    unknown = _batch_of(cloud.db_id, 0,
+    unknown = _batch_of(cloud, 0,
                         [_forged(e, user_id="u-never-seen") for e in entries])
     res = edge.engine.apply_tombstones(unknown)
     assert (res.applied, res.noop) == (2, 2)
@@ -493,7 +508,7 @@ def test_tombstone_apply_vs_publish_50_rounds_sqlite(tmp_path):
             edge.observe(f"round {round_no} content", session_id=f"r{round_no}")
             cloud.observe(f"round {round_no} content", session_id=f"r{round_no}")
             cloud.engine.delete_memories(user_id=USER, purpose="api")
-            batch, _ = cloud.engine.export_tombstones(round_no, 1, peer_db_id=edge.db_id)
+            batch, _ = cloud.engine.export_tombstones(round_no, 1)
             assert len(batch.entries) == 1, (round_no, batch.to_dict())
             assert batch.from_cursor == round_no and batch.to_cursor == round_no + 1
 

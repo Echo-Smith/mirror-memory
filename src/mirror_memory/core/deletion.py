@@ -119,6 +119,10 @@ class DeletionEntry:
     global_key: str = ""
     origin: str = ""
     origin_seq: int = 0
+    # M4 batch-2 patch 2: for an entry produced by APPLYING a remote
+    # tombstone, the origin's log-entry hash it was exported with -- the
+    # stable identity the applied table and the echo check key on
+    origin_hash: str = ""
 
     def payload(self) -> dict:
         """The canonical, hashable form (everything except seq/hash).  The
@@ -142,6 +146,8 @@ class DeletionEntry:
         if self.origin:
             payload["origin"] = self.origin
             payload["origin_seq"] = self.origin_seq
+        if self.origin_hash:
+            payload["origin_hash"] = self.origin_hash
         return payload
 
     def compute_hash(self) -> str:
@@ -176,6 +182,18 @@ class DeletionLog:
     def has_genesis(self, db_id: str) -> bool:  # pragma: no cover - interface
         """Does this log carry the genesis entry (seq 0) for *db_id*?  Its
         absence means the log was created for a DIFFERENT database."""
+        raise NotImplementedError
+
+    def chain_hash_at(self, db_id: str, seq: int) -> str:  # pragma: no cover - interface
+        """The chain hash stored AT *seq* (GENESIS_HASH for seq 0 or when
+        no entry exists at that position) -- the sync channel's continuity
+        anchor (M4 batch-2 patch 2)."""
+        raise NotImplementedError
+
+    def has_entry_with_hash(self, db_id: str, entry_hash: str) -> bool:  # pragma: no cover - interface
+        """Does this log contain an entry whose hash is *entry_hash*?  The
+        echo check: a device receiving its OWN tombstone re-applies it
+        only when the entry is absent from its restored log."""
         raise NotImplementedError
 
     def checkpoint_seq(self, db_id: str) -> int:  # pragma: no cover - interface
@@ -303,6 +321,7 @@ class FileDeletionLog(DeletionLog):
             "global_key": entry.global_key,
             "origin": entry.origin,
             "origin_seq": entry.origin_seq,
+            "origin_hash": entry.origin_hash,
         }
 
     def _iter_entries(self, path: Path) -> Iterator[DeletionEntry]:
@@ -331,6 +350,7 @@ class FileDeletionLog(DeletionLog):
                     global_key=record.get("global_key", ""),
                     origin=record.get("origin", ""),
                     origin_seq=int(record.get("origin_seq", 0) or 0),
+                    origin_hash=record.get("origin_hash", ""),
                 )
 
     def read_from(self, db_id: str, after_seq: int) -> Iterator[DeletionEntry]:
@@ -381,6 +401,23 @@ class FileDeletionLog(DeletionLog):
             if entry.scope == "checkpoint" and entry.seq > best:
                 best = entry.seq
         return best
+
+    def chain_hash_at(self, db_id: str, seq: int) -> str:
+        if seq <= 0:
+            return GENESIS_HASH
+        path = self._path_for(db_id)
+        if not path.exists():
+            return GENESIS_HASH
+        for entry in self._iter_entries(path):
+            if entry.seq == seq:
+                return entry.hash
+        return GENESIS_HASH
+
+    def has_entry_with_hash(self, db_id: str, entry_hash: str) -> bool:
+        path = self._path_for(db_id)
+        if not path.exists():
+            return False
+        return any(e.hash == entry_hash for e in self._iter_entries(path))
 
     def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
         """Rewrite the file: the header, the genesis, a CHECKPOINT entry
@@ -504,6 +541,8 @@ class PgDeletionLog(DeletionLog):
                 "origin CHAR(32) NOT NULL DEFAULT ''",
                 "ALTER TABLE mm_deletion_log ADD COLUMN IF NOT EXISTS "
                 "origin_seq BIGINT NOT NULL DEFAULT 0",
+                "ALTER TABLE mm_deletion_log ADD COLUMN IF NOT EXISTS "
+                "origin_hash VARCHAR(64) NOT NULL DEFAULT ''",
             ):
                 conn.execute(text(ddl))
 
@@ -511,10 +550,11 @@ class PgDeletionLog(DeletionLog):
         conn.execute(text(
             "INSERT INTO mm_deletion_log (db_id, tenant_id, app_id, user_id, "
             "scope, scope_key, fingerprints_json, generation, purpose, "
-            "prev_hash, hash, created_at, global_key, origin, origin_seq) "
+            "prev_hash, hash, created_at, global_key, origin, origin_seq, "
+            "origin_hash) "
             "VALUES (:db, :tenant, :app, :user, "
             ":scope, :scope_key, :fp, :generation, :purpose, :prev, :hash, "
-            ":created, :global_key, :origin, :origin_seq)"
+            ":created, :global_key, :origin, :origin_seq, :origin_hash)"
         ), {
             "db": entry.db_id, "tenant": entry.tenant_id, "app": entry.app_id,
             "user": entry.user_id, "scope": entry.scope,
@@ -524,7 +564,7 @@ class PgDeletionLog(DeletionLog):
             "prev": entry.prev_hash, "hash": entry.hash,
             "created": entry.created_at,
             "global_key": entry.global_key, "origin": entry.origin,
-            "origin_seq": entry.origin_seq,
+            "origin_seq": entry.origin_seq, "origin_hash": entry.origin_hash,
         })
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:
@@ -551,7 +591,7 @@ class PgDeletionLog(DeletionLog):
             rows = conn.execute(text(
                 "SELECT seq, tenant_id, app_id, user_id, scope, scope_key, "
                 "fingerprints_json, generation, purpose, prev_hash, hash, created_at, "
-                "global_key, origin, origin_seq "
+                "global_key, origin, origin_seq, origin_hash "
                 "FROM mm_deletion_log WHERE db_id = :db AND seq > :after ORDER BY seq"
             ), {"db": db_id, "after": after_seq}).all()
         for row in rows:
@@ -564,6 +604,7 @@ class PgDeletionLog(DeletionLog):
                 global_key=(row[12] or "").strip(),
                 origin=(row[13] or "").strip(),
                 origin_seq=int(row[14] or 0),
+                origin_hash=(row[15] or "").strip(),
             )
 
     def head(self, db_id: str) -> tuple[int, str]:
@@ -600,6 +641,25 @@ class PgDeletionLog(DeletionLog):
                 "SELECT max(seq) FROM mm_deletion_log "
                 "WHERE db_id = :db AND scope = 'checkpoint'"), {"db": db_id}).first()
         return int(row[0] or 0) if row and row[0] is not None else 0
+
+    def chain_hash_at(self, db_id: str, seq: int) -> str:
+        self._ensure_schema()
+        if seq <= 0:
+            return GENESIS_HASH
+        with self._engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT hash FROM mm_deletion_log "
+                "WHERE db_id = :db AND seq = :s"), {"db": db_id, "s": seq}).first()
+        return str(row[0]) if row else GENESIS_HASH
+
+    def has_entry_with_hash(self, db_id: str, entry_hash: str) -> bool:
+        self._ensure_schema()
+        with self._engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT 1 FROM mm_deletion_log "
+                "WHERE db_id = :db AND hash = :h LIMIT 1"),
+                {"db": db_id, "h": entry_hash}).first()
+        return row is not None
 
     def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
         """Delete the entries at or below *before_seq* (never the genesis)

@@ -2904,7 +2904,10 @@ def _purge_belief_ledger(session: Session, belief: Belief,
 @_sanctioned_writer("sync")
 def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
     """Record which cross-device tombstones were applied -- the
-    idempotency key is (origin, origin_seq); rows whose scope no longer
+    idempotency key is (origin, origin_hash), the ORIGIN's log-entry hash
+    the tombstone was exported with: a rolled-back sender reuses
+    origin_seq for a different deletion whose hash differs, so seq-based
+    keys would misfile it as a duplicate.  Rows whose scope no longer
     exists locally are recorded too (a no-op apply is still an apply).
     Called only inside the tombstone-application transaction (M4 batch 2
     task 1): a rolled-back batch leaves no applied record behind."""
@@ -2913,6 +2916,7 @@ def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
     for row in rows:
         session.add(TombstoneApplied(
             origin=row["origin"], origin_seq=row["origin_seq"],
+            origin_hash=row["origin_hash"],
             user_id=row["user_id"], scope=row["scope"],
             scope_key=row.get("scope_key", ""),
             local_seq=row.get("local_seq"),
@@ -2922,10 +2926,13 @@ def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
 
 
 @_sanctioned_writer("sync")
-def record_catchup(session: Session, peer_db_id: str, cursor: int) -> None:
-    """Advance the peer's consumed cursor and stamp the catch-up instant
-    (the offline grace period measures from it).  Called from the edge's
-    catch-up path only (M4 batch 2 task 3)."""
+def record_catchup(session: Session, peer_db_id: str, cursor: int,
+                   chain_hash: str = "") -> None:
+    """Advance the peer's consumed cursor + chain hash and stamp the
+    catch-up instant (the offline grace period measures from it).  The
+    chain hash anchors the channel-continuity check: a next batch whose
+    from_chain_hash differs means the peer rolled back.  Called from the
+    edge's catch-up path and the tombstone application (M4 batch 2)."""
     from mirror_memory.core.tenancy import current_tenant
     from mirror_memory.core.models import SyncPeer
 
@@ -2935,6 +2942,8 @@ def record_catchup(session: Session, peer_db_id: str, cursor: int) -> None:
         row = SyncPeer(peer_db_id=peer_db_id, cursor=cursor)
         session.add(row)
     row.cursor = cursor
+    if chain_hash:
+        row.chain_hash = chain_hash
     row.last_catchup_at = datetime.utcnow()
     session.flush()
 

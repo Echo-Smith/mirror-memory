@@ -77,7 +77,7 @@ I2_TARGETS: list[tuple[str, str]] = [
     ("tests.test_deletion_race_backup", "test_tombstone_mesh_three_devices_pg"),
     ("tests.test_sync_mesh", "test_device_joining_midway_catches_up"),
     ("tests.test_sync_mesh", "test_untravelable_entry_does_not_wedge_the_channel"),
-    ("tests.test_sync_mesh", "test_forged_batches_are_refused_with_zero_writes"),
+    ("tests.test_sync_mesh", "test_forged_batches_trigger_rescan_and_apply_with_dedup"),
     ("tests.test_sync_mesh", "test_receiver_restore_repulls_to_the_same_state"),
     ("tests.test_edge_sync", "test_full_restore_then_catchup_cleans_every_read_entrance"),
     ("tests.test_edge_sync", "test_catchup_resumes_after_a_dead_link"),
@@ -150,7 +150,7 @@ def test_edge_catchup_and_local_replay_together(tmp_path):
         assert cloud.engine.forget_belief(user_id=USER, belief_id=cloud_b.id, purpose="api")
         assert cloud.engine.forget_session(user_id=USER, session_id="sa", purpose="api")
         cloud.engine.delete_memories(user_id=USER, purpose="api")
-        batch, cursor = cloud.engine.export_tombstones(0, 100, peer_db_id=edge.db_id)
+        batch, cursor = cloud.engine.export_tombstones(0, 100)
         edge.engine.apply_tombstones(batch)
         assert edge.beliefs() == [], "cross-device propagation cleaned the edge"
 
