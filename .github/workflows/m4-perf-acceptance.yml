@@ -96,6 +96,15 @@ jobs:
             # measured surface: without rewinding them the base revision
             # sees the HEAD yaml and its scope/writer scans report ghosts
             git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
+            # round-validity gate: the measured src tree must BE the
+            # revision's tree (batch-2 patch 3, task 3)
+            local want
+            want=$(git rev-parse "$rev:src")
+            if [ -n "$(git diff --name-only "$rev" -- src)" ]; then
+              echo "TREE-MISMATCH sqlite-$tag round$round: worktree src != $rev ($want)" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "src-tree sqlite-$tag round$round $rev = $want OK" | tee -a "$GITHUB_STEP_SUMMARY"
             export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
             local start end
             start=$(python -c 'import time; print(time.monotonic())')
@@ -132,6 +141,15 @@ jobs:
           measure() {
             local rev="$1" round="$2" tag="$3"
             use_rev "$rev"
+            # round-validity gate: the measured src tree must BE the
+            # revision's tree
+            local want
+            want=$(git rev-parse "$rev:src")
+            if [ -n "$(git diff --name-only "$rev" -- src)" ]; then
+              echo "TREE-MISMATCH longrun-$tag round$round: worktree src != $rev ($want)" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "src-tree longrun-$tag round$round $rev = $want OK" | tee -a "$GITHUB_STEP_SUMMARY"
             export MM_SQL_AUDIT=0 MM_DATABASE_URL="postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test"
             unset MM_TENANT_READ_FILTER MM_PG_RLS MM_ALLOW_UNFILTERED_MEASUREMENT || true
             local start end
@@ -162,6 +180,15 @@ jobs:
               grep -qx "$f" /tmp/keep_micro.txt || rm -f "$f"
             done
             git checkout -f -q "$rev" -- src
+            # round-validity gate: the measured src tree must BE the
+            # revision's tree
+            local want
+            want=$(git rev-parse "$rev:src")
+            if [ -n "$(git diff --name-only "$rev" -- src)" ]; then
+              echo "TREE-MISMATCH micro-$tag round$round: worktree src != $rev ($want)" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "src-tree micro-$tag round$round $rev = $want OK" | tee -a "$GITHUB_STEP_SUMMARY"
             # the harness (tools/) stays at HEAD: it measures, it is not measured
             export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
             python tools/perf_observe_micro.py --observes 2000 \
