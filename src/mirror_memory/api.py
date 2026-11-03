@@ -1335,7 +1335,7 @@ class MemoryEngine:
         idempotently; a scope that no longer exists locally is a no-op
         that is still recorded as applied.
 
-        Returns ``TombstoneApplyResult(applied, skipped, noop)``.
+        Returns ``TombstoneApplyResult(applied, skipped, noop, rescan)``.
         """
         self._ensure_db()
         from mirror_memory.core import metrics
@@ -1486,7 +1486,8 @@ class MemoryEngine:
         metrics.inc(metrics.TOMBSTONES_APPLIED, applied)
         if skipped:
             metrics.inc(metrics.TOMBSTONES_SKIPPED, skipped)
-        return TombstoneApplyResult(applied=applied, skipped=skipped, noop=noop)
+        return TombstoneApplyResult(applied=applied, skipped=skipped,
+                                    noop=noop, rescan=rescan)
 
     def _apply_one_tombstone(self, session, entry, purpose: str):
         """One tombstone -> the local deletion of its scope through the
@@ -1539,7 +1540,7 @@ class MemoryEngine:
 
             metrics.set_gauge(metrics.SYNC_CATCHING_UP, 1.0)
             try:
-                peer_db_id = getattr(self._sync_transport, "db_id", "")
+                peer_db_id = getattr(self._sync_transport, "db_id", "") or ""
                 with self._session() as session:
                     peer = read_sync_peer(session, peer_db_id)
                     cursor = peer.cursor if peer is not None else 0
@@ -1552,13 +1553,27 @@ class MemoryEngine:
                         cursor = peer.cursor if peer is not None else 0
                     batch, _next_cursor = self._sync_transport.export_tombstones(
                         cursor, 500)
+                    if not peer_db_id:
+                        # the transport did not identify its peer: key the
+                        # channel on the envelope's sender -- the SAME
+                        # identity apply_tombstones already trusts when it
+                        # records the cursor.  Without this the read key
+                        # ("") and the write key (batch.sender) disagree
+                        # and the loop would rescan forever.
+                        peer_db_id = batch.sender
                     # apply advances the peer cursor + chain hash to the
                     # batch's to_cursor/to_chain_hash in its own
                     # transaction (even for an empty batch) -- the
                     # catch-up is durable after every batch and resumes
                     # where it got to
-                    self.apply_tombstones(batch, purpose="sync")
-                    if batch.to_cursor == batch.from_cursor:
+                    result = self.apply_tombstones(batch, purpose="sync")
+                    # the tail is reached only on an EMPTY batch that did
+                    # NOT trigger a rescan: after a rescan the channel was
+                    # re-anchored to 0, so the loop must keep pulling from
+                    # the reset cursor even when this batch's own range
+                    # was empty (to_cursor == from_cursor)
+                    if (batch.to_cursor == batch.from_cursor
+                            and not result.rescan):
                         break  # the peer's tail is reached
                 self._sync_state = "normal"
                 self._sync_attempt_failed = False

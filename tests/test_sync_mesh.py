@@ -242,11 +242,14 @@ class _Device:
                 refusals.append(f"export from {peer.name}: {exc!r}")
                 return
             try:
-                self.engine.apply_tombstones(batch)
+                result = self.engine.apply_tombstones(batch)
             except TombstoneBatchRejected as exc:
                 refusals.append(f"apply from {peer.name}: {exc}")
                 return
-            if batch.to_cursor == batch.from_cursor:
+            # a rescan re-anchored the channel to 0: keep pulling from the
+            # reset cursor even when this batch's own range was empty
+            if (batch.to_cursor == batch.from_cursor
+                    and not result.rescan):
                 return
 
     def dispose(self):
@@ -593,6 +596,9 @@ def _restore_device(d: "_Device", backup_db: str, backup_log_dir) -> None:
         config=d.cfg, database_url=d.url, tenant_id=TENANT[0],
         app_id=TENANT[1], llm_client=_FakeLLM(),
         deletion_log=d.log, single_tenant_mode=d.single_tenant)
+    # the reboot reads its own identity (the watermark travels in the
+    # main DB) before anything pulls from it
+    d.engine._ensure_db()
 
 
 def _sender_restore_and_offline_redelete(devices, refusals):
@@ -802,6 +808,148 @@ def test_mesh_survives_a_midstream_full_restore(tmp_path):
         rescans = _mesh_rounds_with_restore(
             devices, refusals, rng, restore_name="A", restore_round=7)
         assert rescans >= 1, "the restore must be DETECTED (rescan metric)"
+    finally:
+        for d in devices.values():
+            d.dispose()
+
+
+# --- M4 batch-2 patch 3, task 1: the catch-up keeps pulling after a rescan
+
+class _PeerTransport:
+    """The in-process link one engine uses to pull another's log (used to
+    drive the engine's own _catch_up loop in the tests below)."""
+
+    def __init__(self, peer_engine):
+        self.peer = peer_engine
+
+    @property
+    def db_id(self):
+        return self.peer._db_id
+
+    def export_tombstones(self, cursor, limit, peer_db_id=None):
+        return self.peer.export_tombstones(cursor, limit)
+
+
+def _deletions(d: "_Device", rounds: range, start: int) -> None:
+    """`rounds` belief-scope deletions on *d*, each its own log entry."""
+    for i in rounds:
+        tag = f"p{start + i}"
+        session_id = f"ps{start + i}"
+        d.observe(f"I like {tag} and coffee.", session_id=session_id)
+        belief = next(b for b in d.beliefs() if tag in b.claim_text)
+        assert d.engine.forget_belief(user_id=USER, belief_id=belief.id,
+                                      purpose="api")
+
+
+def test_catchup_completes_a_rescan_and_repull_in_one_pass(tmp_path):
+    """The task's scenario: the cloud's stored cursor (7) overshoots the
+    restored sender's log tail (5); ONE catch-up pass detects the sender
+    rollback (rescan), re-pulls from the reset cursor, and ends with the
+    stored cursor at the sender's tail and the sync state normal."""
+    from mirror_memory.core import metrics
+
+    root = tmp_path
+    refusals: list[str] = []
+    devices = {
+        "C": _Device(root, "c", single_tenant=False),
+        "A": _Device(root, "a", single_tenant=True),
+    }
+    try:
+        C, A = devices["C"], devices["A"]
+        rescans_before = metrics.value(metrics.TOMBSTONES_RESCANS)
+
+        # A deletes 5 scopes (log entries 1..5) and they sync out
+        _deletions(A, range(5), 0)
+        _sync_star(devices, refusals, random.Random(1))
+        assert refusals == []
+        assert C.peer_cursor(A.db_id) == 5
+
+        # A backs up (main DB + log dir) at tail 5
+        backup_db = str(A.url).replace("sqlite:///", "") + "-backup"
+        backup_logs = A.log_dir.parent / (A.log_dir.name + "-backup")
+        _backup_device(A, backup_db, backup_logs)
+
+        # A deletes 2 more (entries 6..7) and they sync out: cursor 7
+        _deletions(A, range(2), 5)
+        _sync_star(devices, refusals, random.Random(2))
+        assert refusals == []
+        assert C.peer_cursor(A.db_id) == 7
+        assert A.log.head(A.db_id)[0] == 7
+
+        # A FULL MACHINE RESTORES (tail back to 5, same entry hashes)
+        _restore_device(A, backup_db, backup_logs)
+        assert A.log.head(A.db_id)[0] == 5
+
+        # ONE catch-up pass of the cloud against A: rescan + re-pull
+        C.engine._config.sync.enabled = True
+        C.engine._sync_transport = _PeerTransport(A.engine)
+        C.engine._catch_up()
+        assert refusals == []
+        assert C.peer_cursor(A.db_id) == 5, \
+            "one catch-up must land the channel on the sender's tail"
+        assert C.engine.sync_status()["state"] == "normal"
+        assert metrics.value(metrics.TOMBSTONES_RESCANS) > rescans_before, \
+            "the rollback must have been detected (rescan metric)"
+    finally:
+        for d in devices.values():
+            d.dispose()
+
+
+def test_catchup_survives_an_empty_rescan_batch(tmp_path):
+    """The fix's target: the rescan is triggered by an EMPTY batch (the
+    stored cursor equals the sender's tail but the chain hash differs --
+    the sender restored an older log and re-deleted different things).
+    The loop must NOT exit on the empty range: it keeps pulling from the
+    reset cursor and lands on the tail with the new deletions applied,
+    all within the ONE catch-up pass."""
+    from mirror_memory.core import metrics
+
+    root = tmp_path
+    refusals: list[str] = []
+    devices = {
+        "C": _Device(root, "c", single_tenant=False),
+        "A": _Device(root, "a", single_tenant=True),
+    }
+    try:
+        C, A = devices["C"], devices["A"]
+        rescans_before = metrics.value(metrics.TOMBSTONES_RESCANS)
+
+        # A deletes 3 (entries 1..3) -> sync (cursor 3) -> backup at 3
+        _deletions(A, range(3), 0)
+        _sync_star(devices, refusals, random.Random(1))
+        assert refusals == []
+        backup_db = str(A.url).replace("sqlite:///", "") + "-backup"
+        backup_logs = A.log_dir.parent / (A.log_dir.name + "-backup")
+        _backup_device(A, backup_db, backup_logs)
+        assert A.log.head(A.db_id)[0] == 3
+
+        # A deletes 2 more (entries 4..5) -> sync (cursor 5)
+        _deletions(A, range(2), 3)
+        _sync_star(devices, refusals, random.Random(2))
+        assert refusals == []
+        assert C.peer_cursor(A.db_id) == 5
+
+        # A restores the tail-3 backup, then deletes 2 DIFFERENT scopes:
+        # new entries 4..5 with DIFFERENT hashes, and the channel is
+        # idle (nothing synced since)
+        _restore_device(A, backup_db, backup_logs)
+        assert A.log.head(A.db_id)[0] == 3
+        _deletions(A, range(2), 10)  # p10, p11 -- scopes never deleted before
+        assert A.log.head(A.db_id)[0] == 5
+        new_scopes = [f"p10", f"p11"]
+
+        # the cloud pulls ONCE: the first batch is empty (5 -> 5) but
+        # its chain hash betrays the rollback -> rescan -> re-pull -> the
+        # new deletions apply -> the tail
+        C.engine._config.sync.enabled = True
+        C.engine._sync_transport = _PeerTransport(A.engine)
+        C.engine._catch_up()
+        assert refusals == []
+        assert C.peer_cursor(A.db_id) == 5
+        for tag in new_scopes:
+            assert not C.sees(tag, "belief"), \
+                "the re-issued deletions must apply within the same pass"
+        assert metrics.value(metrics.TOMBSTONES_RESCANS) > rescans_before
     finally:
         for d in devices.values():
             d.dispose()

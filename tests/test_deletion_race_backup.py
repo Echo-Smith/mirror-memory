@@ -975,11 +975,15 @@ def test_tombstone_mesh_three_devices_pg(tmp_path):
                         refusals.append(f"export from {peer.name}: {exc!r}")
                         return
                     try:
-                        cloud.apply_tombstones(batch)
+                        result = cloud.apply_tombstones(batch)
                     except TombstoneBatchRejected as exc:
                         refusals.append(f"apply from {peer.name}: {exc}")
                         return
-                    if batch.to_cursor == batch.from_cursor:
+                    # a rescan re-anchors the channel to 0: keep pulling
+                    # from the reset cursor even when this batch's own
+                    # range was empty
+                    if (batch.to_cursor == batch.from_cursor
+                            and not result.rescan):
                         return
 
             @staticmethod
@@ -1139,11 +1143,14 @@ def _pg_cloud_device(cloud, F, cloud_db_id):
                     refusals.append(f"export from {peer.name}: {exc!r}")
                     return
                 try:
-                    cloud.apply_tombstones(batch)
+                    result = cloud.apply_tombstones(batch)
                 except TombstoneBatchRejected as exc:
                     refusals.append(f"apply from {peer.name}: {exc}")
                     return
-                if batch.to_cursor == batch.from_cursor:
+                # a rescan re-anchors the channel to 0: keep pulling from
+                # the reset cursor even when this batch's own range was empty
+                if (batch.to_cursor == batch.from_cursor
+                        and not result.rescan):
                     return
 
         @staticmethod
