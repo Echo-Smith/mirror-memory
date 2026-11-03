@@ -46,6 +46,18 @@ from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqu
 
 USER = "u-race"
 TENANT = ("default", "default")
+
+
+@pytest.fixture(autouse=True)
+def _single_tenant_mode_off():
+    """The mesh devices run single_tenant_mode=True (a process-wide
+    contextvar): reset it before/after every test so later tests keep
+    tenant filtering."""
+    from mirror_memory.core.tenancy import set_single_tenant_mode
+
+    set_single_tenant_mode(False)
+    yield
+    set_single_tenant_mode(False)
 SENTINEL = "RACE-SENTINEL-9"
 
 
