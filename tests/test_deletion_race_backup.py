@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import random
 import threading
 from pathlib import Path
 import os
@@ -881,3 +882,184 @@ def test_tombstone_apply_vs_publish_50_rounds_pg(tmp_path):
         edge.dispose()
         runtime.dispose()
         _pg_drop_database(main_db, admin_url)
+
+
+@_pg_needs
+def test_tombstone_mesh_three_devices_pg(tmp_path):
+    """M4 batch-2 patch task 2 on PostgreSQL: the cloud is a PG engine;
+    the edges are SQLite devices; the 20-round alternating-delete mesh
+    (the deterministic fixed-point variant of the mesh test) runs against
+    the PG cloud."""
+    from tests.test_sync_mesh import USER as SYNC_USER, _Device, _sync_star, _align_all, SCOPES, _cfg
+
+    rng = random.Random(17)
+    refusals: list[str] = []
+    runtime_url, admin_url = _pg_own_database("mm_test_m4_mesh")
+    log_dir = tmp_path / "mesh-cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+
+        cloud_db_id = sm.read_watermark(runtime)[0]
+
+        class _Cloud:
+            """Adapts the PG cloud engine to the mesh's _Device shape."""
+            name = "C"
+            db_id = cloud_db_id
+            engine = cloud
+            log = cloud_log
+
+            @staticmethod
+            def observe(text, session_id):
+                cloud.observe(user_id=SYNC_USER, session_id=session_id,
+                              text=text, purpose="api")
+
+            @staticmethod
+            def peer_cursor(peer_db_id):
+                # the fixed-point sync loop reads this to detect movement:
+                # it must be the REAL stored cursor
+                from mirror_memory.core.repository import read_sync_peer
+
+                with tenant_scope(*TENANT):
+                    s = F()
+                    try:
+                        row = read_sync_peer(s, peer_db_id)
+                        return row.cursor if row is not None else 0
+                    finally:
+                        s.close()
+
+            @staticmethod
+            def pull_from(peer, refusals, *, max_batches=200):
+                from mirror_memory.core.repository import read_sync_peer
+                from mirror_memory.core.tombstones import TombstoneBatchRejected
+
+                for _ in range(max_batches):
+                    with tenant_scope(*TENANT):
+                        s = F()
+                        try:
+                            row = read_sync_peer(s, peer.db_id)
+                            cursor = row.cursor if row is not None else 0
+                        finally:
+                            s.close()
+                    try:
+                        batch, _next = peer.engine.export_tombstones(
+                            cursor, 500, peer_db_id=cloud._db_id)
+                    except Exception as exc:  # noqa: BLE001
+                        refusals.append(f"export from {peer.name}: {exc!r}")
+                        return
+                    try:
+                        cloud.apply_tombstones(batch)
+                    except TombstoneBatchRejected as exc:
+                        refusals.append(f"apply from {peer.name}: {exc}")
+                        return
+                    if batch.to_cursor == batch.from_cursor:
+                        return
+
+            @staticmethod
+            def sees(tag, scope):
+                with tenant_scope(*TENANT):
+                    s = F()
+                    try:
+                        if scope in ("belief", "user") and any(
+                                tag in b.claim_text for b in s.query(
+                                    Belief).filter(
+                                    Belief.user_id == SYNC_USER).all()):
+                            return True
+                        from mirror_memory.core.models import SessionSummary as _SS
+
+                        if scope in ("session", "user") and any(
+                                tag in r.summary_text for r in s.query(
+                                    _SS).filter(
+                                    _SS.user_id == SYNC_USER).all()):
+                            return True
+                        return False
+                    finally:
+                        s.close()
+
+            @staticmethod
+            def dispose():
+                cloud._engine.dispose()
+
+        edges = {
+            "A": _Device(tmp_path, "mesh-a", single_tenant=True),
+            "B": _Device(tmp_path, "mesh-b", single_tenant=True),
+        }
+        devices = {"C": _Cloud(), **edges}
+
+        for round_no in range(20):
+            for d in devices.values():
+                if d is cloud:
+                    cloud.observe(user_id=SYNC_USER, session_id=f"s{round_no}",
+                                  text=f"I like r{round_no} and coffee.",
+                                  purpose="api")
+                else:
+                    d.observe(f"I like r{round_no} and coffee.",
+                              session_id=f"s{round_no}")
+            # adopt the cloud's global_ids on the edges
+            with tenant_scope(*TENANT):
+                s = F()
+                cloud_rows = s.query(Belief).filter(Belief.user_id == USER).all()
+                ids = {b.key: b.global_id for b in cloud_rows}
+                s.close()
+            for e in edges.values():
+                e.adopt_global_ids_by_key(ids)
+            actor_name = ("C", "A", "B")[round_no % 3]
+            scope = SCOPES[round_no % 3]
+            if actor_name == "C":
+                cloud.delete_memories(user_id=SYNC_USER, purpose="api")
+            else:
+                edges[actor_name].delete(scope, round_no)
+            _sync_star(devices, refusals, rng)
+            assert refusals == [], (round_no, refusals)
+            tag = f"r{round_no}"
+            for name, d in devices.items():
+                # the surface the deleted scope owned: belief scope keeps
+                # the raw session text (its own layer) -- like the SQLite
+                # mesh's sees(tag, scope)
+                if d.sees(tag, scope):
+                    from mirror_memory.core.models import SessionSummary as _SSR
+
+                    with tenant_scope(*TENANT):
+                        s2 = F()
+                        rows = [(r.session_id, r.summary_text[:60],
+                                 r.source_purpose) for r in s2.query(
+                            _SSR).filter(_SSR.user_id == SYNC_USER).all()]
+                        bels = [(b.key, b.claim_text[:40]) for b in s2.query(
+                            Belief).filter(Belief.user_id == SYNC_USER).all()]
+                        s2.close()
+                    c_log = [f"C seq={e.seq} origin={e.origin[:6]} "
+                             f"scope={e.scope} key={e.scope_key[:12]}"
+                             for e in cloud_log.read_from(cloud._db_id, 0)]
+                    a_log = [f"A seq={e.seq} origin={e.origin[:6]} "
+                             f"scope={e.scope} key={e.scope_key[:12]}"
+                             for e in edges["A"].log.read_from(
+                                 edges["A"].db_id, 0)]
+                    c_cursors = {n: devices["C"].peer_cursor(dd.db_id)
+                                 for n, dd in devices.items()}
+                    a_cursors = {n: edges["A"].peer_cursor(dd.db_id)
+                                 for n, dd in devices.items()}
+                    with open("/tmp/mesh_fail_state.txt", "w") as _fh:
+                        _fh.write(f"round {round_no} {name} tag={tag} scope={scope}\n"
+                                  f"c_cursors={c_cursors}\na_cursors={a_cursors}\n"
+                                  f"c_log={c_log}\na_log={a_log}\n"
+                                  f"rows={rows}\nbels={bels}\n")
+                    pytest.fail(f"round {round_no} {name} {tag} {scope}")
+
+        for e in edges.values():
+            e.dispose()
+        cloud._engine.dispose()
+    finally:
+        runtime.dispose()
+        _pg_drop_database("mm_test_m4_mesh", admin_url)

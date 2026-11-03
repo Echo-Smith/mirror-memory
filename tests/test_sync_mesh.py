@@ -48,6 +48,17 @@ USER = "u-mesh"
 SCOPES = ["belief", "session", "user"]
 
 
+def _cfg(log_dir):
+    from mirror_memory.config.loader import load_config
+
+    cfg = load_config("config/")
+    cfg.llm_client = _FakeLLM()
+    cfg.worker.job_lease_seconds = 60
+    cfg.session_summary_enabled = True
+    cfg.deletion_log.directory = str(log_dir)
+    return cfg
+
+
 class _FakeLLM:
     def generate(self, **kw):
         return '{"patterns": [], "support_policy": {}}'
@@ -115,6 +126,17 @@ class _Device:
             return tag
         self.engine.delete_memories(user_id=USER, purpose="api")
         return tag
+
+    def adopt_global_ids_by_key(self, ids: dict) -> None:
+        from mirror_memory.core.tenancy import fixture_write_scope
+
+        with tenant_scope(*TENANT), fixture_write_scope("align identity"):
+            s = self.F()
+            for b in s.query(Belief).filter(Belief.user_id == USER).all():
+                if b.key in ids:
+                    b.global_id = ids[b.key]
+            s.commit()
+            s.close()
 
     def adopt_global_ids(self, source: "_Device") -> None:
         """Same-key beliefs adopt the source's global_id (what a shared
