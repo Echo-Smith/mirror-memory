@@ -260,33 +260,52 @@ class FileDeletionLog(DeletionLog):
         # another process -- changes size or mtime, which invalidates the
         # cache; our own writes refresh it under the append lock.
         self._index: dict[str, dict[int, tuple[str, str, str]]] = {}
-        self._index_stat: dict[str, tuple[int, int]] = {}
-        # (last_seq, last_hash) per db_id -- head() without a max() scan
+        self._index_stat: dict[str, tuple[int, int, int]] = {}
+        # (last_seq, last_hash) per db_id -- head() and append's tail
+        # without a max() scan
         self._index_tail: dict[str, tuple[int, str]] = {}
+        # the log's highest checkpoint seq per db_id (checkpoint_seq
+        # without an index walk)
+        self._index_checkpoint: dict[str, int] = {}
 
     def _index_for(self, db_id: str) -> dict[int, tuple[str, str, str]]:
         """The db_id's position index, rebuilt when the file changed on
-        disk (a restore rewrites the file behind our back)."""
+        disk (a restore rewrites the file behind our back).
+
+        The freshness guard is the (inode, size, mtime_ns) stat key: a
+        restore changes the inode (copy) or the size/mtime (rewrite), so
+        the next lookup rebuilds.  HONEST LIMIT (batch-2 patch 4, task 3):
+        an in-place rewrite preserving ALL THREE is not caught here -- an
+        in-place same-stat tamper is what the startup/reconcile chain
+        verification catches (verify_chain), and every process start
+        rebuilds the index from the file anyway.  Our own append folds
+        into the index under the append lock; our own prune invalidates
+        explicitly."""
         path = self._path_for(db_id)
         try:
             st = path.stat()
         except FileNotFoundError:
             self._index_invalidate(db_id)
             return {}
-        stat_key = (st.st_size, st.st_mtime_ns)
+        stat_key = (st.st_ino, st.st_size, st.st_mtime_ns)
         cached = self._index.get(db_id)
         if cached is not None and self._index_stat.get(db_id) == stat_key:
             return cached
         idx: dict[int, tuple[str, str, str]] = {}
+        checkpoint = 0
         for e in self._iter_entries(path):
             idx[e.seq] = (e.hash, e.origin_hash, e.scope)
+            if e.scope == "checkpoint" and e.seq > checkpoint:
+                checkpoint = e.seq
         self._index[db_id] = idx
         self._index_stat[db_id] = stat_key
+        self._index_checkpoint[db_id] = checkpoint
         if idx:
             last = max(idx)
             self._index_tail[db_id] = (last, idx[last][0])
         else:
             self._index_tail.pop(db_id, None)
+            self._index_checkpoint.pop(db_id, None)
         return idx
 
     def _index_record_write(self, db_id: str, seq: int, entry_hash: str,
@@ -303,12 +322,13 @@ class FileDeletionLog(DeletionLog):
         except FileNotFoundError:
             self._index_invalidate(db_id)
             return
-        self._index_stat[db_id] = (st.st_size, st.st_mtime_ns)
+        self._index_stat[db_id] = (st.st_ino, st.st_size, st.st_mtime_ns)
 
     def _index_invalidate(self, db_id: str) -> None:
         self._index.pop(db_id, None)
         self._index_stat.pop(db_id, None)
         self._index_tail.pop(db_id, None)
+        self._index_checkpoint.pop(db_id, None)
 
     def _path_for(self, db_id: str) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -351,12 +371,13 @@ class FileDeletionLog(DeletionLog):
         # tombstone): stamp it before the hash, like the PG backend does
         entry.created_at = entry.created_at or datetime.utcnow()
         with self._locked(path) as fh:
-            # the tail comes from the position index (refreshed under the
-            # lock), not from a full-file parse
-            idx = self._index_for(entry.db_id)
-            last_seq = max(idx) if idx else 0
+            # the tail comes from the cached tail pointer (refreshed under
+            # the lock), not from a full-file parse
+            self._index_for(entry.db_id)
+            tail = self._index_tail.get(entry.db_id)
+            last_seq = tail[0] if tail else 0
             entry.seq = last_seq + 1
-            entry.prev_hash = idx[last_seq][0] if idx else GENESIS_HASH
+            entry.prev_hash = tail[1] if tail else GENESIS_HASH
             entry.hash = entry.compute_hash()
             fh.seek(0, os.SEEK_END)
             fh.write((json.dumps(self._line(entry), sort_keys=True, ensure_ascii=False) + "\n").encode())
@@ -418,6 +439,10 @@ class FileDeletionLog(DeletionLog):
                 )
 
     def read_from(self, db_id: str, after_seq: int) -> Iterator[DeletionEntry]:
+        # NOTE (batch-2 patch 4, task 3): deliberately a linear scan of the
+        # file -- the callers (export, replay, verify) need the entries'
+        # full payloads, which only a parse produces; the position index
+        # serves the per-entry lookups, not this.  O(file) per call.
         path = self._path_for(db_id)
         if not path.exists():
             return
@@ -451,11 +476,8 @@ class FileDeletionLog(DeletionLog):
         return tail if tail is not None else (0, GENESIS_HASH)
 
     def checkpoint_seq(self, db_id: str) -> int:
-        best = 0
-        for _seq, (_h, _oh, scope) in self._index_for(db_id).items():
-            if scope == "checkpoint" and _seq > best:
-                best = _seq
-        return best
+        self._index_for(db_id)  # build/refresh if the file changed
+        return self._index_checkpoint.get(db_id, 0)
 
     def chain_hash_at(self, db_id: str, seq: int) -> str:
         if seq <= 0:

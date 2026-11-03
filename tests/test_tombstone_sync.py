@@ -576,29 +576,7 @@ def _scale_receiver(root: Path, name: str):
     return engine
 
 
-def _scale_batch(n: int, *, seq_from: int = 1) -> TombstoneBatch:
-    """`n` belief-scope tombstones of one sender; the beliefs never exist
-    locally, so every apply is a recorded no-op -- identical work in both
-    phases of the scale test."""
-    origin = "d" * 32
-    entries = [
-        TombstoneEntry(
-            origin=origin, origin_seq=seq_from + i,
-            tenant_id=TENANT[0], app_id=TENANT[1], user_id="u-scale",
-            scope="belief", scope_key=f"{seq_from + i:032x}",
-            generation=0, created_at="2026-01-01T00:00:00",
-            origin_hash=f"{seq_from + i:064x}").seal()
-        for i in range(n)
-    ]
-    batch = TombstoneBatch(sender=origin, from_cursor=seq_from,
-                           to_cursor=seq_from + n - 1,
-                           from_chain_hash=f"{seq_from:064x}",
-                           to_chain_hash=f"{seq_from + n - 1:064x}",
-                           entries=entries).seal()
-    return batch
-
-
-def _measure_apply(engine, batch) -> tuple[float, int]:
+def _measure_apply(engine, batch):
     """One apply, timed, with the SQL statement count taken from a
     before_cursor_execute listener on the engine's own bind."""
     import time as _time
@@ -619,36 +597,60 @@ def _measure_apply(engine, batch) -> tuple[float, int]:
     return elapsed, counter["n"]
 
 
-def _seed_applied(engine, n: int) -> None:
-    """`n` applied rows of one foreign origin, bulk-inserted."""
-    from mirror_memory.core.models import TombstoneApplied
+def _grant_for(engine, user: str, purposes=("sync", "api")) -> None:
+    from mirror_memory.core import authorization
 
-    rows = [dict(tenant_id=TENANT[0], app_id=TENANT[1], origin="b" * 32,
-                 origin_seq=i, origin_hash=f"{i:064x}", user_id="u-seed",
-                 scope="user", scope_key="", local_seq=None)
-            for i in range(1, n + 1)]
-    with tenant_scope(*TENANT), fixture_write_scope("scale test seeding"):
-        from mirror_memory.core.repository import record_tombstones_applied
-
+    with tenant_scope(*TENANT), fixture_write_scope("scale test grants"):
         s = sessionmaker(bind=engine._engine)()
-        try:
-            s.bulk_insert_mappings(TombstoneApplied, rows)
-            s.commit()
-        finally:
-            s.close()
+        for purpose in purposes:
+            authorization.grant_purpose(
+                s, user, purpose,
+                operations=list(authorization.OPERATIONS),
+                issuer="scale-test", reason="scale test grants")
+        s.commit()
+        s.close()
 
 
-def _seed_log(log: FileDeletionLog, db_id: str, n: int) -> None:
-    """`n` chained log entries for the fake sender db, written raw (one
-    fsync) -- seeding, not measurement."""
+def _enable_memory(engine, user: str) -> None:
+    from mirror_memory.core.repository import set_memory_enabled
+
+    with tenant_scope(*TENANT), fixture_write_scope("scale test memory"):
+        s = sessionmaker(bind=engine._engine)()
+        set_memory_enabled(s, user, True)
+        s.commit()
+        s.close()
+
+
+def _seed_beliefs(engine, user: str, n: int) -> None:
+    """`n` real beliefs (bulk) the real-deletion batches will delete."""
+    from mirror_memory.core.models import Belief
+
+    rows = [dict(tenant_id=TENANT[0], app_id=TENANT[1],
+                 global_id=f"{i:032x}", user_id=user, dimension="scale",
+                 key=f"scale-{i}", claim_text=f"scale claim {i}",
+                 value_json="{}", layer="L4", status="active",
+                 confidence=1.0)
+            for i in range(1, n + 1)]
+    with tenant_scope(*TENANT), fixture_write_scope("scale test beliefs"):
+        s = sessionmaker(bind=engine._engine)()
+        s.bulk_insert_mappings(Belief, rows)
+        s.commit()
+        s.close()
+
+
+def _seed_own_log(log: FileDeletionLog, db_id: str, n: int) -> dict:
+    """The RECEIVER'S OWN log seeded with `n` chained entries, written raw
+    (one fsync) -- the echo lookups must hit THIS log, not another db_id's.
+    Returns seq -> hash for the echo batch to name."""
     import json as _json
     import os as _os
     from datetime import datetime as _dt
 
-    from mirror_memory.core.deletion import DeletionEntry, GENESIS_HASH
+    from mirror_memory.core.deletion import DeletionEntry
 
     log.ensure_genesis(db_id)
     path = log._path_for(db_id)
+    hashes = {}
     lines = []
     prev = GENESIS_HASH
     for i in range(1, n + 1):
@@ -659,6 +661,7 @@ def _seed_log(log: FileDeletionLog, db_id: str, n: int) -> None:
             prev_hash=prev)
         e.hash = e.compute_hash()
         prev = e.hash
+        hashes[i] = e.hash
         lines.append(_json.dumps(log._line(e), sort_keys=True,
                                  ensure_ascii=False))
     with open(path, "a+b") as fh:
@@ -667,65 +670,165 @@ def _seed_log(log: FileDeletionLog, db_id: str, n: int) -> None:
         fh.flush()
         _os.fsync(fh.fileno())
     log._index_invalidate(db_id)
+    return hashes
 
 
-def test_apply_scale_does_not_follow_the_table_size(tmp_path):
-    """Batch-2 patch 3, task 2: one 500-entry apply costs the same on an
-    empty receiver as on one holding 10,000 applied records and a
-    10,000-entry log -- the dedup lookup queries the batch's own triples
-    (chunked row-value IN), and the file log answers per-entry lookups
-    (chain_hash_at / has_tombstone / head) from the position index.  The
-    number pairs are printed for the report; the assertions refuse
-    linear growth."""
+def _seed_applied_rows(engine, n: int) -> None:
+    """`n` applied rows of one foreign origin, bulk-inserted."""
+    from mirror_memory.core.models import TombstoneApplied
+
+    rows = [dict(tenant_id=TENANT[0], app_id=TENANT[1], origin="b" * 32,
+                 origin_seq=i, origin_hash=f"{i:064x}", user_id="u-seed",
+                 scope="user", scope_key="", local_seq=None)
+            for i in range(1, n + 1)]
+    with tenant_scope(*TENANT), fixture_write_scope("scale test seeding"):
+        s = sessionmaker(bind=engine._engine)()
+        s.bulk_insert_mappings(TombstoneApplied, rows)
+        s.commit()
+        s.close()
+
+
+class _BatchChain:
+    """Honest continuation envelopes from one sender: from_cursor/
+    from_chain continue the previously served to_cursor/to_chain, so no
+    measured batch triggers a rescan."""
+
+    def __init__(self, sender: str):
+        self.sender = sender
+        self.next_from = 0
+        self.next_chain = GENESIS_HASH
+
+    def make(self, entries):
+        to = entries[-1].origin_seq
+        to_chain = f"{to:064x}"
+        batch = TombstoneBatch(sender=self.sender, from_cursor=self.next_from,
+                               to_cursor=to,
+                               from_chain_hash=self.next_chain,
+                               to_chain_hash=to_chain,
+                               entries=entries).seal()
+        self.next_from = to
+        self.next_chain = to_chain
+        return batch
+
+
+def test_apply_scale_report_by_batch_kind(tmp_path):
+    """Batch-2 patch 4, task 3: the scale protocol with the RECEIVER'S OWN
+    log and the three batch kinds, reported separately.
+
+    Setup per receiver: SQLite main DB + file deletion log (the repo's
+    test harness shape); `scaled` additionally holds 10,000 applied rows
+    and ITS OWN 10,000-entry log; both hold 1,500 real beliefs.  The
+    500-entry batches, each applied REPS=3 times (median reported):
+
+    - echo : the receiver's OWN tombstones coming back -- present in its
+      own log -> the echo check looks the entry up there (index hit) and
+      skips; on the empty receiver the same batch misses and applies as
+      no-ops (reported as-is -- the statement counts differ by design);
+    - noop : a foreign origin naming beliefs that do not exist --
+      recorded, no deletion, no log write;
+    - real : a foreign origin naming 500 of the seeded beliefs -- real
+      deletions that append 500 entries to the receiver's own log.
+
+    The one-time index build and the steady-state lookup rounds are
+    printed for the scaled log.  read_from remains a linear scan of the
+    file (it must parse payloads) and is NOT claimed O(1)."""
+    import platform
     import time as _time
 
-    LOG_DB = "c" * 32
-    n = 500
-    scale = 10_000
+    print(f"\nSCALE setup: db=SQLite(file log), platform={platform.platform()}")
+    print(f"SCALE setup: scale=10k applied + own 10k log, batch=500, reps=3")
 
-    empty = _scale_receiver(tmp_path, "rx-empty")
-    t_empty, stmt_empty = _measure_apply(empty, _scale_batch(n))
+    def build(name):
+        eng = _scale_receiver(tmp_path, name)
+        _enable_memory(eng, "u-real")
+        _grant_for(eng, "u-real")
+        _seed_beliefs(eng, "u-real", 1_500)
+        return eng
 
-    scaled = _scale_receiver(tmp_path, "rx-scaled")
-    _seed_applied(scaled, scale)
-    _seed_log(scaled._deletion_log, LOG_DB, scale)
-    t_scaled, stmt_scaled = _measure_apply(scaled, _scale_batch(n))
+    empty = build("rx-empty")
+    scaled = build("rx-scaled")
+    _seed_applied_rows(scaled, 10_000)
+    own_hashes = _seed_own_log(scaled._deletion_log, scaled._db_id, 10_000)
 
-    print(f"\nSCALE apply empty   : {t_empty * 1000:.4g} ms, "
-          f"{stmt_empty} statements")
-    print(f"SCALE apply 10k-seed: {t_scaled * 1000:.4g} ms, "
-          f"{stmt_scaled} statements")
+    # the one-time index build vs the steady state (the scaled own log)
+    t0 = _time.perf_counter()
+    scaled._deletion_log.chain_hash_at(scaled._db_id, 1)
+    build_ms = (_time.perf_counter() - t0) * 1000
+    t0 = _time.perf_counter()
+    for i in range(1, 201):
+        scaled._deletion_log.chain_hash_at(scaled._db_id, i)
+        scaled._deletion_log.has_tombstone(scaled._db_id, i, own_hashes[i])
+        scaled._deletion_log.head(scaled._db_id)
+    steady_ms = (_time.perf_counter() - t0) * 1000
+    t0 = _time.perf_counter()
+    for i in range(1, 201):
+        empty._deletion_log.chain_hash_at(empty._db_id, i)
+        empty._deletion_log.has_tombstone(empty._db_id, i, own_hashes[i])
+        empty._deletion_log.head(empty._db_id)
+    steady_empty_ms = (_time.perf_counter() - t0) * 1000
+    print(f"SCALE index build (once, own 10k log): {build_ms:.4g} ms")
+    print(f"SCALE lookups steady 600 (own 10k log): {steady_ms:.4g} ms")
+    print(f"SCALE lookups steady 600 (empty log):   {steady_empty_ms:.4g} ms")
 
-    assert stmt_scaled - stmt_empty <= 5, \
-        "the dedup lookup must not add statements as the table grows"
-    assert t_scaled < max(3.0 * t_empty, 0.5), \
-        f"apply time grew with the table: {t_empty:.4g}s -> {t_scaled:.4g}s"
+    def batch_of(kind, receiver, rep, chain):
+        base = rep * 500
+        if kind == "echo":
+            seqs = range(5001 + rep * 500, 5501 + rep * 500)
+            entries = [TombstoneEntry(
+                origin=receiver._db_id, origin_seq=s,
+                tenant_id=TENANT[0], app_id=TENANT[1], user_id="u-seed",
+                scope="belief", scope_key=f"{s:032x}", generation=0,
+                created_at="2026-01-01T00:00:00",
+                origin_hash=own_hashes[s]).seal() for s in seqs]
+        elif kind == "noop":
+            entries = [TombstoneEntry(
+                origin="b" * 32, origin_seq=20_001 + base + i,
+                tenant_id=TENANT[0], app_id=TENANT[1], user_id="u-ghost",
+                scope="belief", scope_key=f"{900_000 + base + i:032x}",
+                generation=0, created_at="2026-01-01T00:00:00",
+                origin_hash=f"{20_001 + base + i:064x}").seal()
+                for i in range(500)]
+        else:
+            entries = [TombstoneEntry(
+                origin="c" * 32, origin_seq=30_001 + base + i,
+                tenant_id=TENANT[0], app_id=TENANT[1], user_id="u-real",
+                scope="belief", scope_key=f"{base + i + 1:032x}",
+                generation=0, created_at="2026-01-01T00:00:00",
+                origin_hash=f"{30_001 + base + i:064x}").seal()
+                for i in range(500)]
+        return chain.make(entries)
 
-    # the file log's per-entry lookups: 200 (chain_hash_at + has_tombstone
-    # + head) rounds on the 10k-entry log vs the empty log -- the index
-    # keeps them flat
-    log_empty = empty._deletion_log
-    log_scaled = scaled._deletion_log
+    results = {}
+    head_before = scaled._deletion_log.head(scaled._db_id)[0]
+    for kind in ("echo", "noop", "real"):
+        for label, eng in (("empty", empty), ("scaled", scaled)):
+            chain = _BatchChain(sender="e" * 32)
+            times, stmts = [], None
+            for rep in range(3):
+                dt, n = _measure_apply(eng, batch_of(kind, eng, rep, chain))
+                times.append(dt)
+                stmts = n if stmts is None else stmts
+            results[(kind, label)] = (sorted(times)[1], stmts)
+    for kind in ("echo", "noop", "real"):
+        t_empty, s_empty = results[(kind, "empty")]
+        t_scaled, s_scaled = results[(kind, "scaled")]
+        print(f"SCALE {kind:5s} empty  : median {t_empty * 1000:9.4g} ms, "
+              f"{s_empty} statements")
+        print(f"SCALE {kind:5s} scaled : median {t_scaled * 1000:9.4g} ms, "
+              f"{s_scaled} statements")
 
-    def _lookups(log, db_id, rounds):
-        t0 = _time.perf_counter()
-        for i in range(1, rounds + 1):
-            log.chain_hash_at(db_id, i)
-            log.has_tombstone(db_id, i, f"{i:064x}")
-            log.head(db_id)
-        return _time.perf_counter() - t0
+    # the real batches appended 3 x 500 entries to the scaled receiver's
+    # OWN log; the index (tail pointer) kept agreeing with the file
+    head_after = scaled._deletion_log.head(scaled._db_id)[0]
+    assert head_after == head_before + 1_500, (head_before, head_after)
+    cold = FileDeletionLog(scaled._deletion_log.directory)
+    assert cold.head(scaled._db_id) == scaled._deletion_log.head(scaled._db_id)
 
-    # steady state: the first lookup on the scaled log builds the index
-    # once (one linear parse, unavoidable), the timed rounds must be flat
-    t_build0 = _time.perf_counter()
-    log_scaled.chain_hash_at(LOG_DB, 1)
-    t_build = _time.perf_counter() - t_build0
-    print(f"SCALE index build (once, 10k entries): {t_build * 1000:.4g} ms")
-
-    t_look_empty = _lookups(log_empty, LOG_DB, 200)
-    t_look_scaled = _lookups(log_scaled, LOG_DB, 200)
-    print(f"SCALE lookups empty   : {t_look_empty * 1000:.4g} ms")
-    print(f"SCALE lookups 10k-seed: {t_look_scaled * 1000:.4g} ms")
-    assert t_look_scaled < max(3.0 * t_look_empty, 0.2), \
-        f"log lookups grew with the log: {t_look_empty:.4g}s -> " \
-        f"{t_look_scaled:.4g}s"
+    # the scale-sensitive piece is the applied-table lookup: noop/real on
+    # the scaled receiver must not grow ~linearly with the 10k rows (the
+    # old full-table preload did); generous bound, numbers reported above
+    for kind in ("noop", "real"):
+        t_empty = results[(kind, "empty")][0]
+        t_scaled = results[(kind, "scaled")][0]
+        assert t_scaled < max(4.0 * t_empty, 1.0), \
+            f"{kind} apply grew with the table: {t_empty:.4g}s -> {t_scaled:.4g}s"

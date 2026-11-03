@@ -337,3 +337,118 @@ def test_fingerprint_distinguishes_a_recreated_row():
     b = fingerprint("mm_beliefs", 7, datetime(2026, 1, 2, 12, 0, 0))
     assert a != b
     assert a == fingerprint("mm_beliefs", 7, datetime(2026, 1, 1, 12, 0, 0))
+
+
+# --- M4 batch-2 patch 4, task 3: the position index stays coherent -----
+
+def _mk_entry(db_id: str, seq: int, prev_hash: str, *,
+              user: str = "u-idx", scope: str = "user") -> DeletionEntry:
+    e = DeletionEntry(db_id=db_id, seq=seq, tenant_id="default",
+                      app_id="default", user_id=user, scope=scope,
+                      scope_key="", fingerprints=[], generation=0,
+                      purpose="idx", created_at=None, prev_hash=prev_hash)
+    e.hash = e.compute_hash()
+    return e
+
+
+def _seed_file(log: FileDeletionLog, db_id: str, n: int) -> list:
+    """n chained entries through the REAL append path (the index folds
+    them in); returns the entries."""
+    log.ensure_genesis(db_id)
+    out = []
+    prev = GENESIS_HASH
+    for i in range(1, n + 1):
+        e = _mk_entry(db_id, i, prev)
+        log.append(e)
+        prev = e.hash
+        out.append(e)
+    return out
+
+
+def test_index_agrees_with_a_cold_parse_after_append_and_prune(tmp_path):
+    """The cached index (head / has_tombstone / chain_hash_at /
+    checkpoint_seq) must agree with a fresh instance's cold parse of the
+    same file, after appends AND after a prune rewrite."""
+    log = FileDeletionLog(tmp_path)
+    db = "a" * 32
+    entries = _seed_file(log, db, 12)
+    cold = FileDeletionLog(tmp_path)
+
+    assert log.head(db) == cold.head(db)
+    assert log.chain_hash_at(db, 7) == cold.chain_hash_at(db, 7) \
+        == entries[6].hash
+    assert log.has_tombstone(db, 7, entries[6].hash)
+    assert not cold.has_tombstone(db, 99, "0" * 64)
+    assert log.checkpoint_seq(db) == cold.checkpoint_seq(db) == 0
+
+    # appends via the tail pointer keep the chain identical to a cold parse
+    more = []
+    prev = entries[-1].hash
+    for i in range(13, 21):
+        e = _mk_entry(db, i, prev)
+        log.append(e)
+        prev = e.hash
+        more.append(e)
+    cold2 = FileDeletionLog(tmp_path)
+    assert log.head(db) == cold2.head(db) == (20, more[-1].hash)
+    assert log.has_tombstone(db, 20, more[-1].hash)
+
+    # the prune rewrites the file: the index invalidates and rebuilds
+    removed = log.prune(db, 5)
+    assert removed > 0
+    cold3 = FileDeletionLog(tmp_path)
+    assert log.head(db) == cold3.head(db)
+    assert log.checkpoint_seq(db) == cold3.checkpoint_seq(db) == 5
+    # pruned positions answer from the checkpoint's recorded hash
+    assert log.chain_hash_at(db, 5) == cold3.chain_hash_at(db, 5)
+    assert not log.has_tombstone(db, 3, entries[2].hash)
+
+
+def test_index_sees_another_process_writes_and_restores(tmp_path):
+    """Another FileDeletionLog instance (another process) appends or
+    RESTORES the file behind our back: the next lookup reflects the file
+    on disk -- new entries visible, rolled-back entries gone -- including
+    the paranoid case of a rewrite with preserved size and mtime
+    (cp -p style)."""
+    import os as _os
+    import time as _time
+
+    log = FileDeletionLog(tmp_path)
+    db = "b" * 32
+    entries = _seed_file(log, db, 10)
+
+    # another process appends: our instance must see entry 11
+    other = FileDeletionLog(tmp_path)
+    e11 = _mk_entry(db, 11, entries[-1].hash, user="u-other")
+    other.append(e11)
+    assert log.has_tombstone(db, 11, e11.hash)
+    assert log.head(db) == (11, e11.hash)
+
+    # a RESTORE rolls the file back to 10 entries behind our back -- and
+    # preserves size-and-mtime style metadata (utime back to the old
+    # stat): the tail-line verification must force a rebuild
+    path = log._path_for(db)
+    old_stat = path.stat()
+    backup_lines = path.read_bytes().splitlines(keepends=True)[:11]  # header-ish genesis + 10
+    e12 = _mk_entry(db, 12, e11.hash, user="u-restore")
+    with open(path, "a+b") as fh:
+        import json as _json
+
+        fh.seek(0, _os.SEEK_END)
+        fh.write((_json.dumps(log._line(e12), sort_keys=True,
+                              ensure_ascii=False) + "\n").encode())
+        fh.flush()
+        _os.fsync(fh.fileno())
+    assert log.head(db) == (12, e12.hash)  # index folded or rebuilt, agrees
+    # roll back to the 10-entry file, preserving the old mtime
+    with open(path, "wb") as fh:
+        fh.write(b"".join(backup_lines))
+        fh.flush()
+        _os.fsync(fh.fileno())
+    _os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert log.head(db) == (10, entries[-1].hash), \
+        "the restored (rolled-back) file must be re-read despite the preserved mtime"
+    assert not log.has_tombstone(db, 12, e12.hash)
+    assert not log.has_tombstone(db, 11, e11.hash)
+    assert log.has_tombstone(db, 10, entries[-1].hash)
+    assert log.chain_hash_at(db, 11) == GENESIS_HASH
