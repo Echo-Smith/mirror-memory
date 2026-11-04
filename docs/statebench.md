@@ -155,6 +155,82 @@ Do not tune on the evaluation split and then present that score as held out.
 Do not compare two runs if the extractor model, prompts, context budget, or
 dataset version changed at the same time.
 
+## Release gate (definition)
+
+The release gate is the fixed set of numbers a claim of architectural advantage
+must clear. It lives in `src/mirror_memory/bench/gate.py`
+(`check_release_gate`) and is applied to a **forced** StateBench v1.1 run
+compared against the matching **production** run:
+
+| Check | Threshold |
+|---|---|
+| state overall | `>= 0.90` |
+| state, per category | `>= 0.85` |
+| production vs forced gap | `<= 0.05` |
+| recall overall | `>= 0.85` |
+| answer overall (fixed answerer) | `>= 0.85` |
+| reports missing a manifest | `0` |
+
+A forced run is *not* sufficient on its own: the gate also requires full v1.1
+case and category coverage, `extraction_mode == "forced"`, and clean K2
+extraction health (every dataset turn attempted, zero failed / empty / unparsed
+/ schema-rejected calls). A run whose extraction degraded is measuring the
+fallback, so the gate rejects it rather than reporting model-labelled numbers.
+
+The gate is **fail-closed**: any track that is not evaluated is a failure, never
+a pass. In particular a track that did not run (`not_run`) does not clear its
+threshold.
+
+Run it locally:
+
+```bash
+PYTHONPATH=src python -m mirror_memory.bench.statebench_v1_1_run \
+  --mode forced --with-answerer \
+  --output artifacts/forced.json \
+  --gate --production-report artifacts/production.json
+```
+
+## The CI gate (how to read a run)
+
+`.github/workflows/statebench-gate.yml` runs the gate weekly, on manual
+dispatch, and on pull requests that touch
+`src/mirror_memory/extraction/**`, `src/mirror_memory/core/**`, or
+`src/mirror_memory/bench/**`.
+
+It is **report-only**. The workflow conclusion is never red: the gate step is
+`continue-on-error` and the verdict is surfaced as data, not as a CI failure.
+The `statebench-gate` artifact carries the JSON report, the provenance manifest
+(commit, dirty flag, dataset SHA-256, model, prompt/config hashes, generation
+params), and a Markdown summary.
+
+Read the run in `$GITHUB_STEP_SUMMARY`:
+
+- the **first line** is `PASS: ...` or `FAIL: <failing items>`;
+- a per-check table lists each check's value, threshold, and pass state;
+- a per-track table lists `state`, `recall`, and `answer` with `not_run`
+  shown explicitly.
+
+LLM-required tracks (forced extraction and the answerer) run **only** when the
+`MM_LLM_API_KEY` secret is present. When it is absent those tracks are recorded
+as `not_run`, the report says so, and the gate treats them as failures. A
+`not_run` track is **not** a pass and must never be read as one.
+
+## When an external "advantage" claim is permitted
+
+An external architectural-advantage claim is permitted only when **all** of the
+following hold:
+
+1. the **forced** run clears every gate above (state overall, every category,
+   recall, answer, manifest present, and clean extraction health); **and**
+2. the forced run matches the **production** run within the gap threshold
+   (`forced - production <= 0.05`), i.e. the throttling escapes are not costing
+   real recall; **and**
+3. no track is `not_run` — a `not_run` track is never a pass, so a run with a
+   missing answer or extraction track cannot support a claim.
+
+Until these clear, the only honest external statement is a reproducible
+measurement (report the numbers, the mode, and the manifest), not an advantage.
+
 ## Validation
 
 The dataset's structural contract is covered by

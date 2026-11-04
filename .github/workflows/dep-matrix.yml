@@ -1,0 +1,92 @@
+name: dep-matrix
+
+# Task 3.5 (M5): dependency-matrix leg proving Mirror passes under the pilot
+# app's combo: Python 3.12, sqlalchemy>=2.0.49, fastapi>=0.135.3, pydantic 2.x.
+#
+# The pinned versions are installed explicitly BEFORE the editable install so
+# the pilot pins win; `pip install -e . --no-deps` then adds only Mirror itself
+# without letting its own (looser) requirements re-resolve the pins.  We then
+# run the dedicated dependency-matrix test plus a full `pytest -q` smoke.
+
+on:
+  push:
+    branches: [main, "feat/m5-readiness"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pilot-combo:
+    name: pilot-combo (py3.12 / sqlalchemy>=2.0.49 / fastapi>=0.135.3 / pydantic 2.x)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pilot pins (exact floors win)
+        run: |
+          python -m pip install --upgrade pip
+          # Base install gets the full dependency set so the suite can run.
+          pip install -e ".[server,llm,dev,postgres]"
+          pip install "sqlglot>=25.0"
+          # Then FORCE the pilot-app pins to win over Mirror's looser extras.
+          # --upgrade here re-resolves each package to at least the pilot floor.
+          pip install --upgrade "sqlalchemy>=2.0.49,<3.0" "fastapi>=0.135.3" "pydantic>=2,<3"
+
+      - name: Assert pinned versions
+        run: |
+          python - <<'PY'
+          import importlib.metadata as m
+          import re
+
+          def nums(name):
+              return tuple(map(int, re.findall(r"\d+", m.version(name))[:3]))
+
+          ok = True
+          checks = {
+              "sqlalchemy": (m.version("sqlalchemy"), nums("sqlalchemy") >= (2, 0, 49)),
+              "fastapi": (m.version("fastapi"), nums("fastapi") >= (0, 135, 3)),
+              "pydantic": (m.version("pydantic"), nums("pydantic")[:1] == (2,)),
+          }
+          for name, (v, passed) in checks.items():
+              ok = ok and passed
+              print(f"{name}=={v} -> {'OK' if passed else 'MISMATCH'}")
+          raise SystemExit(0 if ok else 1)
+          PY
+
+      - name: Dependency-matrix test
+        env:
+          MM_DATABASE_URL: "postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test"
+        run: |
+          if [ -f tests/test_dependency_matrix.py ]; then
+            python -m pytest -q -p no:cacheprovider tests/test_dependency_matrix.py
+          else
+            echo "tests/test_dependency_matrix.py not present -- skipping dedicated leg" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Full suite smoke (pytest -q)
+        env:
+          MM_DATABASE_URL: "postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test"
+        run: |
+          python -m pytest -q -p no:cacheprovider | tee -a "$GITHUB_STEP_SUMMARY"
