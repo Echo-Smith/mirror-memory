@@ -74,6 +74,7 @@ class OpenAILLM:
         max_retries: int = 2,
         timeout: float = 60.0,
         extra_body: dict[str, Any] | None = None,
+        on_call: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         try:
             from openai import OpenAI
@@ -93,11 +94,42 @@ class OpenAILLM:
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._extra_body = extra_body
+        # M5 task 2: a per-call hook receiving
+        # {"ok": bool, "input_tokens": int|None, "output_tokens": int|None,
+        # "latency_ms": int}.  The engine sets this to feed metrics (and the
+        # entry label); storing tokens only at DEBUG made per-entry cost
+        # invisible, which is exactly what the observability task needs.
+        self._on_call: Callable[[dict[str, Any]], None] | None = on_call
         # Call health.  A failed call returns the caller's fallback instead of
         # raising, so the failure is counted here -- where it happens -- or a
         # rate-limited run looks like a model that simply found nothing.
         self.calls = 0
         self.call_failures = 0
+
+    def set_on_call(self, hook: Callable[[dict[str, Any]], None] | None) -> None:
+        """Install (or clear) the per-call usage hook (see ``__init__``)."""
+        self._on_call = hook
+
+    def _emit_call(
+        self,
+        *,
+        ok: bool,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        latency_ms: int,
+    ) -> None:
+        hook = self._on_call
+        if hook is None:
+            return
+        try:
+            hook({
+                "ok": ok,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "latency_ms": latency_ms,
+            })
+        except Exception:  # observability must never break a call
+            logger.warning("LLM usage hook raised; ignoring", exc_info=True)
 
     def generate(
         self,
@@ -148,20 +180,36 @@ class OpenAILLM:
 
             # Log usage if available.
             usage = getattr(response, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+            completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
             if usage:
                 logger.debug(
-                    "LLM call: model=%s tokens=%d/%d latency=%dms",
+                    "LLM call: model=%s tokens=%s/%s latency=%dms",
                     self._model,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
+                    prompt_tokens,
+                    completion_tokens,
                     elapsed_ms,
                 )
+            # M5 task 2: surface usage to the caller's hook (metrics).  When
+            # the provider returns no usage the tokens stay ``None`` and the
+            # hook records the call as usage-unknown -- never a guess.
+            self._emit_call(
+                ok=True,
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                latency_ms=elapsed_ms,
+            )
 
             return content
 
         except Exception:
             self.call_failures += 1
             logger.warning("LLM call failed (model=%s)", self._model, exc_info=True)
+            # A failed call still counts (a call was attempted) but carries
+            # no usage: report ok=False so the hook can tell the difference.
+            self._emit_call(
+                ok=False, input_tokens=None, output_tokens=None, latency_ms=0,
+            )
             if fallback is not None:
                 return fallback()
             raise

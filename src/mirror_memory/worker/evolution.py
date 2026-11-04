@@ -937,12 +937,17 @@ def _formulate(
     )
 
     user_content = f"[Beliefs]\n{beliefs_text or '(none yet)'}"
+    from mirror_memory.core import metrics as _metrics
+
     try:
         raw = llm.generate(
             system_prompt=system_prompt,
             payload_text=user_content,
         )
+        # M5 task 2: attribute this call to the extraction-worker entry.
+        _metrics.record_llm(_metrics.ENTRY_EXTRACTION_WORKER)
     except Exception:
+        _metrics.record_llm(_metrics.ENTRY_EXTRACTION_WORKER)
         logger.warning("evolution: formulate LLM call failed")
         return {"patterns": [], "support_policy": {}}
 
@@ -1076,11 +1081,20 @@ async def evolution_worker(
         purge_expired_audit,
     )
 
+    from mirror_memory.core import metrics as _metrics
+
     while not stop.is_set():
+        _tick_started = time.monotonic()
         try:
             await asyncio.to_thread(process_pending, session_factory, config)
         except Exception:
             logger.warning("evolution: worker will retry on next tick", exc_info=True)
+        finally:
+            # M5 task 2: the background-extraction tick is a latency entry.
+            _metrics.observe_latency(
+                _metrics.ENTRY_EXTRACTION_WORKER,
+                (time.monotonic() - _tick_started) * 1000.0,
+            )
         if next_due(compaction_state, config,
                     interval_seconds=config.deletion_log.prune_interval_seconds):
             try:

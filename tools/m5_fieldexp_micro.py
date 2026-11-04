@@ -373,22 +373,75 @@ def _build_engine(backend: str, tmp: Path, user: str):
     return engine, Session, cleanup
 
 
-def _seed(engine, user, n):
+def _seed(engine, user, n, bulk=False):
+    """Grow the belief population by *n*.
+
+    Default: the product path -- ``observe()`` through the deterministic
+    extraction stub, one belief per call.  Slow under CPU contention (each
+    call commits + fsyncs + runs the extraction/summary pipeline).
+
+    ``bulk=True``: insert belief rows DIRECTLY, bypassing extraction.  Recall
+    latency depends on the *row count and candidate-set size*, not on how the
+    rows were produced, so this is a valid shortcut for the recall-latency
+    dimension when the host is loaded.  It is NOT used for the observe-cost
+    measurement (that path always goes through observe()).  Documented in the
+    design doc's method note.
+    """
     from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
 
-    # distinct preference text per belief -> the deterministic extraction
-    # layer mints exactly one belief per observe
     t0 = time.perf_counter()
+    if not bulk:
+        with tenant_scope("default", "default"), \
+                fixture_write_scope("m5 fieldenc microbenchmark: seed"):
+            for i in range(n):
+                engine.observe(
+                    user_id=user,
+                    session_id=f"s{i % 10}",
+                    text=(f"I prefer coffee variety number {i} "
+                          f"and read science fiction in the evening."),
+                    purpose="api",
+                )
+        return time.perf_counter() - t0
+
+    # bulk path: minimal but schema-valid belief rows in one transaction
+    import uuid as _uuid
+
+    from mirror_memory.core.models import Belief
+
     with tenant_scope("default", "default"), \
-            fixture_write_scope("m5 fieldenc microbenchmark: seed"):
-        for i in range(n):
-            engine.observe(
-                user_id=user,
-                session_id=f"s{i % 10}",
-                text=(f"I prefer coffee variety number {i} "
-                      f"and read science fiction in the evening."),
-                purpose="api",
-            )
+            fixture_write_scope("m5 fieldenc microbenchmark: bulk seed"):
+        with engine._session() as session:
+            start = session.query(Belief).filter(
+                Belief.user_id == user).count()
+            batch = []
+            for i in range(n):
+                j = start + i
+                batch.append(Belief(
+                    global_id=_uuid.uuid4().hex,
+                    user_id=user,
+                    dimension="preference",
+                    key=f"coffee_pref_{j}",
+                    claim_text=(f"I prefer coffee variety number {j} "
+                                f"and read science fiction in the evening."),
+                    value_json="{}",
+                    layer="L4",
+                    status="active",
+                    confidence=0.9,
+                    source="extracted",
+                    evidence_json="[]",
+                    subject="user",
+                    predicate="prefer",
+                    object=f"coffee_{j}",
+                    cardinality="multi",
+                    polarity="neutral",
+                ))
+                if len(batch) >= 500:
+                    session.add_all(batch)
+                    session.flush()
+                    batch = []
+            if batch:
+                session.add_all(batch)
+            session.commit()
     return time.perf_counter() - t0
 
 
@@ -607,7 +660,7 @@ def run_backend(backend, counts, args, key):
         for target in counts:
             if target > seeded:
                 add = target - seeded
-                seed_s = _seed(engine, "u", add)
+                seed_s = _seed(engine, "u", add, bulk=args.bulk_seed)
                 seeded = target
                 print(f"  [{backend}] seeded to {target} beliefs "
                       f"(+{add} in {seed_s:.1f}s)", file=sys.stderr)
@@ -669,6 +722,10 @@ def main() -> int:
                          "AES-GCM is ~1 GB/s plus a few us of per-row "
                          "interpreter/call overhead, i.e. roughly 2000x "
                          "for ~500-byte rows (default 2000; use 1 for raw)")
+    ap.add_argument("--bulk-seed", action="store_true",
+                    help="seed belief rows directly (bypass observe/extraction) "
+                         "for the recall-latency dimension on a loaded host; "
+                         "the observe-cost measurement still uses observe()")
     ap.add_argument("--quick", action="store_true",
                     help="smoke run: sqlite only, 100/300 beliefs")
     ap.add_argument("--json", default=None)

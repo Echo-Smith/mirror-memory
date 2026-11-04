@@ -908,6 +908,36 @@ def create_app(
             logger.warning("stats failed for user %s: %s", user_id[:8], e, exc_info=True)
             raise HTTPException(status_code=500, detail="Internal error")
 
+    # -- Observability (M5 task 2) ------------------------------------------
+    #
+    # /metrics is ADMIN-authenticated with the MM_ADMIN_API_KEY Bearer secret
+    # -- deliberately NOT the tenant bearer key.  The process-wide counters
+    # and histograms are not a tenant resource, and an operator scraping them
+    # must not be able to read any tenant's memory.  When MM_ADMIN_API_KEY is
+    # unset the endpoint is DISABLED (404) rather than open -- fail-closed.
+    # The body carries ONLY counters/gauges/histograms whose single label is
+    # ``entry`` -- never a user id (see core.metrics.render_prometheus).
+    @app.get("/metrics")
+    def metrics_endpoint(request: Request):
+        admin_key = os.environ.get("MM_ADMIN_API_KEY")
+        if not admin_key:
+            # Not configured -- do not advertise the surface at all.
+            raise HTTPException(status_code=404, detail="Not Found")
+        presented = None
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            presented = auth[7:].strip()
+        if presented is None or not hmac.compare_digest(presented, admin_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing admin API key")
+        from fastapi.responses import PlainTextResponse
+
+        from mirror_memory.core import metrics as _metrics
+
+        return PlainTextResponse(
+            _metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     return app
 
 

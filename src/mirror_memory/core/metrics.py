@@ -1,16 +1,41 @@
-"""In-process operational counters (M3 batch 3 task 3): metrics that must
-not cost a query.
+"""In-process operational telemetry (M3 batch 3 task 3, extended for M5).
 
-A ``missing_purpose`` refusal is decided in Python before any SQL (the
-batch-1 invariant), so counting it in the database would either break that
-invariant or need a second write path for a refusal.  The counter lives in
-the process instead: cheap, lock-protected, and reset on restart -- it is
-an operational signal (an integration suddenly calling without purposes),
-not an audit record.
+Everything here must be answerable WITHOUT a query on the request path --
+that is the governing principle ("no extra queries").  The counters and
+gauges are incremented/overwritten where the event already happens; the
+histograms are fixed-bucket aggregates updated per call; storage
+statistics -- the one thing that inherently needs SQL -- are computed by an
+ON-DEMAND function (:func:`storage_stats`) or a low-frequency worker task,
+never from an entry.
+
+Three families:
+
+Counters (monotone, ``inc``/``value``)
+    ``missing_purpose_refusals``, tombstone counters, and the per-entry cost
+    counters: LLM calls, input/output tokens (``unknown`` when the client
+    surfaces no usage), and SQL statements issued.
+
+Gauges (current value, ``set_gauge``/``gauge``)
+    Replay progress, sync state, the age of the last catch-up.
+
+Histograms (latency, bounded memory, ``observe_latency``/``latency_summaries``)
+    Labelled by ENTRY only (``observe`` / ``recall`` / ``extraction_worker``).
+    Fixed exponential buckets: constant memory, no per-sample retention,
+    thread-safe.  Quantiles are a bucket-index interpolation -- accurate to
+    the bucket width and never unbounded.
+
+Privacy / label discipline (M5 task 2)
+    Metrics NEVER carry memory content, user text, or any label other than
+    the metric name and (for histograms) the ``entry`` value.  A user id
+    appears ONLY inside :func:`storage_stats` (a library value) and the
+    ``storage`` section of :func:`report` -- never in a Prometheus label.
+    :func:`render_prometheus` is the ONLY serialiser that touches the wire,
+    and it never sees a user id.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 
 _lock = threading.Lock()
@@ -72,6 +97,9 @@ def gauge(name: str) -> float | None:
 
 
 def snapshot() -> dict[str, int]:
+    """The counter snapshot -- ``snapshot()`` keeps its historical shape
+    (``dict[str, int]``) so existing callers (``snapshot().get(name, 0)``)
+    keep working.  The richer view lives in :func:`report`."""
     with _lock:
         return dict(_counters)
 
@@ -79,3 +107,391 @@ def snapshot() -> dict[str, int]:
 def gauges() -> dict[str, float]:
     with _lock:
         return dict(_gauges)
+
+
+# ---------------------------------------------------------------------------
+# Per-entry cost counters (M5 task 2 requirement 1)
+#
+# Three counters, one entry label apiece.  The entry is a COMPILE-TIME
+# constant at every call site, never user input -- so no label can smuggle
+# content or a user id into the metric name.
+# ---------------------------------------------------------------------------
+
+#: Entries whose cost we attribute.  Closed set.
+ENTRY_OBSERVE = "observe"
+ENTRY_RECALL = "recall"
+ENTRY_EXTRACTION_WORKER = "extraction_worker"
+
+COST_LLM_CALLS_PREFIX = "llm_calls_total"        # + ".<entry>"
+COST_INPUT_TOKENS_PREFIX = "llm_input_tokens"    # + ".<entry>"
+COST_OUTPUT_TOKENS_PREFIX = "llm_output_tokens"  # + ".<entry>"
+#: Calls whose provider surfaced no usage object -> counted separately so
+#: the token counters are never inflated by a guess.
+COST_USAGE_UNKNOWN_PREFIX = "llm_usage_unknown_total"  # + ".<entry>"
+
+#: SQL statements issued, by entry ("unknown" when no request context is
+#: active -- e.g. a manual DDL script).
+SQL_STATEMENTS_PREFIX = "sql_statements_total"  # + ".<entry>"
+
+#: ``unknown`` is the sentinel recorded for a token count a client could not
+#: provide (a stub, an error path, a provider without usage).
+UNKNOWN = "unknown"
+
+
+def record_llm(
+    entry: str,
+    *,
+    input_tokens: int | str | None = None,
+    output_tokens: int | str | None = None,
+) -> None:
+    """Record one LLM call for *entry*.
+
+    The call count always increments (a call was made).  Token counts are
+    added when numeric; when a value is ``None`` or not an int the call is
+    counted under the ``unknown`` counter instead so the token totals mean
+    "tokens we actually measured", never a fabricated number.
+    """
+    inc(f"{COST_LLM_CALLS_PREFIX}.{entry}")
+
+    def _add(prefix: str, tok: int | str | None) -> bool:
+        if isinstance(tok, bool) or not isinstance(tok, int):
+            return False
+        inc(f"{prefix}.{entry}", int(tok))
+        return True
+
+    got_in = _add(COST_INPUT_TOKENS_PREFIX, input_tokens)
+    got_out = _add(COST_OUTPUT_TOKENS_PREFIX, output_tokens)
+    if not (got_in and got_out):
+        inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
+
+
+def record_sql(entry: str = UNKNOWN, n: int = 1) -> None:
+    """Record *n* SQL statements issued for *entry* (count only)."""
+    inc(f"{SQL_STATEMENTS_PREFIX}.{entry}", n)
+
+
+# ---------------------------------------------------------------------------
+# Latency histograms (M5 task 2 requirement 2)
+#
+# Fixed exponential buckets in milliseconds: [0,1,2,4,8,...) plus a +Inf
+# overflow.  Bounded memory (one int array per entry, independent of the
+# number of samples), thread-safe under the shared lock, and quantiles are
+# reported from the bucket edges -- never from retained samples.
+# ---------------------------------------------------------------------------
+
+HIST_ENTRIES = (ENTRY_OBSERVE, ENTRY_RECALL, ENTRY_EXTRACTION_WORKER)
+_HIST_BUCKET_COUNT = 27  # 2**0 .. 2**26 ms (~18.6 h) then +Inf
+_histograms: dict[str, list[int]] = {}
+_hist_sums: dict[str, float] = {}
+
+
+def _bucket_index(ms: float) -> int:
+    """Bucket for *ms*: index i holds values in [2**(i-1), 2**i) with a
+    separate bucket for [0,1).  Index == _HIST_BUCKET_COUNT is the overflow
+    (>= 2**26 ms)."""
+    if ms < 1.0:
+        return 0
+    idx = int(math.ceil(math.log2(ms))) if ms > 0 else 0
+    return min(idx, _HIST_BUCKET_COUNT)
+
+
+def observe_latency(entry: str, ms: float) -> None:
+    """Record one latency sample (milliseconds) for *entry*."""
+    if ms < 0:
+        ms = 0.0
+    with _lock:
+        buckets = _histograms.get(entry)
+        if buckets is None:
+            buckets = [0] * (_HIST_BUCKET_COUNT + 1)
+            _histograms[entry] = buckets
+            _hist_sums[entry] = 0.0
+        buckets[_bucket_index(ms)] += 1
+        _hist_sums[entry] = _hist_sums.get(entry, 0.0) + ms
+
+
+def _bucket_upper(i: int) -> float:
+    if i >= _HIST_BUCKET_COUNT:
+        return float(2 ** _HIST_BUCKET_COUNT)
+    return float(2 ** i)
+
+
+def _qname(q: float) -> str:
+    return f"p{int(round(q * 100))}"
+
+
+def _quantiles_from_buckets(buckets: list[int], quantiles: tuple[float, ...]) -> dict[str, float]:
+    total = sum(buckets)
+    out: dict[str, float] = {}
+    if total == 0:
+        for q in quantiles:
+            out[_qname(q)] = 0.0
+        return out
+    # Reported quantile = the UPPER edge of the bucket the quantile rank
+    # falls in.  This bounds error by the (multiplicative) bucket width --
+    # the standard exponential-bucket tradeoff: bounded memory, a fixed
+    # number of counters regardless of traffic.
+    targets = {q: q * total for q in quantiles}
+    running = 0
+    edge = _bucket_upper(0)
+    qs = sorted(quantiles)
+    qi = 0
+    for i, count in enumerate(buckets):
+        running += count
+        edge = _bucket_upper(i)
+        while qi < len(qs) and running >= targets[qs[qi]]:
+            out[_qname(qs[qi])] = round(edge, 3)
+            qi += 1
+        if qi >= len(qs):
+            break
+    while qi < len(qs):
+        out[_qname(qs[qi])] = round(edge, 3)
+        qi += 1
+    return out
+
+
+def histogram(entry: str) -> dict:
+    """The bounded aggregate for *entry*: cumulative ``le`` buckets + the
+    standard quantile summary.  Empty (zero count) entries are still
+    present so a dashboard never loses a series."""
+    with _lock:
+        buckets = list(_histograms.get(entry, [0] * (_HIST_BUCKET_COUNT + 1)))
+        total_sum = float(_hist_sums.get(entry, 0.0))
+    total = sum(buckets)
+    cumulative = []
+    running = 0
+    for i, count in enumerate(buckets):
+        running += count
+        upper = _bucket_upper(i)
+        if i >= _HIST_BUCKET_COUNT:
+            cumulative.append((float("inf"), running))
+        else:
+            cumulative.append((upper, running))
+    return {
+        "count": total,
+        "sum": total_sum,
+        "buckets": cumulative,  # [(le_ms_or_inf, cumulative_count)]
+        "summary": _quantiles_from_buckets(buckets, (0.5, 0.95, 0.99)),
+    }
+
+
+def latency_summaries() -> dict[str, dict]:
+    """``{entry: {"count", "p50", "p95", "p99"}}`` for every entry with
+    samples (plus known entries that have none, at zero)."""
+    out: dict[str, dict] = {}
+    with _lock:
+        seen = set(_histograms) | set(HIST_ENTRIES)
+    for entry in sorted(seen):
+        h = histogram(entry)
+        out[entry] = {"count": h["count"], **h["summary"]}
+    return out
+
+
+def histogram_all() -> dict[str, dict]:
+    """Every histogram entry (known entries included at zero) -- the sealed
+    set of entry labels the exposition may emit."""
+    with _lock:
+        entries = set(_histograms) | set(HIST_ENTRIES)
+    return {e: histogram(e) for e in sorted(entries)}
+
+
+# ---------------------------------------------------------------------------
+# Storage growth (M5 task 2 requirement 3)
+#
+# Row counts and estimated bytes PER USER, PER TABLE, by an ON-DEMAND SQL
+# pass -- never on the request path.  Call it from an admin endpoint, a
+# low-frequency worker tick, or a benchmark.  SQLite uses
+# ``length(CAST(col AS BLOB))``; PostgreSQL uses ``octet_length(col)``.
+# The aggregate read crosses tenants by design (a capacity report), so it
+# runs inside ``system_scope`` with a recorded reason; it is never reached
+# from an engine request path.
+# ---------------------------------------------------------------------------
+
+#: Columns whose on-disk size dominates a row; a cheap per-table estimate
+#: sums their octet length.  Keys are the ORM table names.
+_ESTIMATE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "mm_beliefs": ("claim_text", "key", "dimension", "predicate", "object"),
+    "mm_evidence": ("content",),
+    "mm_evidence_digests": ("digest",),
+    "mm_session_summaries": ("summary",),
+    "mm_belief_events": ("reason",),
+}
+
+
+def storage_stats(engine) -> dict[str, dict[str, dict[str, int]]]:
+    """Per-user, per-table row counts + estimated bytes.
+
+    Returns ``{user_id: {table: {"rows": int, "bytes": int}}}``.  Pure read;
+    runs one aggregate ``GROUP BY user_id`` per tenant table.  NOT called
+    from any request handler.  User ids live ONLY here (and in the
+    snapshot's ``storage`` section) -- :func:`render_prometheus` never reads
+    this.
+
+    Column choice is schema-tolerant: if an estimate column is missing the
+    table still reports its row count with ``bytes`` estimated as 0 rather
+    than failing the whole report.
+    """
+    from sqlalchemy import inspect as _inspect
+    from sqlalchemy import text as _text
+
+    from mirror_memory.core.tenancy import system_scope
+
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    inspector = _inspect(engine)
+    tables = set(inspector.get_table_names())
+    with system_scope(reason="metrics.storage_stats: admin on-demand per-user storage report"):
+        with engine.connect() as conn:
+            for table in sorted(tables):
+                if not table.startswith("mm_"):
+                    continue
+                cols = {c["name"] for c in inspector.get_columns(table)}
+                if "user_id" not in cols:
+                    continue
+                size_cols = [c for c in _ESTIMATE_COLUMNS.get(table, ()) if c in cols]
+                if size_cols:
+                    dialect = engine.dialect.name
+                    if dialect == "postgresql":
+                        size_expr = " + ".join(
+                            f"COALESCE(octet_length({c}), 0)" for c in size_cols
+                        )
+                    else:
+                        size_expr = " + ".join(
+                            f"COALESCE(length(CAST({c} AS BLOB)), 0)" for c in size_cols
+                        )
+                    sql = (
+                        f"SELECT user_id, COUNT(*) AS n, "
+                        f"COALESCE(SUM({size_expr}), 0) AS b "
+                        f"FROM {table} GROUP BY user_id"
+                    )
+                else:
+                    sql = f"SELECT user_id, COUNT(*) AS n, 0 AS b FROM {table} GROUP BY user_id"
+                for user_id, n, b in conn.execute(_text(sql)):
+                    out.setdefault(str(user_id), {})[table] = {
+                        "rows": int(n), "bytes": int(b),
+                    }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The rich report (backward-compatible ``snapshot()`` stays untouched)
+# ---------------------------------------------------------------------------
+
+
+def report(*, storage: dict | None = None) -> dict:
+    """Everything the library knows: counters, gauges, latency summaries,
+    and (only when explicitly computed) storage stats.
+
+    ``storage`` is passed in by the caller that just ran :func:`storage_stats`
+    -- the request path never computes it.
+    """
+    return {
+        "counters": snapshot(),
+        "gauges": gauges(),
+        "latency": latency_summaries(),
+        "storage": storage if storage is not None else {},
+    }
+
+
+def reset_for_tests() -> None:
+    """Clear every in-process aggregate.  Test-only; never called by the
+    engine."""
+    with _lock:
+        _counters.clear()
+        _gauges.clear()
+        _histograms.clear()
+        _hist_sums.clear()
+
+
+# ---------------------------------------------------------------------------
+# Prometheus text exposition (M5 task 2 requirement 5)
+#
+# Labels are a CLOSED set: metric family name + (for histograms) ``entry``.
+# There is deliberately no ``user``/``tenant``/``purpose`` label anywhere,
+# so a user id cannot reach the wire even by accident.
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_PREFIXES = (
+    COST_LLM_CALLS_PREFIX,
+    COST_INPUT_TOKENS_PREFIX,
+    COST_OUTPUT_TOKENS_PREFIX,
+    COST_USAGE_UNKNOWN_PREFIX,
+    SQL_STATEMENTS_PREFIX,
+)
+
+_HELP = {
+    COST_LLM_CALLS_PREFIX: "LLM calls made, by engine entry.",
+    COST_INPUT_TOKENS_PREFIX: "Measured LLM input (prompt) tokens, by entry.",
+    COST_OUTPUT_TOKENS_PREFIX: "Measured LLM output (completion) tokens, by entry.",
+    COST_USAGE_UNKNOWN_PREFIX: "LLM calls with no provider usage object, by entry.",
+    SQL_STATEMENTS_PREFIX: "SQL statements issued, by entry.",
+}
+
+
+def _emit_counter_family(lines: list[str], family: str, samples: dict[str, int]) -> None:
+    if not samples:
+        return
+    lines.append(f"# HELP {family} {_HELP.get(family, '')}".rstrip())
+    lines.append(f"# TYPE {family} counter")
+    for entry, val in sorted(samples.items()):
+        lines.append(f'{family}{{entry="{entry}"}} {val}')
+
+
+def render_prometheus() -> str:
+    """Serialise counters, gauges and latency histograms to Prometheus text
+    exposition format.  NEVER includes storage stats, user ids, or content.
+    """
+    counters = snapshot()
+    gauges_ = gauges()
+    lines: list[str] = []
+
+    # Fixed operational counters (no labels).
+    fixed = {
+        MISSING_PURPOSE: "mirror_memory_missing_purpose_refusals_total",
+        DELETION_RECONCILE_FAILURES: "mirror_memory_deletion_reconcile_failures_total",
+        TOMBSTONES_APPLIED: "mirror_memory_tombstones_applied_total",
+        TOMBSTONES_SKIPPED: "mirror_memory_tombstones_skipped_total",
+        TOMBSTONES_EXPORT_SKIPPED: "mirror_memory_tombstones_export_skipped_total",
+        TOMBSTONES_RESCANS: "mirror_memory_tombstones_rescans_total",
+    }
+    for name, pname in fixed.items():
+        lines.append(f"# HELP {pname} {name} counter.")
+        lines.append(f"# TYPE {pname} counter")
+        lines.append(f"{pname} {counters.get(name, 0)}")
+
+    # Tombstone rejections by reason: label is the reason token only.
+    rejected = {
+        k[len(TOMBSTONES_REJECTED_PREFIX):]: v
+        for k, v in counters.items() if k.startswith(TOMBSTONES_REJECTED_PREFIX)
+    }
+    if rejected:
+        lines.append("# HELP mirror_memory_tombstones_rejected_total Rejected tombstone batches by reason.")
+        lines.append("# TYPE mirror_memory_tombstones_rejected_total counter")
+        for reason, v in sorted(rejected.items()):
+            lines.append(f'mirror_memory_tombstones_rejected_total{{reason="{reason}"}} {v}')
+
+    # Cost counters grouped by dynamic family.
+    for prefix in _DYNAMIC_PREFIXES:
+        family_samples: dict[str, int] = {}
+        for k, v in counters.items():
+            if k.startswith(prefix + "."):
+                family_samples[k[len(prefix) + 1:]] = v
+        _emit_counter_family(lines, prefix, family_samples)
+
+    # Gauges (fixed names, no labels).
+    for name, val in sorted(gauges_.items()):
+        pname = f"mirror_memory_{name}"
+        lines.append(f"# HELP {pname} {name} gauge.")
+        lines.append(f"# TYPE {pname} gauge")
+        lines.append(f"{pname} {val}")
+
+    # Latency histograms: ONE family, family name + entry label ONLY.
+    pname = "mirror_memory_latency_ms"
+    lines.append(f"# HELP {pname} Entry latency in milliseconds, by entry.")
+    lines.append(f"# TYPE {pname} histogram")
+    for entry, h in histogram_all().items():
+        for le, count in h["buckets"]:
+            le_label = "+Inf" if le == float("inf") else repr(float(le))
+            lines.append(f'{pname}_bucket{{entry="{entry}",le="{le_label}"}} {count}')
+        lines.append(f'{pname}_sum{{entry="{entry}"}} {h.get("sum", 0.0)}')
+        lines.append(f'{pname}_count{{entry="{entry}"}} {h["count"]}')
+
+    return "\n".join(lines) + "\n"

@@ -212,6 +212,12 @@ class MemoryEngine:
         self._initializing = False
         self._init_tls = threading.local()
         self._pipeline = None  # lazy-initialized
+        # M5 task 2 (observability): per-entry cost + latency.  The LLM hook
+        # is installed lazily around each entry (see _metrics_llm_scope) so
+        # the same client can be shared; the SQL count rides the engine's own
+        # event listener, never an extra query.
+        self._metrics_tls = threading.local()
+        self._install_metrics_sql_listener()
         # M4: the independent deletion log.  An explicit instance wins;
         # otherwise the config decides (backend file|postgres).  None =>
         # deletions are refused (fail-closed: an unlogged deletion cannot
@@ -465,6 +471,78 @@ class MemoryEngine:
             self._pipeline = ExtractionPipeline(config=self._config, llm_client=self._llm_client)
         return self._pipeline
 
+    # -- observability (M5 task 2): per-entry cost + latency ----------------
+
+    def _install_metrics_sql_listener(self) -> None:
+        """Count SQL statements per entry off the SAME cursor event the
+        auditor uses -- no extra query, no second code path.  The listener
+        is a no-op unless an entry opened a metrics scope on this thread, so
+        unrelated traffic (migrations, other engines' pools) is untouched."""
+        try:
+            from sqlalchemy import event
+            from sqlalchemy.engine import Engine as _SAEngine
+
+            if getattr(type(self), "_metrics_sql_installed", False):
+                return
+
+            def _count(conn, cursor, statement, parameters, context, executemany):
+                entry = getattr(self._metrics_tls, "entry", None)
+                if entry is None:
+                    return
+                from mirror_memory.core import metrics
+                metrics.record_sql(entry)
+
+            event.listen(_SAEngine, "after_cursor_execute", _count)
+            type(self)._metrics_sql_installed = True
+        except Exception:  # observability must never break engine construction
+            logger.debug("metrics: SQL listener not installed", exc_info=True)
+
+    @contextmanager
+    def _metrics_llm_scope(self, entry: str):
+        """Attribute every LLM call made inside *entry* to that entry.
+
+        Installs a per-call hook on the engine's LLM client (when it supports
+        one) so provider usage -- input/output tokens -- reaches metrics.
+        A client without usage (the test stub) yields ``unknown`` tokens."""
+        from mirror_memory.core import metrics
+
+        llm = self._llm_client
+        hook_installed = False
+        previous = None
+        if llm is not None and hasattr(llm, "set_on_call"):
+            previous = getattr(llm, "_on_call", None)
+
+            def _hook(info: dict) -> None:
+                metrics.record_llm(
+                    entry,
+                    input_tokens=info.get("input_tokens"),
+                    output_tokens=info.get("output_tokens"),
+                )
+
+            llm.set_on_call(_hook)
+            hook_installed = True
+        try:
+            yield
+        finally:
+            if hook_installed:
+                llm.set_on_call(previous)
+
+    @contextmanager
+    def _metrics_entry(self, entry: str):
+        """Time *entry*, record its latency, and mark this thread so the SQL
+        listener counts statements for it."""
+        from mirror_memory.core import metrics
+
+        started = time.monotonic()
+        previous = getattr(self._metrics_tls, "entry", None)
+        self._metrics_tls.entry = entry
+        try:
+            yield
+        finally:
+            self._metrics_tls.entry = previous
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            metrics.observe_latency(entry, elapsed_ms)
+
     # -- purpose authorization (M3 batch-1 tasks 2/3) ------------------------
 
     def _purpose_or_default(self, purpose: str | None) -> str:
@@ -641,17 +719,20 @@ class MemoryEngine:
         self._sync_gate(read=False)
         pipeline = self._get_pipeline()
         started = time.monotonic()
-        with self._session() as session:
-            self._authorize(session, user_id, purpose, "observe")
-            claims = pipeline.observe(
-                session,
-                user_id=user_id,
-                session_id=session_id,
-                text=text,
-                turn_count=turn_count,
-                **kwargs,
-            )
-            session.commit()
+        from mirror_memory.core import metrics as _metrics
+        with self._metrics_entry(_metrics.ENTRY_OBSERVE):
+            with self._metrics_llm_scope(_metrics.ENTRY_OBSERVE):
+                with self._session() as session:
+                    self._authorize(session, user_id, purpose, "observe")
+                    claims = pipeline.observe(
+                        session,
+                        user_id=user_id,
+                        session_id=session_id,
+                        text=text,
+                        turn_count=turn_count,
+                        **kwargs,
+                    )
+                    session.commit()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "observe: user=%s session=%s claims=%d latency=%dms",
@@ -712,28 +793,30 @@ class MemoryEngine:
         from mirror_memory.render.renderer import render_memory_block_with_ids
 
         started = time.monotonic()
-        with self._session() as session:
-            authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
-            rule = provenance.visibility(session, user_id, authorized.purpose)
-            result, rendered_ids = render_memory_block_with_ids(
-                session,
-                user_id,
-                config=self._config,
-                language=language,
-                user_message=query,
-                tail_load=tail_load,
-                trace_hook=trace_hook,
-                now=now,
-                visibility=rule,
-            )
-            # The access audit row (M3 batch-2 task 2) rides the same
-            # transaction as the read, together with the access telemetry
-            # (which beliefs reached the prompt -- the reheat signal).  The
-            # commit is mandatory: if the audit cannot be written the block
-            # is NOT returned (fail-closed).
-            self._audit(session, authorized, user_id=user_id, operation="recall",
-                        entry=ENTRY_RECALL, memory_ids=rendered_ids)
-            session.commit()
+        from mirror_memory.core import metrics as _metrics
+        with self._metrics_entry(_metrics.ENTRY_RECALL):
+            with self._session() as session:
+                authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
+                rule = provenance.visibility(session, user_id, authorized.purpose)
+                result, rendered_ids = render_memory_block_with_ids(
+                    session,
+                    user_id,
+                    config=self._config,
+                    language=language,
+                    user_message=query,
+                    tail_load=tail_load,
+                    trace_hook=trace_hook,
+                    now=now,
+                    visibility=rule,
+                )
+                # The access audit row (M3 batch-2 task 2) rides the same
+                # transaction as the read, together with the access telemetry
+                # (which beliefs reached the prompt -- the reheat signal).  The
+                # commit is mandatory: if the audit cannot be written the block
+                # is NOT returned (fail-closed).
+                self._audit(session, authorized, user_id=user_id, operation="recall",
+                            entry=ENTRY_RECALL, memory_ids=rendered_ids)
+                session.commit()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "recall: user=%s chars=%d latency=%dms",
@@ -785,12 +868,15 @@ class MemoryEngine:
         # refuse; offline deletions are untouched)
         self._sync_gate(read=True)
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
+        from mirror_memory.core import metrics as _metrics
 
-        with self._session() as session:
-            self._authorize(session, user_id, purpose, "extract")
-            report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)
-            session.commit()
-            return report.as_dict()
+        with self._metrics_entry(_metrics.ENTRY_OBSERVE):
+            with self._metrics_llm_scope(_metrics.ENTRY_OBSERVE):
+                with self._session() as session:
+                    self._authorize(session, user_id, purpose, "extract")
+                    report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)
+                    session.commit()
+                    return report.as_dict()
 
     def panel(
         self,

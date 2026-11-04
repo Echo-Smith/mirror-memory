@@ -22,4 +22,4 @@ __all__ = [
     "ValidationError",
     # OpenAILLM: from mirror_memory.llm import OpenAILLM
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
