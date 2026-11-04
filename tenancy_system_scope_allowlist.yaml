@@ -130,3 +130,14 @@
     only from Step12BeliefGlobalId.apply on PostgreSQL.
   reviewer: Echo-Smith
   reviewed_at: "2026-11-04"
+
+- module: mirror_memory.core.metrics
+  function: storage_stats
+  reason: >
+    M5 task 2: on-demand per-user storage report (row counts + estimated
+    bytes per mm_* table).  There is no request tenant to scope to -- it is
+    an admin/worker-only aggregate that GROUP BYs user_id across all
+    tenants.  NOT called from any request path; the returned user ids never
+    reach Prometheus.  New in this batch -- pending Echo-Smith review.
+  reviewer: Echo-Smith
+  reviewed_at: "PENDING (M5 review)"

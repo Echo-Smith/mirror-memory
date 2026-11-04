@@ -552,6 +552,12 @@ ENTRY_REGISTRY: dict[str, dict] = {
         "operation": "forget (allowed_regardless)", "engine": "tenant(app)",
         "purpose_source": "X-MM-Purpose header, checked against the key's registered set (403 pre-SQL); invocation audited",
     },
+    "mirror_memory.server.metrics_endpoint": {
+        "reads_memory": False,
+        "operation": "admin metrics scrape (NOT a memory read; admin Bearer key MM_ADMIN_API_KEY, not the tenant key)",
+        "engine": "process-local telemetry only (no tenant engine, no DB)",
+        "purpose_source": "admin API key (MM_ADMIN_API_KEY); no purpose header; never touches memory/DB",
+    },
     # ---- background worker ------------------------------------------------
     "mirror_memory.worker.evolution._process_single_job": {
         "operation": "extract", "engine": "tenant(app) for the job's tenant; maintenance engine only for the queue scan",
