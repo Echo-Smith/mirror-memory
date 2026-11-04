@@ -32,6 +32,21 @@ class BeliefInfo:
     retention_class: str = ""
 
 
+@dataclass
+class TombstoneApplyResult:
+    """What apply_tombstones did with a batch (M4 batch 2).
+
+    ``rescan`` is True when the batch failed the channel-continuity
+    check (sender rollback): the channel was re-anchored to 0 and the
+    caller's pull loop MUST keep pulling from the reset cursor instead
+    of stopping on the batch's (possibly empty) cursor range."""
+
+    applied: int
+    skipped: int
+    noop: int
+    rescan: bool = False
+
+
 @dataclass(frozen=True)
 class DeleteResult:
     """Result of ``MemoryEngine.delete_memories()``."""

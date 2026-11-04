@@ -69,6 +69,25 @@ writers:
       - mirror_memory.api
       - mirror_memory.worker.maintenance
 
+  # ---- deletion class: the deletion-generation counter (M4; reviewed
+  # 2026-11-01 by Echo-Smith) ----
+  # Reviewed 2026-11-01 by Echo-Smith: the write class "deletion" covers
+  # mm_deletion_generations only.  Two openers: this sanctioned writer
+  # (the forget paths) and the replayer's inline deletion_write_scope in
+  # core/replay.py (generation alignment to the log) -- the latter is
+  # registered in the inline-scope inventory (tests/test_writer_callers.py).
+  bump_deletion_generation:
+    reason: >
+      Advances the user's deletion generation by inserting the next value;
+      the composite primary key is the compare-and-swap.  Called by the
+      forget paths (forget_belief / delete_user_memories) inside their
+      deletion transaction.  The replayer does NOT call it: it aligns the
+      generation to the log through its own inline deletion_write_scope.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-11-01"
+    callers:
+      - mirror_memory.core.repository
+
   # ---- consent class: purpose authorization (M3 batch 1; reviewed
   # 2026-10-30 by Echo-Smith) ----
   grant_purpose:
@@ -209,3 +228,36 @@ writers:
       session fallback summary alongside the structured claims.
     callers:
       - mirror_memory.extraction.pipeline
+
+  # ---- sync class: the tombstone-synchronization bookkeeping (M4 batch 2,
+  #  Reviewed 2026-11-04 by Echo-Smith) ----
+  record_tombstones_applied:
+    reason: >
+      Records (origin, origin_seq) for every applied cross-device tombstone
+      -- the idempotency key of the sync channel -- inside the same
+      transaction as the deletions it bookkeeps; a rolled-back batch
+      leaves no record.  Called only by the engine's tombstone application
+      (MemoryEngine.apply_tombstones).
+    callers:
+      - mirror_memory.api
+  record_catchup:
+    reason: >
+      Advances the per-peer consumed cursor + chain hash (per-batch sync
+      progress only -- deliberately does NOT touch last_catchup_at: a
+      partial catch-up or rescan re-anchor is never recorded as a
+      complete one, batch-2 patch 4 task 1).  Called only inside the
+      engine's tombstone application (MemoryEngine.apply_tombstones).
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-11-04"
+    callers:
+      - mirror_memory.api
+  mark_catchup_complete:
+    reason: >
+      Stamps last_catchup_at, the offline grace period's anchor, and is
+      the ONLY writer of that instant -- called exclusively by the
+      catch-up loop (MemoryEngine._catch_up) after it confirms the peer's
+      tail with an empty batch that did not rescan.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-11-04"
+    callers:
+      - mirror_memory.api

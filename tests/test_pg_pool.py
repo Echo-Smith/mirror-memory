@@ -334,6 +334,8 @@ def test_wrapper_never_disposes_a_shared_pool(tmp_path):
 
     shared = create_engine(f"sqlite:///{tmp_path}/shared.db")
     Base.metadata.create_all(shared)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(shared)
     disposed = []
     original = shared.pool.dispose
     shared.pool.dispose = lambda: (disposed.append(1), original())  # type: ignore[method-assign]

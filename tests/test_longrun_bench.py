@@ -22,10 +22,15 @@ from mirror_memory.bench.longrun import (
 
 
 @pytest.fixture
-def config():
+def config(tmp_path):
     from mirror_memory.config.loader import load_config
 
-    return load_config("config/")
+    cfg = load_config("config/")
+    # the bench runs on a server database on the PG leg: the file backend
+    # then needs an explicit directory (M4 patch task 2 -- no derived
+    # default for non-SQLite URLs)
+    cfg.deletion_log.directory = str(tmp_path / "deletions")
+    return cfg
 
 
 SMALL = dict(days=40, preferences=12, goals=5, corrections=6, conflicts=5, forgets=3)

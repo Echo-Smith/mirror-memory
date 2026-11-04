@@ -49,6 +49,9 @@ def _seed(db_url, tenant, key, claim):
     register_tenant_key(key, tenant[0], tenant[1], purposes={"test"})
     engine = create_engine(db_url)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_mint
+
+    _sm_mint.ensure_watermark(engine)
     factory = sessionmaker(bind=engine)
     with tenant_scope(*tenant), fixture_write_scope("server test seed"):
         s = factory()

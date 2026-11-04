@@ -419,6 +419,91 @@ class AccessAuditConfig(BaseModel):
     )
 
 
+class DeletionLogConfig(BaseModel):
+    """The independent deletion log (M4 task 1)."""
+
+    backend: str = Field(
+        default="file",
+        description=(
+            '"file" (embedded: an append-only JSONL file per database life, '
+            'fsynced, hash-chained, never the main DB file) or "postgres" (a '
+            'SEPARATE database whose app role holds INSERT/SELECT only) or '
+            '"none" (deletions are refused).'
+        ),
+    )
+    directory: str = Field(
+        default="",
+        description='Directory for the "file" backend; empty = derived from the database URL.',
+    )
+    url: str = Field(
+        default="",
+        description='Connection string for the "postgres" backend (its own database).',
+    )
+    retention_days: int = Field(
+        default=35, ge=1,
+        description=(
+            "How long deletion entries are kept before compaction prunes "
+            "them (a checkpoint entry carries the chain forward).  Must "
+            "not be shorter than backup_retention_days: a log pruned "
+            "before the backups it protects can no longer replay them."
+        ),
+    )
+    backup_retention_days: int = Field(
+        default=30, ge=1,
+        description=(
+            "How long backups of the main database are kept (M4 batch 2 "
+            "task 4): the deletion log's retention must cover the backup "
+            "retention, and startup refuses a configuration that prunes "
+            "the log before the oldest replayable backup."
+        ),
+    )
+    prune_interval_seconds: int = Field(
+        default=86_400, ge=1,
+        description="How often the background compaction pass runs.",
+    )
+    maintenance_url: str = Field(
+        default="",
+        description=(
+            'Connection string for compaction of the "postgres" log '
+            "backend: pruning DELETES rows, and the app role holds "
+            "INSERT/SELECT only, so the prune runs on this (maintenance) "
+            "connection.  Empty = compaction is not available."
+        ),
+    )
+
+
+class SyncConfig(BaseModel):
+    """Cross-device tombstone synchronization (M4 batch 2 task 3): the
+    edge pulls and applies the cloud's tombstones until the cloud's tail
+    before it serves.  The transport itself is injected by the host (this
+    batch is interface + application logic only)."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether this engine catches up against a sync peer at startup.",
+    )
+    offline_grace_days: int = Field(
+        default=7, ge=0,
+        description=(
+            "How long the edge keeps serving after it last caught up "
+            "successfully (a failed catch-up at startup is an offline "
+            "grace, not a refusal).  Past the grace, read entries refuse "
+            "with SyncCatchupRequired until the next successful catch-up.  "
+            "Measured from the last successful catch-up stored in the main "
+            "database -- a restored backup rewinds it, expiring the grace "
+            "sooner, which is correct."
+        ),
+    )
+    reminder_days: int = Field(
+        default=2, ge=0,
+        description=(
+            "sync_status() carries a reminder flag once the remaining "
+            "grace is at or below this many days, so the product can ask "
+            "the user to go online before the refusal hits."
+        ),
+    )
+
+
 class MemoryConfig(BaseModel):
     """Root configuration object assembled from multiple YAML files.
 
@@ -438,6 +523,8 @@ class MemoryConfig(BaseModel):
     render: RenderConfig = Field(default_factory=RenderConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     access_audit: AccessAuditConfig = Field(default_factory=AccessAuditConfig)
+    deletion_log: DeletionLogConfig = Field(default_factory=DeletionLogConfig)
+    sync: SyncConfig = Field(default_factory=SyncConfig)
     question_value_tiers: dict[str, int] = Field(
         default_factory=dict,
         description="Dimension -> priority tier for verification question candidates "

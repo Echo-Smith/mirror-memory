@@ -24,6 +24,20 @@ from mirror_memory.core import schema_migration as sm
 from mirror_memory.core.schema_migration import upgrade_database
 from mirror_memory.core.sql_audit import no_audit_scope
 
+
+def _migration_cfg():
+    """A deletion-log config for step-11 migrations that don't exercise
+    the log itself (M4 patch 2: the migration refuses to mint a
+    data-bearing database without a log to consult)."""
+    import tempfile
+
+    from mirror_memory.config.loader import load_config
+
+    cfg = load_config("config/")
+    cfg.deletion_log.directory = tempfile.mkdtemp(prefix="mm-migration-log-")
+    return cfg
+
+
 IS_PG = os.environ.get("MM_DATABASE_URL", "").startswith("postgresql")
 
 pytestmark = [
@@ -333,12 +347,9 @@ def test_v5_database_upgrades_to_latest_with_interrupted_step(pg_admin_engine):
     # the interrupted re-run: everything from 7 to latest, WITH the shared
     # legacy choice (explicit list -- swapping steps[-1] would drop step 10
     # and duplicate version 9)
-    steps = [
-        sm.Step7SourcePurpose(legacy_job_purpose="legacy-app"),
-        sm.Step8AccessAudit(),
-        sm.Step9RecallVisibility(legacy_job_purpose="legacy-app"),
-        sm.Step10DerivedProvenance(),
-    ]
+    steps = list(sm.DEFAULT_STEPS[6:])
+    steps[0] = sm.Step7SourcePurpose(legacy_job_purpose="legacy-app")
+    steps[2] = sm.Step9RecallVisibility(legacy_job_purpose="legacy-app")
     upgrade_database(pg_admin_engine, default_tenant="tA", default_app="app",
                      steps=steps, confirm_backup=True)
     assert sm.current_version(pg_admin_engine) == sm.LATEST_VERSION

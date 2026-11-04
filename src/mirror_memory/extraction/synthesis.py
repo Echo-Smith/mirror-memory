@@ -181,6 +181,20 @@ def _parse_understanding(raw: str) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
+def _snapshot_generation_current(snapshot: object, session: object, user_id: str) -> bool:
+    """M4: a snapshot synthesised before a deletion (or a restore + replay)
+    carries merged text that may include the deleted content -- skip it
+    when the user's CURRENT deletion generation differs from the one
+    recorded at synthesis.  Pre-M4 snapshots (NULL) are always skipped:
+    conservatively rebuilt."""
+    from mirror_memory.core.repository import current_deletion_generation
+
+    recorded = getattr(snapshot, "source_generation", None)
+    if recorded is None:
+        return False
+    return int(recorded) == current_deletion_generation(session, user_id)
+
+
 def _snapshot_provenance_visible(snapshot: object, visibility: "VisibilityRule") -> bool:
     """The AND rule over the snapshot's recorded input union (M3 batch-3
     patch): the snapshot merges several inputs' text, so EVERY input
@@ -215,6 +229,7 @@ def _get_slice_summaries(session: object, user_id: str, *, visibility: "Visibili
             .limit(_MAX_SUMMARIES * 4 if visibility else _MAX_SUMMARIES)
             .all()
         )
+        rows = [r for r in rows if _snapshot_generation_current(r, session, user_id)]
         if visibility is not None:
             rows = [
                 r for r in rows
@@ -246,6 +261,8 @@ def _get_current_understanding(session: object, user_id: str, *, visibility: "Vi
             .limit(1)
             .first()
         )
+        if snap and not _snapshot_generation_current(snap, session, user_id):
+            return ""
         if snap and visibility is not None and not _snapshot_provenance_visible(snap, visibility):
             return ""
         if snap and snap.content_json and snap.content_json != "{}":

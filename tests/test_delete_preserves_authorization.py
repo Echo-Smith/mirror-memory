@@ -31,6 +31,8 @@ PURPOSE = "api"
 def engine(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path}/delete-switches.db")
     Base.metadata.create_all(eng)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng)
     yield eng
     eng.dispose()
 

@@ -937,6 +937,13 @@ TABLE_WRITE_CLASSES: dict[str, str] = {
     # by the entries in the same transaction as the read; its only deletion
     # is the retention purge
     "mm_access_audit": "audit",
+    # deletion: the deletion-generation counter (M4) -- advanced by the
+    # forget paths inside their deletion transaction and by the replayer
+    "mm_deletion_generations": "deletion",
+    # sync: the tombstone-application bookkeeping (M4 batch 2) -- written
+    # in the same transaction as the deletions it bookkeeps
+    "mm_tombstones_applied": "sync",
+    "mm_sync_peers": "sync",
 }
 
 _WRITE_SCOPE_CLASS: dict[str, str] = {
@@ -945,6 +952,7 @@ _WRITE_SCOPE_CLASS: dict[str, str] = {
     "consent": "consent",
     "telemetry": "telemetry",
     "audit": "audit",
+    "deletion": "deletion",
     "fixture": "fixture",  # test seeding: matches every class
 }
 
@@ -992,6 +1000,19 @@ def telemetry_write_scope() -> contextlib.AbstractContextManager[None]:
     """Sanctioned *telemetry* writer scope (extraction stats, session
     summaries, intervention events)."""
     return _class_write_scope("telemetry")
+
+
+def deletion_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *deletion* writer scope (the generation counter of M4:
+    forget paths inside their deletion transaction, and the replayer)."""
+    return _class_write_scope("deletion")
+
+
+def sync_write_scope() -> contextlib.AbstractContextManager[None]:
+    """Sanctioned *sync* writer scope (M4 batch 2: the tombstone-applied
+    record and the per-peer catch-up state, written inside the tombstone
+    application transaction)."""
+    return _class_write_scope("sync")
 
 
 def audit_write_scope() -> contextlib.AbstractContextManager[None]:
@@ -1061,6 +1082,8 @@ def install_write_guard() -> None:
                 "consent": "consent_write_scope (preference/consent setters)",
                 "telemetry": "telemetry_write_scope (stats/summary/intervention recorders)",
                 "audit": "audit_write_scope (core.access_audit record/purge)",
+                "deletion": "deletion_write_scope (the deletion-generation counter)",
+                "sync": "sync_write_scope (the tombstone-synchronization bookkeeping)",
             }.get(required, "an unclassified table -- add it to TABLE_WRITE_CLASSES")
             raise WriteGuardViolation(
                 f"{type(target).__name__}.{initiator.key} (table "

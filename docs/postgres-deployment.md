@@ -118,3 +118,33 @@
 
 PostgreSQL 迁移前要求 `confirm_backup=True`；库不复制文件，缺参数时打印
 `pg_dump` 命令提示。
+
+## 6. 删除日志运维（M4）
+
+主库的单行水位 `mm_deletion_watermark`（`db_id`, `applied_seq`）与独立删除
+日志按 `db_id` 配对：备份恢复后水位随库回滚，启动对账发现落后即按日志重放
+（指纹只删当初删掉的行，id 复用不会误删）。
+
+**部署**：M4 迁移（Step 11）在部署时创建水位行（`db_id` 现铸）并写日志创世
+条目（seq 0）。部署前的备份都是「M4 之前」形态。
+
+**M4 部署前的备份恢复后必须先认领**：这种备份带着租户数据但没有水位行，
+启动会拒绝（`WatermarkMissing`，报错含 `PRE-M4 backup` 与认领命令）。认领：
+
+```bash
+python -m mirror_memory.deletion_adopt --database-url <主库 URL> \
+    --db-id <该库历史所在的日志 db_id>
+```
+
+认领写入水位行（applied_seq = 0），下次启动对账重放该 `db_id` 的全部条目。
+
+**日志位置必须显式**：`backend=file` 只在端侧单租户 SQLite（含内存库）允许
+由 URL 推导目录；server / 多租户部署必须配置 `deletion_log.directory`。
+`backend=postgres` 必须配置 `deletion_log.url`（独立于主库的库，app 角色
+只有 INSERT/SELECT）。`backend=none` 只允许在从未应用过删除条目的库上使用。
+
+**对账失败即停工**：worker 每个 tick 先对账；断链（`LogChainBroken`）、
+日志不可达（`DeletionLogUnavailable`）、水位缺失（`WatermarkMissing`）等
+任何异常都跳过本轮——不回收租约、不认领、不发布——按退避重试并累加
+`deletion_reconcile_failures` 告警计数。日志比主库旧（`DeletionLogStale`）
+同样拒绝：日志的恢复点绝不能落后于主库。

@@ -64,6 +64,9 @@ def test_worker_missing_purpose_cancellation_counts(tmp_path):
     cfg = load_config("config/")
     db = create_engine(f"sqlite:///{tmp_path / 'w.db'}")
     Base.metadata.create_all(db)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(db)
     F = sessionmaker(bind=db)
     with tenant_scope(*TENANT), fixture_write_scope("seed job"):
         s = F()
@@ -126,6 +129,9 @@ def _backdate(db, ids, days: int) -> None:
 def test_maintenance_purges_expired_rows_per_tenant_in_batches(tmp_path):
     db = create_engine(f"sqlite:///{tmp_path / 'm.db'}")
     Base.metadata.create_all(db)
+    from mirror_memory.core import schema_migration as _sm_mint
+
+    _sm_mint.ensure_watermark(db)
     t_a, t_b = ("tA", "app"), ("tB", "app")
     a_expired = _seed_audit(db, t_a, 5)
     a_live = _seed_audit(db, t_a, 2)

@@ -282,7 +282,7 @@ class TestForget:
         assert db_session.query(EvidenceDigest).filter_by(belief_id=belief.id).count() == 1
         belief_id = belief.id
 
-        assert forget_belief(db_session, "u1", belief_id) is True
+        assert forget_belief(db_session, "u1", belief_id) >= 1
         assert db_session.query(type(belief)).count() == 0
         assert db_session.query(EvidenceDigest).filter_by(belief_id=belief_id).count() == 0
         assert (

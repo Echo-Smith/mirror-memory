@@ -28,6 +28,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import desc, false, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mirror_memory.core.confidence import compute_confidence_weight
@@ -88,7 +89,9 @@ def _sanctioned_writer(write_class: str):
     from mirror_memory.core.tenancy import (
         audit_write_scope,
         consent_write_scope,
+        deletion_write_scope,
         engine_write_scope,
+        sync_write_scope,
         telemetry_write_scope,
     )
 
@@ -97,6 +100,8 @@ def _sanctioned_writer(write_class: str):
         "consent": consent_write_scope,
         "telemetry": telemetry_write_scope,
         "audit": audit_write_scope,
+        "deletion": deletion_write_scope,
+        "sync": sync_write_scope,
     }
     scope = scopes[write_class]
 
@@ -478,7 +483,8 @@ def evidence_summary(
     return summary
 
 
-def _prune_orphan_evidence(session: Session, user_id: str) -> int:
+def _prune_orphan_evidence(session: Session, user_id: str,
+                           *, fingerprints: list | None = None) -> int:
     """Delete evidence rows for *user_id* that no belief points at any more.
 
     Evidence is shared: one message can back several beliefs, so a row only
@@ -489,12 +495,11 @@ def _prune_orphan_evidence(session: Session, user_id: str) -> int:
             select(Evidence.id).where(Evidence.user_id == user_id)
         )
     )
-    deleted = (
-        session.query(Evidence)
-        .filter(Evidence.user_id == user_id, Evidence.id.not_in(linked_ids))
-        .delete(synchronize_session=False)
+    return _collect(
+        session, Evidence,
+        (Evidence.user_id == user_id, Evidence.id.not_in(linked_ids)),
+        fingerprints, "mm_evidence",
     )
-    return int(deleted)
 
 
 def evidence_counts_for_beliefs(session: Session, belief_ids: list[int]) -> dict[int, int]:
@@ -2549,7 +2554,8 @@ def record_extraction_stats(
 # ---------------------------------------------------------------------------
 
 
-def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
+def delete_user_memories(session: Session, user_id: str,
+                         *, fingerprints: list | None = None) -> dict[str, int]:
     """Cascade-delete all memory data for a user.
 
     Deletes beliefs, events, stats, snapshots, intervention events,
@@ -2562,47 +2568,26 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     Returns counts of deleted rows per table.
     """
     # Order matters: child tables first.
-    events_deleted = (
-        session.query(BeliefEvent)
-        .filter(BeliefEvent.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    interventions_deleted = (
-        session.query(InterventionEvent)
-        .filter(InterventionEvent.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    digests_deleted = (
-        session.query(EvidenceDigest)
-        .filter(EvidenceDigest.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    transitions_deleted = (
-        session.query(MemoryTransition)
-        .filter(MemoryTransition.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
+    events_deleted = _collect(session, BeliefEvent, (BeliefEvent.user_id == user_id,),
+                              fingerprints, "mm_belief_events")
+    interventions_deleted = _collect(session, InterventionEvent,
+                                     (InterventionEvent.user_id == user_id,),
+                                     fingerprints, "mm_intervention_events")
+    digests_deleted = _collect(session, EvidenceDigest, (EvidenceDigest.user_id == user_id,),
+                               fingerprints, "mm_evidence_digests")
+    transitions_deleted = _collect(session, MemoryTransition, (MemoryTransition.user_id == user_id,),
+                                   fingerprints, "mm_memory_transitions")
     # The versioned ledger holds the plaintext object of every value the
     # user ever asserted, so a full deletion has to take the whole chain:
     # versions first (they reference the identity), then the identities.
-    versions_deleted = (
-        session.query(BeliefVersion)
-        .filter(BeliefVersion.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    identities_deleted = (
-        session.query(BeliefIdentity)
-        .filter(BeliefIdentity.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    proposals_deleted = (
-        session.query(ProposalLog)
-        .filter(ProposalLog.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    beliefs_deleted = (
-        session.query(Belief).filter(Belief.user_id == user_id).delete(synchronize_session=False)
-    )
+    versions_deleted = _collect(session, BeliefVersion, (BeliefVersion.user_id == user_id,),
+                                fingerprints, "mm_belief_versions")
+    identities_deleted = _collect(session, BeliefIdentity, (BeliefIdentity.user_id == user_id,),
+                                  fingerprints, "mm_belief_identities")
+    proposals_deleted = _collect(session, ProposalLog, (ProposalLog.user_id == user_id,),
+                                 fingerprints, "mm_proposal_log")
+    beliefs_deleted = _collect(session, Belief, (Belief.user_id == user_id,),
+                               fingerprints, "mm_beliefs")
     # Evidence links hang off belief ids, so they go with the beliefs.
     evidence_ids = [
         row[0]
@@ -2612,38 +2597,25 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
     ]
     links_deleted = 0
     if evidence_ids:
-        links_deleted = (
-            session.query(BeliefEvidenceLink)
-            .filter(BeliefEvidenceLink.evidence_id.in_(evidence_ids))
-            .delete(synchronize_session=False)
-        )
-    evidence_deleted = (
-        session.query(Evidence).filter(Evidence.user_id == user_id).delete(synchronize_session=False)
-    )
-    stats_deleted = (
-        session.query(ExtractionStats)
-        .filter(ExtractionStats.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    jobs_deleted = (
-        session.query(EvolutionJob)
-        .filter(EvolutionJob.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
-    snapshots_deleted = (
-        session.query(Snapshot).filter(Snapshot.user_id == user_id).delete(synchronize_session=False)
-    )
+        links_deleted = _collect(session, BeliefEvidenceLink,
+                                 (BeliefEvidenceLink.evidence_id.in_(evidence_ids),),
+                                 fingerprints, "mm_belief_evidence_links")
+    evidence_deleted = _collect(session, Evidence, (Evidence.user_id == user_id,),
+                                fingerprints, "mm_evidence")
+    stats_deleted = _collect(session, ExtractionStats, (ExtractionStats.user_id == user_id,),
+                             fingerprints, "mm_extraction_stats")
+    jobs_deleted = _collect(session, EvolutionJob, (EvolutionJob.user_id == user_id,),
+                            fingerprints, "mm_evolution_jobs")
+    snapshots_deleted = _collect(session, Snapshot, (Snapshot.user_id == user_id,),
+                                 fingerprints, "mm_snapshots")
     # Authorization and switches are NOT memory content: the feature
     # consent rows, the global memory preference and the purpose grants
     # (and their audit trail) survive a memory delete.  Deleting them here
     # silently re-enabled disabled features after a delete -- the fallback
     # "missing feature row = global preference" flipped the user back on.
     # "Delete AND revoke" is an explicit two-step for the caller.
-    summaries_deleted = (
-        session.query(SessionSummary)
-        .filter(SessionSummary.user_id == user_id)
-        .delete(synchronize_session=False)
-    )
+    summaries_deleted = _collect(session, SessionSummary, (SessionSummary.user_id == user_id,),
+                                 fingerprints, "mm_session_summaries")
     counts = {
         "beliefs": int(beliefs_deleted),
         "belief_events": int(events_deleted),
@@ -2661,8 +2633,115 @@ def delete_user_memories(session: Session, user_id: str) -> dict[str, int]:
         "proposals": int(proposals_deleted),
     }
     _write_deletion_tombstone(session, user_id, scope="user", scope_hash=_scope_hash("user", user_id), counts=counts)
+    generation = bump_deletion_generation(session, user_id, scope="user")
     touch_memory_state(session, user_id)
+    counts["generation"] = generation
     return counts
+
+
+@_sanctioned_writer("deletion")
+def bump_deletion_generation(
+    session: Session, user_id: str, *, scope: str, expected: int | None = None,
+) -> int:
+    """Advance the user's deletion generation by INSERTING the next value
+    (M4): the composite primary key (tenant, app, user, generation) is the
+    compare-and-swap -- a concurrent deletion racing for the same next
+    generation loses on the key conflict and retries, so generations are
+    unique and gapless per successful deletion.  *expected* re-checks the
+    caller's view (the generation the deletion started from); a mismatch
+    raises ``StaleDeletionGeneration`` and the caller retries."""
+    from mirror_memory.core.models import DeletionGeneration
+    from mirror_memory.core.tenancy import current_tenant, deletion_write_scope
+
+    for _ in range(64):
+        latest = session.scalar(
+            select(func.max(DeletionGeneration.generation)).where(
+                DeletionGeneration.user_id == user_id
+            )
+        )
+        nxt = int(latest or 0) + 1
+        if expected is not None and latest != expected:
+            raise StaleDeletionGeneration(
+                f"user {user_id}: generation moved to {latest} "
+                f"(started from {expected})"
+            )
+        tenant_id, app_id = current_tenant()
+        try:
+            with deletion_write_scope():
+                session.add(DeletionGeneration(
+                    user_id=user_id, generation=nxt, scope=scope,
+                ))
+            session.flush()
+            return nxt
+        except IntegrityError:
+            session.rollback()
+    raise StaleDeletionGeneration(f"user {user_id}: generation race did not settle")
+
+
+class StaleDeletionGeneration(RuntimeError):
+    """The user's deletion generation moved under the caller."""
+
+
+def _collect(session: Session, model, criteria, fingerprints: list | None,
+             table: str) -> int:
+    """Delete rows matching *criteria* and append their fingerprints
+    ({table, id, created_at} -- content-free) to *fingerprints* when
+    collecting.  Returns the number deleted."""
+    from mirror_memory.core.deletion import fingerprint
+
+    ids = None
+    if fingerprints is not None:
+        rows = session.execute(
+            select(model.id, model.created_at).where(*criteria)
+        ).all()
+        for row_id, created_at in rows:
+            # mm_evolution_jobs.id is a string (uuid) -- ids are stored as
+            # given, only converted where the column is an integer
+            fingerprints.append({
+                "table": table, "id": row_id if isinstance(row_id, int) else str(row_id),
+                "created_at": created_at.isoformat() if created_at else None,
+                "_fp": fingerprint(table, row_id, created_at),
+            })
+        ids = [r[0] for r in rows]
+    query = session.query(model).filter(*criteria)
+    if ids is not None:
+        if not ids:
+            return 0
+        query = session.query(model).filter(model.id.in_(ids))
+    deleted = query.delete(synchronize_session=False)
+    return int(deleted)
+
+
+def _fingerprint_row(table: str, row) -> dict:
+    from mirror_memory.core.deletion import fingerprint
+
+    created = getattr(row, "created_at", None)
+    return {
+        "table": table, "id": row.id if isinstance(row.id, int) else str(row.id),
+        "created_at": created.isoformat() if created else None,
+        "_fp": fingerprint(table, row.id, created),
+    }
+
+
+def current_deletion_generation(session: Session, user_id: str) -> int:
+    """The user's current deletion generation (0 before any deletion).
+    The LOG is the authority; this in-database view is aligned by replay."""
+    from mirror_memory.core.models import DeletionGeneration
+
+    return int(session.scalar(
+        select(func.max(DeletionGeneration.generation))
+        .where(DeletionGeneration.user_id == user_id)
+    ) or 0)
+
+
+def ensure_deletion_watermark(session: Session) -> tuple[str, int]:
+    """(db_id, applied_seq) of the main database's deletion watermark,
+    creating the row on first use.  The row lives in the MAIN database
+    (it must roll back with it); the schema/table themselves are created
+    by migration step 11 or, on a fresh database, right here."""
+    from mirror_memory.core import schema_migration
+
+    return schema_migration.ensure_watermark(session.get_bind())
 
 
 def _scope_hash(scope: str, identity: str) -> str:
@@ -2704,7 +2783,8 @@ def _write_deletion_tombstone(
 
 @_sanctioned_claim_writer
 def forget_belief(
-    session: Session, user_id: str, belief_id: int, *, bump_revision: bool = True
+    session: Session, user_id: str, belief_id: int, *,
+    bump_revision: bool = True, fingerprints: list | None = None,
 ) -> bool:
     """Targeted forget: delete a single belief and everything derived from it.
 
@@ -2715,59 +2795,55 @@ def forget_belief(
     with the advanced deletion generation is written.  The state revision
     is bumped so stale worker writes are refused.
 
-    Returns ``True`` if the belief was found and deleted.
+    Returns the advanced deletion generation (the caller writes it into
+    the deletion log), or ``None`` if the belief was not found.
     """
     belief = session.get(Belief, belief_id)
     if belief is None or belief.user_id != user_id:
-        return False
+        return None
 
     # Capture the scope identity before the rows disappear (the tombstone
     # stores its hash, never the key itself).
     scope_hash = _scope_hash("belief", f"{belief_id}:{belief.key}")
 
-    # Delete events first.
-    session.query(BeliefEvent).filter(BeliefEvent.belief_id == belief_id).delete(
-        synchronize_session=False
-    )
+    # Delete events first (fingerprints collected for the deletion log).
+    _collect(session, BeliefEvent, (BeliefEvent.belief_id == belief_id,),
+             fingerprints, "mm_belief_events")
     # Drop this belief's edges into the evidence graph.
-    session.query(BeliefEvidenceLink).filter(
-        BeliefEvidenceLink.belief_id == belief_id
-    ).delete(synchronize_session=False)
+    _collect(session, BeliefEvidenceLink, (BeliefEvidenceLink.belief_id == belief_id,),
+             fingerprints, "mm_belief_evidence_links")
     # The compaction aggregate and the tier-audit trail are belief-scoped.
-    session.query(EvidenceDigest).filter(EvidenceDigest.belief_id == belief_id).delete(
-        synchronize_session=False
-    )
-    session.query(MemoryTransition).filter(
-        MemoryTransition.entity_type == "belief",
-        MemoryTransition.entity_id == belief_id,
-    ).delete(synchronize_session=False)
+    _collect(session, EvidenceDigest, (EvidenceDigest.belief_id == belief_id,),
+             fingerprints, "mm_evidence_digests")
+    _collect(session, MemoryTransition,
+             (MemoryTransition.entity_type == "belief",
+              MemoryTransition.entity_id == belief_id),
+             fingerprints, "mm_memory_transitions")
     # The versioned ledger holds the plaintext object in every version of
     # the slot, so forgetting the belief means forgetting its whole history
     # chain -- otherwise the deleted content survives in BeliefVersion.
-    ledger_counts = _purge_belief_ledger(session, belief)
+    ledger_counts = _purge_belief_ledger(session, belief, fingerprints=fingerprints)
     # The publish log is idempotency state; its rows name the belief that
     # was deleted (either as the target or as the row the commit created),
     # so they go with it (the tombstone and the revision barrier still
     # refuse a replayed proposal afterwards).
-    proposals_deleted = (
-        session.query(ProposalLog)
-        .filter(
-            or_(
-                ProposalLog.target_belief_id == belief_id,
-                ProposalLog.created_belief_id == belief_id,
-            )
-        )
-        .delete(synchronize_session=False)
+    proposals_deleted = _collect(
+        session, ProposalLog,
+        (or_(ProposalLog.target_belief_id == belief_id,
+             ProposalLog.created_belief_id == belief_id),),
+        fingerprints, "mm_proposal_log",
     )
+    fingerprints and fingerprints.append(_fingerprint_row("mm_beliefs", belief))
     session.delete(belief)
     session.flush()
     # Evidence no belief points at is garbage, not provenance.
-    pruned = _prune_orphan_evidence(session, user_id)
+    pruned = _prune_orphan_evidence(session, user_id, fingerprints=fingerprints)
 
     # Invalidate derived state: source memory was deleted, so
     # snapshots (derived understanding) and pending evolution jobs
     # are no longer valid.
-    session.query(Snapshot).filter(Snapshot.user_id == user_id).delete(synchronize_session=False)
+    _collect(session, Snapshot, (Snapshot.user_id == user_id,),
+             fingerprints, "mm_snapshots")
     session.query(EvolutionJob).filter(
         EvolutionJob.user_id == user_id,
         EvolutionJob.status.in_(("pending", "running")),
@@ -2787,12 +2863,14 @@ def forget_belief(
             "proposals": int(proposals_deleted),
         },
     )
+    generation = bump_deletion_generation(session, user_id, scope="belief")
     if bump_revision:
         touch_memory_state(session, user_id)
-    return True
+    return generation
 
 
-def _purge_belief_ledger(session: Session, belief: Belief) -> dict[str, int]:
+def _purge_belief_ledger(session: Session, belief: Belief,
+                         fingerprints: list | None = None) -> dict[str, int]:
     """Delete the versioned-ledger rows for one belief's slot.
 
     A slot is (user, subject, predicate, slot key); every value it ever
@@ -2811,16 +2889,138 @@ def _purge_belief_ledger(session: Session, belief: Belief) -> dict[str, int]:
     )
     if identity is None:
         return {"versions": 0, "identities": 0}
-    versions_deleted = (
-        session.query(BeliefVersion)
-        .filter(BeliefVersion.identity_id == identity.id)
-        .delete(synchronize_session=False)
-    )
+    if fingerprints is not None:
+        _collect(session, BeliefVersion, (BeliefVersion.identity_id == identity.id,),
+                 fingerprints, "mm_belief_versions")
+    else:
+        session.query(BeliefVersion).filter(
+            BeliefVersion.identity_id == identity.id
+        ).delete(synchronize_session=False)
+    fingerprints and fingerprints.append(_fingerprint_row("mm_belief_identities", identity))
     session.delete(identity)
-    return {"versions": int(versions_deleted), "identities": 1}
+    return {"versions": 1, "identities": 1}
 
 
-def forget_session_summary(session: Session, user_id: str, session_id: str) -> bool:
+@_sanctioned_writer("sync")
+def record_tombstones_applied(session: Session, rows: list[dict]) -> int:
+    """Record which cross-device tombstones were applied -- the
+    idempotency key is (origin, origin_seq, origin_hash) -- the origin's
+    log position AND its entry hash: a rolled-back sender re-issuing a
+    deletion at a reused seq has a different entry hash, so it applies
+    instead of colliding
+    the tombstone was exported with: a rolled-back sender reuses
+    origin_seq for a different deletion whose hash differs, so seq-based
+    keys would misfile it as a duplicate.  Rows whose scope no longer
+    exists locally are recorded too (a no-op apply is still an apply).
+    Called only inside the tombstone-application transaction (M4 batch 2
+    task 1): a rolled-back batch leaves no applied record behind."""
+    from mirror_memory.core.models import TombstoneApplied
+
+    for row in rows:
+        session.add(TombstoneApplied(
+            origin=row["origin"], origin_seq=row["origin_seq"],
+            origin_hash=row["origin_hash"],
+            user_id=row["user_id"], scope=row["scope"],
+            scope_key=row.get("scope_key", ""),
+            local_seq=row.get("local_seq"),
+        ))
+    session.flush()
+    return len(rows)
+
+
+@_sanctioned_writer("sync")
+def record_catchup(session: Session, peer_db_id: str, cursor: int,
+                   chain_hash: str = "") -> None:
+    """Advance the peer's consumed cursor + chain hash.  The chain hash
+    anchors the channel-continuity check: a next batch whose
+    from_chain_hash differs means the peer rolled back.
+
+    This is PER-BATCH PROGRESS only -- it deliberately does NOT touch
+    ``last_catchup_at``: a partial catch-up (or a rescan re-anchor, or a
+    bare apply call) must never be recorded as a complete one, or the
+    offline grace would restart on progress the peer never finished
+    (batch-2 patch 4, task 1).  Only :func:`mark_catchup_complete`, called
+    by the catch-up loop after it CONFIRMS the tail, stamps the instant."""
+    from mirror_memory.core.tenancy import current_tenant
+    from mirror_memory.core.models import SyncPeer
+
+    tenant_id, app_id = current_tenant()
+    row = session.get(SyncPeer, (tenant_id, app_id, peer_db_id))
+    if row is None:
+        row = SyncPeer(peer_db_id=peer_db_id, cursor=cursor)
+        session.add(row)
+    row.cursor = cursor
+    if chain_hash:
+        row.chain_hash = chain_hash
+
+
+@_sanctioned_writer("sync")
+def mark_catchup_complete(session: Session, peer_db_id: str) -> None:
+    """Stamp ``last_catchup_at`` -- the instant the catch-up loop reached
+    the peer's tail (an empty batch that did not rescan).  This is the
+    ONLY writer of the offline grace period's anchor: intermediate
+    batches, rescan re-anchors and bare ``apply_tombstones`` calls record
+    progress, never completion.  Called only by the engine's catch-up
+    loop (MemoryEngine._catch_up), after its exit condition."""
+    from mirror_memory.core.tenancy import current_tenant
+    from mirror_memory.core.models import SyncPeer
+
+    tenant_id, app_id = current_tenant()
+    row = session.get(SyncPeer, (tenant_id, app_id, peer_db_id))
+    if row is None:
+        row = SyncPeer(peer_db_id=peer_db_id, cursor=0)
+        session.add(row)
+    row.last_catchup_at = datetime.utcnow()
+    session.flush()
+
+
+def tenant_knows_user(session: Session, user_id: str) -> bool:
+    """Has THIS tenant ever seen *user_id*?  Any of: a memory preference
+    row, a purpose grant, a belief, a users row.  The cloud refuses
+    tombstones for users its authenticated tenant does not know (M4
+    batch 2 task 2); the check reads under the tenant scope, so another
+    tenant's rows for the same user id are invisible."""
+    from mirror_memory.core.models import PurposeGrant, User
+
+    if session.get(MemoryPreference, user_id) is not None:
+        return True
+    if session.scalar(select(Belief.id).where(Belief.user_id == user_id).limit(1)) is not None:
+        return True
+    if session.scalar(select(PurposeGrant.user_id).where(
+            PurposeGrant.user_id == user_id).limit(1)) is not None:
+        return True
+    return session.scalar(select(User.id).where(User.id == user_id).limit(1)) is not None
+
+
+def read_sync_peer(session: Session, peer_db_id: str) -> SyncPeer | None:
+    """The stored peer state (cursor, last catch-up).  A read."""
+    from mirror_memory.core.models import SyncPeer
+
+    return session.get(SyncPeer, (*_tenant_key(), peer_db_id))
+
+
+def _tenant_key() -> tuple[str, str]:
+    from mirror_memory.core.tenancy import current_tenant
+
+    return current_tenant()
+
+
+def belief_by_global_id(session: Session, user_id: str, global_id: str) -> Belief | None:
+    """The user's belief with this cross-device identity (M4 batch 2):
+    tombstones name beliefs by global_id, never by the local integer id
+    (restores and other devices reuse those)."""
+    if not global_id:
+        return None
+    return session.scalar(
+        select(Belief).where(
+            Belief.user_id == user_id,
+            Belief.global_id == global_id,
+        )
+    )
+
+
+def forget_session_summary(session: Session, user_id: str, session_id: str,
+                           *, fingerprints: list | None = None) -> bool:
     """Targeted forget: delete EVERY session summary for (user, session).
 
     Since the per-purpose summary split (M3 batch-3 patch) a session
@@ -2829,13 +3029,10 @@ def forget_session_summary(session: Session, user_id: str, session_id: str) -> b
     forget must be unconditional (any authorization state, no visibility
     filter).  Returns ``True`` if at least one row was removed.
     """
-    removed = (
-        session.query(SessionSummary)
-        .filter(
-            SessionSummary.user_id == user_id,
-            SessionSummary.session_id == session_id,
-        )
-        .delete(synchronize_session=False)
+    removed = _collect(
+        session, SessionSummary,
+        (SessionSummary.user_id == user_id, SessionSummary.session_id == session_id),
+        fingerprints, "mm_session_summaries",
     )
     session.flush()
     return removed > 0

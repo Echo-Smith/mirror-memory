@@ -16,6 +16,7 @@ it, so a new memory-reading entry cannot ship un-audited.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,8 @@ PURPOSE = "api"
 def db(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path}/audit.db")
     Base.metadata.create_all(eng)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng)
     yield eng
     eng.dispose()
 
@@ -428,6 +431,10 @@ def test_each_allowed_read_adds_exactly_one_audit_insert(db):
         assert all(a.upper().startswith("INSERT") for a in audit), (key, audit)
 
 
+@pytest.mark.skipif(
+    os.environ.get("MM_DATABASE_URL", "").startswith("postgresql"),
+    reason="the embedded write-lock behaviour under concurrent audited reads "
+           "is SQLite semantics (PG readers do not take the file write lock)")
 def test_sqlite_concurrent_reads_complete_under_the_write_lock(tmp_path):
     """On SQLite every audited read is now a write transaction: concurrent
     readers serialise on the file's write lock instead of running in
@@ -436,6 +443,11 @@ def test_sqlite_concurrent_reads_complete_under_the_write_lock(tmp_path):
     url = f"sqlite:///{tmp_path}/audit-lock.db"
     eng0 = create_engine(url)
     Base.metadata.create_all(eng0)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(eng0)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(eng0)
     eng0.dispose()
     db = create_engine(url)
     try:

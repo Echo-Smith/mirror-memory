@@ -1,0 +1,1302 @@
+"""M4 task 4: deletion racing the publish, 50 real rounds -- and task 5's
+backup/restore e2e with the REAL backup tools (pg_dump / pg_restore on
+PostgreSQL; SQLite's backup API embedded).
+
+Each race round: memory + a claimed job; a deletion (user scope)
+commits while the worker publishes.  Every round ends ONE of two ways:
+- the publish completed BEFORE the deletion committed -> the deletion
+  removes what it wrote (nothing lands after the deletion);
+- the job was cancelled/deleted (deletion_generation_changed,
+  LeaseLost, or the job row gone) -> zero writes.
+A publish that lands AFTER the deletion committed is the failure.
+
+The e2e flows drive the REAL restore path: pg_dump the main DB, delete,
+pg_restore it back (the watermark row returns with the backup), startup
+reconciliation replays the log, and no read surface (inventory-driven)
+carries the sentinel.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import random
+import threading
+from pathlib import Path
+import os
+import subprocess
+
+import pytest
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import sessionmaker
+
+from mirror_memory.api import MemoryEngine
+from mirror_memory.config.loader import load_config
+from mirror_memory.core import schema_migration as sm
+from mirror_memory.core.schema_migration import Step11DeletionReplay
+from mirror_memory.core.deletion import FileDeletionLog
+from mirror_memory.core.models import (
+    Base, Belief, DeletionGeneration, EvolutionJob, Snapshot,
+)
+from mirror_memory.core.replay import reconcile
+from mirror_memory.core.sql_audit import no_audit_scope
+from mirror_memory.core.repository import set_memory_enabled
+from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqueue_job
+
+USER = "u-race"
+# the mesh/sync plane runs under the mesh file's user (the two constants
+# exist side by side on purpose: USER belongs to the local-restore tests)
+from tests.test_sync_mesh import USER as SYNC_USER  # noqa: E402
+TENANT = ("default", "default")
+
+
+@pytest.fixture(autouse=True)
+def _single_tenant_mode_off():
+    """The mesh devices run single_tenant_mode=True (a process-wide
+    contextvar): reset it before/after every test so later tests keep
+    tenant filtering."""
+    from mirror_memory.core.tenancy import set_single_tenant_mode
+
+    set_single_tenant_mode(False)
+    yield
+    set_single_tenant_mode(False)
+SENTINEL = "RACE-SENTINEL-9"
+
+
+class _FakeLLM:
+    def generate(self, **kw):
+        return '{"patterns": [], "support_policy": {}}'
+
+
+def _config():
+    cfg = load_config("config/")
+    cfg.llm_client = _FakeLLM()
+    cfg.worker.job_lease_seconds = 60
+    return cfg
+
+
+def _seed(db) -> None:
+    Base.metadata.create_all(db)
+
+    from mirror_memory.core import schema_migration as _sm_mint
+    _sm_mint.ensure_watermark(db)
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+
+
+def _race_round(db, round_no, *, deletion_log: FileDeletionLog | None = None,
+                database_url: str | None = None) -> None:
+    """One deletion-vs-publish round (SQLite: writer serialisation; the
+    worker's publish and the deletion interleave through the file lock).
+    The PG leg passes its own deletion log (a non-SQLite URL never gets a
+    derived directory -- M4 patch task 2) and tolerates deadlock/
+    serialisation aborts as "did not land" outcomes with a bounded retry."""
+    cfg = _config()
+    if deletion_log is not None:
+        cfg.deletion_log.directory = str(deletion_log.directory)
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("seed the round"):
+        s = F()
+        set_memory_enabled(s, USER, True)
+        s.commit()
+        s.close()
+
+    outcomes: dict = {}
+
+    #: a PG deadlock/serialisation victim rolled back ENTIRELY: it "did
+    # not land" -- retry a bounded number of times before giving up
+    import time as _time
+
+    from sqlalchemy.exc import OperationalError
+
+    def _pg_retry(work, *, attempts: int = 3):
+        for attempt in range(attempts):
+            try:
+                return work(), None
+            except OperationalError as exc:
+                if attempt == attempts - 1:
+                    return None, repr(exc)
+                _time.sleep(0.05 * (attempt + 1))
+
+    def run_publish():
+        def work():
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    job = enqueue_job(s, USER, cfg, purpose="api")
+                    s.commit()
+                    token = _claim_job(s, job.id, lease_seconds=60)
+                    row = s.get(EvolutionJob, job.id)
+                    _process_single_job(s, row, cfg, token)
+                    s.commit()
+                    s.expire_all()
+                    final = s.get(EvolutionJob, job.id)
+                    outcomes["publish"] = (final.status if final else "deleted",
+                                           final.error_code if final else "")
+                except Exception as exc:
+                    # a job ROW deleted under the publisher (user-scope
+                    # delete) surfaces here -- that IS the "job deleted"
+                    # outcome, not an error
+                    s.rollback()
+                    outcomes["publish"] = ("deleted-or-cancelled", repr(exc))
+                finally:
+                    s.close()
+        try:
+            _, err = _pg_retry(work)
+            if err is not None:
+                outcomes["publish"] = ("aborted", err)
+        except Exception as exc:  # noqa: BLE001 -- recorded
+            outcomes["publish"] = ("error", repr(exc))
+
+    def run_delete():
+        # ONE engine for the whole round (retried attempts reuse it): a
+        # fresh engine per attempt leaks PG connection slots
+        try:
+            me = MemoryEngine(config=cfg,
+                              database_url=database_url or str(db.url),
+                              tenant_id=TENANT[0], app_id=TENANT[1],
+                              llm_client=_FakeLLM(),
+                              **({"deletion_log": deletion_log}
+                                 if deletion_log is not None else {}))
+            try:
+                def work():
+                    with tenant_scope(*TENANT):
+                        s = F()
+                        try:
+                            me.delete_memories(user_id=USER, purpose="api")
+                        finally:
+                            s.close()
+                _, err = _pg_retry(work)
+                outcomes["delete"] = ("committed" if err is None
+                                      else f"aborted: {err}")
+            finally:
+                me._engine.dispose()
+        except Exception as exc:  # noqa: BLE001
+            outcomes["delete"] = repr(exc)
+
+    # the memory the publish would write through (claimed work): observe
+    # first, then enqueue so the publish has something to synthesise
+    with tenant_scope(*TENANT), fixture_write_scope("seed content"):
+        s = F()
+        from mirror_memory.core.repository import record_claim
+
+        record_claim(s, USER, dimension="topic", key=f"k{round_no}",
+                     claim_text=f"round {round_no} content", confidence=0.8,
+                     session_id=f"sr{round_no}")
+        s.commit()
+        s.close()
+
+    tp = threading.Thread(target=run_publish)
+    td = threading.Thread(target=run_delete)
+    td.start()
+    tp.start()
+    td.join(timeout=60)
+    tp.join(timeout=60)
+
+    # BOTH threads finished (no poisoning for the next round)
+    assert "delete" in outcomes and "publish" in outcomes, outcomes
+    assert "error', repr" not in str(outcomes.get("publish", "")), outcomes
+
+    # the invariant: whatever the publish wrote is GONE once the deletion
+    # has committed
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            left = s.query(Belief).filter(Belief.user_id == USER).count()
+            gen = s.execute(
+                select(DeletionGeneration.generation)
+                .where(DeletionGeneration.user_id == USER)
+                .order_by(DeletionGeneration.generation.desc())
+            ).scalars().first()
+        finally:
+            s.close()
+    assert left == 0, (outcomes, left)
+    assert gen is not None and gen >= 1
+
+
+def test_deletion_vs_publish_50_rounds_sqlite(tmp_path):
+    db = create_engine(f"sqlite:///{tmp_path / 'race.db'}", connect_args={"timeout": 30.0})
+    _seed(db)
+    for round_no in range(50):
+        _race_round(db, round_no)
+    db.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M4 batch-1 patch task 5: the SAME races as REAL PG concurrency, each on
+# its OWN database (never the shared mm_test -- its historical state
+# poisoned earlier attempts)
+# ---------------------------------------------------------------------------
+
+
+def _pg_own_database(main_db: str):
+    """An INDEPENDENT PG database for one test: dropped, recreated, and
+    brought up owner-side (schema + RLS + watermark + Step11 grants).
+    Returns (runtime_url, admin_url); the caller drops it again."""
+    admin_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/postgres"
+    main_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with no_audit_scope(), admin_engine.connect() as conn:
+        conn.exec_driver_sql(
+            f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+        conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+    admin_engine.dispose()
+    from mirror_memory.core.models import Base as _Base
+    from mirror_memory.core.schema_migration import (
+        Step11DeletionReplay,
+        install_row_level_security,
+    )
+
+    owner_engine = create_engine(main_url)
+    _Base.metadata.create_all(owner_engine)
+    sm.ensure_watermark(owner_engine)
+    install_row_level_security(owner_engine, verify=False)
+    Step11DeletionReplay().apply(owner_engine)
+    Step11DeletionReplay().verify(owner_engine)
+    owner_engine.dispose()
+    from sqlalchemy.engine import make_url
+
+    from tests.conftest import PG_TEST_ROLE_PASSWORDS
+
+    runtime_url = (
+        make_url(main_url)
+        .set(username="mm_app", password=PG_TEST_ROLE_PASSWORDS["app"])
+        .render_as_string(hide_password=False)
+    )
+    return runtime_url, admin_url
+
+
+def _pg_drop_database(main_db: str, admin_url: str) -> None:
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with contextlib.suppress(Exception), no_audit_scope(), admin_engine.connect() as conn:
+        conn.exec_driver_sql(
+            f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+    admin_engine.dispose()
+
+
+_pg_needs = pytest.mark.skipif(
+    not os.environ.get("MM_DATABASE_URL", "").startswith("postgresql"),
+    reason="needs MM_DATABASE_URL pointing at PostgreSQL",
+)
+
+
+@_pg_needs
+def test_generation_cas_concurrency_pg(tmp_path):
+    """The generation compare-and-swap under REAL PG concurrency: 8
+    threads x 25 bumps (200 total) on its own database -- every generation
+    exactly once, no duplicates, no gaps."""
+    from mirror_memory.core.repository import (
+        StaleDeletionGeneration,
+        bump_deletion_generation,
+    )
+
+    main_db = "mm_test_m4_cas"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    engine = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=engine)
+    results: list[int] = []
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        got: list[int] = []
+        try:
+            for _ in range(25):
+                while True:
+                    try:
+                        with tenant_scope(*TENANT):
+                            s = F()
+                            try:
+                                gen = bump_deletion_generation(
+                                    s, USER, scope="user")
+                                s.commit()
+                            finally:
+                                s.close()
+                        got.append(gen)
+                        break
+                    except StaleDeletionGeneration:
+                        continue  # the CAS lost the race: retry
+        except Exception as exc:  # noqa: BLE001 -- recorded
+            failures.append(repr(exc))
+        with lock:
+            results.extend(got)
+
+    try:
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not failures, failures
+        assert len(results) == 200, len(results)
+        assert sorted(results) == list(range(1, 201)), (
+            "generations must be exactly 1..200: no duplicates, no gaps")
+    finally:
+        engine.dispose()
+        _pg_drop_database(main_db, admin_url)
+
+
+@_pg_needs
+def test_deletion_vs_publish_50_rounds_pg(tmp_path):
+    """The 50-round deletion-vs-publish race on REAL PostgreSQL (its own
+    database): a publish that lands AFTER the deletion committed is the
+    failure -- whatever the publish wrote is gone once the deletion has
+    committed."""
+    main_db = "mm_test_m4_race"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    log = FileDeletionLog(tmp_path / "deletions")
+    engine = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    try:
+        _seed(engine)
+        for round_no in range(50):
+            _race_round(engine, round_no, deletion_log=log,
+                        database_url=runtime_url)
+    finally:
+        engine.dispose()
+        _pg_drop_database(main_db, admin_url)
+
+
+# ---------------------------------------------------------------------------
+# task 5: the real backup tools
+# ---------------------------------------------------------------------------
+
+
+def _docker() -> str | None:
+    """The docker CLI when the PG server runs in the container mm-pg (the
+    local dev shape); CI installs the client tools natively."""
+    import shutil
+
+    if shutil.which("docker") and subprocess.run(
+        ["docker", "inspect", "mm-pg"], capture_output=True
+    ).returncode == 0:
+        return "docker"
+    return None
+
+
+def _pg_dump(main_db: str, out: str, main_url: str | None = None) -> None:
+    """A custom-format dump of *main_db*, taken inside the container when
+    the server runs there (the file lands on the host either way)."""
+    env = dict(os.environ, PGPASSWORD="mm")
+    docker = _docker()
+    if docker:
+        result = subprocess.run(
+            ["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg",
+             "pg_dump", "-U", "postgres", "--format=custom", main_db],
+            env=env, capture_output=True, check=True)
+        Path(out).write_bytes(result.stdout)
+    else:
+        # the CI runner has the client tools; connect explicitly (a bare
+        # db name would use the OS user's local socket).  Strip ONLY the
+        # driver segment: "+psycopg" leaves a bare scheme otherwise.
+        pg_url = (main_url or "").replace("postgresql+psycopg://", "postgresql://", 1)
+        subprocess.run(["pg_dump", "--format=custom", "--file", out, pg_url],
+                       env=env, check=True)
+
+
+def _pg_restore(main_db: str, dump: str, main_url: str) -> None:
+    env = dict(os.environ, PGPASSWORD="mm")
+    docker = _docker()
+    if docker:
+        psql = (["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg", "psql",
+                 "-U", "postgres"]) + ["-c"]
+    else:
+        # the CI runner's psql connects via TCP with the password (there is
+        # no local socket for a service-container server)
+        pg_admin = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/postgres"
+        pg_admin = pg_admin.replace("postgresql+psycopg://", "postgresql://", 1)
+        psql = ["psql", pg_admin, "-c"]
+    import time
+
+    result = None
+    for attempt in range(5):
+        # WITH (FORCE) terminates attached backends (PG 13+) -- the e2e's
+        # own leaked pools would otherwise hold the drop forever
+        result = subprocess.run(
+            psql + [f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)'],
+            env=env, capture_output=True, text=True)
+        if result.returncode == 0:
+            break
+        time.sleep(0.5 * (attempt + 1))  # terminated backends take a moment
+    if result.returncode != 0:
+        detail = result.stderr or result.stdout or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        raise RuntimeError(f"drop failed: {detail}")
+    subprocess.run(psql + [f'CREATE DATABASE "{main_db}"'], env=env, check=True)
+    if docker:
+        restore = ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+                   "pg_restore", "-U", "postgres", "--dbname", main_db]
+        subprocess.run(restore, input=Path(dump).read_bytes(), env=env, check=True)
+    else:
+        # the native pg_restore connects explicitly (a bare db name would
+        # use the OS user's local socket); pg_restore CANNOT restore into a
+        # database that has live connections, so the drop used WITH (FORCE)
+        # and the restore must not race the terminated backends: retry
+        import time
+
+        from sqlalchemy.engine import make_url
+
+        # the native pg_restore connects explicitly and MUST target the
+        # e2e's own database -- restoring into MM_DATABASE_URL (the shared
+        # mm_test) would wipe the shared state mid-run
+        # libpq only recognises a URI when the scheme is a bare
+        # postgresql:// -- the "+psycopg" driver segment would make it
+        # fall back to the local socket
+        pg_url = (
+            make_url(main_url)
+            .set(drivername="postgresql", username="postgres", password="mm")
+            .render_as_string(hide_password=False)
+        )
+        result = subprocess.run(
+            ["pg_restore", "--dbname", pg_url],
+            input=Path(dump).read_bytes(), env=env, capture_output=True)
+        if result.returncode != 0:
+            detail = result.stderr or result.stdout or ""
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            raise RuntimeError(f"pg_restore failed: {detail}")
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MM_DATABASE_URL", "").startswith("postgresql"),
+    reason="needs MM_DATABASE_URL pointing at PostgreSQL",
+)
+def test_backup_restore_replay_end_to_end_pg(tmp_path):
+    """The FULL restore story with the real tools: pg_dump -> deletions ->
+    pg_restore -> startup reconciliation -> every read surface clean.
+    Runs against its OWN database (the dump/restore drops and recreates
+    it), owner-side first: the app role never runs DDL."""
+    main_db = "mm_test_m4_e2e"
+    admin_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/postgres"
+    main_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    dump_path = str(tmp_path / "main.dump")
+    log = FileDeletionLog(tmp_path / "deletions")
+
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin_engine.connect() as conn:
+            # start clean: a leftover from a failed previous run would carry
+            # a watermark ahead of this run's fresh log; WITH (FORCE)
+            # terminates attached backends (the e2e's own leaked pools)
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+            conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+        admin_engine.dispose()
+
+        # the owner builds the schema + RLS + watermark (the app role never
+        # runs DDL); the app role then serves
+        from mirror_memory.core.models import Base as _Base
+
+        owner_engine = create_engine(main_url)
+        _Base.metadata.create_all(owner_engine)
+        from mirror_memory.core import schema_migration as _sm_mint
+
+        _sm_mint.ensure_watermark(owner_engine)
+        from mirror_memory.core.schema_migration import (
+            Step11DeletionReplay, install_row_level_security,
+        )
+
+        # the same call the harness makes: ownership, grants, ENABLE+FORCE,
+        # policies -- everything the app role needs to serve
+        install_row_level_security(owner_engine, verify=False)
+        Step11DeletionReplay().apply(owner_engine)
+        Step11DeletionReplay().verify(owner_engine)
+        owner_engine.dispose()
+
+        # the runtime serves through the APP role (mode A) like production
+        # -- re-point THIS database's URL at the app login
+        from sqlalchemy.engine import make_url
+
+        from tests.conftest import PG_TEST_ROLE_PASSWORDS
+
+        runtime_url = (
+            make_url(main_url)
+            .set(username="mm_app", password=PG_TEST_ROLE_PASSWORDS["app"])
+            .render_as_string(hide_password=False)
+        )
+        e2e_cfg = _config()
+        e2e_cfg.session_summary_enabled = True  # the session-scope delete needs rows
+        eng = MemoryEngine(config=e2e_cfg, database_url=runtime_url,
+                           tenant_id=TENANT[0], app_id=TENANT[1],
+                           llm_client=_FakeLLM(), deletion_log=log)
+        eng._ensure_db()
+        sqlalchemy_engine = eng._engine
+        eng.observe(user_id=USER, session_id="s1",
+                    text="I like PGSENTINEL and coffee.", purpose="api")
+
+        # BACKUP (the real tool)
+        _pg_dump(main_db, dump_path, main_url=main_url)
+
+        # three scopes of deletion
+        F = sessionmaker(bind=create_engine(runtime_url))
+        with tenant_scope(*TENANT):
+            s = F()
+            try:
+                belief = s.query(Belief).filter(
+                    Belief.claim_text.contains("PGSENTINEL")).first()
+            finally:
+                s.close()
+        assert eng.forget_belief(user_id=USER, belief_id=belief.id, purpose="api") is True
+        eng.observe(user_id=USER, session_id="s2", text="I also nap at noon.", purpose="api")
+        eng.forget_session(user_id=USER, session_id="s2", purpose="api")
+        eng.delete_memories(user_id=USER, purpose="api")
+        db_id, applied = sm.read_watermark(create_engine(runtime_url))
+        tail = log.head(db_id)[0]
+        assert applied == tail >= 3
+
+        # RESTORE with the real tool: the watermark row comes back with it
+        sqlalchemy_engine.dispose()
+        _pg_restore(main_db, dump_path, main_url=main_url)
+
+        # STARTUP: the replay happens at reconcile -- the app role cannot
+        # run the watermark DDL, so the check runs owner-side first (a
+        # restored production database is brought up by the owner too),
+        # then the app engine serves
+        owner_engine = create_engine(main_url)
+        # a real bring-up of a restored database re-applies the RLS
+        # posture and the watermark grants owner-side first (the restore
+        # dropped the app role's grants -- they ride the dumped objects)
+        _Base.metadata.create_all(owner_engine)
+        install_row_level_security(owner_engine, verify=False)
+        Step11DeletionReplay().apply(owner_engine)
+        Step11DeletionReplay().verify(owner_engine)
+        status = reconcile(lambda: sessionmaker(bind=owner_engine)(), log)
+        owner_engine.dispose()
+        dbg_engine = create_engine(main_url)
+        _db_id_dbg, applied_owner = sm.read_watermark(dbg_engine)
+        dbg_engine.dispose()
+        _db_id2, applied2 = sm.read_watermark(create_engine(runtime_url))
+        assert applied2 == tail == applied_owner, (
+            applied2, tail, applied_owner, status)
+
+        # every read surface is clean (the SAME log instance: a default-
+        # constructed engine would look at a different log and refuse)
+        eng2 = MemoryEngine(config=e2e_cfg, database_url=runtime_url,
+                            tenant_id=TENANT[0], app_id=TENANT[1],
+                            llm_client=_FakeLLM(), deletion_log=log)
+        assert "PGSENTINEL" not in (eng2.recall(user_id=USER, query="PGSENTINEL", purpose="api") or "")
+        assert "PGSENTINEL" not in json.dumps(
+            eng2.export_page(user_id=USER, purpose="api").to_dict(), default=str)
+        assert eng2.get_beliefs(user_id=USER, purpose="api") == []
+        eng2._engine.dispose()
+
+        # the e2e's own database is dropped again (it must not leak)
+        with no_audit_scope(), admin_engine.connect() as conn:
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+        admin_engine.dispose()
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+            with no_audit_scope(), cleanup.connect() as conn:
+                conn.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+            cleanup.dispose()
+
+
+def test_id_reuse_is_not_fooled_by_the_fingerprint(tmp_path):
+    """BACKUP -> create A -> delete A -> RESTORE -> create B (same id) ->
+    replay: B survives (different created_at), A does not resurrect."""
+    db = create_engine(f"sqlite:///{tmp_path / 'reuse.db'}")
+    _seed(db)
+    log = FileDeletionLog(tmp_path / "deletions")
+    main_engine = create_engine(str(db.url))
+    eng = MemoryEngine(config=_config(), database_url=str(db.url),
+                       tenant_id=TENANT[0], app_id=TENANT[1],
+                       llm_client=_FakeLLM(), deletion_log=log)
+
+    backup_url = str(db.url).replace("reuse.db", "reuse-backup.db")
+    src = main_engine.raw_connection()
+    dest = create_engine(backup_url).raw_connection()
+    src.connection.backup(dest.connection)
+    dest.close()
+    src.close()
+
+    # create A (with a KNOWN created_at), then delete it
+    F = sessionmaker(bind=db)
+    with tenant_scope(*TENANT), fixture_write_scope("create A"):
+        s = F()
+        from mirror_memory.core.repository import record_claim
+
+        record_claim(s, USER, dimension="topic", key="a", claim_text="belief A",
+                     confidence=0.9, session_id="s1")
+        row = s.query(Belief).filter_by(key="a").one()
+        row.created_at = row.created_at.replace(year=2020)
+        s.commit()
+        a_id = row.id
+        s.close()
+    eng.forget_belief(user_id=USER, belief_id=a_id, purpose="api")
+
+    # RESTORE (A is back), then create B with the SAME id and a DIFFERENT
+    # created_at (the autoincrement continues after a restore into the
+    # same file -- force the reuse explicitly to pin the mechanism)
+    main_engine.dispose()
+    db.dispose()
+    restored = create_engine(backup_url)
+    raw = restored.raw_connection()
+    dest2 = create_engine(str(eng._database_url)).raw_connection()
+    raw.connection.backup(dest2.connection)
+    dest2.close()
+    raw.close()
+    restored.dispose()
+
+    F = sessionmaker(bind=create_engine(eng._database_url))
+    with tenant_scope(*TENANT), fixture_write_scope("create B with A's id"):
+        s = F()
+        from mirror_memory.core.repository import record_claim
+
+        record_claim(s, USER, dimension="topic", key="b", claim_text="belief B",
+                     confidence=0.9, session_id="s2")
+        row = s.query(Belief).filter_by(key="b").one()
+        row.id = a_id  # force the id reuse
+        row.created_at = row.created_at.replace(year=2026)
+        s.commit()
+        b_id = row.id
+        s.close()
+    assert b_id == a_id, "the test must actually reuse the id"
+
+    reconcile(lambda: F(), log, tenant=TENANT)
+
+    with tenant_scope(*TENANT):
+        s = F()
+        try:
+            rows = s.query(Belief).all()
+        finally:
+            s.close()
+    assert [(r.id, r.claim_text) for r in rows] == [(a_id, "belief B")], (
+        "B (recreated) must survive; A must not resurrect")
+
+
+@_pg_needs
+def test_real_step10_backup_flow_pg(tmp_path):
+    """The lineage story on PostgreSQL with the real tools: strip a live
+    database to the step-10 shape, pg_dump it (the pre-M4 backup), deploy
+    M4 (FIRST mint -- the log is empty), delete the sentinel, restore the
+    step-10 backup, REFUSE the migration (the log holds the genesis),
+    adopt (migrates with minting suppressed), replay: sentinel gone."""
+    from sqlalchemy.orm import sessionmaker
+
+    from mirror_memory.core.repository import (
+        record_claim,
+        set_memory_enabled,
+    )
+    from mirror_memory.core.schema_migration import (
+        install_row_level_security,
+        upgrade_database,
+    )
+    from tests.conftest import strip_to_step10
+
+    main_db = "mm_test_m4_v10"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    owner_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    log = FileDeletionLog(tmp_path / "deletions")
+    cfg = _config()
+    cfg.deletion_log.directory = str(tmp_path / "deletions")
+
+    owner = create_engine(owner_url)
+    runtime = create_engine(runtime_url)
+    F = sessionmaker(bind=runtime)
+    try:
+        # seed through the app role WITHOUT starting an engine (no genesis)
+        with tenant_scope(*TENANT), fixture_write_scope("seed pre-M4 data"):
+            s = F()
+            set_memory_enabled(s, USER, True)
+            s.commit()
+            record_claim(s, USER, dimension="topic", key="k",
+                         claim_text="I like PGV10RESTORE and coffee.",
+                         confidence=0.9, session_id="s1")
+            s.commit()
+            s.close()
+
+        # strip to the REAL step-10 shape (owner-side)
+        strip_to_step10(owner)
+        assert sm.current_version(owner) == 10
+
+        # the REAL step-10 backup
+        dump_path = str(tmp_path / "v10.dump")
+        _pg_dump(main_db, dump_path, main_url=owner_url)
+
+        # deploy M4: first deployment (empty log) -> the migration MINTS
+        upgrade_database(owner, default_tenant="default",
+                         default_app="default", config=cfg,
+                         confirm_backup=True)
+        db_id, applied = sm.read_watermark(runtime)
+        assert db_id and applied == 0
+
+        # the engine binds the genesis to the minted db_id; delete
+        eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                           tenant_id=TENANT[0], app_id=TENANT[1],
+                           llm_client=_FakeLLM(), deletion_log=log)
+        with tenant_scope(*TENANT):
+            s = F()
+            belief = s.query(Belief).filter(
+                Belief.claim_text.contains("PGV10RESTORE")).one()
+            s.close()
+        assert eng.forget_belief(user_id=USER, belief_id=belief.id,
+                                 purpose="api")
+        eng._engine.dispose()
+        runtime.dispose()
+
+        # restore the step-10 backup (real tools)
+        _pg_restore(main_db, dump_path, main_url=owner_url)
+        owner = create_engine(owner_url)
+        runtime = create_engine(runtime_url)
+        assert sm.read_watermark(runtime) is None
+        assert sm.current_version(owner) == 10
+        # the restore bring-up re-applies the posture owner-side first
+        # (the e2e's lesson: the dumped grants ride the objects, the
+        # ownership/posture re-assertion is part of bring-up)
+        install_row_level_security(owner, verify=False)
+
+        # the migration REFUSES: the log proves the line ran M4 already
+        from mirror_memory.core.schema_migration import WatermarkMissing
+
+        with pytest.raises(WatermarkMissing) as info:
+            upgrade_database(owner, default_tenant="default",
+                             default_app="default", config=cfg,
+                             confirm_backup=True)
+        assert db_id[:8] in str(info.value)
+
+        # adopt: migrates first (mint suppressed), then the log's db_id
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "mirror_memory.deletion_adopt",
+             "--database-url", owner_url, "--db-id", db_id,
+             "--config-dir", "config/"],
+            capture_output=True, text=True, env=dict(os.environ))
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "minting suppressed" in result.stdout
+        assert "watermark adopted" in result.stdout
+
+        # belt and braces: the posture the app role serves under (the e2e's
+        # restore bring-up; step-11 grants came from the adopt migration)
+        install_row_level_security(owner, verify=False)
+
+        # the replay removes the sentinel
+        app2 = MemoryEngine(config=cfg, database_url=runtime_url,
+                            tenant_id=TENANT[0], app_id=TENANT[1],
+                            llm_client=_FakeLLM(), deletion_log=log)
+        app2.get_beliefs(user_id=USER, purpose="api")  # startup + replay
+        got_db_id, got_applied = sm.read_watermark(runtime)
+        assert got_db_id == db_id and got_applied >= 1
+        with tenant_scope(*TENANT):
+            s = F()
+            assert s.query(Belief).filter(
+                Belief.claim_text.contains("PGV10RESTORE")).count() == 0
+            s.close()
+        app2._engine.dispose()
+    finally:
+        owner.dispose()
+        runtime.dispose()
+        _pg_drop_database(main_db, admin_url)
+
+
+@_pg_needs
+def test_tombstone_apply_vs_publish_50_rounds_pg(tmp_path):
+    """M4 batch 2 task 1 on PostgreSQL: the cloud (PG, multi-tenant mode)
+    applies a user-scope tombstone uploaded by the edge (SQLite) while a
+    claimed job publishes.  The tombstone advances the generation; the
+    publish is cancelled or its writes are removed by the deletion --
+    memory never lands after the tombstone."""
+    from sqlalchemy.orm import sessionmaker
+
+    from mirror_memory.core.models import DeletionGeneration
+    from mirror_memory.worker.evolution import _claim_job, _process_single_job, enqueue_job
+    from tests.test_tombstone_sync import USER as SYNC_USER, _Device, _cfg
+
+    main_db = "mm_test_m4_sync_race"
+    runtime_url, admin_url = _pg_own_database(main_db)
+    log_dir = tmp_path / "cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    edge = _Device(tmp_path, "edge-pg-race", single_tenant=True)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+        for round_no in range(50):
+            cloud.observe(user_id=SYNC_USER, session_id=f"r{round_no}",
+                          text=f"round {round_no} content", purpose="api")
+            edge.observe(f"round {round_no} content", session_id=f"r{round_no}")
+            edge.engine.delete_memories(user_id=SYNC_USER, purpose="api")
+            batch, _ = edge.engine.export_tombstones(round_no, 1000)
+            assert len(batch.entries) == 1
+            assert batch.from_cursor == round_no
+
+            outcomes: dict = {}
+
+            def run_publish():
+                try:
+                    with tenant_scope(*TENANT):
+                        s = F()
+                        try:
+                            job = enqueue_job(s, SYNC_USER, cfg, purpose="api")
+                            s.commit()
+                            token = _claim_job(s, job.id, lease_seconds=60)
+                            row = s.get(EvolutionJob, job.id)
+                            _process_single_job(s, row, cfg, token)
+                            s.commit()
+                            s.expire_all()
+                            final = s.get(EvolutionJob, job.id)
+                            outcomes["publish"] = (final.status if final else "deleted",
+                                                   final.error_code if final else "")
+                        except Exception as exc:  # noqa: BLE001
+                            s.rollback()
+                            outcomes["publish"] = ("deleted-or-cancelled", repr(exc))
+                        finally:
+                            s.close()
+                except Exception as exc:  # noqa: BLE001
+                    outcomes["publish"] = ("error", repr(exc))
+
+            def run_apply():
+                try:
+                    cloud.apply_tombstones(batch, auth_tenant=TENANT)
+                    outcomes["apply"] = "applied"
+                except Exception as exc:  # noqa: BLE001
+                    outcomes["apply"] = repr(exc)
+
+            tp = threading.Thread(target=run_publish)
+            ta = threading.Thread(target=run_apply)
+            ta.start()
+            tp.start()
+            ta.join(timeout=60)
+            tp.join(timeout=60)
+            assert "apply" in outcomes and "publish" in outcomes, outcomes
+            assert outcomes["apply"] == "applied", outcomes
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    left = s.query(Belief).filter(Belief.user_id == SYNC_USER).count()
+                    gen = s.execute(
+                        select(DeletionGeneration.generation)
+                        .where(DeletionGeneration.user_id == SYNC_USER)
+                        .order_by(DeletionGeneration.generation.desc())
+                    ).scalars().first()
+                finally:
+                    s.close()
+            assert left == 0, (round_no, outcomes, left)
+            assert gen is not None and gen >= round_no + 1
+        cloud._engine.dispose()
+    finally:
+        edge.dispose()
+        runtime.dispose()
+        _pg_drop_database(main_db, admin_url)
+
+
+@_pg_needs
+def test_tombstone_mesh_three_devices_pg(tmp_path):
+    """M4 batch-2 patch task 2 on PostgreSQL: the cloud is a PG engine;
+    the edges are SQLite devices; the 20-round alternating-delete mesh
+    (the deterministic fixed-point variant of the mesh test) runs against
+    the PG cloud."""
+    from tests.test_sync_mesh import USER as SYNC_USER, _Device, _sync_star, _align_all, SCOPES, _cfg
+
+    rng = random.Random(17)
+    refusals: list[str] = []
+    runtime_url, admin_url = _pg_own_database("mm_test_m4_mesh")
+    log_dir = tmp_path / "mesh-cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+
+        cloud_db_id = sm.read_watermark(runtime)[0]
+
+        class _Cloud:
+            """Adapts the PG cloud engine to the mesh's _Device shape."""
+            name = "C"
+            db_id = cloud_db_id
+            engine = cloud
+            log = cloud_log
+
+            @staticmethod
+            def observe(text, session_id):
+                cloud.observe(user_id=SYNC_USER, session_id=session_id,
+                              text=text, purpose="api")
+
+            @staticmethod
+            def peer_cursor(peer_db_id):
+                # the fixed-point sync loop reads this to detect movement:
+                # it must be the REAL stored cursor
+                from mirror_memory.core.repository import read_sync_peer
+
+                with tenant_scope(*TENANT):
+                    s = F()
+                    try:
+                        row = read_sync_peer(s, peer_db_id)
+                        return row.cursor if row is not None else 0
+                    finally:
+                        s.close()
+
+            @staticmethod
+            def pull_from(peer, refusals, *, max_batches=200):
+                from mirror_memory.core.repository import read_sync_peer
+                from mirror_memory.core.tombstones import TombstoneBatchRejected
+
+                for _ in range(max_batches):
+                    with tenant_scope(*TENANT):
+                        s = F()
+                        try:
+                            row = read_sync_peer(s, peer.db_id)
+                            cursor = row.cursor if row is not None else 0
+                        finally:
+                            s.close()
+                    try:
+                        batch, _next = peer.engine.export_tombstones(
+                            cursor, 500)
+                    except Exception as exc:  # noqa: BLE001
+                        refusals.append(f"export from {peer.name}: {exc!r}")
+                        return
+                    try:
+                        result = cloud.apply_tombstones(batch)
+                    except TombstoneBatchRejected as exc:
+                        refusals.append(f"apply from {peer.name}: {exc}")
+                        return
+                    # a rescan re-anchors the channel to 0: keep pulling
+                    # from the reset cursor even when this batch's own
+                    # range was empty
+                    if (batch.to_cursor == batch.from_cursor
+                            and not result.rescan):
+                        return
+
+            @staticmethod
+            def sees(tag, scope):
+                with tenant_scope(*TENANT):
+                    s = F()
+                    try:
+                        if scope in ("belief", "user") and any(
+                                tag in b.claim_text for b in s.query(
+                                    Belief).filter(
+                                    Belief.user_id == SYNC_USER).all()):
+                            return True
+                        from mirror_memory.core.models import SessionSummary as _SS
+
+                        if scope in ("session", "user") and any(
+                                tag in r.summary_text for r in s.query(
+                                    _SS).filter(
+                                    _SS.user_id == SYNC_USER).all()):
+                            return True
+                        return False
+                    finally:
+                        s.close()
+
+            @staticmethod
+            def dispose():
+                cloud._engine.dispose()
+
+        edges = {
+            "A": _Device(tmp_path, "mesh-a", single_tenant=True),
+            "B": _Device(tmp_path, "mesh-b", single_tenant=True),
+        }
+        devices = {"C": _Cloud(), **edges}
+
+        for round_no in range(20):
+            for d in devices.values():
+                if d is cloud:
+                    cloud.observe(user_id=SYNC_USER, session_id=f"s{round_no}",
+                                  text=f"I like r{round_no} and coffee.",
+                                  purpose="api")
+                else:
+                    d.observe(f"I like r{round_no} and coffee.",
+                              session_id=f"s{round_no}")
+            # adopt the cloud's global_ids on the edges (the CLOUD's
+            # user, SYNC_USER -- not this module's USER)
+            with tenant_scope(*TENANT):
+                s = F()
+                cloud_rows = s.query(Belief).filter(
+                    Belief.user_id == SYNC_USER).all()
+                ids = {b.key: b.global_id for b in cloud_rows}
+                s.close()
+            for e in edges.values():
+                e.adopt_global_ids_by_key(ids)
+            actor_name = ("C", "A", "B")[round_no % 3]
+            scope = SCOPES[round_no % 3]
+            if actor_name == "C":
+                cloud.delete_memories(user_id=SYNC_USER, purpose="api")
+            else:
+                edges[actor_name].delete(scope, round_no)
+            _sync_star(devices, refusals, rng)
+            assert refusals == [], (round_no, refusals)
+            tag = f"r{round_no}"
+            for name, d in devices.items():
+                # the surface the deleted scope owned: belief scope keeps
+                # the raw session text (its own layer) -- like the SQLite
+                # mesh's sees(tag, scope)
+                if d.sees(tag, scope):
+                    from mirror_memory.core.models import SessionSummary as _SSR
+
+                    with tenant_scope(*TENANT):
+                        s2 = F()
+                        rows = [(r.session_id, r.summary_text[:60],
+                                 r.source_purpose) for r in s2.query(
+                            _SSR).filter(_SSR.user_id == SYNC_USER).all()]
+                        bels = [(b.key, b.claim_text[:40]) for b in s2.query(
+                            Belief).filter(Belief.user_id == SYNC_USER).all()]
+                        s2.close()
+                    cursors = {n: d.peer_cursor(dd.db_id)
+                               for n, dd in devices.items()}
+                    pytest.fail(
+                        f"round {round_no} {name} {tag} {scope} "
+                        f"cursors={cursors} summaries={rows} beliefs={bels}")
+
+        for e in edges.values():
+            e.dispose()
+        cloud._engine.dispose()
+    finally:
+        runtime.dispose()
+        _pg_drop_database("mm_test_m4_mesh", admin_url)
+
+
+# --- M4 batch-2 patch 2, task 2: full-machine restore, PG cloud leg ---
+
+def _pg_cloud_device(cloud, F, cloud_db_id):
+    """Adapts a PG cloud engine to the mesh's _Device shape: everything
+    the sync helpers (_sync_star, _align_all, the restore helpers) touch
+    -- observe, beliefs, visible_state, sees, cursors, pulls."""
+
+    class _PgCloud:
+        name = "C"
+        db_id = cloud_db_id
+        engine = cloud
+
+        @staticmethod
+        def observe(text, session_id):
+            cloud.observe(user_id=SYNC_USER, session_id=session_id,
+                          text=text, purpose="api")
+
+        @staticmethod
+        def beliefs():
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    return s.query(Belief).filter(
+                        Belief.user_id == SYNC_USER).all()
+                finally:
+                    s.close()
+
+        @staticmethod
+        def summaries():
+            from mirror_memory.core.models import SessionSummary as _SS
+
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    return s.query(_SS).filter(
+                        _SS.user_id == SYNC_USER).count()
+                finally:
+                    s.close()
+
+        @classmethod
+        def visible_state(cls):
+            return (tuple(sorted(b.key for b in cls.beliefs())),
+                    cls.summaries())
+
+        @staticmethod
+        def peer_cursor(peer_db_id):
+            from mirror_memory.core.repository import read_sync_peer
+
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    row = read_sync_peer(s, peer_db_id)
+                    return row.cursor if row is not None else 0
+                finally:
+                    s.close()
+
+        @staticmethod
+        def pull_from(peer, refusals, *, max_batches=200):
+            from mirror_memory.core.tombstones import TombstoneBatchRejected
+
+            for _ in range(max_batches):
+                cursor = _PgCloud.peer_cursor(peer.db_id)
+                try:
+                    batch, _next = peer.engine.export_tombstones(
+                        cursor, 500)
+                except Exception as exc:  # noqa: BLE001 -- recorded
+                    refusals.append(f"export from {peer.name}: {exc!r}")
+                    return
+                try:
+                    result = cloud.apply_tombstones(batch)
+                except TombstoneBatchRejected as exc:
+                    refusals.append(f"apply from {peer.name}: {exc}")
+                    return
+                # a rescan re-anchors the channel to 0: keep pulling from
+                # the reset cursor even when this batch's own range was empty
+                if (batch.to_cursor == batch.from_cursor
+                        and not result.rescan):
+                    return
+
+        @staticmethod
+        def sees(tag, scope):
+            with tenant_scope(*TENANT):
+                s = F()
+                try:
+                    if scope in ("belief", "user") and any(
+                            tag in b.claim_text for b in s.query(
+                                Belief).filter(
+                                Belief.user_id == SYNC_USER).all()):
+                        return True
+                    from mirror_memory.core.models import SessionSummary as _SS
+
+                    if scope in ("session", "user") and any(
+                            tag in r.summary_text for r in s.query(
+                                _SS).filter(
+                                _SS.user_id == SYNC_USER).all()):
+                        return True
+                    return False
+                finally:
+                    s.close()
+
+        @classmethod
+        def delete(cls, scope, round_no):
+            """One deletion of *scope* (the _Device.delete contract)."""
+            tag = f"r{round_no}"
+            session_id = f"s{round_no}"
+            cls.observe(f"I like {tag} and coffee.", session_id=session_id)
+            if scope == "belief":
+                belief = next(b for b in cls.beliefs() if tag in b.claim_text)
+                assert cloud.forget_belief(user_id=SYNC_USER,
+                                           belief_id=belief.id,
+                                           purpose="api")
+                return tag
+            if scope == "session":
+                assert cloud.forget_session(user_id=SYNC_USER,
+                                            session_id=session_id,
+                                            purpose="api")
+                return tag
+            cloud.delete_memories(user_id=SYNC_USER, purpose="api")
+            return tag
+
+        @staticmethod
+        def dispose():
+            cloud._engine.dispose()
+
+    return _PgCloud
+
+
+@_pg_needs
+def test_sender_full_restore_then_offline_redelete_pg(tmp_path):
+    """Batch-2 patch 2, task 2 on PostgreSQL: the sender-restore and the
+    offline re-delete (see
+    tests.test_sync_mesh._sender_restore_and_offline_redelete) with the
+    PG cloud as the hub."""
+    from tests.test_sync_mesh import (
+        _Device,
+        _cfg,
+        _sender_restore_and_offline_redelete,
+    )
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    refusals: list[str] = []
+    runtime_url, admin_url = _pg_own_database("mm_test_m4_sender_pg")
+    log_dir = tmp_path / "sender-cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+        from mirror_memory.core import schema_migration as sm
+
+        C = _pg_cloud_device(cloud, F, sm.read_watermark(runtime)[0])
+        devices = {
+            "C": C,
+            "A": _Device(tmp_path, "sr-a", single_tenant=True),
+            "B": _Device(tmp_path, "sr-b", single_tenant=True),
+        }
+        try:
+            rescans = _sender_restore_and_offline_redelete(devices, refusals)
+            assert rescans >= 1, "the sender's rollback must be DETECTED"
+        finally:
+            for d in devices.values():
+                d.dispose()
+    finally:
+        runtime.dispose()
+        _pg_drop_database("mm_test_m4_sender_pg", admin_url)
+
+
+@_pg_needs
+def test_tombstone_mesh_with_full_restore_pg(tmp_path):
+    """Batch-2 patch 2, task 2 mesh variant on PostgreSQL: the PG cloud
+    is the hub, one edge fully restores mid-stream, the channel
+    auto-rescans, zero refusals, three-way convergence."""
+    from tests.test_sync_mesh import (
+        _Device,
+        _cfg,
+        _mesh_rounds_with_restore,
+    )
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    rng = random.Random(31)
+    refusals: list[str] = []
+    runtime_url, admin_url = _pg_own_database("mm_test_m4_mesh_restore_pg")
+    log_dir = tmp_path / "mesh-restore-cloud-deletions"
+    cfg = _cfg(log_dir)
+    cloud_log = FileDeletionLog(log_dir)
+    runtime = create_engine(runtime_url, pool_size=4, max_overflow=12)
+    F = sessionmaker(bind=runtime)
+    try:
+        with tenant_scope(*TENANT), fixture_write_scope("enable memory"):
+            s = F()
+            set_memory_enabled(s, SYNC_USER, True)
+            s.commit()
+            s.close()
+        cloud = MemoryEngine(config=cfg, database_url=runtime_url,
+                             tenant_id=TENANT[0], app_id=TENANT[1],
+                             llm_client=_FakeLLM(), deletion_log=cloud_log,
+                             single_tenant_mode=False)
+        cloud._ensure_db()
+        from mirror_memory.core import schema_migration as sm
+
+        C = _pg_cloud_device(cloud, F, sm.read_watermark(runtime)[0])
+        devices = {
+            "C": C,
+            "A": _Device(tmp_path, "mr-a", single_tenant=True),
+            "B": _Device(tmp_path, "mr-b", single_tenant=True),
+        }
+        try:
+            rescans = _mesh_rounds_with_restore(
+                devices, refusals, rng, restore_name="B", restore_round=9)
+            assert rescans >= 1, "the restore must be DETECTED (rescan)"
+        finally:
+            for d in devices.values():
+                d.dispose()
+    finally:
+        runtime.dispose()
+        _pg_drop_database("mm_test_m4_mesh_restore_pg", admin_url)

@@ -51,6 +51,8 @@ def server(tmp_path):
     url = f"sqlite:///{tmp_path}/purpose-server.db"
     engine = create_engine(url)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(engine)
     factory = sessionmaker(bind=engine)
     with tenant_scope("tA", "app"), fixture_write_scope("seed"):
         s = factory()
@@ -281,6 +283,11 @@ def test_missing_purpose_refused_before_any_sql(pg_app_url, monkeypatch):
                 tenant_id="default", app_id="default", engine=engine,
                 schema_ready=True, default_purpose=None,
             )
+            # warm the engine (schema + watermark setup) OUTSIDE the
+            # measurement: the invariant under test is that the REFUSAL
+            # issues no SQL, not that engine initialization does
+            eng._ensure_db()
+            statements.clear()
             with pytest.raises(PurposeDenied, match="missing_purpose"):
                 eng.recall(user_id="u1")
             with pytest.raises(PurposeDenied, match="missing_purpose"):

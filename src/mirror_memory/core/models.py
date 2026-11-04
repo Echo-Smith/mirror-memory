@@ -8,6 +8,8 @@ generic and ships with the engine.
 
 from __future__ import annotations
 
+import uuid
+
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -121,9 +123,18 @@ class Belief(TenantScoped, Base):
             "tenant_id", "app_id", "user_id", "key",
             name="uq_mm_beliefs_user_key",
         ),
+        # M4 batch 2 task 0: the cross-device identity of a belief.  The
+        # integer id is local (restores and other devices reuse it); the
+        # global_id is minted once at creation and travels in tombstones.
+        UniqueConstraint(
+            "tenant_id", "app_id", "global_id",
+            name="uq_mm_beliefs_global_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    global_id: Mapped[str] = mapped_column(
+        String(32), default=lambda: uuid.uuid4().hex)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     dimension: Mapped[str] = mapped_column(String(64), index=True)
     key: Mapped[str] = mapped_column(String(128))
@@ -474,6 +485,89 @@ class DeletionTombstone(TenantScoped, Base):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Deletion generation (M4): the per-user counter behind the revision barrier
+# ---------------------------------------------------------------------------
+
+
+class DeletionGeneration(TenantScoped, Base):
+    """One row per (user, generation): the counter is advanced by INSERTING
+    the next value, so the primary key IS the compare-and-swap -- two
+    concurrent deletions racing for generation N+1 cannot both win, and
+    the history of generations is the table.  The AUTHORITY for a user's
+    generation is the independent deletion log; after a backup restore +
+    replay the rows here are (re)aligned to the log's per-user maximum,
+    so a restore can never roll the generation back.
+
+    Written only by the deletion paths (write class ``deletion``) and the
+    replayer."""
+
+    __tablename__ = "mm_deletion_generations"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "user_id", "generation"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer)
+    scope: Mapped[str] = mapped_column(String(16), default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TombstoneApplied(TenantScoped, Base):
+    """M4 batch 2 (patch 2): which cross-device tombstones THIS database
+    has already applied -- ``(origin, origin_hash)`` is the idempotency
+    key, where origin_hash identifies the ORIGIN's log entry the
+    tombstone was exported from.  A rolled-back sender reuses origin_seq
+    for a different deletion whose entry hash differs, so seq-based keys
+    would misfile the new deletion as a duplicate; the entry hash does
+    not.  A restore of this database rewinds the record together with the
+    data (the tombstones come back and are re-applied, exactly like the
+    local deletion log replays).  Scope that no longer exists locally is
+    recorded too (a no-op apply is still an apply).  Written only by the
+    tombstone-application transaction, in the same commit as the
+    deletions it bookkeeps (write class ``sync``)."""
+
+    __tablename__ = "mm_tombstones_applied"
+    __table_args__ = (
+        # (origin, origin_seq, origin_hash): the origin's log position AND
+        # its entry hash -- a rolled-back sender re-issuing a deletion at
+        # a reused seq produces a different origin_hash, so it applies
+        # instead of colliding
+        PrimaryKeyConstraint("tenant_id", "app_id", "origin", "origin_seq",
+                             "origin_hash"),
+    )
+
+    origin: Mapped[str] = mapped_column(String(32))
+    origin_seq: Mapped[int] = mapped_column(Integer)
+    origin_hash: Mapped[str] = mapped_column(String(64))
+    user_id: Mapped[str] = mapped_column(String(64))
+    scope: Mapped[str] = mapped_column(String(16))
+    scope_key: Mapped[str] = mapped_column(String(128), default="")
+    local_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SyncPeer(TenantScoped, Base):
+    """M4 batch 2 (patch 2): one row per sync peer -- the cursor into the
+    peer's deletion log this database has consumed, the peer's CHAIN HASH
+    at that cursor (a mismatch on the next batch means the peer rolled
+    back and the channel rescans from 0), and the instant of the last
+    successful catch-up.  They live in the MAIN database on purpose: a
+    restored backup rewinds them, so the offline grace period expires
+    sooner and the catch-up re-pulls the peer's log from before the
+    restore point -- both correct for a restored edge."""
+
+    __tablename__ = "mm_sync_peers"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "app_id", "peer_db_id"),
+    )
+
+    peer_db_id: Mapped[str] = mapped_column(String(32))
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    chain_hash: Mapped[str] = mapped_column(String(64), default="")
+    last_catchup_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class ProposalLog(TenantScoped, Base):
     """Append-only record of every *committed* proposal.
 
@@ -656,6 +750,12 @@ class Snapshot(TenantScoped, Base):
     source_purposes_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default="[]",
     )
+    # The user's deletion generation when this snapshot was synthesised
+    # (M4): a reader skips the snapshot when the user's CURRENT generation
+    # differs -- any deletion after synthesis (or a restore + replay)
+    # invalidates the merged text, and the next job rebuilds it.  NULL =
+    # pre-M4 snapshot: always skipped (conservative).
+    source_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

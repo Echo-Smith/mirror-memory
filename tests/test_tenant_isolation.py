@@ -54,6 +54,9 @@ class MockLLM:
 
 def make_config(**overrides):
     cfg = load_config("config/")
+    # worker/background tests without a deletion log: an explicit
+    # backend=none deployment (M4 patch-4 semantics; nothing applied)
+    cfg.deletion_log.backend = "none"
     # Lower the compaction threshold so the metabolism cycle actually folds
     # evidence instead of scanning past everything.
     cfg.metabolism.compaction.min_support_links = 2
@@ -77,6 +80,9 @@ def session_at(url):
     """Session factory against the shared database, tables ensured."""
     engine = create_engine(url)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_mint
+
+    _sm_mint.ensure_watermark(engine)
     return sessionmaker(bind=engine)
 
 

@@ -37,6 +37,8 @@ def session_at(url):
 
     engine = create_engine(url, poolclass=NullPool)
     Base.metadata.create_all(engine)
+    from mirror_memory.core import schema_migration as _sm_wm
+    _sm_wm.ensure_watermark(engine)
     return sessionmaker(bind=engine)
 
 
@@ -135,6 +137,8 @@ def test_worker_uses_job_tenant_not_scheduler_context(tmp_path):
 
     factory = session_at(f"sqlite:///{tmp_path}/worker.db")
     cfg = load_config("config/")
+    # worker tick without a deletion log: explicit backend=none (M4 patch-4)
+    cfg.deletion_log.backend = "none"
 
     class FakeLLM:
         def generate(self, **kw):

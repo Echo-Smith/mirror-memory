@@ -19,6 +19,9 @@ Usage::
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+import threading
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,7 +30,7 @@ from typing import Any, Iterator, NamedTuple
 from mirror_memory.config.loader import load_config
 from mirror_memory.config.schema import MemoryConfig
 from mirror_memory.exceptions import ValidationError
-from mirror_memory.models import BeliefInfo, DeleteResult, PanelData
+from mirror_memory.models import BeliefInfo, DeleteResult, PanelData, TombstoneApplyResult
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,11 @@ ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
 
 
 from mirror_memory.core import provenance
+from mirror_memory.core.deletion import DeletionEntry, DeletionLog, DeletionLogUnavailable
+
+# the __init__ default: builds the log from config unless an explicit
+# instance (including an explicit None) is passed
+_DELETION_LOG_DEFAULT = object()
 from mirror_memory.core.export import ExportPage  # re-exported for hosts
 
 
@@ -55,6 +63,55 @@ class Authorized(NamedTuple):
 
     purpose: str
     grant_version: int | None
+
+
+
+# ---------------------------------------------------------------------------
+# Sync channel errors (M4 batch 2 task 3) -- distinct from replay mode and
+# from the deletion-log errors, so the product can tell them apart
+# ---------------------------------------------------------------------------
+
+class SyncCatchingUp(RuntimeError):
+    """Entries are refused while the edge is catching up against its
+    peer (the tombstone application is in progress)."""
+
+    def __init__(self):
+        super().__init__(
+            "memory sync is catching up with the peer; entries are "
+            "refused until it finishes -- retry shortly")
+        self.user_message = (
+            "记忆正在同步，请稍后重试。")
+
+
+class SyncTransportIdentityMissing(RuntimeError):
+    """The sync transport does not declare its peer's db_id.
+
+    Fail-closed (batch-2 patch 4, task 2): every artifact of the channel
+    -- the cursor rows, the last-complete-catchup instant, sync_status
+    and the expiry errors -- is keyed by ONE peer identity.  A transport
+    that cannot name its peer could mix identities (read key vs the
+    envelope's self-claimed sender) and the envelope's identity must
+    never substitute for a transport that the network layer has
+    authenticated.  Configure the transport with its peer's db_id."""
+
+class SyncCatchupRequired(RuntimeError):
+    """Read entries are refused: the edge has not caught up with the
+    peer for longer than the offline grace period.  Carries the last
+    successful catch-up and a sentence the product can show the user."""
+
+    def __init__(self, last_catchup_at, message: str | None = None):
+        import datetime as _dt
+
+        shown = (last_catchup_at.isoformat(timespec="minutes")
+                 if last_catchup_at else "never")
+        user_friendly = message or (
+            "此设备已超过允许的离线时间，需要联网同步后才能继续查看记忆。")
+        super().__init__(
+            f"the last successful sync catch-up was at {shown}: the "
+            "offline grace period has expired, read entries are refused "
+            "until a catch-up succeeds")
+        self.last_catchup_at = last_catchup_at
+        self.user_message = user_friendly
 
 
 class MemoryEngine:
@@ -98,6 +155,8 @@ class MemoryEngine:
         engine: Any | None = None,
         schema_ready: bool = False,
         default_purpose: str | None = None,
+        deletion_log: "DeletionLog | None | object" = _DELETION_LOG_DEFAULT,
+        sync_transport: Any | None = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -107,6 +166,13 @@ class MemoryEngine:
             raise ValueError("Provide either config_path or config")
 
         self._database_url = database_url
+        # M4 batch 2 task 3: the in-process transport to the sync peer (an
+        # object with .db_id and .export_tombstones(cursor, limit,
+        # peer_db_id)); the network is the host's business
+        self._sync_transport = sync_transport
+        self._sync_state = "normal"  # normal / catching_up / offline_grace / expired
+        self._sync_attempt_failed = False
+        self._sync_lock = threading.Lock()
         self._llm_client = llm_client or self._build_llm(llm_api_key, llm_model, llm_base_url)
         # M1 tenancy: the engine entry point pins an explicit tenant; every
         # session it opens is created inside that scope and therefore bound
@@ -133,7 +199,48 @@ class MemoryEngine:
             else os.environ.get("MM_SINGLE_TENANT", "0") == "1"
         )
         self._initialized = False
+        # batch-2 patch 7, task 2: concurrent initialization of the SAME
+        # engine.  `_initializing` (guard by _init_lock) marks the init in
+        # flight; concurrent callers of OTHER threads wait on _init_done
+        # and only proceed once the verdict -- startup catch-up included --
+        # is visible, so no entry can serve before the channel state is
+        # published.  `_init_tls.in_init` lets the startup catch-up's own
+        # applies re-enter _ensure_db on the SAME thread without waiting
+        # on themselves (no recursion deadlock).
+        self._init_lock = threading.Lock()
+        self._init_done = threading.Event()
+        self._initializing = False
+        self._init_tls = threading.local()
         self._pipeline = None  # lazy-initialized
+        # M4: the independent deletion log.  An explicit instance wins;
+        # otherwise the config decides (backend file|postgres).  None =>
+        # deletions are refused (fail-closed: an unlogged deletion cannot
+        # be replayed after a restore).
+        # an explicitly PASSED None (vs the absent default) must mean "no
+        # log": distinguish via the parameter sentinel below
+        # M4 merge prep, transport contract: a transport MUST carry its
+        # own network timeouts -- the initialization wait has no cap of
+        # its own and bounds itself by the transport failing fast; the
+        # envelope's self-claimed sender is never trusted for identity
+        # (batch-2 patch 4).  sync_transport_factory (server): the host
+        # decides per eng._tenant -- return the tenant's transport, or
+        # None for a tenant that does not sync; the factory IS called for
+        # the lifespan engine too (tenant-key mode), and returning None
+        # there puts that engine in the no-transport gate mode.
+        self._deletion_log = (
+            deletion_log if deletion_log is not _DELETION_LOG_DEFAULT
+            else self._build_deletion_log()
+        )
+        self._db_id: str | None = None
+
+    def _build_deletion_log(self) -> "DeletionLog | None":
+        """The deletion log from configuration (M4 task 1) -- the shared
+        derivation in core.deletion, so the migration and the adopt
+        command read the SAME log the engines write (M4 patch 2)."""
+        from mirror_memory.core.deletion import deletion_log_from_config
+
+        return deletion_log_from_config(self._config.deletion_log,
+                                        self._database_url)
 
     @staticmethod
     def _build_llm(api_key: str | None, model: str, base_url: str | None) -> Any:
@@ -146,9 +253,64 @@ class MemoryEngine:
 
     def _ensure_db(self) -> None:
         """Create tables on first use (SQLite) or verify the owner-created
-        schema and the row-level-security posture (PostgreSQL)."""
+        schema and the row-level-security posture (PostgreSQL).
+
+        Batch-2 patch 7, task 2: the initialization INCLUDES the startup
+        catch-up, and the serviceable state (`_initialized`) is published
+        only after its verdict.  A concurrent caller of another thread
+        waits for that verdict instead of serving (its entries then hit
+        the gate with the true channel state); a FAILED initialization
+        leaves the flag unset so the next call retries the whole init --
+        never bypasses it; the startup catch-up's own applies re-enter on
+        the same thread via `_init_tls` without waiting on themselves.
+        Batch-2 merge-prep: waiters LOOP instead of recursing, and a new
+        round clears `_init_done` under the lock -- a waiter waking after
+        a failed round either takes the init over itself or blocks on the
+        next round's verdict; the transport's own timeouts bound every
+        wait (there is no cap here)."""
         if self._initialized:
             return
+        if getattr(self._init_tls, "in_init", False):
+            # re-entered by OUR OWN startup catch-up (apply_tombstones
+            # ensures the db): the engine is mid-initialization on this
+            # very thread -- proceed without waiting on ourselves
+            return
+        while True:
+            wait = False
+            with self._init_lock:
+                if self._initialized:
+                    return
+                if self._initializing:
+                    wait = True  # another thread's init is in flight
+                else:
+                    # a fresh round: clear the done event so waiters
+                    # block until THIS round's verdict
+                    self._initializing = True
+                    self._init_tls.in_init = True
+                    self._init_done.clear()
+            if wait:
+                # the in-flight init carries the startup catch-up: wait
+                # for its verdict (bounded by the catch-up's own network
+                # timeouts and the offline-grace failure path), then
+                # RE-CHECK by looping -- the round may have failed and a
+                # new one started, or nobody may be initializing (a
+                # failed round) in which case THIS call takes over
+                self._init_done.wait()
+                continue
+            try:
+                self._initialize_db()
+            finally:
+                self._init_tls.in_init = False
+                self._initializing = False
+                self._init_done.set()
+            return
+
+    def _initialize_db(self) -> None:
+        """The one-time initialization body (see _ensure_db for the
+        concurrency wrapper): schema work, then the startup catch-up --
+        the serviceable flag is published only AFTER the catch-up
+        verdict, so a concurrent entry either waits here or hits the gate
+        with the true channel state."""
         from mirror_memory.core.migrate import check_schema
         from mirror_memory.core.models import Base
         from mirror_memory.core.pg_engine import build_engine
@@ -159,6 +321,18 @@ class MemoryEngine:
             if self._schema_ready:
                 # The owner of the shared engine ran the schema / posture /
                 # single-tenant checks once; a per-tenant wrapper only binds.
+                from mirror_memory.core import schema_migration
+
+                self._db_id, self._applied_seq = schema_migration.read_watermark(
+                    self._engine
+                ) or (None, 0)
+                # batch-2 patch 6/7, task 2: binding is NOT the whole
+                # story -- the sync channel is per-engine, so a
+                # sync-enabled wrapper runs the same startup catch-up the
+                # normal path does, and the serviceable flag publishes
+                # only AFTER its verdict.  No transport: the no-transport
+                # gate mode decides (the warning below says so once).
+                self._catch_up_at_startup()
                 self._initialized = True
                 return
         else:
@@ -171,6 +345,30 @@ class MemoryEngine:
             prepare_runtime_engine(self._engine)
         else:
             Base.metadata.create_all(self._engine)
+        # M4: the deletion watermark (db_id + applied seq) is created
+        # OUTSIDE any transaction -- it must exist before the first
+        # deletion (which only READS it; creating it here also avoids a
+        # second-connection DDL inside a SQLite write transaction).  A
+        # fresh database gets a fresh db_id; a RESTORED one brings its
+        # watermark row back, which is how a restore is detected.
+        from mirror_memory.core import schema_migration
+
+        self._db_id, self._applied_seq = schema_migration.ensure_watermark(self._engine)
+        # M4 batch-1 patch task 2: bind this log to the database life by
+        # writing the genesis entry if it is not there yet
+        if self._deletion_log is not None:
+            self._deletion_log.ensure_genesis(self._db_id)
+        # M4: startup check against the deletion log.  Equal -> normal; the
+        # main DB behind its log (a restored backup) -> replay now, in this
+        # process, before any entry serves; the log behind the main DB ->
+        # refuse.  Another instance holding the replay lock raises
+        # ReplayPending: this engine fails to start and the caller retries.
+        from sqlalchemy.orm import Session as _Session
+
+        from mirror_memory.core import replay
+
+        replay.reconcile(lambda: _Session(self._engine), self._deletion_log,
+                         tenant=self._tenant)
         # A database written by an older engine lacks the metabolism columns
         # the ORM now expects; fail with instructions instead of a mid-query
         # "no such column" error.
@@ -180,6 +378,10 @@ class MemoryEngine:
             from mirror_memory.core.tenancy import set_single_tenant_mode
 
             set_single_tenant_mode(True)
+        # M4 batch 2 task 3 / patch 7 task 2: an edge with sync enabled
+        # catches up against its peer BEFORE any entry serves -- and the
+        # serviceable flag publishes only after the verdict
+        self._catch_up_at_startup()
         self._initialized = True
 
     def _verify_single_tenant_startup(self) -> None:
@@ -332,6 +534,61 @@ class MemoryEngine:
             max_ids=self._config.access_audit.max_ids,
         )
 
+    def _append_deletion_log(self, session, user_id: str, *, scope: str,
+                             scope_key: str, fingerprints: list[dict],
+                             generation: int, purpose: str | None,
+                             global_key: str = "", origin: str = "",
+                             origin_seq: int = 0, origin_hash: str = ""):
+        """Write the deletion-log entry for a deletion that is about to
+        commit.  The log write happens BEFORE the main-DB commit (the
+        entry is part of the transaction's preconditions): a log failure
+        raises and rolls the deletion back; the reverse window -- log
+        written, commit fails -- is safe because replay matches
+        fingerprints that will never be found (core.deletion docstring).
+
+        *global_key* is the cross-device scope key the entry exports as a
+        tombstone (a belief's global_id / the session_id); *origin* and
+        *origin_seq* mark a deletion produced by APPLYING a remote
+        tombstone, so the export never echoes it back (M4 batch 2).
+        Returns the appended entry (its seq is the local record)."""
+        from mirror_memory.core.deletion import DeletionEntry
+
+        if self._deletion_log is None:
+            raise DeletionLogUnavailable(
+                "no deletion log is configured: deletions are refused "
+                "(an unlogged deletion cannot be replayed after a restore)"
+            )
+        if not self._db_id:
+            raise DeletionLogUnavailable("the deletion watermark is missing: run the schema setup first")
+        entry = self._deletion_log.append(DeletionEntry(
+            db_id=self._db_id, tenant_id=self._tenant[0], app_id=self._tenant[1],
+            user_id=user_id, scope=scope, scope_key=scope_key,
+            fingerprints=fingerprints, generation=generation,
+            purpose=self._purpose_or_default(purpose),
+            global_key=global_key, origin=origin, origin_seq=origin_seq,
+            origin_hash=origin_hash,
+        ))
+        # the entry is APPLIED by this very transaction: advance the
+        # watermark here, so a committed deletion never needs a replay
+        # (only a restore does)
+        from mirror_memory.core import schema_migration
+
+        wtable = schema_migration._watermark_table(schema_migration.MetaData())
+        session.execute(
+            wtable.update().where(wtable.c.id == 1).values(applied_seq=entry.seq))
+        self._applied_seq = entry.seq
+        return entry
+
+    def _current_deletion_generation(self, session, user_id: str) -> int:
+        from sqlalchemy import func as _func, select as _select
+
+        from mirror_memory.core.models import DeletionGeneration
+
+        return int(session.scalar(
+            _select(_func.max(DeletionGeneration.generation))
+            .where(DeletionGeneration.user_id == user_id)
+        ) or 0)
+
     def _record_forget_invocation(self, session, user_id: str, purpose: str | None) -> str:
         """The forget paths run regardless of authorization state (a revoked
         user can still have their data erased) but must carry a purpose, and
@@ -381,6 +638,7 @@ class MemoryEngine:
             raise ValidationError("text exceeds maximum length of 50000 characters")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         pipeline = self._get_pipeline()
         started = time.monotonic()
         with self._session() as session:
@@ -450,6 +708,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.render.renderer import render_memory_block_with_ids
 
         started = time.monotonic()
@@ -521,6 +780,10 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: the cycle reads memory and proposes
+        # tier transitions -- gated like a read (expired / catching up
+        # refuse; offline deletions are untouched)
+        self._sync_gate(read=True)
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
 
         with self._session() as session:
@@ -554,6 +817,7 @@ class MemoryEngine:
             raise ValidationError(f"language must be 'zh' or 'en', got '{language}'")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.render.panel import build_panel
 
         with self._session() as session:
@@ -595,6 +859,7 @@ class MemoryEngine:
             raise ValidationError("limit must be between 1 and 200")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.core.repository import list_active_beliefs
 
         with self._session() as session:
@@ -669,6 +934,10 @@ class MemoryEngine:
             return []
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: gated BEFORE the fail-open selection
+        # below -- a refusal (expired / catching up) must reach the caller,
+        # never be swallowed into an empty list
+        self._sync_gate(read=True)
         from mirror_memory.extraction.verification import (
             build_verification_question,
             get_question_candidates,
@@ -743,6 +1012,10 @@ class MemoryEngine:
             return False
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: the judgment reads memory state and
+        # derives transitions -- gated like a read, and BEFORE the
+        # fail-open try so a refusal is never swallowed into "not consumed"
+        self._sync_gate(read=True)
         from mirror_memory.extraction.verification import run_verification_judgment
 
         with self._session() as session:
@@ -915,13 +1188,31 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
+        with self._session() as session:
+            counts, _entry = self._delete_user_in(session, user_id, purpose)
+            session.commit()
+            counts.pop("generation", None)
+            return DeleteResult(**counts)
+
+    def _delete_user_in(self, session, user_id: str, purpose: str | None, *,
+                        origin: str = "", origin_seq: int = 0,
+                        origin_hash: str = ""):
+        """The user-scope deletion inside the caller's transaction: the
+        cascade, then the log entry (before the commit).  Shared by
+        delete_memories and the tombstone application (M4 batch 2)."""
         from mirror_memory.core.repository import delete_user_memories
 
-        with self._session() as session:
-            self._record_forget_invocation(session, user_id, purpose)
-            counts = delete_user_memories(session, user_id)
-            session.commit()
-            return DeleteResult(**counts)
+        self._record_forget_invocation(session, user_id, purpose)
+        fingerprints: list[dict] = []
+        counts = delete_user_memories(session, user_id, fingerprints=fingerprints)
+        entry = self._append_deletion_log(
+            session, user_id, scope="user", scope_key="",
+            fingerprints=fingerprints, generation=counts["generation"],
+            purpose=purpose, origin=origin, origin_seq=origin_seq,
+            origin_hash=origin_hash,
+        )
+        return counts, entry
 
     def forget_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Targeted forget: delete a single belief and everything derived from it.
@@ -934,6 +1225,13 @@ class MemoryEngine:
         change; unlike collection, deletion is allowed even while memory
         is disabled.
 
+        RETENTION PROMISE (M4 merge prep): only ORPHANED evidence is
+        pruned.  A source message that still supports a SURVIVING belief
+        keeps its evidence row (and its raw text) — deleting one belief
+        never erases the provenance of what remains.  A sender that must
+        not retain a message therefore deletes every belief derived from
+        it (or the whole user scope).
+
         Returns ``True`` if the belief was found and deleted.
 
         Raises
@@ -945,6 +1243,21 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
+        with self._session() as session:
+            committed, _entry = self._forget_belief_in(session, user_id, belief_id, purpose)
+            session.commit()
+            return committed
+
+    def _forget_belief_in(self, session, user_id: str, belief_id: int,
+                          purpose: str | None, *, origin: str = "",
+                          origin_seq: int = 0, origin_hash: str = ""):
+        """The belief-scope deletion inside the caller's transaction
+        (Publisher FORGET), then the log entry carrying the belief's
+        global_id as the cross-device key.  Shared by forget_belief and
+        the tombstone application (M4 batch 2).  Returns (committed,
+        entry-or-None)."""
+        from mirror_memory.core.models import Belief
         from mirror_memory.core.proposal import (
             TRANSITION_FORGET,
             StateTransitionProposal,
@@ -952,18 +1265,32 @@ class MemoryEngine:
         from mirror_memory.core.publisher import Publisher
         from mirror_memory.core.repository import get_state_revision
 
-        with self._session() as session:
-            self._record_forget_invocation(session, user_id, purpose)
-            decision = Publisher(session, self._config).publish(
-                StateTransitionProposal(
-                    transition=TRANSITION_FORGET,
-                    user_id=user_id,
-                    target_belief_id=belief_id,
-                    expected_revision=get_state_revision(session, user_id),
-                )
+        self._record_forget_invocation(session, user_id, purpose)
+        # the cross-device key must be captured BEFORE the row is gone
+        belief = session.get(Belief, (*self._tenant, belief_id))
+        global_key = belief.global_id if belief is not None and belief.user_id == user_id else ""
+        collector: dict = {"fingerprints": [], "generation": None}
+        decision = Publisher(session, self._config).publish(
+            StateTransitionProposal(
+                transition=TRANSITION_FORGET,
+                user_id=user_id,
+                target_belief_id=belief_id,
+                expected_revision=get_state_revision(session, user_id),
+                payload={"deletion_collector": collector},
             )
-            session.commit()
-            return decision.committed
+        )
+        entry = None
+        if decision.committed and collector["generation"] is not None:
+            # the deletion log is written BEFORE the main-DB commit
+            # (fail-closed: a log failure rolls the deletion back)
+            entry = self._append_deletion_log(
+                session, user_id, scope="belief", scope_key=str(belief_id),
+                fingerprints=collector["fingerprints"],
+                generation=collector["generation"], purpose=purpose,
+                global_key=global_key or "", origin=origin,
+                origin_seq=origin_seq, origin_hash=origin_hash,
+            )
+        return decision.committed, entry
 
     def restore_belief(self, *, user_id: str, belief_id: int, purpose: str | None = None) -> bool:
         """Restore an archived belief into the default retrieval scan.
@@ -985,6 +1312,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         from mirror_memory.core.models import Belief
         from mirror_memory.core.proposal import (
             TRANSITION_TIER_TRANSITION,
@@ -1037,13 +1365,573 @@ class MemoryEngine:
             raise ValidationError("session_id must be a non-empty string")
 
         self._ensure_db()
-        from mirror_memory.core.repository import forget_session_summary
-
+        self._sync_gate(read=False)
         with self._session() as session:
-            self._record_forget_invocation(session, user_id, purpose)
-            result = forget_session_summary(session, user_id, session_id)
+            result, _entry = self._forget_session_in(session, user_id, session_id, purpose)
             session.commit()
             return result
+
+    def _forget_session_in(self, session, user_id: str, session_id: str,
+                           purpose: str | None, *, origin: str = "",
+                           origin_seq: int = 0, origin_hash: str = ""):
+        """The session-scope deletion inside the caller's transaction, then
+        the log entry (the session_id is its own cross-device key).  Shared
+        by forget_session and the tombstone application (M4 batch 2)."""
+        from mirror_memory.core.repository import forget_session_summary
+
+        self._record_forget_invocation(session, user_id, purpose)
+        fingerprints: list[dict] = []
+        result = forget_session_summary(session, user_id, session_id,
+                                        fingerprints=fingerprints)
+        entry = None
+        if result:
+            # the summary rows were deleted: log before commit.  Session
+            # scope does not bump the generation (no belief content
+            # changed) -- M4's log entry records the deletion for replay
+            # with the user's CURRENT generation.
+            entry = self._append_deletion_log(
+                session, user_id, scope="session", scope_key=session_id,
+                fingerprints=fingerprints,
+                generation=self._current_deletion_generation(session, user_id),
+                purpose=purpose, global_key=session_id,
+                origin=origin, origin_seq=origin_seq, origin_hash=origin_hash,
+            )
+        return result, entry
+
+    # ------------------------------------------------------------------
+    # Tombstone synchronization (M4 batch 2 tasks 1-2)
+    # ------------------------------------------------------------------
+
+    def export_tombstones(self, since_cursor: int = 0, limit: int = 500):
+        """The next batch of cross-device tombstones from this database's
+        deletion log, after *since_cursor* (a local seq; 0 = from the
+        start).  Returns ``(batch, next_cursor)``; pass ``next_cursor``
+        back to continue.  Echoes are handled RECEIVER-side (an entry
+        originating from the receiver is re-applied only when its log
+        lost the entry in a restore), so no exclusion is needed here.  A
+        cursor above the log's head rewinds the batch to 0 (the caller's
+        cursor overshoots a rolled-back log).  A cursor before the log's
+        compaction checkpoint raises TombstoneCursorPruned: the peer
+        must rebuild (task 4)."""
+        self._ensure_db()
+        from mirror_memory.core import metrics
+        from mirror_memory.core.tombstones import export_from_log
+
+        if self._deletion_log is None:
+            raise DeletionLogUnavailable(
+                "no deletion log is configured: there is nothing to export")
+        batch, cursor, skipped = export_from_log(
+            self._deletion_log, self._db_id, int(since_cursor), int(limit))
+        if skipped:
+            metrics.inc(metrics.TOMBSTONES_EXPORT_SKIPPED, skipped)
+        return batch, cursor
+
+    def apply_tombstones(self, batch, *, auth_tenant: tuple[str, str] | None = None,
+                         purpose: str = "sync"):
+        """Apply a transport batch of cross-device tombstones: every entry
+        runs the normal local deletion for its scope (belief by global_id
+        / session / user -- fingerprints collected, local log written,
+        local generation advanced) and ``(origin, origin_hash)`` is
+        recorded as applied, all in ONE transaction.
+
+        The batch is a :class:`~mirror_memory.core.tombstones.TombstoneBatch`
+        (or its dict form): sender, from_cursor/to_cursor (the sender's
+        local log seq range), from_chain_hash/to_chain_hash (the sender's
+        chain hashes at those seqs), the entries and the envelope hash.
+
+        Channel continuity (patch 2): batch.from_cursor must equal THIS
+        receiver's stored cursor for that sender, AND
+        batch.from_chain_hash must equal the stored chain hash.  On a
+        mismatch the sender's log was RESTORED/REWRITTEN under seqs this
+        receiver already consumed -- the channel RESCANS: it re-anchors
+        to (0, GENESIS) so the caller's pull loop re-fetches the sender's
+        whole log, while the (origin, origin_hash) applied records
+        deduplicate the re-delivery.  Not silent: warning + the
+        tombstones_rescans metric.  Any failure while applying rolls the
+        whole batch back.  Already-applied entries are skipped
+        idempotently; a scope that no longer exists locally is a no-op
+        that is still recorded as applied.
+
+        Returns ``TombstoneApplyResult(applied, skipped, noop, rescan)``.
+        """
+        self._ensure_db()
+        from mirror_memory.core import metrics
+        from mirror_memory.core.repository import read_sync_peer, record_catchup
+        from mirror_memory.core.tombstones import (
+            TombstoneBatch,
+            TombstoneBatchRejected,
+            TombstoneEntry,
+            validate_batch,
+        )
+
+        if isinstance(batch, dict):
+            batch = TombstoneBatch.from_dict(batch)
+        if not isinstance(batch, TombstoneBatch):
+            raise TombstoneBatchRejected(
+                "format", "apply_tombstones takes a TombstoneBatch (or its dict form)")
+        expected = tuple(auth_tenant) if auth_tenant is not None else tuple(self._tenant)
+        if expected != tuple(self._tenant):
+            # a receiver engine always IS its tenant: a mismatch here is a
+            # routing bug, not a data problem -- refuse rather than guess
+            raise TombstoneBatchRejected(
+                "tenant",
+                f"the authenticated tenant {expected!r} is not this engine's "
+                f"{tuple(self._tenant)!r}: the batch is refused")
+        try:
+            validate_batch(batch, expected_tenant=expected)
+        except TombstoneBatchRejected as exc:
+            metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
+            raise
+
+        from mirror_memory.core.deletion import GENESIS_HASH
+        from mirror_memory.core.models import TombstoneApplied
+        from mirror_memory.core.repository import (
+            record_tombstones_applied,
+            tenant_knows_user,
+        )
+
+        with self._session() as session:
+            try:
+                peer = read_sync_peer(session, batch.sender)
+                stored_cursor = peer.cursor if peer is not None else 0
+                stored_chain = (peer.chain_hash if peer is not None
+                                else GENESIS_HASH) or GENESIS_HASH
+                rescan = (batch.from_cursor != stored_cursor
+                          or batch.from_chain_hash != stored_chain)
+                if rescan:
+                    # SENDER ROLLBACK (a restored log rewrote the seqs the
+                    # receiver already consumed) or a first contact after
+                    # a prune.  NOT silent: warn + rescan metric.  The
+                    # channel re-anchors to (0, GENESIS) so the caller's
+                    # pull loop re-fetches the sender's whole log, while
+                    # the (origin, origin_hash) applied records
+                    # deduplicate the re-delivery -- deletions that
+                    # survived on this receiver are kept, the sender's
+                    # re-issued deletions re-apply onto its restored
+                    # data, and genuinely NEW deletions (new entry hashes
+                    # at reused seqs) are never misfiled as duplicates.
+                    metrics.inc(metrics.TOMBSTONES_RESCANS)
+                    logger.warning(
+                        "tombstone channel rescan: sender %s sent from_cursor=%d "
+                        "from_chain_hash=%s but stored (cursor=%d, chain=%s); "
+                        "re-fetching the sender's log from 0 with entry-level dedup",
+                        batch.sender[:8], batch.from_cursor,
+                        batch.from_chain_hash[:8], stored_cursor,
+                        stored_chain[:8])
+                if not self._single_tenant:
+                    # a multi-tenant receiver (the cloud) only accepts
+                    # tombstones for users the authenticated tenant knows
+                    for entry in batch.entries:
+                        if not tenant_knows_user(session, entry.user_id):
+                            raise TombstoneBatchRejected(
+                                "user",
+                                f"tombstone {entry.origin[:8]}.../{entry.origin_seq} names "
+                                f"user {entry.user_id!r}, unknown to tenant "
+                                f"{tuple(self._tenant)!r}: the whole batch is refused")
+            except TombstoneBatchRejected as exc:
+                metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
+                raise
+
+            # NOTE: the dedup lookup covers EVERY origin (a hub relays
+            # entries whose origin is another device) but queries ONLY the
+            # triples this batch actually carries -- chunked row-value IN
+            # lists -- so its cost follows the batch size, not the size of
+            # the applied table (batch-2 patch 3, task 2).
+            from sqlalchemy import tuple_ as _sa_tuple
+
+            existing: set[tuple[str, int, str]] = set()
+            batch_keys = sorted({(e.origin, int(e.origin_seq),
+                                  e.origin_hash or "")
+                                 for e in batch.entries})
+            for _i in range(0, len(batch_keys), 250):
+                _chunk = batch_keys[_i:_i + 250]
+                for row_key in session.query(
+                        TombstoneApplied.origin, TombstoneApplied.origin_seq,
+                        TombstoneApplied.origin_hash).filter(
+                        _sa_tuple(
+                            TombstoneApplied.origin,
+                            TombstoneApplied.origin_seq,
+                            TombstoneApplied.origin_hash).in_(_chunk)).all():
+                    existing.add((row_key[0], row_key[1], row_key[2]))
+
+            rows: list[dict] = []
+            noop = 0
+            skipped = 0
+            applied = 0
+            seen_in_batch: set[tuple[str, int, str]] = set()
+            try:
+                for entry in batch.entries:
+                    key = (entry.origin, entry.origin_seq, entry.origin_hash)
+                    if key in existing or key in seen_in_batch:
+                        skipped += 1
+                        continue  # already applied: idempotent skip
+                    seen_in_batch.add(key)
+                    # ECHO CHECK: a tombstone ORIGINATING from this device
+                    # is re-applied only when the entry is absent from the
+                    # local log -- a full restore lost it (re-delete);
+                    # a device that still holds it skips (true echo).  The
+                    # lookup is by (origin_seq, origin_hash): the tombstone
+                    # names the sender's log position it was exported from
+                    if entry.origin == self._db_id and self._deletion_log is not None:
+                        if self._deletion_log.has_tombstone(
+                                self._db_id, entry.origin_seq,
+                                entry.origin_hash):
+                            skipped += 1
+                            continue
+                    applied += 1
+                    local_seq = self._apply_one_tombstone(session, entry, purpose)
+                    if local_seq is None:
+                        noop += 1
+                    rows.append({
+                        "origin": entry.origin, "origin_seq": entry.origin_seq,
+                        "origin_hash": entry.origin_hash,
+                        "user_id": entry.user_id, "scope": entry.scope,
+                        "scope_key": entry.scope_key, "local_seq": local_seq,
+                    })
+                if rows:
+                    record_tombstones_applied(session, rows)
+                if rescan:
+                    # the rescan re-anchors the channel to (0, GENESIS):
+                    # the caller's pull loop re-reads this cursor and
+                    # re-fetches the sender's whole log, deduplicating
+                    record_catchup(session, batch.sender, 0,
+                                   chain_hash=GENESIS_HASH)
+                else:
+                    # the channel cursor + chain hash advance to the
+                    # batch's to_cursor/to_chain_hash in the SAME
+                    # transaction -- even for an all-excluded/empty batch,
+                    # so entries that cannot travel never wedge the
+                    # channel
+                    record_catchup(session, batch.sender, batch.to_cursor,
+                                   chain_hash=batch.to_chain_hash)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + "apply")
+                raise TombstoneBatchRejected(
+                    "apply",
+                    f"applying tombstone batch failed ({type(exc).__name__}: {exc}); "
+                    "the whole batch was rolled back") from exc
+        applied = len(rows)  # recorded applications (incl. no-ops)
+        metrics.inc(metrics.TOMBSTONES_APPLIED, applied)
+        if skipped:
+            metrics.inc(metrics.TOMBSTONES_SKIPPED, skipped)
+        return TombstoneApplyResult(applied=applied, skipped=skipped,
+                                    noop=noop, rescan=rescan)
+
+    def _apply_one_tombstone(self, session, entry, purpose: str):
+        """One tombstone -> the local deletion of its scope through the
+        normal path.  Returns the local log seq, or None for a no-op (the
+        scope no longer exists here)."""
+        from mirror_memory.core.repository import belief_by_global_id
+
+        if entry.scope == "user":
+            _counts, log_entry = self._delete_user_in(
+                session, entry.user_id, purpose,
+                origin=entry.origin, origin_seq=entry.origin_seq,
+                origin_hash=entry.origin_hash)
+            return log_entry.seq if log_entry is not None else None
+        if entry.scope == "session":
+            found, log_entry = self._forget_session_in(
+                session, entry.user_id, entry.scope_key, purpose,
+                origin=entry.origin, origin_seq=entry.origin_seq,
+                origin_hash=entry.origin_hash)
+            return log_entry.seq if found and log_entry is not None else None
+        belief = belief_by_global_id(session, entry.user_id, entry.scope_key)
+        if belief is None:
+            return None
+        committed, log_entry = self._forget_belief_in(
+            session, entry.user_id, belief.id, purpose,
+            origin=entry.origin, origin_seq=entry.origin_seq,
+            origin_hash=entry.origin_hash)
+        return log_entry.seq if committed and log_entry is not None else None
+
+    # ------------------------------------------------------------------
+    # Edge catch-up against the sync peer (M4 batch 2 task 3)
+    # ------------------------------------------------------------------
+
+    def _catch_up(self) -> None:
+        """Pull and apply the peer's tombstones until the peer's tail.
+        State transitions: catching_up -> normal on success;
+        catching_up -> offline_grace / expired on a transport failure,
+        measured from the last successful catch-up (stored in the main
+        database -- a restored backup rewinds it and expires the grace
+        sooner).  Re-entrant and cursor-resumable: the peer cursor lives
+        in mm_sync_peers, applied tombstones are skipped idempotently."""
+        from mirror_memory.core import metrics
+        from mirror_memory.core.repository import read_sync_peer, record_catchup
+        from mirror_memory.core.tombstones import TombstoneBatchRejected
+
+        if self._sync_transport is None:
+            return
+        with self._sync_lock:
+            previous = self._sync_state
+            self._sync_state = "catching_up"
+            from mirror_memory.core import metrics
+
+            metrics.set_gauge(metrics.SYNC_CATCHING_UP, 1.0)
+            try:
+                # ONE trusted peer identity for the whole channel: the
+                # transport must DECLARE its peer.  A falsy db_id is
+                # fail-closed (SyncTransportIdentityMissing) -- the
+                # envelope's self-claimed sender never substitutes for it.
+                peer_db_id = getattr(self._sync_transport, "db_id", None)
+                if not peer_db_id:
+                    raise SyncTransportIdentityMissing(
+                        "the sync transport does not declare its peer's "
+                        "db_id: the channel's cursors, the last-complete "
+                        "catchup instant and every status/error must be "
+                        "keyed by one identity -- configure the transport "
+                        "with its peer's db_id")
+                with self._session() as session:
+                    peer = read_sync_peer(session, peer_db_id)
+                    cursor = peer.cursor if peer is not None else 0
+                while True:
+                    # the stored cursor is RE-READ every iteration: a
+                    # channel rescan (sender rollback) resets it to 0, so
+                    # the loop re-fetches the peer's log from the start
+                    with self._session() as session:
+                        peer = read_sync_peer(session, peer_db_id)
+                        cursor = peer.cursor if peer is not None else 0
+                    batch, _next_cursor = self._sync_transport.export_tombstones(
+                        cursor, 500)
+                    if batch.sender != peer_db_id:
+                        # the transport dialed one peer but the envelope
+                        # claims another: refuse instead of writing the
+                        # channel state into a surprise identity's row
+                        metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX
+                                    + "sender")
+                        raise TombstoneBatchRejected(
+                            "sender",
+                            f"the sync transport declares peer "
+                            f"{str(peer_db_id)[:8]}... but the batch "
+                            f"envelope says {batch.sender[:8]}...: the "
+                            "channel identity must be one -- refused")
+                    # apply advances the peer cursor + chain hash to the
+                    # batch's to_cursor/to_chain_hash in its own
+                    # transaction (even for an empty batch) -- the
+                    # catch-up is durable after every batch and resumes
+                    # where it got to
+                    result = self.apply_tombstones(batch, purpose="sync")
+                    # the tail is reached only on an EMPTY batch that did
+                    # NOT trigger a rescan: after a rescan the channel was
+                    # re-anchored to 0, so the loop must keep pulling from
+                    # the reset cursor even when this batch's own range
+                    # was empty (to_cursor == from_cursor)
+                    if (batch.to_cursor == batch.from_cursor
+                            and not result.rescan):
+                        break  # the peer's tail is reached
+                # the tail is CONFIRMED (an empty batch that did not
+                # rescan): only now is the offline grace's anchor stamped
+                # -- intermediate batches and rescan re-anchors recorded
+                # progress above, never completion (batch-2 patch 4, task 1)
+                from mirror_memory.core.repository import mark_catchup_complete
+
+                with self._session() as session:
+                    mark_catchup_complete(session, peer_db_id)
+                    session.commit()
+                self._sync_state = "normal"
+                self._sync_attempt_failed = False
+                metrics.set_gauge(metrics.SYNC_CATCHING_UP, 0.0)
+            except (ConnectionError, TimeoutError) as exc:
+                self._sync_attempt_failed = True
+                self._sync_state = self._grace_state()
+                logger.warning(
+                    "sync catch-up failed (%s); state=%s", exc, self._sync_state)
+            # any other exception propagates (a bad batch is a real problem,
+            # not an offline condition) with the state left at catching_up
+            # -- entries refuse until it is resolved
+
+    def _grace_status(self) -> dict:
+        """The offline-grace arithmetic from the stored last catch-up."""
+        from mirror_memory.core.repository import read_sync_peer
+
+        grace_days = self._config.sync.offline_grace_days
+        reminder_days = self._config.sync.reminder_days
+        with self._session() as session:
+            peer = read_sync_peer(session, getattr(self._sync_transport, "db_id", ""))
+            last = peer.last_catchup_at if peer is not None else None
+        now = datetime.utcnow()
+        if last is None:
+            return {"state": "expired", "last_catchup_at": None,
+                    "remaining_grace_days": 0.0, "reminder": True}
+        remaining = grace_days - (now - last).total_seconds() / 86400.0
+        expired = remaining <= 0
+        from mirror_memory.core import metrics
+
+        metrics.set_gauge(
+            metrics.SYNC_SINCE_LAST_CATCHUP_SECONDS,
+            (now - last).total_seconds())
+        metrics.set_gauge(metrics.SYNC_CATCHING_UP,
+                          1.0 if self._sync_state == "catching_up" else 0.0)
+        return {"state": "expired" if expired else "normal",
+                "last_catchup_at": last,
+                "remaining_grace_days": max(0.0, round(remaining, 3)),
+                "reminder": remaining <= reminder_days,
+                "expired": expired}
+
+    def _grace_state(self) -> str:
+        """The service state after a FAILED catch-up attempt: expired when
+        the grace is out (or was never earned), offline_grace while within
+        it, and expired sticks when it already was."""
+        status = self._grace_status()
+        if status["state"] == "expired" or self._sync_state == "expired":
+            return "expired"
+        return "offline_grace"
+
+    def sync_status(self) -> dict:
+        """The user-facing synchronization state (M4 batch 2 task 3):
+        last successful catch-up, remaining grace days, the state (normal
+        / catching_up / offline_grace / expired) and a reminder flag once
+        the remaining grace is at or below sync.reminder_days."""
+        self._ensure_db()
+        if self._config.sync.enabled and self._sync_transport is not None:
+            status = self._grace_status()
+            if self._sync_state == "catching_up":
+                status["state"] = "catching_up"
+            elif self._sync_attempt_failed and self._sync_state in ("offline_grace", "expired"):
+                # live arithmetic: the anchor ages while the state variable
+                # waits for the next attempt -- report the clock's verdict
+                status["state"] = self._grace_state()
+            status["transport_injected"] = True
+            return status
+        if self._config.sync.enabled:
+            # enabled but no transport: the stored channel history decides
+            # (batch-2 patch 5, task 3) -- never reported as "disabled"
+            row, ambiguous = self._stored_channel_history()
+            last = row.last_catchup_at if row is not None else None
+            remaining = None
+            expired = True
+            if row is not None and not ambiguous:
+                remaining = self._config.sync.offline_grace_days - (
+                    datetime.utcnow() - last).total_seconds() / 86400.0
+                expired = remaining <= 0
+            # batch-2 patch 6, task 3: without a transport the engine IS
+            # offline -- within the stored grace the honest label is
+            # offline_grace, never normal (nothing can catch up)
+            return {"state": "expired" if expired else "offline_grace",
+                    "last_catchup_at": last,
+                    "remaining_grace_days": (max(0.0, round(remaining, 3))
+                                             if remaining is not None else None),
+                    "reminder": (remaining is not None
+                                 and remaining <= self._config.sync.reminder_days),
+                    "transport_injected": False}
+        return {"state": "disabled", "last_catchup_at": None,
+                "remaining_grace_days": None, "reminder": False}
+
+    def _stored_channel_history(self):
+        """The stored channel history for the no-transport mode (batch-2
+        patch 5, task 3): the peer rows THIS engine stamped complete -- its
+        own record of its trusted peer(s) and their last complete
+        catch-up.  Returns ``(row, ambiguous)``: the single completed peer
+        (None when there is none) and whether more than one exists (the
+        trusted peer cannot then be located unambiguously).
+
+        Boundary of the single-history inference (batch-2 patch 6,
+        task 3): it ASSUMES the one completed peer is the peer a future
+        transport would dial.  That holds for a single-peer edge whose
+        history this engine wrote itself; a future NETWORK transport must
+        bind the peer's db_id to the AUTHENTICATED peer at the protocol
+        layer -- the envelope's self-claimed sender and a stored row are
+        history, not authentication."""
+        from mirror_memory.core.models import SyncPeer
+
+        with self._session() as session:
+            rows = session.query(SyncPeer).filter(
+                SyncPeer.last_catchup_at.isnot(None)).order_by(
+                SyncPeer.last_catchup_at.desc()).all()
+            rows = list(rows)
+        if len(rows) == 1:
+            return rows[0], False
+        return (rows[0] if rows else None), len(rows) > 1
+
+    def _gate_without_transport(self, *, read: bool) -> None:
+        """sync.enabled=True but the host injected no transport (batch-2
+        patch 5, task 3): NOT the disabled behavior.  The channel history
+        in THIS database is the only trustworthy source -- reads serve
+        under the standard offline grace measured from the stored
+        completion, refuse when it is out (or when there is none, or when
+        the completed peer cannot be located unambiguously).  No catch-up
+        can run and the stored instant is never refreshed or invented;
+        writes stay available (offline deletions)."""
+        if not read:
+            return  # offline deletions stay available
+        row, ambiguous = self._stored_channel_history()
+        if row is None:
+            raise SyncCatchupRequired(None)
+        if ambiguous:
+            raise SyncCatchupRequired(row.last_catchup_at)
+        remaining = self._config.sync.offline_grace_days - (
+            datetime.utcnow() - row.last_catchup_at).total_seconds() / 86400.0
+        if remaining <= 0:
+            raise SyncCatchupRequired(row.last_catchup_at)
+        # within the grace measured from the stored completion: serve
+
+    def _sync_gate(self, *, read: bool) -> None:
+        """Entry-point gate (M4 batch 2 task 3): refuse while catching up
+        (all entries, like replay mode), refuse reads when the offline
+        grace has expired -- and RE-ATTEMPT the catch-up first, so coming
+        back online restores service without a restart.
+
+        Batch-2 patch 5, task 1: the clock runs in NORMAL state too -- a
+        long-lived engine whose last COMPLETE catch-up ages past the grace
+        stops serving reads even if no attempt has failed yet; the gate
+        attempts one catch-up on the spot (a working link heals with no
+        restart, middle batches still never refresh the instant) and a
+        failed attempt leaves the reads refused."""
+        if not self._config.sync.enabled:
+            return
+        if self._sync_transport is None:
+            self._gate_without_transport(read=read)
+            return
+        if self._sync_state == "catching_up":
+            raise SyncCatchingUp()
+        if self._sync_state == "normal":
+            status = self._grace_status()
+            if status["state"] == "expired":
+                # the grace ran out without a failed attempt: try once now
+                try:
+                    self._catch_up()
+                except (ConnectionError, TimeoutError):
+                    pass
+                if self._sync_state != "normal":
+                    if read:
+                        raise SyncCatchupRequired(status["last_catchup_at"])
+                    return
+        if self._sync_state in ("expired", "offline_grace") and self._sync_attempt_failed:
+            # one re-attempt per entry: a working link heals immediately,
+            # no restart needed
+            try:
+                self._catch_up()
+            except (ConnectionError, TimeoutError):
+                pass
+        if self._sync_state == "expired" and read:
+            with self._session() as session:
+                from mirror_memory.core.repository import read_sync_peer
+
+                peer = read_sync_peer(session, getattr(self._sync_transport, "db_id", ""))
+                last = peer.last_catchup_at if peer is not None else None
+            raise SyncCatchupRequired(last)
+
+    def _catch_up_at_startup(self) -> None:
+        """The startup catch-up: before any entry serves, the edge pulls
+        and applies the peer's tombstones until the peer's tail."""
+        if not self._config.sync.enabled:
+            return
+        if self._sync_transport is None:
+            # enabled but no transport (batch-2 patch 5, task 3): entries
+            # serve under the stored grace via the gate -- the operator
+            # must know the channel is NOT syncing
+            logger.warning(
+                "sync.enabled=true but no sync transport was injected: "
+                "no catch-up can run; entries serve under the stored "
+                "offline grace and refuse once it is out")
+            return
+        try:
+            self._catch_up()
+        except (ConnectionError, TimeoutError):
+            pass  # the grace arithmetic decided the state; entries are gated
+
 
     def correct(
         self,
@@ -1076,6 +1964,7 @@ class MemoryEngine:
             raise ValidationError("new_claim_text must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=False)
         from mirror_memory.core.proposal import (
             TRANSITION_CORRECT,
             StateTransitionProposal,
@@ -1149,6 +2038,7 @@ class MemoryEngine:
         if not user_id or not user_id.strip():
             raise ValidationError("user_id must be a non-empty string")
         self._ensure_db()
+        self._sync_gate(read=True)
         with self._session() as session:
             authorized = self._authorize(session, user_id, purpose, "export", audit_entry=ENTRY_EXPORT_PAGE)
             rule = provenance.visibility(session, user_id, authorized.purpose)
@@ -1208,6 +2098,9 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        # batch-2 patch 5, task 2: a version chain is memory content --
+        # the sync gate applies like every other read entrance
+        self._sync_gate(read=True)
         from mirror_memory.core.repository import belief_history
 
         with self._session() as session:
@@ -1234,6 +2127,7 @@ class MemoryEngine:
             raise ValidationError("user_id must be a non-empty string")
 
         self._ensure_db()
+        self._sync_gate(read=True)
         from mirror_memory.core.repository import explain_belief
 
         with self._session() as session:

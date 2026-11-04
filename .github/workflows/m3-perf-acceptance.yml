@@ -15,6 +15,10 @@ on:
   push:
     branches: ["perf/m3-batch1", "perf/m3-batch2", "perf/m3-batch3", "perf/m3-batch3-patch", "perf/m3-premerge"]
   workflow_dispatch:
+    inputs:
+      head_rev:
+        description: 'revision under test (base is fixed at 403f38d)'
+        default: 'HEAD'
 
 jobs:
   measure:
@@ -55,10 +59,12 @@ jobs:
           done
           echo "postgres not ready"; exit 1
 
-      - name: Collect the ID intersection (main vs HEAD)
+      - name: Collect the ID intersection (main vs the revision under test)
         run: |
           set -eu
-          python tools/perf_ids.py collect 403f38d HEAD --out /tmp/ids.txt
+          HEAD_REV="${{ inputs.head_rev || 'HEAD' }}"
+          echo "head_rev=$HEAD_REV" | tee -a "$GITHUB_STEP_SUMMARY"
+          python tools/perf_ids.py collect 403f38d "$HEAD_REV" --out /tmp/ids.txt
           # Mechanism tests that cannot run under the measurement口径
           # (auditor off): the two auditor verdict-cache tests require the
           # audit listener installed; the writer-caller scanner tests
@@ -89,6 +95,15 @@ jobs:
             # measured surface: without rewinding them the base revision
             # sees the HEAD yaml and its scope/writer scans report ghosts
             git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
+            # round-validity gate: the measured src tree must BE the
+            # revision's tree (batch-2 patch 3, task 3)
+            local want
+            want=$(git rev-parse "$rev:src")
+            if [ -n "$(git diff --name-only "$rev" -- src)" ]; then
+              echo "TREE-MISMATCH sqlite-$tag round$round: worktree src != $rev ($want)" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "src-tree sqlite-$tag round$round $rev = $want OK" | tee -a "$GITHUB_STEP_SUMMARY"
             export MM_SQL_AUDIT=0 MM_DATABASE_URL=""
             local start end
             start=$(python -c 'import time; print(time.monotonic())')
@@ -97,9 +112,10 @@ jobs:
             end=$(python -c 'import time; print(time.monotonic())')
             echo "sqlite-$tag($rev) round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/sql_${tag}_$round.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
           }
+          HEAD_REV="${{ inputs.head_rev || 'HEAD' }}"
           for round in 1 2 3; do
             measure 403f38d "$round" main
-            measure HEAD "$round" head
+            measure "$HEAD_REV" "$round" head
             if python tools/perf_ids.py verify "/tmp/sql_main_$round.xml" "/tmp/sql_head_$round.xml" | tee -a "$GITHUB_STEP_SUMMARY"; then
               echo "sqlite round $round VALID" | tee -a "$GITHUB_STEP_SUMMARY"
             fi
@@ -108,6 +124,9 @@ jobs:
       - name: PostgreSQL longrun (mode A), interleaved x3 (auditor off, guards on)
         run: |
           set -u -o pipefail
+          # ONE definition: a second same-name definition used to shadow
+          # this one, so the longrun rounds never rewound src/tests and
+          # measured the wrong revision (batch-2 patch 3, task 3)
           use_rev() {
             local rev="$1"
             git ls-tree -r --name-only "$rev" -- src tests > /tmp/keep.txt
@@ -118,14 +137,20 @@ jobs:
               grep -qx "$f" /tmp/keep.txt || rm -f "$f"
             done
             git checkout -f -q "$rev" -- src tests pyproject.toml
-          }
-          use_rev() {
-            local rev="$1"
-            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml tools
+            git checkout -f -q "$rev" -- tenancy_system_scope_allowlist.yaml tenancy_writer_callers.yaml
           }
           measure() {
             local rev="$1" round="$2" tag="$3"
             use_rev "$rev"
+            # round-validity gate: the measured src tree must BE the
+            # revision's tree
+            local want
+            want=$(git rev-parse "$rev:src")
+            if [ -n "$(git diff --name-only "$rev" -- src)" ]; then
+              echo "TREE-MISMATCH longrun-$tag round$round: worktree src != $rev ($want)" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "src-tree longrun-$tag round$round $rev = $want OK" | tee -a "$GITHUB_STEP_SUMMARY"
             export MM_SQL_AUDIT=0 MM_DATABASE_URL="postgresql+psycopg://postgres:mm@127.0.0.1:5432/mm_test"
             unset MM_TENANT_READ_FILTER MM_PG_RLS MM_ALLOW_UNFILTERED_MEASUREMENT || true
             local start end
@@ -135,9 +160,10 @@ jobs:
             end=$(python -c 'import time; print(time.monotonic())')
             echo "longrun-$tag($rev) round$round secs=$(python -c "print(f'{$end-$start:.1f}')") | $(grep -oE '[0-9]+ passed' /tmp/lr_${tag}_$round.txt | tail -1)" | tee -a "$GITHUB_STEP_SUMMARY"
           }
+          HEAD_REV="${{ inputs.head_rev || 'HEAD' }}"
           for round in 1 2 3; do
             measure 403f38d "$round" main
-            measure HEAD "$round" head
+            measure "$HEAD_REV" "$round" head
             if python tools/perf_ids.py verify "/tmp/lr_main_$round.xml" "/tmp/lr_head_$round.xml" | tee -a "$GITHUB_STEP_SUMMARY"; then
               echo "longrun round $round VALID" | tee -a "$GITHUB_STEP_SUMMARY"
             fi

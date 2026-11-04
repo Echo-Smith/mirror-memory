@@ -25,6 +25,12 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
+        "sqlite_only(reason): the test exercises embedded-SQLite behaviour "
+        "(the file write lock) that PostgreSQL does not have; mandatory "
+        "reason, mirrored",
+    )
+    config.addinivalue_line(
+        "markers",
         "postgres_only(reason): the test exercises PostgreSQL catalog "
         "behaviour that SQLite cannot express; mandatory reason, mirrored "
         "on the sqlite_only side by dialect-conditional skips",
@@ -478,7 +484,10 @@ def _pg_fresh_schema(admin_engine) -> None:
     def drop_bounded() -> None:
         from sqlalchemy import MetaData
 
-        from mirror_memory.core.schema_migration import _version_table
+        from mirror_memory.core.schema_migration import (
+            WATERMARK_TABLE,
+            _version_table,
+        )
 
         with admin_engine.connect() as conn:
             conn.execute(text("SET LOCAL lock_timeout = '2s'"))
@@ -487,6 +496,11 @@ def _pg_fresh_schema(admin_engine) -> None:
             # no migration history either (a leftover row would make the
             # next upgrade_database skip every step)
             _version_table(MetaData()).drop(conn, checkfirst=True)
+            # the deletion watermark is not in Base.metadata either; a
+            # leftover row pairs the fresh schema with a stale (db_id,
+            # applied_seq) the new test's log cannot match (M4)
+            conn.execute(text(
+                f"DROP TABLE IF EXISTS {WATERMARK_TABLE}"))
             conn.commit()
 
     try:
@@ -518,6 +532,19 @@ def _pg_fresh_schema(admin_engine) -> None:
 
     if rls.rls_enabled():
         install_row_level_security(admin_engine, verify=False)
+
+    # M4: the deletion watermark lives outside the model metadata -- the
+    # runtime (app role) reads and advances it, so it needs the grants too
+    from mirror_memory.core import rls as _rls, schema_migration as _sm
+    from mirror_memory.core.tenancy import system_scope as _system_scope
+
+    with _system_scope(reason="test harness: watermark parity with step 11"):
+        _sm.ensure_watermark(admin_engine)
+    with admin_engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"GRANT SELECT, INSERT, UPDATE ON mm_deletion_watermark "
+            f"TO {_rls.app_role()}, {_rls.maintenance_role()}")
+
 
 
 @pytest.fixture
@@ -626,6 +653,11 @@ def db_session():
     if pg is None:
         engine = create_engine("sqlite://", echo=False)
         Base.metadata.create_all(engine)
+        # M4: deploy-time shape -- the watermark row exists before any
+        # content is seeded (matching the PG branch / Step 11)
+        from mirror_memory.core import schema_migration as _sm
+
+        _sm.ensure_watermark(engine)
         SessionFactory = sessionmaker(bind=engine)
         session = SessionFactory()
         yield session
@@ -670,3 +702,132 @@ class MockLLM:
 def mock_llm():
     """Default mock LLM returning empty claims."""
     return MockLLM()
+
+
+# ---------------------------------------------------------------------------
+# M4 batch-1 patch task 2: on the PostgreSQL leg the default `file`
+# deletion-log backend needs an explicit directory for server URLs (the
+# URL-derived default is embedded-SQLite only).  The wrapper runs at
+# conftest import time, so every test module's `from ... import
+# load_config` binds it; tests that exercise the deletion log set their
+# own backend/directory after load_config and override this default.
+# ---------------------------------------------------------------------------
+import functools as _functools
+
+import mirror_memory.config.loader as _cfg_loader
+
+_original_load_config = _cfg_loader.load_config
+
+
+@_functools.wraps(_original_load_config)
+def _load_config_with_log_directory(*args, **kwargs):
+    cfg = _original_load_config(*args, **kwargs)
+    import os as _os
+
+    if _os.environ.get("MM_DATABASE_URL", "").startswith("postgres"):
+        cfg.deletion_log.directory = (
+            cfg.deletion_log.directory
+            or f"/tmp/mm-test-deletions-{_os.getpid()}")
+    return cfg
+
+
+_cfg_loader.load_config = _load_config_with_log_directory
+
+
+def strip_to_step10(engine) -> None:
+    """Roll a current database back to EXACTLY the step-10 shape (M4 patch
+    2 tests): see strip_to_step."""
+    strip_to_step(engine, 10)
+
+
+def strip_to_step(engine, version: int) -> None:
+    """Roll a current database back to the shape of *version* (10 or 11):
+    drop every artifact of the later steps and the version rows above it.
+    The result is what a real backup from that era looks like.  Run it
+    owner-side on PostgreSQL."""
+    from sqlalchemy import MetaData, inspect, text
+
+    from mirror_memory.core.schema_migration import (
+        WATERMARK_TABLE,
+        _version_table,
+    )
+
+    assert version in (10, 11, 12), version
+    with engine.begin() as conn:
+        # step 13 (sync bookkeeping tables)
+        conn.exec_driver_sql("DROP TABLE IF EXISTS mm_tombstones_applied")
+        conn.exec_driver_sql("DROP TABLE IF EXISTS mm_sync_peers")
+        if version >= 12:
+            pass  # keep step 12's column/index
+        # step 12 (global_id).  PostgreSQL: drop the constraint/index and
+        # the column.  SQLite cannot drop a column a table-level UNIQUE
+        # constraint references (create_all's autoindex), so the table is
+        # REBUILT without it (step 1's SQLite strategy: create, copy, drop,
+        # rename) -- the genuine step-11 shape.
+        if version <= 11:
+            if engine.dialect.name == "postgresql":
+                # the constraint owns the index (create_all) -- drop it
+                # first; a migration-built bare index is dropped by name
+                conn.exec_driver_sql(
+                    "ALTER TABLE mm_beliefs DROP CONSTRAINT IF EXISTS "
+                    "uq_mm_beliefs_global_id")
+            conn.exec_driver_sql("DROP INDEX IF EXISTS uq_mm_beliefs_global_id")
+            if "global_id" in {
+                    c["name"] for c in inspect(conn).get_columns("mm_beliefs")}:
+                if engine.dialect.name == "postgresql":
+                    conn.exec_driver_sql("ALTER TABLE mm_beliefs DROP COLUMN global_id")
+                else:
+                    _rebuild_sqlite_beliefs_without(conn, "global_id")
+        if version <= 10:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {WATERMARK_TABLE}")
+            conn.exec_driver_sql("DROP TABLE IF EXISTS mm_deletion_generations")
+            if "source_generation" in {
+                    c["name"] for c in inspect(conn).get_columns("mm_snapshots")}:
+                conn.exec_driver_sql(
+                    "ALTER TABLE mm_snapshots DROP COLUMN source_generation")
+        _version_table(MetaData()).create(conn, checkfirst=True)  # same connection: SQLite holds the write lock
+        conn.execute(text(
+            "DELETE FROM mm_schema_version WHERE version > :v"), {"v": version})
+        if conn.execute(text(
+                "SELECT max(version) FROM mm_schema_version")).scalar() is None:
+            rows = [(1, "tenancy"), (5, "pending-jobs index"), (10, "derived provenance")]
+            if version >= 11:
+                rows.append((11, "deletion replay"))
+            if version >= 12:
+                rows.append((12, "belief global_id"))
+            for v, note in rows:
+                conn.execute(text(
+                    "INSERT INTO mm_schema_version (version, note) "
+                    "VALUES (:v, :n)"), {"v": v, "n": note})
+    # pooled SQLite connections cache the pre-rebuild schema: drop them so
+    # the next statement reads the rebuilt table (engines reconnect lazily)
+    engine.dispose()
+
+
+def _rebuild_sqlite_beliefs_without(conn, dropped: str) -> None:
+    """SQLite: recreate mm_beliefs without *dropped* (and any constraint /
+    index naming it) -- rename the old table away, drop its named indexes
+    (SQLite index names are database-global), create the model's table
+    minus the column under the real name, copy the rows, drop the old."""
+    from sqlalchemy import MetaData, inspect
+
+    old_indexes = [
+        ix["name"] for ix in inspect(conn).get_indexes("mm_beliefs")
+        if ix.get("name") and not ix["name"].startswith("sqlite_autoindex")]
+    conn.exec_driver_sql("ALTER TABLE mm_beliefs RENAME TO mm_beliefs__old")
+    for name in old_indexes:
+        conn.exec_driver_sql(f'DROP INDEX IF EXISTS "{name}"')
+    rebuilt = Base.metadata.tables["mm_beliefs"].to_metadata(MetaData())
+    col = rebuilt.c[dropped]
+    for constraint in list(rebuilt.constraints):
+        if any(c.name == dropped for c in getattr(constraint, "columns", [])):
+            rebuilt.constraints.discard(constraint)
+    for ix in list(rebuilt.indexes):
+        if any(c.name == dropped for c in ix.columns):
+            rebuilt.indexes.discard(ix)
+    rebuilt._columns.remove(col)
+    rebuilt.create(conn)
+    cols = ", ".join(c.name for c in rebuilt.columns)
+    conn.exec_driver_sql(
+        f"INSERT INTO mm_beliefs ({cols}) SELECT {cols} FROM mm_beliefs__old")
+    conn.exec_driver_sql("DROP TABLE mm_beliefs__old")

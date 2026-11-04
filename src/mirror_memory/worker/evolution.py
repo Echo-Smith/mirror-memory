@@ -186,6 +186,46 @@ def process_pending(session_factory: object, config: MemoryConfig) -> None:
             # (core.tenancy routes system_scope sessions), where the
             # cross-tenant scan can see every tenant's jobs.
             session = session_factory() if callable(session_factory) else session_factory
+            # M4 task 3: keep the main DB aligned with its deletion log.
+            # A mismatch means a restore happened (or a replay is running
+            # elsewhere): the worker attempts the replay itself and
+            # otherwise skips this tick -- it must not process jobs while
+            # the database is behind its log.
+            from mirror_memory.core import replay as deletion_replay
+            from mirror_memory.core import metrics
+
+            log = _deletion_log_for(config, str(session.get_bind().url))
+            if log is not None:
+                # M4 batch-1 patch task 4: the worker only works on a main
+                # database that is IN SYNC with its deletion log.  Any
+                # reconcile outcome other than ok/replayed -- a broken log
+                # chain, an unavailable log, a missing watermark, a replay
+                # running elsewhere, an infrastructure error -- skips the
+                # WHOLE tick: no lease recovery, no claims, no publishes
+                # (working on a database that may be a pre-deletion restore
+                # would resurrect deleted content).  Failing reconciles
+                # back off exponentially instead of being hammered every
+                # tick, and the refusal raises the alert metric.
+                bind_url = str(session.get_bind().url)
+                if not _reconcile_gate(bind_url):
+                    logger.warning(
+                        "deletion reconcile is in backoff after a failure; "
+                        "skipping this tick -- no lease recovery, no claims, "
+                        "no publishes")
+                    return
+                try:
+                    status = deletion_replay.reconcile(session_factory, log)
+                except Exception as exc:
+                    delay = _reconcile_record_failure(bind_url)
+                    metrics.inc(metrics.DELETION_RECONCILE_FAILURES)
+                    logger.error(
+                        "deletion reconcile failed (%s: %s); skipping this "
+                        "tick -- no lease recovery, no claims, no publishes; "
+                        "retrying in ~%.0fs", type(exc).__name__, exc, delay)
+                    return
+                _reconcile_record_success(bind_url)
+                logger.debug("deletion reconcile: %s", status)
+
             # Crash recovery: expire leases whose holder is gone.  The
             # lease_token is deliberately NOT reset -- it is the monotonic
             # fencing generation (I3).
@@ -404,6 +444,13 @@ def _process_single_job(
         # between enqueue and compute, so we re-read the current value to
         # compare against the post-compute revision at Node 6.
         expected_revision = get_state_revision(session, user_id)
+        # M4 task 4: the deletion generation at claim time -- the publish
+        # re-checks it (with the revision) so a deletion -- or a backup
+        # restore + replay -- that happened during the compute cancels the
+        # job instead of writing deleted content back.
+        from mirror_memory.core.repository import current_deletion_generation
+
+        expected_generation = current_deletion_generation(session, user_id)
 
         # Node 1: load_evidence (plain data, no ORM instances retained),
         # filtered to memory the job's purpose may see
@@ -511,6 +558,20 @@ def _process_single_job(
             actor="worker",
             reason=f"snapshot_version={grant_version} publish_version={publish_grant_version}",
         )
+        # M4 task 4: the deletion generation, re-checked WITH the revision
+        # at the same point and under the same lock -- a deletion that
+        # committed during the compute (or a restore + replay that moved
+        # the generation) must cancel the job, never write through it.
+        # This also fixes the revision ABA: a restore rewinds the revision
+        # to a stale-but-matching value, but the replay raises the
+        # generation past the claim-time one.
+        from mirror_memory.core.repository import current_deletion_generation
+
+        current_generation = current_deletion_generation(session, user_id)
+        if current_generation != expected_generation:
+            session.rollback()
+            _block_job(session, job, "deletion_generation_changed", token)
+            return
 
         # Node 6: publish.  The Publisher is the only component allowed to
         # write derived state, and it re-checks consent, revision, and
@@ -638,6 +699,80 @@ def _previous_snapshot_purposes(session: object, user_id: str) -> set[str]:
 #: How long the BUSY bookkeeping keeps retrying the fenced pending-update
 #: before giving up and surfacing the lock error (the sweep retries anyway).
 _BUSY_BOOKKEEPING_TIMEOUT = 6.0
+
+
+#: Per-database-URL reconcile backoff after a failure (M4 batch-1 patch
+#: task 4): url -> (consecutive failures, next-attempt time.monotonic()).
+#: A failing reconciliation must not be hammered every tick -- the worker
+#: skips whole ticks until the window elapses, then retries.
+_RECONCILE_BACKOFF: dict[str, tuple[int, float]] = {}
+_RECONCILE_BACKOFF_BASE_SECONDS = 2.0
+_RECONCILE_BACKOFF_CAP_SECONDS = 60.0
+
+
+def _reconcile_gate(database_url: str) -> bool:
+    """False while *database_url* is inside a backoff window."""
+    state = _RECONCILE_BACKOFF.get(database_url)
+    return state is None or time.monotonic() >= state[1]
+
+
+def _reconcile_record_failure(database_url: str) -> float:
+    """Record a failed reconcile: escalate the consecutive-failure count
+    and schedule the next attempt (exponential, capped).  Returns the
+    delay in seconds."""
+    failures, _ = _RECONCILE_BACKOFF.get(database_url, (0, 0.0))
+    failures += 1
+    delay = min(_RECONCILE_BACKOFF_BASE_SECONDS * 2 ** (failures - 1),
+                _RECONCILE_BACKOFF_CAP_SECONDS)
+    _RECONCILE_BACKOFF[database_url] = (failures, time.monotonic() + delay)
+    return delay
+
+
+def _reconcile_record_success(database_url: str) -> None:
+    _RECONCILE_BACKOFF.pop(database_url, None)
+
+
+def _any_bind_url(session_factory, config: MemoryConfig) -> str:
+    """The worker session factory's bind URL (for the log derivation)."""
+    session = session_factory() if callable(session_factory) else session_factory
+    try:
+        return str(session.get_bind().url)
+    finally:
+        session.close()
+
+
+def _log_db_id(session_factory) -> str:
+    """The watermark's db_id (the compaction prunes the CURRENT life); the
+    watermark table is not a tenant table, so a plain read suffices."""
+    from mirror_memory.core import schema_migration as sm
+
+    session = session_factory() if callable(session_factory) else session_factory
+    try:
+        row = sm.read_watermark(session.get_bind())
+        return row[0] if row else ""
+    finally:
+        session.close()
+
+
+def _deletion_log_for(config: MemoryConfig, database_url: str):
+    """The deletion log for the worker's reconciliation (M4 task 3), built
+    with the SAME derivation the engine uses for *database_url* -- a
+    mismatched pairing would wedge the worker in replay-refusal forever."""
+    cache = getattr(config, "_deletion_log_instances", None)
+    if cache is None:
+        cache = config._deletion_log_instances = {}
+    if database_url in cache:
+        return cache[database_url]
+    from mirror_memory.core.deletion import FileDeletionLog, PgDeletionLog, default_directory
+
+    settings = config.deletion_log
+    instance = None
+    if settings.backend == "postgres" and settings.url:
+        instance = PgDeletionLog(settings.url)
+    elif settings.backend == "file":
+        instance = FileDeletionLog(settings.directory or default_directory(database_url))
+    cache[database_url] = instance
+    return instance
 
 
 def _is_sqlite_busy(exc: BaseException) -> bool:
@@ -931,15 +1066,32 @@ async def evolution_worker(
     """
     session_factory = config.session_factory
     poll_interval = config.worker.poll_interval_seconds
-    # audit-retention maintenance runs on its own (much longer) cadence
+    # audit-retention maintenance and the deletion-log compaction run on
+    # their own (much longer) cadences
     maintenance_state: dict[str, float] = {}
-    from mirror_memory.worker.maintenance import next_due, purge_expired_audit
+    compaction_state: dict[str, float] = {}
+    from mirror_memory.worker.maintenance import (
+        next_due,
+        prune_deletion_log,
+        purge_expired_audit,
+    )
 
     while not stop.is_set():
         try:
             await asyncio.to_thread(process_pending, session_factory, config)
         except Exception:
             logger.warning("evolution: worker will retry on next tick", exc_info=True)
+        if next_due(compaction_state, config,
+                    interval_seconds=config.deletion_log.prune_interval_seconds):
+            try:
+                log = _deletion_log_for(config, str(_any_bind_url(session_factory, config)))
+                db_id = _log_db_id(session_factory)
+                if log is not None and db_id:
+                    removed = prune_deletion_log(config, log, db_id)
+                    if removed:
+                        logger.info("deletion log compaction: pruned %d entrie(s)", removed)
+            except Exception:
+                logger.warning("deletion log compaction failed; will retry", exc_info=True)
         if next_due(maintenance_state, config):
             try:
                 await asyncio.to_thread(purge_expired_audit, session_factory, config)

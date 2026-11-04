@@ -599,12 +599,16 @@ class Publisher:
         return corrected.id if corrected is not None else None
 
     def _commit_forget(self, proposal: StateTransitionProposal) -> int | None:
-        forget_belief(
+        collector = proposal.payload.get("deletion_collector")
+        generation = forget_belief(
             self._session,
             proposal.user_id,
             proposal.target_belief_id,
             bump_revision=False,
+            fingerprints=collector["fingerprints"] if collector else None,
         )
+        if collector is not None:
+            collector["generation"] = generation
         return None
 
     def _commit_verify(self, proposal: StateTransitionProposal) -> int | None:
@@ -675,6 +679,8 @@ class Publisher:
         from mirror_memory.worker.snapshot import persist_snapshot
 
         payload = proposal.payload
+        from mirror_memory.core.repository import current_deletion_generation
+
         persist_snapshot(
             self._session,
             proposal.user_id,
@@ -683,6 +689,7 @@ class Publisher:
             payload.get("watermark") or "",
             shadow=bool(payload.get("shadow", False)),
             source_purposes=list(payload.get("source_purposes") or []),
+            source_generation=current_deletion_generation(self._session, proposal.user_id),
         )
         return get_state_revision(self._session, proposal.user_id)
 

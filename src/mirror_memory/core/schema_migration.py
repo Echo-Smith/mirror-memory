@@ -1707,6 +1707,559 @@ class Step10DerivedProvenance:
                 raise MigrationError(f"verification failed: {table}.{column} missing")
 
 
+#: The watermark row is deliberately OUTSIDE Base.metadata (like
+#: mm_schema_version): one row per database, no tenant columns, and it must
+#: be restored together with the main DB (that is the whole mechanism).
+WATERMARK_TABLE = "mm_deletion_watermark"
+
+
+def _watermark_table(metadata: MetaData) -> Table:
+    return Table(
+        WATERMARK_TABLE,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("db_id", String(32), nullable=False),
+        Column("applied_seq", Integer, nullable=False, server_default=text("0")),
+    )
+
+
+class WatermarkMissing(RuntimeError):
+    """The main database holds tenant data but has no deletion-watermark
+    row: it was restored from a PRE-M4 backup (or migrated from a legacy
+    schema).  An unclaimed database cannot be reconciled against a
+    deletion log -- start with the ``adopt`` command."""
+
+
+#: The tenant tables whose non-emptiness makes a database "pre-existing"
+#: (the deletion-coverage matrix's content-bearing core).
+_DATA_TABLES_FOR_ADOPT = ("mm_beliefs", "mm_evidence", "mm_session_summaries", "mm_snapshots")
+
+
+def _main_db_has_data(engine: Engine) -> bool:
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    insp = inspect(engine)
+    for table in _DATA_TABLES_FOR_ADOPT:
+        if not insp.has_table(table):
+            continue
+        with no_audit_scope(), engine.connect() as conn:
+            if conn.execute(select(func.count()).select_from(
+                    Table(table, MetaData(), autoload_with=engine))).scalar_one() > 0:
+                return True
+    return False
+
+
+def ensure_watermark(engine: Engine) -> tuple[str, int]:
+    """Create the watermark table and its single row on first use; returns
+    ``(db_id, applied_seq)``.  The row lives in the main DB, so a restore
+    brings back the backup's db_id and applied seq -- which is exactly how
+    a restore is detected (see core.replay).
+
+    A database that holds tenant data but has NO watermark row was
+    restored from a PRE-M4 backup (or migrated from a legacy schema): its
+    deletions cannot be reconciled against any log, so startup is refused
+    with :class:`WatermarkMissing` until an operator claims it with
+    ``adopt_watermark`` (which pairs it with an existing log).  A truly
+    fresh database (no tenant data) is minted normally.  M4's own
+    migration step creates the row at deploy time, so this refusal only
+    fires for pre-M4 restores.  MINTING AT MIGRATION TIME is decided by
+    the deletion log (Step11DeletionReplay, M4 patch 2) -- never here.
+    """
+    table = _watermark_table(MetaData())
+    if not inspect(engine).has_table(WATERMARK_TABLE):
+        # concurrent creators race on the DDL; the loser re-checks (the
+        # winner's table is identical) instead of failing the startup
+        try:
+            table.create(engine, checkfirst=True)
+        except Exception:
+            if not inspect(engine).has_table(WATERMARK_TABLE):
+                raise
+    # First-time creation is serialised per database (a session-level
+    # advisory lock on a DEDICATED connection -- the caller's transaction
+    # must not hold it): concurrent startups (the server engine cache
+    # warming several tenants at once) queue instead of racing on the
+    # INSERT, so no request loses its transaction to the DDL race.
+    is_postgres = engine.dialect.name == "postgresql"
+    lock_conn = engine.connect() if is_postgres else None
+    try:
+        if lock_conn is not None:
+            lock_conn.execution_options(isolation_level="AUTOCOMMIT").execute(
+                text("SELECT pg_advisory_lock(hashtext(:k))"),
+                {"k": f"mm-watermark:{engine.url.render_as_string(hide_password=True)}"},
+            )
+        for _ in range(3):
+            with engine.begin() as conn:
+                row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                                   .where(table.c.id == 1)).first()
+                if row is not None:
+                    return str(row[0]), int(row[1])
+                if _main_db_has_data(engine):
+                    raise WatermarkMissing(
+                        "the main database holds tenant data but has no deletion "
+                        "watermark row: it looks like a restore from a PRE-M4 backup "
+                        "(or a legacy migration).  Deletions cannot be reconciled "
+                        "against a deletion log until the database is CLAIMED -- run "
+                        "the adopt command with the db_id of the deletion log this "
+                        "database's history lives in "
+                        "(python -m mirror_memory.deletion_adopt --db-id <db_id>), "
+                        "then start again."
+                    )
+                import uuid as _uuid
+
+                db_id = _uuid.uuid4().hex
+                try:
+                    conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+                    return db_id, 0
+                except Exception:
+                    pass  # the aborted transaction is discarded with the connection
+        raise RuntimeError("the deletion watermark row could not be created")
+    finally:
+        if lock_conn is not None:
+            with contextlib.suppress(Exception):
+                lock_conn.execute(text(
+                    "SELECT pg_advisory_unlock(hashtext(:k))"),
+                    {"k": f"mm-watermark:{engine.url.render_as_string(hide_password=True)}"},
+                )
+            lock_conn.close()
+
+
+def adopt_watermark(engine: Engine, db_id: str) -> tuple[str, int]:
+    """Operator command: claim a pre-M4-restored database for an EXISTING
+    deletion log.  Writes the watermark row (db_id, applied_seq = 0); the
+    startup reconciliation then replays every entry of that log -- the
+    fingerprint matching makes it safe to apply them onto whatever the
+    restored backup contains."""
+    import uuid as _uuid
+
+    if not db_id or any(c.isspace() for c in db_id):
+        raise ValueError("db_id must be a non-empty string without whitespace")
+    table = _watermark_table(MetaData())
+    table.create(engine, checkfirst=True)
+    with engine.begin() as conn:
+        row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                           .where(table.c.id == 1)).first()
+        if row is not None:
+            raise ValueError(
+                f"the watermark row already exists (db_id {str(row[0])[:8]}..., "
+                f"applied {row[1]}): nothing to adopt"
+            )
+        conn.execute(table.insert().values(id=1, db_id=db_id, applied_seq=0))
+    return db_id, 0
+
+
+def read_watermark(engine: Engine) -> tuple[str, int] | None:
+    """(db_id, applied_seq) or None when the row is absent (a fresh or
+    restored-without-watermark database)."""
+    table = _watermark_table(MetaData())
+    if not inspect(engine).has_table(WATERMARK_TABLE):
+        return None
+    with engine.connect() as conn:
+        row = conn.execute(select(table.c.db_id, table.c.applied_seq)
+                           .where(table.c.id == 1)).first()
+    return (str(row[0]), int(row[1])) if row else None
+
+
+def advance_watermark(engine: Engine, seq: int) -> None:
+    table = _watermark_table(MetaData())
+    with engine.begin() as conn:
+        conn.execute(table.update().where(table.c.id == 1)
+                     .values(applied_seq=seq))
+
+
+@dataclass
+class Step11DeletionReplay:
+    """Deletion-replay support (M4): the generation counter, the watermark
+    table and the snapshot synthesis generation.
+
+    - ``mm_deletion_generations``: one row per (user, generation) -- the
+      composite key IS the CAS; created FROM THE MODEL METADATA, RLS
+      posture applied, write class ``deletion``.
+    - ``mm_deletion_watermark``: single row (db_id, applied_seq), outside
+      the model metadata (like mm_schema_version).  It rolls back WITH the
+      main database -- comparing it to the deletion log's tail is how a
+      restore is detected.
+    - ``mm_snapshots.source_generation`` (nullable): the user's deletion
+      generation at synthesis time; a reader skips snapshots whose value
+      is missing or behind the user's current generation (pre-M4
+      snapshots and anything invalidated by a deletion / restore +
+      replay are rebuilt by the next job).
+    """
+
+    version: int = 11
+    name: str = "deletion replay: generations, watermark, snapshot generation"
+
+    #: The lineage inputs (M4 patch 2), assigned by ``upgrade_database``:
+    #: the SAME config the engines load, so the migration reads the SAME
+    #: deletion log the engines write.
+    deletion_log_config: object = None
+    #: Explicit override: mint a fresh db_id even though the log already
+    #: holds earlier lives (their deletions will NOT be replayed).
+    new_lineage: bool = False
+    #: False for the adopt path: create the schema, let the operator's
+    #: db_id become the watermark row.
+    mint_watermark: bool = True
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        if not insp.has_table("mm_deletion_generations"):
+            return True
+        if "source_generation" not in _table_columns(engine, "mm_snapshots"):
+            return True
+        if not insp.has_table(WATERMARK_TABLE):
+            return True
+        # a v11-SHAPED database without the watermark row (a refused /
+        # half-applied migration, or a restored backup of one) must go
+        # through apply again: the lineage decision and the posture run
+        # there (M4 patch 2)
+        table = _watermark_table(MetaData())
+        with engine.connect() as conn:
+            return conn.execute(
+                select(table.c.id).where(table.c.id == 1)).first() is None
+
+    def apply(self, engine: Engine) -> None:
+        Base.metadata.tables["mm_deletion_generations"].create(engine, checkfirst=True)
+        if "source_generation" not in _table_columns(engine, "mm_snapshots"):
+            _DDLPlan([AddColumn("mm_snapshots", "source_generation", "INTEGER")]).run(engine)
+        # M4 batch-1 patch: the watermark row is created AT DEPLOY TIME, not
+        # lazily on first start -- a pre-M4 backup restored after this deploy
+        # then has no row and startup refuses with WatermarkMissing until the
+        # operator adopts it (deploy-time backups taken BEFORE this step are
+        # pre-M4 by definition).
+        #
+        # M4 patch 2: whether the row may be MINTED is decided by the
+        # deletion log -- a log that already holds genesis entries has run
+        # M4 before, so a data-bearing database without a watermark row is
+        # a restore from that lineage and must be ADOPTED, not minted.
+        table = _watermark_table(MetaData())
+        table.create(engine, checkfirst=True)
+        if self.mint_watermark:
+            self._mint_watermark_row(engine, table)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=["mm_deletion_generations"])).run(engine)
+            # the app role reads the watermark at startup and advances it in
+            # the deletion transaction; the MAINTENANCE role needs the same:
+            # the worker's tick reconcile runs under system_scope, which
+            # routes to the maintenance engine (owner-created table, like
+            # every other)
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"GRANT SELECT, INSERT, UPDATE ON {WATERMARK_TABLE} "
+                    f"TO {rls.app_role()}, {rls.maintenance_role()}"))
+
+    def verify(self, engine: Engine) -> None:
+        cols = {c["name"] for c in inspect(engine).get_columns("mm_deletion_generations")}
+        if "generation" not in cols:
+            raise MigrationError("verification failed: mm_deletion_generations missing")
+        if "source_generation" not in _table_columns(engine, "mm_snapshots"):
+            raise MigrationError("verification failed: mm_snapshots.source_generation missing")
+        if not inspect(engine).has_table(WATERMARK_TABLE):
+            raise MigrationError("verification failed: watermark table missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=["mm_deletion_generations"])
+
+    # -- the watermark row: mint, refuse, or adopt -------------------------
+
+    def _mint_watermark_row(self, engine: Engine, table) -> None:
+        with engine.begin() as conn:
+            row = conn.execute(
+                select(table.c.db_id, table.c.applied_seq)
+                .where(table.c.id == 1)).first()
+        if row is not None:
+            return
+        if not _main_db_has_data(engine):
+            self._insert_row(engine, table)  # a truly fresh database
+            return
+        # tenant data without a watermark row: only a genuine FIRST
+        # deployment may mint, and the deletion log decides (M4 patch 2)
+        self._mint_or_refuse(engine, table)
+
+    def _mint_or_refuse(self, engine: Engine, table) -> None:
+        config = self.deletion_log_config
+        if config is None:
+            raise WatermarkMissing(
+                "the migration must read the deletion log configuration to "
+                "decide whether a database that holds tenant data may be "
+                "minted: pass the engine's config to upgrade_database(..., "
+                "config=...).  Without the log the deployment lineage cannot "
+                "be verified, so no watermark row is created.")
+        from mirror_memory.core.deletion import deletion_log_from_config
+
+        try:
+            log = deletion_log_from_config(config.deletion_log,
+                                           str(engine.url))
+        except ValueError as exc:
+            raise WatermarkMissing(
+                f"the deletion log configuration is invalid: {exc}.  Fix the "
+                "configuration before migrating -- an unverifiable lineage "
+                "is never minted.")
+        if log is None:
+            raise WatermarkMissing(
+                "deletion_log.backend=none: the migration cannot verify the "
+                "deployment lineage without a log.  Configure the deletion "
+                "log the engines will use before migrating a database that "
+                "holds tenant data.")
+        try:
+            entries = log.genesis_entries()
+        except Exception as exc:
+            raise WatermarkMissing(
+                f"the deletion log is unreachable ({type(exc).__name__}: "
+                f"{exc}): refusing to mint -- the deployment lineage cannot "
+                "be verified.  Restore the log (or fix its configuration) "
+                "before migrating.")
+        if entries:
+            listing = "; ".join(
+                f"{db_id[:8]}... (genesis "
+                f"{created.isoformat() if created else 'at an unknown time'})"
+                for db_id, created in entries)
+            if not self.new_lineage:
+                raise WatermarkMissing(
+                    "the deletion log already holds genesis entries -- this "
+                    "deployment line has run M4 before: " + listing + ".  "
+                    "This database holds tenant data but has no watermark "
+                    "row, so it looks like a restore from that lineage: "
+                    "claim it with python -m mirror_memory.deletion_adopt "
+                    "--database-url <url> --db-id <db_id>.  To start a NEW "
+                    "deployment line instead, pass new_lineage=True (the old "
+                    "log's deletions will NOT be replayed).")
+            message = (
+                "NEW-LINEAGE: minting a fresh db_id while the deletion log "
+                "holds earlier database lives: " + listing + ".  The old "
+                "log's deletions will NOT be replayed onto this database.")
+            print(f"WARNING: {message}")
+            logger.warning(message)
+        self._insert_row(engine, table)
+
+    def _insert_row(self, engine: Engine, table) -> None:
+        import uuid as _uuid
+
+        with engine.begin() as conn:
+            conn.execute(table.insert().values(
+                id=1, db_id=_uuid.uuid4().hex, applied_seq=0))
+
+
+
+# ---------------------------------------------------------------------------
+# Step 12: the belief's global identity (M4 batch 2 task 0)
+# ---------------------------------------------------------------------------
+
+GLOBAL_ID_INDEX = "uq_mm_beliefs_global_id"
+
+
+def _global_id_index(concurrently: bool) -> Index:
+    """The unique (tenant, app, global_id) index -- the migration builds
+    exactly the model's constraint by name, so schema parity holds; built
+    on a detached table copy for the same reason as _pkey_build_index."""
+    table = Base.metadata.tables["mm_beliefs"].to_metadata(MetaData())
+    return Index(
+        GLOBAL_ID_INDEX,
+        table.c.tenant_id, table.c.app_id, table.c.global_id,
+        unique=True,
+        postgresql_concurrently=concurrently,
+    )
+
+
+def _count_unfilled_global_ids(engine: Engine) -> int:
+    """Beliefs without a global_id (NULL or the '' marker), across all
+    tenants -- the step's needed()/verify() probe (migration scope)."""
+    table = _live_table(engine, "mm_beliefs")
+    if table is None:
+        return 0
+    with system_scope(reason=_MIGRATION_REASON):
+        with engine.connect() as conn:
+            return conn.execute(
+                select(func.count()).select_from(table).where(
+                    table.c.global_id.is_(None) | (table.c.global_id == ""))
+            ).scalar_one()
+
+
+def _build_global_id_index(engine: Engine, state: str | None) -> None:
+    """CREATE UNIQUE INDEX CONCURRENTLY on PostgreSQL (outside any
+    transaction; an INVALID leftover is dropped first).  Catalog DDL over
+    the whole table -- no tenant to scope it to (migration scope)."""
+    index = _global_id_index(concurrently=True)
+    elements: list = [_lock_timeout_element()]
+    if state == "invalid":
+        elements.append(DropIndex(index, if_exists=True))
+    elements.append(CreateIndex(index))
+    with system_scope(reason=_MIGRATION_REASON):
+        _DDLPlan(elements, autocommit=True).run(engine)
+
+
+def _backfill_global_ids(engine: Engine, batch: int) -> int:
+    """Batched, re-entrant: every row whose global_id is NULL or '' gets a
+    fresh UUID minted BY THE DATABASE (one per row -- a bound literal would
+    stamp the same value on the whole batch).  One transaction per batch,
+    composite keys matched as a row value, like _backfill_column."""
+    from sqlalchemy import literal_column
+
+    table = _live_table(engine, "mm_beliefs")
+    if table is None:
+        return 0
+    pk = list(table.primary_key.columns)
+    key = pk[0] if len(pk) == 1 else tuple_(*pk)
+    if _is_postgres(engine):
+        fresh = literal_column("replace(gen_random_uuid()::text, '-', '')")
+    else:
+        fresh = literal_column("lower(hex(randomblob(16)))")
+    missing = table.c.global_id.is_(None) | (table.c.global_id == "")
+    total = 0
+    while True:
+        batch_keys = select(*pk).where(missing).limit(batch)
+        stmt = update(table).where(key.in_(batch_keys)).values(global_id=fresh)
+        with system_scope(reason=_MIGRATION_REASON):
+            with engine.begin() as conn:
+                result = conn.execute(stmt)
+                if result.rowcount == 0:
+                    return total
+                total += result.rowcount
+
+
+class Step12BeliefGlobalId:
+    """``mm_beliefs.global_id``: a UUID minted at creation, unique per
+    (tenant, app) -- the identity a tombstone carries across devices
+    (the integer id is local: restores and other devices reuse it).
+
+    The M2 big-table strategy, re-entrant at every stage (step 11's
+    lesson: ``needed()`` looks at the FULL set of artifacts, so an
+    interrupted run resumes instead of being skipped):
+
+    PostgreSQL: ADD COLUMN nullable -> batched backfill (``gen_random_uuid``
+    per row, one transaction per batch) -> NOT NULL proven without a
+    blocking scan (NOT VALID CHECK, VALIDATE, SET NOT NULL, drop the
+    helper) -> ``CREATE UNIQUE INDEX CONCURRENTLY`` (an INVALID leftover
+    of a failed build is dropped first).
+
+    SQLite (no SET NOT NULL, no CONCURRENTLY): ADD COLUMN ``NOT NULL
+    DEFAULT ''`` (allowed with a non-null default), backfill the ''
+    marker with ``randomblob`` UUIDs, plain unique index with checkfirst.
+    """
+
+    version: int = 12
+    name: str = "belief global_id: column, backfill, NOT NULL, unique index"
+
+    def _column_state(self, engine: Engine) -> dict | None:
+        for col in inspect(engine).get_columns("mm_beliefs"):
+            if col["name"] == "global_id":
+                return col
+        return None
+
+    def needed(self, engine: Engine) -> bool:
+        if not inspect(engine).has_table("mm_beliefs"):
+            return False
+        col = self._column_state(engine)
+        if col is None:
+            return True
+        if _count_unfilled_global_ids(engine):
+            return True
+        if _is_postgres(engine) and col.get("nullable", True):
+            return True
+        return _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX) != "valid"
+
+    def apply(self, engine: Engine, batch: int = DEFAULT_BACKFILL_BATCH) -> None:
+        if not inspect(engine).has_table("mm_beliefs"):
+            return
+        if _is_postgres(engine):
+            self._apply_postgres(engine, batch)
+        else:
+            self._apply_sqlite(engine, batch)
+
+    def _apply_postgres(self, engine: Engine, batch: int) -> None:
+        col = self._column_state(engine)
+        if col is None:
+            _DDLPlan([_lock_timeout_element(),
+                      AddColumn("mm_beliefs", "global_id", "VARCHAR(32)")]).run(engine)
+        _backfill_global_ids(engine, batch)
+        col = self._column_state(engine)
+        if col is not None and col.get("nullable", True):
+            live_checks = {
+                c["name"] for c in inspect(engine).get_check_constraints("mm_beliefs")}
+            check = AddNotNullCheck("mm_beliefs", "global_id")
+            plan: list = [_lock_timeout_element()]
+            if check.constraint_name not in live_checks:
+                plan.append(check)  # re-entry: the constraint survived a retry
+            plan.append(ValidateConstraint("mm_beliefs", check.constraint_name))
+            plan.append(AlterColumnClause("mm_beliefs", "global_id", "SET NOT NULL"))
+            plan.append(DropConstraintByName("mm_beliefs", check.constraint_name))
+            _DDLPlan(plan).run(engine)
+        state = _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX)
+        if state != "valid":
+            _build_global_id_index(engine, state)
+
+    def _apply_sqlite(self, engine: Engine, batch: int) -> None:
+        if self._column_state(engine) is None:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE mm_beliefs ADD COLUMN global_id VARCHAR(32) "
+                    "NOT NULL DEFAULT ''")
+        _backfill_global_ids(engine, batch)
+        if _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX) != "valid":
+            index = _global_id_index(concurrently=False)
+            with engine.begin() as conn:
+                conn.execute(CreateIndex(index))
+
+    def verify(self, engine: Engine) -> None:
+        if not inspect(engine).has_table("mm_beliefs"):
+            return
+        col = self._column_state(engine)
+        if col is None:
+            raise MigrationError("verification failed: mm_beliefs.global_id missing")
+        unfilled = _count_unfilled_global_ids(engine)
+        if unfilled:
+            raise MigrationError(
+                "verification failed: " + str(unfilled) + " beliefs without a global_id")
+        if _is_postgres(engine) and col.get("nullable", True):
+            raise MigrationError("verification failed: mm_beliefs.global_id is nullable")
+        if _index_state(engine, "mm_beliefs", GLOBAL_ID_INDEX) != "valid":
+            raise MigrationError(
+                "verification failed: unique index " + GLOBAL_ID_INDEX + " missing or invalid")
+
+
+
+# ---------------------------------------------------------------------------
+# Step 13: tombstone synchronization bookkeeping (M4 batch 2 tasks 1 & 3)
+# ---------------------------------------------------------------------------
+
+SYNC_TABLES = ("mm_tombstones_applied", "mm_sync_peers")
+
+
+class Step13SyncState:
+    """``mm_tombstones_applied`` (which cross-device tombstones this
+    database applied -- the idempotency key of the sync channel) and
+    ``mm_sync_peers`` (per-peer consumed cursor + last catch-up instant).
+    Both are tenant tables created FROM THE MODEL METADATA with the RLS
+    posture applied, write class ``sync``.  Re-entrant: each table is
+    created with checkfirst and the posture plan is idempotent."""
+
+    version: int = 13
+    name: str = "tombstone sync: applied record, peer state"
+
+    def needed(self, engine: Engine) -> bool:
+        insp = inspect(engine)
+        return any(not insp.has_table(name) for name in SYNC_TABLES)
+
+    def apply(self, engine: Engine) -> None:
+        for name in SYNC_TABLES:
+            Base.metadata.tables[name].create(engine, checkfirst=True)
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            _DDLPlan(rls.rls_plan(engine, tables=list(SYNC_TABLES))).run(engine)
+
+    def verify(self, engine: Engine) -> None:
+        insp = inspect(engine)
+        for name in SYNC_TABLES:
+            if not insp.has_table(name):
+                raise MigrationError("verification failed: " + name + " missing")
+        if _is_postgres(engine):
+            from mirror_memory.core import rls
+
+            rls.verify_posture(engine, tables=list(SYNC_TABLES))
+
+
 #: Ordered migration steps.  A database advances by running every step
 #: whose version exceeds its recorded version, so an older database (say,
 #: one already at version 1) picks up only what it is missing.
@@ -1721,6 +2274,9 @@ DEFAULT_STEPS: list = [
     Step8AccessAudit(),
     Step9RecallVisibility(),
     Step10DerivedProvenance(),
+    Step11DeletionReplay(),
+    Step12BeliefGlobalId(),
+    Step13SyncState(),
 ]
 
 #: The version a freshly upgraded database records.
@@ -1735,6 +2291,9 @@ def upgrade_database(
     steps: list | None = None,
     confirm_backup: bool = False,
     batch: int = DEFAULT_BACKFILL_BATCH,
+    config: object = None,
+    new_lineage: bool = False,
+    mint_watermark: bool = True,
 ) -> dict[str, int]:
     """Advance the schema to the latest version; returns pre-run row counts.
 
@@ -1769,6 +2328,12 @@ def upgrade_database(
                     continue
                 if hasattr(step, "default_tenant"):
                     step.default_tenant = (default_tenant, default_app)
+                if isinstance(step, Step11DeletionReplay):
+                    # the lineage inputs (M4 patch 2): the same config the
+                    # engines load, so the migration reads the SAME log
+                    step.deletion_log_config = config
+                    step.new_lineage = new_lineage
+                    step.mint_watermark = mint_watermark
                 applied = step.needed(engine)
                 if applied:
                     logger.info("migration: applying step %d (%s)", step.version, step.name)
@@ -1784,7 +2349,7 @@ def upgrade_database(
                     before["legacy_jobs_to_cancel"] = int(step.legacy_jobs_to_cancel)
         except Exception as exc:
             _restore_sqlite(engine, backup)
-            if isinstance(exc, MigrationError):
+            if isinstance(exc, (MigrationError, WatermarkMissing)):
                 raise
             raise MigrationError(
                 "migration step failed (" + type(exc).__name__ + ": " + str(exc) + ")"

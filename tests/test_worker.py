@@ -81,6 +81,11 @@ class TestProcessPending:
             def generate(self, **kw):
                 return '{"patterns": [], "support_policy": {}}'
         cfg.llm_client = FakeLLM()
+        # These tests do not exercise the deletion log: an explicit
+        # backend=none deployment (the worker's reconcile then skips the
+        # log check; the DB has nothing applied, so this is allowed --
+        # M4 batch-1 patch task 2/4 semantics)
+        cfg.deletion_log.backend = "none"
         return cfg
 
     def test_processes_pending_job(self, db_session, config):

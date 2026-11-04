@@ -25,6 +25,7 @@ def persist_snapshot(
     *,
     shadow: bool = False,
     source_purposes: list[str] | None = None,
+    source_generation: int | None = None,
 ) -> Snapshot:
     """Save a versioned snapshot for *user_id*.
 
@@ -87,6 +88,10 @@ def persist_snapshot(
             source_purposes_json=json.dumps(
                 sorted(set(source_purposes or [])), ensure_ascii=False,
             ),
+            # M4: any deletion after synthesis invalidates the merged text
+            # (restore + replay included) -- the reader skips when the
+            # user's CURRENT generation differs
+            source_generation=source_generation,
         )
         session.add(snapshot)
         session.flush()
