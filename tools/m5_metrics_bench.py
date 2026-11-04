@@ -226,21 +226,16 @@ def main() -> int:
         report["baselines"]["postgresql"] = {}
         for n in SIZES:
             print(f"[pg] seeding {n} beliefs and measuring recall...", file=sys.stderr)
-            # Fresh schema per size so the table is not cumulative.
-            schema = "mm_bench_" + uuid.uuid4().hex[:8]
-            try:
-                report["baselines"]["postgresql"][str(n)] = _bench_pg(
-                    pg_url, schema, n, tmp_dir
-                )
-            finally:
-                _drop_pg_schema(pg_url, schema)
+            # Fresh DATABASE per size (a stale existing schema lacks newer
+            # columns; create_all only fills a fresh database correctly).
+            result, db_url = _bench_pg(pg_url, n, tmp_dir)
+            report["baselines"]["postgresql"][str(n)] = result
+            _drop_pg_db(pg_url, db_url)
         print("[pg] measuring metrics overhead...", file=sys.stderr)
-        schema = "mm_bench_ov_" + uuid.uuid4().hex[:6]
-        try:
-            _pg_p50 = report["baselines"]["postgresql"]["1000"]["recall_p50_ms"]
-            report["overhead"]["postgresql"] = _overhead_pg(pg_url, schema, 1000, tmp_dir, _pg_p50)
-        finally:
-            _drop_pg_schema(pg_url, schema)
+        _pg_p50 = report["baselines"]["postgresql"]["1000"]["recall_p50_ms"]
+        ov, db_url = _overhead_pg(pg_url, 1000, tmp_dir, _pg_p50)
+        report["overhead"]["postgresql"] = ov
+        _drop_pg_db(pg_url, db_url)
     else:
         report["baselines"]["postgresql"] = "skipped (set MM_BENCH_PG)"
 
@@ -249,35 +244,60 @@ def main() -> int:
     return 0
 
 
-def _schema_url(pg_url: str, schema: str) -> str:
-    sep = "&" if "?" in pg_url else "?"
-    return f"{pg_url}{sep}options=-csearch_path%3D{schema}"
-
-
 def _admin_conn(pg_url: str):
     import psycopg
 
     return psycopg.connect(pg_url, autocommit=True)
 
 
-def _drop_pg_schema(pg_url: str, schema: str) -> None:
+def _db_name(url: str) -> str:
+    return url.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+
+
+def _fresh_db_url(pg_url: str) -> str:
+    """Create a brand-new PostgreSQL database and return its URL.
+
+    A fresh DATABASE (not just a schema) is required: the engine's
+    ``Base.metadata.create_all`` targets the connect-time search_path, and
+    an existing database may carry a stale schema (missing ``global_id``
+    and later columns).  A fresh database always builds the CURRENT schema.
+    """
+    import psycopg
+
+    name = "mm_bench_" + uuid.uuid4().hex[:8]
+    with _admin_conn(pg_url) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    base = pg_url.rsplit("/", 1)[0]
+    return f"{base}/{name}"
+
+
+def _drop_pg_db(pg_url: str, db_url: str) -> None:
+    import psycopg
+
+    name = _db_name(db_url)
     try:
         with _admin_conn(pg_url) as conn:
-            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            # terminate stragglers so DROP DATABASE is not blocked
+            conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()", (name,)
+            )
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
     except Exception as exc:  # noqa: BLE001
-        print(f"warning: dropping schema {schema} failed: {exc}", file=sys.stderr)
+        print(f"warning: dropping database {name} failed: {exc}", file=sys.stderr)
 
 
-def _bench_pg(pg_url: str, schema: str, n: int, tmp_dir: str) -> dict:
-    with _admin_conn(pg_url) as conn:
-        conn.execute(f'CREATE SCHEMA "{schema}"')
-    return bench_one(_schema_url(pg_url, schema), n, tmp_dir, metrics_on=False)
+def _bench_pg(pg_url: str, n: int, tmp_dir: str) -> tuple[dict, str]:
+    db_url = _fresh_db_url(pg_url)
+    try:
+        return bench_one(db_url, n, tmp_dir, metrics_on=False), db_url
+    finally:
+        pass  # caller drops after collecting
 
 
-def _overhead_pg(pg_url: str, schema: str, n: int, tmp_dir: str, recall_p50_ms: float) -> dict:
-    with _admin_conn(pg_url) as conn:
-        conn.execute(f'CREATE SCHEMA "{schema}"')
-    return _overhead_run(_schema_url(pg_url, schema), n, tmp_dir, recall_p50_ms)
+def _overhead_pg(pg_url: str, n: int, tmp_dir: str, recall_p50_ms: float) -> tuple[dict, str]:
+    db_url = _fresh_db_url(pg_url)
+    return _overhead_run(db_url, n, tmp_dir, recall_p50_ms), db_url
 
 
 def _print_table(report: dict) -> None:
