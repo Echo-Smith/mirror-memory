@@ -476,6 +476,16 @@ def create_app(
     llm_base_url: str | None = None,
     sync_transport_factory: Any | None = None,
 ) -> FastAPI:
+    """...
+
+    sync_transport_factory (M4 merge prep): called once per engine with
+    the engine as the argument -- INCLUDING the lifespan engine in
+    tenant-key mode.  Return the transport bound to ``eng._tenant``, or
+    ``None`` for a tenant that does not sync (that engine then serves
+    reads only under its stored offline grace).  A transport must carry
+    its OWN network timeouts: the initialization wait has no cap of its
+    own.  The factory's returned db_id must be bound to the
+    AUTHENTICATED peer at the network layer."""
     """Create a FastAPI app with mirror-memory endpoints.
 
     Parameters

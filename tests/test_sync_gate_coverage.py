@@ -726,3 +726,141 @@ def test_concurrent_init_normal_shape(tmp_path):
 def test_concurrent_init_shared_shape(tmp_path):
     _concurrent_init_scenario(tmp_path, shared_shape=True)
     _concurrent_init_retry_scenario(tmp_path, shared_shape=True)
+
+
+# --- M4 merge-prep, task 1: init-retry waiters loop, never recurse -----
+
+def _init_retry_wait_scenario(tmp_path, *, shared_shape: bool):
+    """The first init fails (non-Connection); thread A retries with its
+    startup catch-up stalled on a barrier; thread B's call must WAIT
+    (no RecursionError, no content), and after the release both threads
+    finish normally with the sentinel gone."""
+    cloud = _engine(tmp_path / "cl", "gc-cl")
+    template = _engine(tmp_path / "b", "gc-b", transport=_Transport(cloud))
+    _observe(template, "I like retrywait and coffee.")
+    _observe(cloud, "I like retrywait and coffee.")
+    _align(template, cloud)
+    with tenant_scope(*TENANT), fixture_write_scope("choose retrywait gid"):
+        s = sessionmaker(bind=template._engine)()
+        for b in s.query(Belief).filter(Belief.user_id == USER).all():
+            if "retrywait" in b.claim_text:
+                b.global_id = "7" * 32
+        s.commit()
+        s.close()
+    template._engine.dispose()
+    assert template.sync_status()["state"] == "normal"
+
+    # both copies carry one chosen global_id (the extractors mint
+    # different keys): the pending tombstone actually reaches and removes
+    # the engine's sentinel once the barrier releases
+    with tenant_scope(*TENANT), fixture_write_scope("align retrywait"):
+        s = sessionmaker(bind=cloud._engine)()
+        for b in s.query(Belief).filter(Belief.user_id == USER).all():
+            if "retrywait" in b.claim_text:
+                b.global_id = "7" * 32
+        s.commit()
+        s.close()
+
+    # the cloud DELETES its sentinel while the engine is offline: the
+    # tombstone is pending on the peer for the barrier round to deliver
+    cb = next(b for b in _beliefs(cloud) if "retrywait" in b.claim_text)
+    assert cloud.forget_belief(user_id=USER, belief_id=cb.id, purpose="api")
+
+    class _BoomThenBarrier:
+        """call 1: a real (non-Connection) init failure; call 2+: stall on
+        the barrier, then serve the peer's log."""
+
+        def __init__(self):
+            self.calls = 0
+            self.gate = threading.Event()
+            self.entered = threading.Event()
+
+        @property
+        def db_id(self):
+            return cloud._db_id
+
+        def export_tombstones(self, cursor, limit, peer_db_id=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom (real init failure)")
+            self.entered.set()
+            self.gate.wait(timeout=30)
+            return cloud.export_tombstones(cursor, limit)
+
+    def template_beliefs():
+        return _beliefs(template)
+
+    if shared_shape:
+        base = MemoryEngine(
+            config=template._config, database_url=template._database_url,
+            tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+            deletion_log=template._deletion_log, single_tenant_mode=True,
+            sync_transport=None)
+        base._ensure_db()
+        base._engine.dispose()
+        eng = MemoryEngine(
+            config=template._config, database_url=template._database_url,
+            tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+            deletion_log=template._deletion_log, single_tenant_mode=True,
+            engine=base._engine, schema_ready=True,
+            sync_transport=_BoomThenBarrier())
+    else:
+        eng = MemoryEngine(
+            config=template._config, database_url=template._database_url,
+            tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+            deletion_log=template._deletion_log, single_tenant_mode=True,
+            sync_transport=_BoomThenBarrier())
+
+    # round 1 fails (non-Connection): the engine is NOT serviceable
+    with pytest.raises(RuntimeError, match="boom"):
+        eng._ensure_db()
+    assert not eng._initialized
+
+    # thread A retries: the catch-up stalls on the barrier
+    transport = eng._sync_transport
+    t1_err: list = []
+
+    def retry():
+        try:
+            eng._ensure_db()
+        except Exception as e:  # pragma: no cover
+            t1_err.append(e)
+
+    t1 = threading.Thread(target=retry)
+    t1.start()
+    assert transport.entered.wait(timeout=10), "the retry never stalled"
+
+    # thread B: the call must WAIT -- no RecursionError, no content
+    t2_res: list = []
+
+    def waiter():
+        try:
+            eng._ensure_db()
+            t2_res.append("ok")
+        except Exception as e:
+            t2_res.append(e)
+
+    t2 = threading.Thread(target=waiter)
+    t2.start()
+    time.sleep(0.5)
+    assert t2_res == [], \
+        f"thread B must wait while the catch-up runs: {t2_res}"
+
+    # release: both threads finish, the sentinel is gone
+    transport.gate.set()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert t1_err == [], t1_err
+    assert t2_res == ["ok"], t2_res
+    assert eng._initialized
+    assert not any("retrywait" in b.claim_text for b in _beliefs(eng))
+    eng._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_init_retry_wait_normal_shape(tmp_path):
+    _init_retry_wait_scenario(tmp_path, shared_shape=False)
+
+
+def test_init_retry_wait_shared_shape(tmp_path):
+    _init_retry_wait_scenario(tmp_path, shared_shape=True)

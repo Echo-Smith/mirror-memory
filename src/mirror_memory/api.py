@@ -218,6 +218,15 @@ class MemoryEngine:
         # be replayed after a restore).
         # an explicitly PASSED None (vs the absent default) must mean "no
         # log": distinguish via the parameter sentinel below
+        # M4 merge prep, transport contract: a transport MUST carry its
+        # own network timeouts -- the initialization wait has no cap of
+        # its own and bounds itself by the transport failing fast; the
+        # envelope's self-claimed sender is never trusted for identity
+        # (batch-2 patch 4).  sync_transport_factory (server): the host
+        # decides per eng._tenant -- return the tenant's transport, or
+        # None for a tenant that does not sync; the factory IS called for
+        # the lifespan engine too (tenant-key mode), and returning None
+        # there puts that engine in the no-transport gate mode.
         self._deletion_log = (
             deletion_log if deletion_log is not _DELETION_LOG_DEFAULT
             else self._build_deletion_log()
@@ -253,7 +262,12 @@ class MemoryEngine:
         the gate with the true channel state); a FAILED initialization
         leaves the flag unset so the next call retries the whole init --
         never bypasses it; the startup catch-up's own applies re-enter on
-        the same thread via `_init_tls` without waiting on themselves."""
+        the same thread via `_init_tls` without waiting on themselves.
+        Batch-2 merge-prep: waiters LOOP instead of recursing, and a new
+        round clears `_init_done` under the lock -- a waiter waking after
+        a failed round either takes the init over itself or blocks on the
+        next round's verdict; the transport's own timeouts bound every
+        wait (there is no cap here)."""
         if self._initialized:
             return
         if getattr(self._init_tls, "in_init", False):
@@ -261,27 +275,35 @@ class MemoryEngine:
             # ensures the db): the engine is mid-initialization on this
             # very thread -- proceed without waiting on ourselves
             return
-        wait = False
-        with self._init_lock:
-            if self._initialized:
-                return
-            if self._initializing:
-                wait = True  # another thread's init is in flight
-            else:
-                self._initializing = True
-                self._init_tls.in_init = True
-        if wait:
-            # the in-flight init carries the startup catch-up: wait for
-            # its verdict (bounded by the catch-up's own network timeouts
-            # and the offline-grace failure path), then re-check
-            self._init_done.wait()
-            return self._ensure_db()
-        try:
-            self._initialize_db()
-        finally:
-            self._init_tls.in_init = False
-            self._initializing = False
-            self._init_done.set()
+        while True:
+            wait = False
+            with self._init_lock:
+                if self._initialized:
+                    return
+                if self._initializing:
+                    wait = True  # another thread's init is in flight
+                else:
+                    # a fresh round: clear the done event so waiters
+                    # block until THIS round's verdict
+                    self._initializing = True
+                    self._init_tls.in_init = True
+                    self._init_done.clear()
+            if wait:
+                # the in-flight init carries the startup catch-up: wait
+                # for its verdict (bounded by the catch-up's own network
+                # timeouts and the offline-grace failure path), then
+                # RE-CHECK by looping -- the round may have failed and a
+                # new one started, or nobody may be initializing (a
+                # failed round) in which case THIS call takes over
+                self._init_done.wait()
+                continue
+            try:
+                self._initialize_db()
+            finally:
+                self._init_tls.in_init = False
+                self._initializing = False
+                self._init_done.set()
+            return
 
     def _initialize_db(self) -> None:
         """The one-time initialization body (see _ensure_db for the
@@ -1202,6 +1224,13 @@ class MemoryEngine:
         data back).  Routed through the Publisher like every other state
         change; unlike collection, deletion is allowed even while memory
         is disabled.
+
+        RETENTION PROMISE (M4 merge prep): only ORPHANED evidence is
+        pruned.  A source message that still supports a SURVIVING belief
+        keeps its evidence row (and its raw text) — deleting one belief
+        never erases the provenance of what remains.  A sender that must
+        not retain a message therefore deletes every belief derived from
+        it (or the whole user scope).
 
         Returns ``True`` if the belief was found and deleted.
 

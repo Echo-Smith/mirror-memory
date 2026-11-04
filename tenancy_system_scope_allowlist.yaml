@@ -108,7 +108,8 @@
     M4 batch 2 step 12: counts beliefs without a global_id across all
     tenants -- the step's needed()/verify() probe.  Called only from
     upgrade_database (Step12BeliefGlobalId).
-  reviewer: 待评审
+  reviewer: Echo-Smith
+  reviewed_at: "2026-11-04"
 
 - module: mirror_memory.core.schema_migration
   function: _backfill_global_ids
@@ -117,7 +118,8 @@
     database-minted UUID per row (NULL or the '' marker), composite keys
     matched as a row value, one transaction per batch.  Called only from
     Step12BeliefGlobalId.apply.
-  reviewer: 待评审
+  reviewer: Echo-Smith
+  reviewed_at: "2026-11-04"
 
 - module: mirror_memory.core.schema_migration
   function: _build_global_id_index
@@ -126,4 +128,5 @@
     mm_beliefs(tenant_id, app_id, global_id) -- catalog DDL over the whole
     table, no tenant to scope it to (the step-5 index pattern).  Called
     only from Step12BeliefGlobalId.apply on PostgreSQL.
-  reviewer: 待评审
+  reviewer: Echo-Smith
+  reviewed_at: "2026-11-04"

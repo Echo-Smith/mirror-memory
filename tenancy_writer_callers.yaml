@@ -230,7 +230,7 @@ writers:
       - mirror_memory.extraction.pipeline
 
   # ---- sync class: the tombstone-synchronization bookkeeping (M4 batch 2,
-  #  reviewer 待评审) ----
+  #  Reviewed 2026-11-04 by Echo-Smith) ----
   record_tombstones_applied:
     reason: >
       Records (origin, origin_seq) for every applied cross-device tombstone
@@ -247,13 +247,17 @@ writers:
       partial catch-up or rescan re-anchor is never recorded as a
       complete one, batch-2 patch 4 task 1).  Called only inside the
       engine's tombstone application (MemoryEngine.apply_tombstones).
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-11-04"
     callers:
       - mirror_memory.api
-  mark_catchup_complete:   # 待评审 (batch-2 patch 4, task 1 -- new writer)
+  mark_catchup_complete:
     reason: >
       Stamps last_catchup_at, the offline grace period's anchor, and is
       the ONLY writer of that instant -- called exclusively by the
       catch-up loop (MemoryEngine._catch_up) after it confirms the peer's
       tail with an empty batch that did not rescan.
+    reviewed_by: Echo-Smith
+    reviewed_at: "2026-11-04"
     callers:
       - mirror_memory.api

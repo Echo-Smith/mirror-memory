@@ -585,7 +585,11 @@ UNGATED_ENGINE_METHODS: dict[str, str] = {
     # deletion log only (ids + scope keys -- content-free by construction,
     # the tombstone format carries no payload); apply_tombstones performs
     # DELETIONS (forget is allowed regardless of authorization state, the
-    # M3 rule) and sync_status is pure bookkeeping state.
+    # M3 rule) and sync_status is pure bookkeeping state.  FUTURE NETWORK
+    # ROUTING must go through tenant authentication and pass auth_tenant
+    # to apply, and the transport's db_id must be bound to the
+    # AUTHENTICATED peer (batch-2 patch 4; the envelope's self-claimed
+    # sender is never trusted for identity).
     "export_tombstones": "sync plane: content-free deletion identifiers out of the local log (no memory content)",
     "apply_tombstones": "sync plane: deletions only -- the forget paths run regardless of authorization state (M3)",
     "sync_status": "sync plane: bookkeeping state (cursor, grace, mode); no memory touched",
