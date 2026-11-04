@@ -840,10 +840,12 @@ def test_apply_scale_report_by_batch_kind(tmp_path):
     # the same batch applies as no-ops (hundreds of INSERTs) -- the
     # asymmetry is the measured path, reported above
     assert results[("echo", "scaled")][1] <= 20
-    # a loose timing guard for pathological regressions only (load-noisy)
+    # a loose timing guard for pathological regressions only (load-noisy:
+    # it flaked once inside a fully loaded suite -- the statement-count
+    # assertions above carry the real property)
     for kind in ("noop", "real"):
         t_empty = results[(kind, "empty")][0]
         t_scaled = results[(kind, "scaled")][0]
-        assert t_scaled < max(6.0 * t_empty, 3.0), \
+        assert t_scaled < max(8.0 * t_empty, 5.0), \
             f"{kind} apply grew pathologically with the table: " \
             f"{t_empty:.4g}s -> {t_scaled:.4g}s"

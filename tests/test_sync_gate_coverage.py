@@ -24,6 +24,8 @@ entrance fails this test until a driver is written for it.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -520,3 +522,207 @@ def test_shared_wrapper_startup_catchup(tmp_path):
 
 def _session_of(engine):
     return sessionmaker(bind=engine._engine)()
+
+
+# --- M4 batch-2 patch 7, task 2: concurrent initialization -------------
+
+class _BarrierTransport:
+    """A live transport whose FIRST export blocks on an event: the startup
+    catch-up of the engine under construction stalls mid-flight until the
+    test releases it."""
+
+    def __init__(self, peer_engine, gate: threading.Event, entered:
+                 threading.Event):
+        self.peer = peer_engine
+        self.gate = gate
+        self.entered = entered
+        self.calls = 0
+
+    @property
+    def db_id(self):
+        return self.peer._db_id
+
+    def export_tombstones(self, cursor, limit, peer_db_id=None):
+        self.calls += 1
+        self.entered.set()
+        self.gate.wait(timeout=30)
+        return self.peer.export_tombstones(cursor, limit)
+
+
+def _concurrent_init_scenario(tmp_path, *, shared_shape: bool):
+    """Thread 1 initializes the engine (its startup catch-up stalls on the
+    barrier); thread 2 reads a sentinel-carrying entrance while the peer
+    already holds the deletion.  The read must NOT return content before
+    the catch-up's verdict: it waits, and the post-catch-up result is
+    sentinel-free.  A failed initialization (non-Connection error) leaves
+    the engine un-serviceable and the next call RETRIES the init instead
+    of bypassing it."""
+    cloud = _engine(tmp_path / "cl", "gc-cl")
+    template = _engine(tmp_path / "b", "gc-b", transport=_Transport(cloud))
+    _observe(template, "I like concurrentinit and coffee.")
+    _observe(cloud, "I like concurrentinit and coffee.")
+    _align(template, cloud)
+    assert template.sync_status()["state"] == "normal"
+    template._engine.dispose()
+
+    # the cloud deletes the sentinel now (the tombstone is pending)
+    from mirror_memory.core.tenancy import fixture_write_scope as _fws
+
+    gid = next(b.global_id for b in _beliefs(cloud)
+               if "concurrentinit" in b.claim_text)
+    with tenant_scope(*TENANT), _fws("align concurrentinit"):
+        s = sessionmaker(bind=cloud._engine)()
+        for b in s.query(Belief).filter(Belief.user_id == USER).all():
+            if "concurrentinit" in b.claim_text:
+                b.global_id = gid
+        s.commit()
+        s.close()
+    cb = next(b for b in _beliefs(cloud)
+              if "concurrentinit" in b.claim_text)
+    assert cloud.forget_belief(user_id=USER, belief_id=cb.id, purpose="api")
+
+    # the engine under construction: a FRESH database that already holds
+    # the sentinel data (as a restore would) and a within-grace anchor
+    root = tmp_path / "engine"
+    root.mkdir(exist_ok=True)
+    if shared_shape:
+        # the shared pool must hold the SAME database the data lives in
+        base = MemoryEngine(
+            config=template._config, database_url=template._database_url,
+            tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+            deletion_log=template._deletion_log, single_tenant_mode=True,
+            sync_transport=None)
+        base._ensure_db()
+        base._engine.dispose()
+        kwargs = dict(engine=base._engine, schema_ready=True)
+    else:
+        kwargs = {}
+    gate = threading.Event()
+    entered = threading.Event()
+
+    # the engine under construction rides the TEMPLATE's database (the
+    # sentinel data is in it).  Prelude: initialize it OFFLINE (a dead
+    # link -- the startup catch-up fails into the grace, the sentinel
+    # stays), then reset the initialization state: the concurrent
+    # scenario starts from "not yet serviceable" with a live barrier
+    # transport and a pending deletion.
+    eng = MemoryEngine(
+        config=template._config, database_url=template._database_url,
+        tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+        deletion_log=template._deletion_log, single_tenant_mode=True,
+        sync_transport=_Transport(cloud, fail_after=0), **kwargs)
+    eng._ensure_db()
+    assert any("concurrentinit" in b.claim_text for b in _beliefs(eng))
+    eng._initialized = False
+    eng._initializing = False
+    eng._init_done.clear()
+
+    transport = _BarrierTransport(cloud, gate, entered)
+    eng._sync_transport = transport
+
+    # thread 1: the initialization (its catch-up stalls on the barrier)
+    t1_err: list = []
+
+    def init_thread():
+        try:
+            eng._ensure_db()
+        except Exception as e:  # pragma: no cover - recorded
+            t1_err.append(e)
+
+    t1 = threading.Thread(target=init_thread)
+    t1.start()
+    assert entered.wait(timeout=10), "the startup catch-up never stalled"
+    assert not eng._initialized, "not serviceable while the catch-up runs"
+
+    # thread 2: a read while the catch-up is in flight -- it must not
+    # return the sentinel (it waits for the verdict)
+    t2_result: list = []
+
+    def read_thread():
+        try:
+            t2_result.append(("ok", _drv_recall(eng)))
+        except Exception as e:
+            t2_result.append(("err", e))
+
+    t2 = threading.Thread(target=read_thread)
+    t2.start()
+    time.sleep(0.5)
+    state = [r[0] for r in t2_result]
+    assert state == [], "thread 2 must not return before the verdict"
+
+    # release the barrier: the catch-up completes, thread 2's read
+    # proceeds with the post-catch-up state -- no sentinel
+    gate.set()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert t1_err == [], t1_err
+    assert t2_result and t2_result[0][0] == "ok", t2_result
+    assert "concurrentinit" not in t2_result[0][1]
+    assert not any("concurrentinit" in b.claim_text
+                   for b in _beliefs(eng))
+    eng._engine.dispose()
+    cloud._engine.dispose()
+
+
+def _concurrent_init_retry_scenario(tmp_path, *, shared_shape: bool):
+    """A non-Connection failure inside the initialization leaves the
+    engine un-serviceable; the NEXT _ensure_db call re-runs the whole
+    init (the transport sees a second call) instead of serving."""
+    cloud = _engine(tmp_path / "cl", "gc-cl")
+    root = tmp_path / "engine-retry"
+    root.mkdir(exist_ok=True)
+    if shared_shape:
+        # the wrapper binds a shared pool that owns a prepared database
+        base = _engine(root, "gc-e", transport=None)
+        base._engine.dispose()
+        database_url = base._database_url
+        kwargs = dict(engine=base._engine, schema_ready=True)
+    else:
+        database_url = f"sqlite:///{root / 'e.db'}"
+        kwargs = {}
+
+    class _BrokenThenWorking:
+        def __init__(self):
+            self.calls = 0
+
+        @property
+        def db_id(self):
+            return cloud._db_id
+
+        def export_tombstones(self, cursor, limit, peer_db_id=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom (a real init failure)")
+            return cloud.export_tombstones(cursor, limit)
+
+    transport = _BrokenThenWorking()
+    retry_cfg = _cfg(tmp_path / "cfg-deletions")
+    retry_cfg.sync.enabled = True  # the boom lives in the startup catch-up
+    eng = MemoryEngine(
+        config=retry_cfg,
+        database_url=database_url,
+        tenant_id=TENANT[0], app_id=TENANT[1], llm_client=_FakeLLM(),
+        deletion_log=FileDeletionLog(tmp_path / "e-deletions"),
+        single_tenant_mode=True, sync_transport=transport, **kwargs)
+    with pytest.raises(RuntimeError, match="boom"):
+        eng._ensure_db()
+    assert not eng._initialized
+    calls_after_failure = transport.calls
+    assert calls_after_failure >= 1
+    eng._ensure_db()  # retries the WHOLE init, no bypass
+    assert eng._initialized
+    # the retry re-ran the startup catch-up (a fresh export went out)
+    # instead of publishing the half-initialized engine
+    assert transport.calls > calls_after_failure
+    eng._engine.dispose()
+    cloud._engine.dispose()
+
+
+def test_concurrent_init_normal_shape(tmp_path):
+    _concurrent_init_scenario(tmp_path, shared_shape=False)
+    _concurrent_init_retry_scenario(tmp_path, shared_shape=False)
+
+
+def test_concurrent_init_shared_shape(tmp_path):
+    _concurrent_init_scenario(tmp_path, shared_shape=True)
+    _concurrent_init_retry_scenario(tmp_path, shared_shape=True)

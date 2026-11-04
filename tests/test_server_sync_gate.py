@@ -16,11 +16,13 @@ scenario drives a restored server whose channel has NOT caught up:
 /belief/{id} and /stats are covered directly, including the unchanged
 cross-tenant 404 and purpose 403 semantics.
 
-Databases: the SQLite matrix always runs.  The same scenario runs
-against a REAL PostgreSQL server database (owner-side provisioned, the
-app gets the app-role URL) when MM_DATABASE_URL points at PostgreSQL --
-on that leg the per-tenant wrappers are the schema_ready shared-engine
-shape, so the run also exercises their startup catch-up over HTTP.
+Databases and restore scope (patch 7, task 3 -- stated exactly): the
+SQLite matrix restores the MAIN DATABASE FILE only (the deletion-log
+directory is NOT rewound -- a main-DB restore with the log retained).
+The PostgreSQL run performs NO restore: it is the un-caught-up state on
+a real PG server database (anchor aged past the grace), NOT a restore
+test -- the full-machine restore scenarios live in
+tests/test_sync_mesh.py and tests/test_edge_sync.py and are untouched.
 """
 
 from __future__ import annotations
@@ -70,9 +72,9 @@ class _FakeLLM:
 class _SwappingTransport:
     """The transport a server engine holds: `.dead` flips the link."""
 
-    def __init__(self, peer_engine):
+    def __init__(self, peer_engine, dead: bool = False):
         self.peer = peer_engine
-        self.dead = False
+        self.dead = dead
         self.calls = 0
 
     @property
@@ -206,8 +208,9 @@ def test_server_registry_covers_every_read():
     assert missing == [], f"HTTP drivers missing for: {missing}"
 
 
-def _age_server_anchor(database_url, days: float):
-    with tenant_scope(*TENANT), fixture_write_scope("age the server anchor"):
+def _age_server_anchor(database_url, days: float, tenant=None):
+    with tenant_scope(*(tenant or TENANT)), \
+            fixture_write_scope("age the server anchor"):
         s = sessionmaker(bind=create_engine(database_url))()
         s.query(SyncPeer).update(
             {"last_catchup_at": datetime.utcnow() - timedelta(days=days)},
@@ -273,7 +276,12 @@ def _run_http_scenario(tmp_path, database_url, *, pg_cleanup=None):
     if backup_db is not None:
         shutil.copyfile(backup_db, db_file)
 
-    # --- expired phase: the anchor aged past the grace, the link dead
+    # --- expired phase: the anchor aged past the grace, the link dead.
+    # The detail must be the EXACT expired sentence (patch 7, task 3 --
+    # the two refusal texts share no common substring test anymore).
+    EXPIRED_DETAIL = "此设备已超过允许的离线时间，需要联网同步后才能继续查看记忆。"
+    CATCHING_UP_DETAIL = "记忆正在同步，请稍后重试。"
+
     def dead_factory(eng):
         if eng._tenant != TENANT:
             return None
@@ -291,25 +299,29 @@ def _run_http_scenario(tmp_path, database_url, *, pg_cleanup=None):
         for name, drv in sorted(drivers.items()):
             r = drv()
             assert r.status_code == 503, (name, r.status_code, r.text[:200])
-            detail = r.json()["detail"]
-            assert ("离线" in detail or "expired" in detail.lower()), \
-                (name, detail)
+            assert r.json()["detail"] == EXPIRED_DETAIL, (name, r.text[:200])
             assert SENTINEL not in r.text, name
 
-    # --- catching-up phase: the state machine mid-catch-up
+    # --- catching-up phase: the state machine of the engine THAT SERVES
+    # this app's requests (a warmup request materializes the wrapper,
+    # then the state flips; the previous version mutated a stale engine
+    # and verified the expired text by a loose shared substring)
     _tenant_engines.clear()
     app3 = create_app(config=cfg, database_url=database_url,
                       llm_client=_FakeLLM(), sync_transport_factory=dead_factory)
     with TestClient(app3) as client:
+        warm = client.get("/beliefs", params={"user_id": USER},
+                          headers=_http_headers())
+        assert warm.status_code == 503  # still expired
         eng = captured[-1]
+        assert eng._tenant == TENANT
         eng._sync_state = "catching_up"
         drivers = _http_drivers(client)
         for name, drv in sorted(drivers.items()):
             r = drv()
             assert r.status_code == 503, (name, r.status_code, r.text[:200])
-            detail = r.json()["detail"]
-            assert ("同步" in detail or "catching" in detail.lower()), \
-                (name, detail)
+            assert r.json()["detail"] == CATCHING_UP_DETAIL, \
+                (name, r.text[:200])
             assert SENTINEL not in r.text, name
         eng._sync_state = "normal"
 
@@ -394,3 +406,142 @@ def test_http_gate_matrix_real_pg(tmp_path):
         from tests.test_deletion_race_backup import _pg_drop_database
 
         _pg_drop_database("mm_test_http_gate", admin_url)
+
+
+# --- M4 batch-2 patch 7, task 1: the default and legacy MM_API_KEY
+# --- service modes get the factory transport on the lifespan engine
+
+def _seed_default_db(db_url, log_dir):
+    """The server rows for the DEFAULT tenant (the default / legacy
+    single-key modes serve this tenant through the lifespan engine)."""
+    from mirror_memory.core.models import Base as _Base
+
+    dflt = ("default", "default")
+    engine = create_engine(db_url)
+    _Base.metadata.create_all(engine)
+    sm.ensure_watermark(engine)
+    FileDeletionLog(log_dir).ensure_genesis(sm.read_watermark(engine)[0])
+    with tenant_scope(*dflt), fixture_write_scope("default-mode seed"):
+        s = sessionmaker(bind=engine)()
+        set_memory_enabled(s, USER, True)
+        s.add(Belief(user_id=USER, dimension="topic", key="k-sentinel",
+                     global_id="1" * 32,
+                     claim_text=f"I like {SENTINEL} and coffee.",
+                     confidence=0.9))
+        s.commit()
+        s.close()
+    engine.dispose()
+
+
+def _build_default_cloud(root):
+    log_dir = root / "cloud-deletions"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    cfg = load_config("config/")
+    cfg.deletion_log.directory = str(log_dir)
+    cloud = MemoryEngine(
+        config=cfg, database_url=f"sqlite:///{root / 'cloud.db'}",
+        tenant_id="default", app_id="default", llm_client=_FakeLLM(),
+        deletion_log=FileDeletionLog(log_dir), single_tenant_mode=False)
+    cloud._ensure_db()
+    with tenant_scope(*("default", "default")), \
+            fixture_write_scope("default-mode cloud seed"):
+        s = sessionmaker(bind=cloud._engine)()
+        set_memory_enabled(s, USER, True)
+        s.add(Belief(user_id=USER, dimension="topic", key="k-sentinel",
+                     global_id="1" * 32,
+                     claim_text=f"I like {SENTINEL} and coffee.",
+                     confidence=0.9))
+        s.commit()
+        s.close()
+    return cloud
+
+
+def _default_mode_scenario(tmp_path, *, legacy: bool, monkeypatch):
+    """No tenant registry (or legacy MM_API_KEY): _get_engine(None)
+    serves through the LIFESPAN engine, which carries the factory's
+    transport -- the startup catch-up applies the cloud's deletion
+    before the first read."""
+    root = tmp_path
+    log_dir = root / "server-deletions"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    db_url = f"sqlite:///{root / 'server.db'}"
+    _seed_default_db(db_url, log_dir)
+    cloud = _build_default_cloud(root)
+    register_tenant_key("key-A", "tA", "app", purposes={"test"}) \
+        if False else None
+    if legacy:
+        monkeypatch.setenv("MM_API_KEY", "legacy-key")
+    headers = ({"Authorization": "Bearer legacy-key", "X-MM-Purpose": "api"}
+               if legacy else {})
+
+    cfg = _server_config(log_dir)
+    captured: list = []
+
+    def factory(eng):
+        captured.append(eng)
+        return _SwappingTransport(cloud)
+
+    # the cloud deletes the sentinel BEFORE the server starts
+    with tenant_scope(*("default", "default")):
+        s = sessionmaker(bind=cloud._engine)()
+        cbs = list(s.query(Belief).filter(Belief.user_id == USER).all())
+        s.close()
+    cb = next(b for b in cbs if SENTINEL in b.claim_text)
+    assert cloud.forget_belief(user_id=USER, belief_id=cb.id, purpose="api")
+
+    app = create_app(config=cfg, database_url=db_url, llm_client=_FakeLLM(),
+                     sync_transport_factory=factory)
+    with TestClient(app) as client:
+        # the first read: the startup catch-up has ALREADY applied the
+        # deletion -- the sentinel is gone, and the route serves
+        r = client.get("/beliefs", params={"user_id": USER}, headers=headers)
+        assert r.status_code == 200, r.text[:200]
+        assert SENTINEL not in r.text
+        assert captured and captured[0]._tenant == ("default", "default"), \
+            "the lifespan engine carries the factory transport"
+        eng = captured[0]
+        from mirror_memory.core.repository import read_sync_peer
+
+        with tenant_scope(*("default", "default")):
+            s = sessionmaker(bind=create_engine(db_url))()
+            row = read_sync_peer(s, cloud._db_id)
+            s.close()
+        assert row is not None and row.cursor >= 1, \
+            "the startup catch-up consumed the peer's tombstone"
+
+    # offline: a dead link keeps the stored grace; aged past it, refuse
+    _age_server_anchor(db_url, days=8.0, tenant=("default", "default"))
+    app2 = create_app(
+        config=cfg, database_url=db_url, llm_client=_FakeLLM(),
+        sync_transport_factory=lambda eng: _SwappingTransport(cloud, dead=True))
+    with TestClient(app2) as client:
+        r = client.get("/beliefs", params={"user_id": USER}, headers=headers)
+        assert r.status_code == 503
+        assert r.json()["detail"] == \
+            "此设备已超过允许的离线时间，需要联网同步后才能继续查看记忆。"
+    cloud._engine.dispose()
+
+
+def test_http_default_mode_catches_up_before_first_read(tmp_path, monkeypatch):
+    _default_mode_scenario(tmp_path, legacy=False, monkeypatch=monkeypatch)
+
+
+def test_http_legacy_api_key_mode_catches_up(tmp_path, monkeypatch):
+    _default_mode_scenario(tmp_path, legacy=True, monkeypatch=monkeypatch)
+
+
+def test_http_sync_off_unchanged(tmp_path):
+    """sync.enabled=False: no gate, no transport -- the original behavior
+    (reads serve whatever the database holds)."""
+    root = tmp_path
+    log_dir = root / "server-deletions"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    db_url = f"sqlite:///{root / 'server.db'}"
+    _seed_default_db(db_url, log_dir)
+    cfg = _server_config(log_dir)
+    cfg.sync.enabled = False
+    app = create_app(config=cfg, database_url=db_url, llm_client=_FakeLLM())
+    with TestClient(app) as client:
+        r = client.get("/beliefs", params={"user_id": USER})
+        assert r.status_code == 200
+        assert SENTINEL in r.text  # sync is off: nothing gates the read

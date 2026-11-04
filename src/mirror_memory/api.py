@@ -199,6 +199,18 @@ class MemoryEngine:
             else os.environ.get("MM_SINGLE_TENANT", "0") == "1"
         )
         self._initialized = False
+        # batch-2 patch 7, task 2: concurrent initialization of the SAME
+        # engine.  `_initializing` (guard by _init_lock) marks the init in
+        # flight; concurrent callers of OTHER threads wait on _init_done
+        # and only proceed once the verdict -- startup catch-up included --
+        # is visible, so no entry can serve before the channel state is
+        # published.  `_init_tls.in_init` lets the startup catch-up's own
+        # applies re-enter _ensure_db on the SAME thread without waiting
+        # on themselves (no recursion deadlock).
+        self._init_lock = threading.Lock()
+        self._init_done = threading.Event()
+        self._initializing = False
+        self._init_tls = threading.local()
         self._pipeline = None  # lazy-initialized
         # M4: the independent deletion log.  An explicit instance wins;
         # otherwise the config decides (backend file|postgres).  None =>
@@ -232,9 +244,51 @@ class MemoryEngine:
 
     def _ensure_db(self) -> None:
         """Create tables on first use (SQLite) or verify the owner-created
-        schema and the row-level-security posture (PostgreSQL)."""
+        schema and the row-level-security posture (PostgreSQL).
+
+        Batch-2 patch 7, task 2: the initialization INCLUDES the startup
+        catch-up, and the serviceable state (`_initialized`) is published
+        only after its verdict.  A concurrent caller of another thread
+        waits for that verdict instead of serving (its entries then hit
+        the gate with the true channel state); a FAILED initialization
+        leaves the flag unset so the next call retries the whole init --
+        never bypasses it; the startup catch-up's own applies re-enter on
+        the same thread via `_init_tls` without waiting on themselves."""
         if self._initialized:
             return
+        if getattr(self._init_tls, "in_init", False):
+            # re-entered by OUR OWN startup catch-up (apply_tombstones
+            # ensures the db): the engine is mid-initialization on this
+            # very thread -- proceed without waiting on ourselves
+            return
+        wait = False
+        with self._init_lock:
+            if self._initialized:
+                return
+            if self._initializing:
+                wait = True  # another thread's init is in flight
+            else:
+                self._initializing = True
+                self._init_tls.in_init = True
+        if wait:
+            # the in-flight init carries the startup catch-up: wait for
+            # its verdict (bounded by the catch-up's own network timeouts
+            # and the offline-grace failure path), then re-check
+            self._init_done.wait()
+            return self._ensure_db()
+        try:
+            self._initialize_db()
+        finally:
+            self._init_tls.in_init = False
+            self._initializing = False
+            self._init_done.set()
+
+    def _initialize_db(self) -> None:
+        """The one-time initialization body (see _ensure_db for the
+        concurrency wrapper): schema work, then the startup catch-up --
+        the serviceable flag is published only AFTER the catch-up
+        verdict, so a concurrent entry either waits here or hits the gate
+        with the true channel state."""
         from mirror_memory.core.migrate import check_schema
         from mirror_memory.core.models import Base
         from mirror_memory.core.pg_engine import build_engine
@@ -250,14 +304,14 @@ class MemoryEngine:
                 self._db_id, self._applied_seq = schema_migration.read_watermark(
                     self._engine
                 ) or (None, 0)
-                self._initialized = True
-                # batch-2 patch 6, task 2: binding is NOT the whole story --
-                # the sync channel is per-engine, so a sync-enabled wrapper
-                # runs the same startup catch-up the normal path does
-                # BEFORE any entry serves (entries are gated meanwhile).
-                # No transport: the no-transport gate mode decides (the
-                # warning below says so once).
+                # batch-2 patch 6/7, task 2: binding is NOT the whole
+                # story -- the sync channel is per-engine, so a
+                # sync-enabled wrapper runs the same startup catch-up the
+                # normal path does, and the serviceable flag publishes
+                # only AFTER its verdict.  No transport: the no-transport
+                # gate mode decides (the warning below says so once).
                 self._catch_up_at_startup()
+                self._initialized = True
                 return
         else:
             self._engine = build_engine(self._database_url)
@@ -302,10 +356,11 @@ class MemoryEngine:
             from mirror_memory.core.tenancy import set_single_tenant_mode
 
             set_single_tenant_mode(True)
-        self._initialized = True
-        # M4 batch 2 task 3: an edge with sync enabled catches up against
-        # its peer BEFORE any entry serves (entries are gated meanwhile)
+        # M4 batch 2 task 3 / patch 7 task 2: an edge with sync enabled
+        # catches up against its peer BEFORE any entry serves -- and the
+        # serviceable flag publishes only after the verdict
         self._catch_up_at_startup()
+        self._initialized = True
 
     def _verify_single_tenant_startup(self) -> None:
         """Fail-closed startup checks for end-side single-tenant mode.

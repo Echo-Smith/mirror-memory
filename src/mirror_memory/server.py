@@ -525,12 +525,15 @@ def create_app(
             llm_model=os.environ.get("MM_LLM_MODEL", llm_model),
             llm_base_url=llm_base_url or os.environ.get("MM_LLM_BASE_URL"),
         )
-        # NOTE: the LIFESPAN engine is the owner/infra engine (default
-        # tenant) and deliberately gets NO sync transport -- tombstones
-        # are tenant-scoped, so only the per-tenant wrappers (each bound
-        # to its key's tenant) may pull a channel.  Without a transport
-        # the lifespan engine sits in the no-transport gate mode, which
-        # never serves user entries anyway.
+        # The LIFESPAN engine is the serving engine of the DEFAULT and
+        # legacy MM_API_KEY modes (_get_engine(None) returns it): it gets
+        # the host's transport and catches up before its first entry
+        # (batch-2 patch 7, task 1).  In registered-tenant-key mode it
+        # serves no user entries -- the host factory decides what it
+        # returns for it (None is fine); the per-tenant wrappers each get
+        # their own authenticated tenant's transport in _engine_for.
+        if sync_transport_factory:
+            _engine._sync_transport = sync_transport_factory(_engine)
         _engine._ensure_db()
         # Task 5: per-tenant engine factory state + optional key file.
         # PostgreSQL: the lifespan engine's SQLAlchemy engine is THE shared
