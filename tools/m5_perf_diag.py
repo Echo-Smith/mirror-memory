@@ -1,60 +1,55 @@
 """M5 Task 0 -- PostgreSQL performance diagnosis across three revisions.
 
-Diagnosis only: this script measures and decomposes; it never modifies
-``src/`` or ``tests/`` for any purpose other than temporarily materialising
-a baseline revision in the worktree (restored to the starting branch at the
-end).  See ``docs/reports/2026-11-04-m5-pg-perf-diag.md`` for the findings.
+DIAGNOSIS ONLY.  This script measures and decomposes; it never edits the
+shared checkout's ``src/``/``tests/``.  Each revision is materialised in
+its OWN detached git worktree (``/tmp/mm-perf-<short>``), so three agents
+can share one checkout without anyone swapping files under the others:
 
-What it does (one process, one run per measurement so noise is shared):
+    git worktree add --detach /tmp/mm-perf-403 403f38d   # M2
+    git worktree add --detach /tmp/mm-perf-aed aed0639   # M3
+    git worktree add --detach /tmp/mm-perf-d61 d61e7b7   # M4
 
-  measure     interleaved three-point timing.  For round in 1..R: for
-              rev in [M2=403f38d, M3=aed0639, M4=d61e7b7]: materialise the
-              revision (git checkout rev -- src tests pyproject.toml), run
-              ``tests/test_longrun_bench.py`` against PostgreSQL mode A
-              (MM_PG_RLS=1, app read filter, MM_SQL_AUDIT=0), record wall
-              time and junit.  Prints median and min per revision, and
-              saves the raw rounds to JSON.
+Every run imports the revision under test through ``PYTHONPATH=<wt>/src``
+and executes from inside that worktree directory.  The shared checkout is
+only ever READ.
 
-  profile     per-revision cProfile of ``run_longrun`` through the same
-              small scenario the longrun tests use, so Python-side time is
-              attributed to functions (sqlalchemy execute, authorization,
-              access audit, deletion guard, ...).
+What it measures (all on PostgreSQL, mode A = RLS on + application read
+filter, SQL auditor off -- production's shape today):
 
-  statements  per-revision SQL statement COUNTS from a live longrun run,
-              via a SQLAlchemy ``before_cursor_execute`` listener attached
-              to the Engine class.  Reports total statements plus
-              per-category call counts (read gate / visibility filter /
-              audit writes / deletion checks / sync catch-up / other) by
-              the stack frame that issued them, and the top-5 hottest
-              individual statements.  This is COUNT-only (no timing):
-              per-statement TIMING is not feasible without an APM inside
-              every execute, so it is stated as a limitation, not faked.
+  measure     Interleaved three-point wall time.  For round in 1..R:
+              for rev in [M2, M3, M4]: run tests/test_longrun_bench.py
+              (18 tests) in that rev's worktree, record wall time + junit.
+              Prints median and min per revision; saves raw rounds.
+  statements  Per-revision SQL statement COUNTS from one representative
+              longrun test via a before_cursor_execute listener, bucketed
+              into the increment sources by the issuing call site.  COUNT
+              only (no per-statement timing -- see caveats).
+  profile     Per-revision cProfile of run_longrun (Python-time
+              attribution) on a fresh PG schema built from that revision.
 
-  restore     materialise the starting branch back into the worktree and
-              print ``git status`` for src/tests/pyproject.toml.
+  worktrees   Create the three worktrees (measure/statements/profile do this
+              automatically).
+  cleanup     Remove the worktrees this tool created.
 
-Methodology reused from ``tools/perf_ids.py`` (``_use_rev``) and
-``tools/m2_mode_perf.py`` (``mode_env``, junit accounting).  Run from the
-repo root with the project venv, e.g.::
+Methodology borrowed from tools/perf_ids.py (worktree isolation) and
+tools/m2_mode_perf.py (mode_env, junit accounting).  Run from the shared
+checkout root with the project venv::
 
     MM_DATABASE_URL=postgresql://postgres:mm@127.0.0.1:5437/mm_test \
-    MM_PG_RLS=1 MM_TENANT_READ_FILTER=app \
     .venv/bin/python tools/m5_perf_diag.py measure --rounds 3
 
-Caveats (repeat in the report): local Docker PG 16 is smaller than a CI
-runner; each ``test_longrun_bench.py`` file run executes all 18 tests and
-takes minutes, so the three-point sweep is 3*3 runs of that length.
+Limitations (repeated in the report): local Docker PG 16 is smaller than a
+CI runner; each test_longrun_bench.py run is minutes long, so a 3-point
+sweep is 9 runs of that length; per-statement TIMING is not captured (only
+counts) -- there is no APM inside every execute, so it is stated as a
+limitation rather than fabricated.
 """
 
 from __future__ import annotations
 
 import argparse
-import cProfile
-import importlib
-import io
 import json
 import os
-import pstats
 import re
 import statistics
 import subprocess
@@ -63,96 +58,76 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# revision label -> commit
+# revision label -> commit; worktree dir derived from the short sha.
 REVS: dict[str, str] = {"M2": "403f38d", "M3": "aed0639", "M4": "d61e7b7"}
 REV_ORDER = ("M2", "M3", "M4")
-BRANCH = "feat/m5-readiness"
-MANAGED_PATHS = ["src", "tests", "pyproject.toml"]
 LONGRUN = "tests/test_longrun_bench.py"
-# tests/test_longrun_bench.py has 18 tests; recorded for the validity check.
-EXPECTED_TESTS = 18
+EXPECTED_TESTS = 18             # tests/test_longrun_bench.py has 18 tests
+SHORT = {"M2": "403", "M3": "aed", "M4": "d61"}
+WT_ROOT = Path("/tmp")
+WT = {label: WT_ROOT / f"mm-perf-{SHORT[label]}" for label in REV_ORDER}
 
 _ADMIN_URL = os.environ.get("MM_DATABASE_URL", "postgresql://postgres:mm@127.0.0.1:5437/mm_test")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_PY = sys.executable
 
-# Mode A = production today: RLS on + application read filter, SQL auditor off
-# for measurement (the M1 acceptance figure disables it in every leg).
+# Mode A = production today: RLS on + application read filter, SQL auditor
+# off for measurement (the M1 acceptance figure disables it in every leg).
 MODE_A_ENV: dict[str, str] = {
     "MM_PG_RLS": "1",
     "MM_TENANT_READ_FILTER": "app",
     "MM_SQL_AUDIT": "0",
 }
-_MODE_ENV_KEYS = {"MM_PG_RLS", "MM_TENANT_READ_FILTER", "MM_ALLOW_UNFILTERED_MEASUREMENT", "MM_SQL_AUDIT"}
-# Env keys a revision sweep must clear so nothing leaks between revisions.
-_LEAK_KEYS = _MODE_ENV_KEYS | {"MM_LONGRUN_DATABASE_URL"}
+_LEAK_KEYS = {
+    "MM_PG_RLS", "MM_TENANT_READ_FILTER", "MM_ALLOW_UNFILTERED_MEASUREMENT",
+    "MM_SQL_AUDIT", "MM_LONGRUN_DATABASE_URL", "PYTHONPATH",
+}
 
 
-def mode_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+def mode_env(wt: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _LEAK_KEYS}
     env.update(MODE_A_ENV)
     env["MM_DATABASE_URL"] = _ADMIN_URL
+    env["PYTHONPATH"] = str(wt / "src")
     if extra:
         env.update(extra)
     return env
 
 
 # ---------------------------------------------------------------------------
-# Revision materialisation (reuses perf_ids._use_rev semantics; kept local so
-# this tool has no import-time dependency on the tools package).
+# worktrees
 # ---------------------------------------------------------------------------
 
 
-def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=check)
+def ensure_worktrees() -> None:
+    existing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=_REPO_ROOT,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    for label in REV_ORDER:
+        wt = WT[label]
+        if str(wt) in existing or str(wt.resolve()) in existing:
+            continue
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(wt), REVS[label]],
+            cwd=_REPO_ROOT, check=True, capture_output=True,
+        )
+        print(f"# worktree {label} -> {wt} @ {REVS[label]}")
 
 
-def _use_rev(rev: str) -> None:
-    """Make worktree src/tests/pyproject.toml match *rev* exactly.
-
-    ``git checkout <rev> -- path`` never deletes files that exist in the
-    worktree but not in *rev*.  Remove worktree files under src/tests that
-    the revision's tree does not contain first, then materialise.  This is
-    the same logic as ``tools/perf_ids.py::_use_rev``.
-    """
-    keep = set(
-        _git("ls-tree", "-r", "--name-only", rev, "--", "src", "tests").stdout.splitlines()
-    )
-    listed = _git("ls-files", "--", "src", "tests").stdout.splitlines()
-    for path in listed:
-        if path not in keep and os.path.exists(path):
-            os.remove(path)
-    for root, _dirs, files in os.walk("tests"):
-        for name in files:
-            if name.endswith(".py"):
-                rel = os.path.join(root, name)
-                if rel not in keep:
-                    os.remove(rel)
-    _git("checkout", "-q", rev, "--", *MANAGED_PATHS)
-    _git("reset", "-q", "HEAD", "--", "src", "tests", check=False)
-    _purge_bytecode()
-
-
-def _purge_bytecode() -> None:
-    for root, dirs, _files in os.walk("src"):
-        for d in list(dirs):
-            if d == "__pycache__":
-                for f in Path(os.path.join(root, d)).glob("*.pyc"):
-                    f.unlink(missing_ok=True)
-
-
-def _restore(work: Path) -> None:
-    print(f"# restoring branch {BRANCH} into the worktree", file=sys.stderr)
-    _git("checkout", "-q", BRANCH, "--", *MANAGED_PATHS)
-    _git("reset", "-q", "HEAD", "--", "src", "tests", check=False)
-    _purge_bytecode()
-    status = _git("status", "--porcelain", "--", *MANAGED_PATHS)
-    changed = [l for l in status.stdout.splitlines() if l.strip()]
-    print(f"# src/tests/pyproject.toml changes after restore: {len(changed)}")
-    for line in changed:
-        print("  " + line)
+def cmd_cleanup() -> None:
+    for label in REV_ORDER:
+        wt = WT[label]
+        if wt.exists():
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(wt)],
+                cwd=_REPO_ROOT, check=False, capture_output=True,
+            )
+            print(f"# removed worktree {wt}")
 
 
 # ---------------------------------------------------------------------------
-# junit helpers (same shape as m2_mode_perf)
+# junit (same accounting as m2_mode_perf)
 # ---------------------------------------------------------------------------
 
 
@@ -163,23 +138,17 @@ def junit_counts(path: Path) -> dict[str, int]:
     failures = sum(int(s.get("failures", 0)) for s in suites)
     errors = sum(int(s.get("errors", 0)) for s in suites)
     skipped = sum(int(s.get("skipped", 0)) for s in suites)
-    return {
-        "tests": tests,
-        "passed": tests - failures - errors - skipped,
-        "failed": failures,
-        "errors": errors,
-        "skipped": skipped,
-    }
+    return {"tests": tests, "passed": tests - failures - errors - skipped,
+            "failed": failures, "errors": errors, "skipped": skipped}
 
 
-def _run_pytest(env: dict[str, str], junit: Path, out: Path) -> float:
-    cmd = [
-        sys.executable, "-m", "pytest", LONGRUN, "-q",
-        "-p", "no:cacheprovider", f"--junitxml={junit}",
-    ]
+def _run_pytest(wt: Path, env: dict[str, str], junit: Path, out: Path,
+                extra_args: list[str] | None = None) -> float:
+    cmd = [_PY, "-m", "pytest", LONGRUN, "-q", "-p", "no:cacheprovider",
+           f"--junitxml={junit}", *(extra_args or [])]
     start = time.monotonic()
     with open(out, "w", encoding="utf-8") as fh:
-        subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False)
+        subprocess.run(cmd, cwd=wt, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False)
     return time.monotonic() - start
 
 
@@ -190,56 +159,47 @@ def _run_pytest(env: dict[str, str], junit: Path, out: Path) -> float:
 
 def cmd_measure(rounds: int, work: Path) -> dict:
     work.mkdir(parents=True, exist_ok=True)
-    report: dict = {"branch": BRANCH, "mode": "A", "expected_tests": EXPECTED_TESTS, "rounds": []}
+    ensure_worktrees()
+    report: dict = {"mode": "A", "expected_tests": EXPECTED_TESTS, "rounds": []}
     for r in range(1, rounds + 1):
         row: dict = {}
         for label in REV_ORDER:
-            rev = REVS[label]
-            _use_rev(rev)
+            wt = WT[label]
             junit = work / f"measure_{label}_r{r}.xml"
             out = work / f"measure_{label}_r{r}.txt"
-            secs = _run_pytest(mode_env(), junit, out)
+            secs = _run_pytest(wt, mode_env(wt), junit, out)
             counts = junit_counts(junit)
-            valid = (
-                counts["failed"] == 0
-                and counts["errors"] == 0
-                and counts["passed"] == EXPECTED_TESTS
-            )
-            row[label] = {"rev": rev, "secs": round(secs, 1), **counts, "valid": valid}
-            print(
-                f"round {r} {label} ({rev}): {row[label]['secs']}s "
-                f"passed={counts['passed']} failed={counts['failed']} "
-                f"errors={counts['errors']} {'VALID' if valid else 'INVALID'}",
-                flush=True,
-            )
+            valid = counts["failed"] == 0 and counts["errors"] == 0 and counts["passed"] == EXPECTED_TESTS
+            row[label] = {"rev": REVS[label], "secs": round(secs, 1), **counts, "valid": valid}
+            print(f"round {r} {label} ({REVS[label]}): {row[label]['secs']}s "
+                  f"passed={counts['passed']} failed={counts['failed']} "
+                  f"errors={counts['errors']} {'VALID' if valid else 'INVALID'}", flush=True)
         row["valid"] = all(row[t]["valid"] for t in REV_ORDER)
-        # interleaving frame: a round is usable only if all three passed
         report["rounds"].append(row)
         print(f"round {r}: {'VALID' if row['valid'] else 'INVALID'}\n", flush=True)
+    report["stats"] = _stats(report["rounds"])
+    (work / "measure.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    _print_stats(report["stats"])
+    return report
 
-    valid_rows = [row for row in report["rounds"] if row["valid"]]
+
+def _stats(rounds: list[dict]) -> dict:
+    valid_rows = [row for row in rounds if row["valid"]]
     stats: dict = {"valid_rounds": len(valid_rows), "per_rev": {}}
     for label in REV_ORDER:
         samples = [row[label]["secs"] for row in valid_rows]
         if not samples:
             stats["per_rev"][label] = {"n": 0}
             continue
-        stats["per_rev"][label] = {
-            "n": len(samples),
-            "min": round(min(samples), 1),
-            "median": round(statistics.median(samples), 1),
-            "all": samples,
-        }
+        stats["per_rev"][label] = {"n": len(samples), "min": round(min(samples), 1),
+                                   "median": round(statistics.median(samples), 1), "all": samples}
     base = stats["per_rev"].get("M2", {})
     for label in ("M3", "M4"):
         cur = stats["per_rev"].get(label, {})
         if base.get("min") and cur.get("min"):
             cur["min_ratio_vs_M2"] = round(cur["min"] / base["min"], 3)
             cur["median_ratio_vs_M2"] = round(cur["median"] / base["median"], 3)
-    report["stats"] = stats
-    (work / "measure.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    _print_stats(stats)
-    return report
+    return stats
 
 
 def _print_stats(stats: dict) -> None:
@@ -254,95 +214,31 @@ def _print_stats(stats: dict) -> None:
             continue
         mn = s.get("min_ratio_vs_M2", 1.0)
         md = s.get("median_ratio_vs_M2", 1.0)
-        print(
-            f"| {label} ({REVS[label]}) | {s['n']} | {s['min']:.1f} | "
-            f"{s['median']:.1f} | {mn:.3f} | {md:.3f} |"
-        )
+        print(f"| {label} ({REVS[label]}) | {s['n']} | {s['min']:.1f} | "
+              f"{s['median']:.1f} | {mn:.3f} | {md:.3f} |")
 
 
 # ---------------------------------------------------------------------------
-# profile
+# statements  (via a tiny pytest plugin counting SQL on the bench engine)
 # ---------------------------------------------------------------------------
 
-SMALL = dict(days=40, preferences=12, goals=5, corrections=6, conflicts=5, forgets=3)
+COUNTER_PLUGIN = r'''
+"""pytest plugin: count SQL statements per increment source during the bench.
 
+Attaches before_cursor_execute to the SQLAlchemy Engine class (the bench
+builds its engine through pg_engine.build_engine, which is sqlalchemy.create_engine
+under the hood and therefore covered).  Buckets by issuing call site, then
+writes a JSON blob to $M5_STMT_OUT at session finish.
+"""
+import json, os, re, traceback
 
-def cmd_profile(work: Path) -> dict:
-    """cProfile one small run_longrun per revision, on the PG bench database.
-
-    The bench builds its own engine inside run_longrun, so we call it direct
-    with an explicit PG URL rather than going through pytest.  Correctness
-    isn't the point here (timing is), and the harness verifies invariants
-    anyway.
-    """
-    work.mkdir(parents=True, exist_ok=True)
-    url = os.environ.get("MM_LONGRUN_DATABASE_URL") or os.environ.get("MM_M5_LONGRUN_URL")
-    if not url:
-        raise SystemExit(
-            "profile needs MM_LONGRUN_DATABASE_URL pointing at a ready PG schema "
-            "(build one with the pg harness, or run measure first)."
-        )
-    sys.path.insert(0, os.path.abspath("src"))
-    result: dict = {"per_rev": {}, "scenario": SMALL}
-    for label in REV_ORDER:
-        _use_rev(REVS[label])
-        # fresh import so we exercise the materialised revision
-        for mod in [m for m in sys.modules if m.startswith("mirror_memory")]:
-            del sys.modules[mod]
-        longrun = importlib.import_module("mirror_memory.bench.longrun")
-        from mirror_memory.config.loader import load_config
-
-        cfg = load_config("config/")
-        if hasattr(cfg, "deletion_log"):
-            cfg.deletion_log.directory = str(work / f"deletion_{label}")
-        prof = cProfile.Profile()
-        prof.enable()
-        t0 = time.monotonic()
-        rep = longrun.run_longrun(cfg, scenario_kwargs=SMALL, database_url=url)
-        wall = time.monotonic() - t0
-        prof.disable()
-        buf = io.StringIO()
-        pstats.Stats(prof, stream=buf).sort_stats("cumulative").print_stats(45)
-        (work / f"profile_{label}.txt").write_text(buf.getvalue(), encoding="utf-8")
-        # top cumulative self functions (python time attribution)
-        stats = pstats.Stats(prof)
-        stats.sort_stats("cumulative")
-        top: list[dict] = []
-        for func, (_cc, _nc, _tt, ct, callers) in stats.stats.items():
-            top.append({"func": f"{func[2]}:{func[0].split('/')[-1]}:{func[1]}",
-                        "cum_s": round(ct, 3), "calls": _nc})
-        top.sort(key=lambda d: d["cum_s"], reverse=True)
-        result["per_rev"][label] = {
-            "rev": REVS[label],
-            "wall_s": round(wall, 3),
-            "top_cumulative": top[:30],
-        }
-        print(f"profile {label} ({REVS[label]}): wall {wall:.1f}s -> {work}/profile_{label}.txt", flush=True)
-    (work / "profile.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# statement counts
-# ---------------------------------------------------------------------------
-
-
-def _classify(sql: str, chain: str) -> str:
-    """Bucket a statement+call-site into one increment source.
-
-    Both the SQL text and the Python call chain are used: the same SQL
-    shape can be issued by the authorization gate, a visibility filter or a
-    deletion check, and only the call site distinguishes them.  Order
-    matters; the first match wins.  ``chain`` is the lowercased
-    ``file:function`` chain of the issuing frames (mirror_memory frames
-    only, nearest last).
-    """
+def _classify(sql, chain):
     low = sql.lower()
     if "grant_purpose" in chain or "grant_bench_purpose" in chain:
         return "bench_grant_setup"
     if "mm_access_audit" in low or "access_audit" in chain:
         return "access_audit_writes"
-    if "authorization.py" in chain or "authorize_or_raise" in chain or "authorize<" in chain or ":authorize" in chain:
+    if "authorization.py" in chain or "authorize_or_raise" in chain or ":authorize" in chain:
         return "purpose_auth_gate"
     if "deletion.py" in chain or "tombstones.py" in chain or "replay.py" in chain \
             or "mm_deletion" in low or "mm_tombstone" in low:
@@ -353,186 +249,186 @@ def _classify(sql: str, chain: str) -> str:
         return "cross_purpose_visibility"
     return "other"
 
+def pytest_configure(config):
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+    state = {"total": 0, "cats": {}, "stmts": {}}
 
-def _build_pg_env(work: Path) -> tuple[str, dict[str, str]]:
-    """Create the PG login roles and a fresh RLS schema, register the
-    maintenance routing, and return (app_runtime_url, env).  Mirrors the
-    test harness fixtures (tests/conftest.py) so standalone runs exercise
-    the identical hosted shape."""
-    os.environ.update(MM_DATABASE_URL=_ADMIN_URL, MM_PG_RLS="1",
-                      MM_TENANT_READ_FILTER="app", MM_SQL_AUDIT="0")
-    tests_dir = os.path.abspath("tests")
-    if tests_dir not in sys.path:
-        sys.path.insert(0, tests_dir)
-    if os.path.abspath("src") not in sys.path:
-        sys.path.insert(0, os.path.abspath("src"))
-    import conftest
-    import psycopg
-    from psycopg import sql as psql
-    from sqlalchemy import create_engine
-    from sqlalchemy.engine import make_url
+    def _on(conn, cursor, statement, parameters, context, executemany):
+        state["total"] += 1
+        frames = traceback.extract_stack(limit=80)
+        chain = " ".join(
+            os.path.basename(f.filename) + ":" + f.name
+            for f in frames
+            if "/mirror_memory/" in f.filename or "/tests/" in f.filename
+        )
+        cat = _classify(statement, chain)
+        state["cats"][cat] = state["cats"].get(cat, 0) + 1
+        key = re.sub(r"\s+", " ", statement.strip())[:200]
+        state["stmts"][key] = state["stmts"].get(key, 0) + 1
 
-    from mirror_memory.core import rls
+    event.listen(Engine, "before_cursor_execute", _on)
+    config._m5_state = state
 
-    admin = _ADMIN_URL
-    conninfo = make_url(admin).set(drivername="postgresql").render_as_string(hide_password=False)
-    roles = (
-        (rls.owner_role(), False, None),
-        (rls.app_role(), True, conftest.PG_TEST_ROLE_PASSWORDS["app"]),
-        (rls.maintenance_role(), True, conftest.PG_TEST_ROLE_PASSWORDS["maintenance"]),
-    )
-    with psycopg.connect(conninfo, autocommit=True) as conn:
-        for name, login, pw in roles:
-            exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (name,)).fetchone()
-            if exists is None:
-                stmt = (
-                    psql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(psql.Identifier(name), psql.Literal(pw))
-                    if login else psql.SQL("CREATE ROLE {} NOLOGIN").format(psql.Identifier(name))
-                )
-                conn.execute(stmt)
-            elif login:
-                conn.execute(
-                    psql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {}").format(psql.Identifier(name), psql.Literal(pw))
-                )
-    engine = create_engine(admin)
-    conftest._pg_fresh_schema(engine)
-    engine.dispose()
-    app_url = conftest._pg_role_url("app")
-    maint_url = conftest._pg_role_url("maintenance")
-    rls.register_maintenance_url(admin, maint_url)
-    rls.register_maintenance_url(app_url, maint_url)
-    return app_url, mode_env()
-
-
-def _reload_mirror_memory() -> None:
-    for mod in [m for m in sys.modules if m.startswith("mirror_memory")]:
-        del sys.modules[mod]
-
-
-def cmd_profile(work: Path) -> dict:
-    """cProfile one small run_longrun per revision on a fresh PG schema."""
-    work.mkdir(parents=True, exist_ok=True)
-    result: dict = {"per_rev": {}, "scenario": SMALL}
-    for label in REV_ORDER:
-        _use_rev(REVS[label])
-        _reload_mirror_memory()
-        app_url, env = _build_pg_env(work)
-        for k, v in env.items():
-            if k.startswith("MM_"):
-                os.environ[k] = v
-        longrun = importlib.import_module("mirror_memory.bench.longrun")
-        from mirror_memory.config.loader import load_config
-
-        cfg = load_config("config/")
-        if hasattr(cfg, "deletion_log"):
-            cfg.deletion_log.directory = str(work / f"deletion_{label}")
-        prof = cProfile.Profile()
-        prof.enable()
-        t0 = time.monotonic()
-        longrun.run_longrun(cfg, scenario_kwargs=SMALL, database_url=app_url)
-        wall = time.monotonic() - t0
-        prof.disable()
-        buf = io.StringIO()
-        pstats.Stats(prof, stream=buf).sort_stats("cumulative").print_stats(50)
-        (work / f"profile_{label}.txt").write_text(buf.getvalue(), encoding="utf-8")
-        stats = pstats.Stats(prof)
-        stats.sort_stats("cumulative")
-        top = []
-        for func, (_cc, nc, _tt, ct, _callers) in stats.stats.items():
-            top.append({"func": f"{func[2]} ({os.path.basename(func[0])}:{func[1]})",
-                        "cum_s": round(ct, 3), "calls": nc})
-        top.sort(key=lambda d: d["cum_s"], reverse=True)
-        result["per_rev"][label] = {"rev": REVS[label], "wall_s": round(wall, 3),
-                                    "top_cumulative": top[:30]}
-        print(f"profile {label} ({REVS[label]}): wall {wall:.1f}s -> {work}/profile_{label}.txt", flush=True)
-    (work / "profile.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    return result
+def pytest_sessionfinish(session, exitstatus):
+    state = getattr(session.config, "_m5_state", None)
+    out = os.environ.get("M5_STMT_OUT")
+    if state is None or not out:
+        return
+    top = sorted(state["stmts"].items(), key=lambda kv: kv[1], reverse=True)[:10]
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump({"total_statements": state["total"], "by_category": state["cats"],
+                   "top_statements": [{"sql": s, "count": c} for s, c in top]}, fh, indent=2)
+'''
 
 
 def cmd_statements(work: Path) -> dict:
-    """Count SQL statements issued during one small longrun per revision,
-    bucketed by the increment source that issued them."""
     work.mkdir(parents=True, exist_ok=True)
-    result: dict = {"per_rev": {}, "scenario": SMALL}
+    ensure_worktrees()
+    result: dict = {"per_rev": {}}
     for label in REV_ORDER:
-        _use_rev(REVS[label])
-        _reload_mirror_memory()
-        app_url, env = _build_pg_env(work)
-        for k, v in env.items():
-            if k.startswith("MM_"):
-                os.environ[k] = v
-        from sqlalchemy import event
-        from sqlalchemy.engine import Engine
-
-        counts: dict[str, int] = {}
-        cats: dict[str, int] = {}
-        total = [0]
-
-        def _on_exec(conn, cursor, statement, parameters, context, executemany):
-            import traceback
-
-            total[0] += 1
-            frames = traceback.extract_stack(limit=80)
-            chain = " ".join(
-                f"{os.path.basename(f.filename)}:{f.name}"
-                for f in frames if "/mirror_memory/" in f.filename or "/tests/" in f.filename
-            )
-            cat = _classify(statement, chain)
-            cats[cat] = cats.get(cat, 0) + 1
-            key = re.sub(r"\s+", " ", statement.strip())[:200]
-            counts[key] = counts.get(key, 0) + 1
-
-        event.listen(Engine, "before_cursor_execute", _on_exec)
-        try:
-            from mirror_memory.bench import longrun
-            from mirror_memory.config.loader import load_config
-
-            cfg = load_config("config/")
-            if hasattr(cfg, "deletion_log"):
-                cfg.deletion_log.directory = str(work / f"stmt_deletion_{label}")
-            longrun.run_longrun(cfg, scenario_kwargs=SMALL, database_url=app_url)
-            # the bench grants the `benchmark` purpose for its own users;
-            # exclude those issuance statements (one-time setup per run),
-            # keeping only the steady-state per-entry statement load.
-            cats.pop("bench_grant_setup", None)
-        finally:
-            event.remove(Engine, "before_cursor_execute", _on_exec)
-        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        result["per_rev"][label] = {
-            "rev": REVS[label],
-            "total_statements": total[0],
-            "by_category": cats,
-            "top_statements": [{"sql": s, "count": c} for s, c in top],
-        }
-        print(f"statements {label} ({REVS[label]}): total={total[0]} cats={cats}", flush=True)
+        wt = WT[label]
+        plugin = wt / "m5_sqlcount.py"
+        plugin.write_text(COUNTER_PLUGIN, encoding="utf-8")
+        out_json = work / f"statements_{label}.json"
+        junit = work / f"statements_{label}.xml"
+        env = mode_env(wt, {"M5_STMT_OUT": str(out_json),
+                            "PYTHONPATH": str(wt / "src") + os.pathsep + str(wt)})
+        args = ["-p", "m5_sqlcount", "-k", "test_year_survives_and_reports"]
+        _run_pytest(wt, env, junit, work / f"statements_{label}.txt", extra_args=args)
+        plugin.unlink(missing_ok=True)
+        if out_json.exists():
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+        else:
+            data = {"total_statements": None, "by_category": {}, "top_statements": [],
+                    "error": "plugin produced no output"}
+        data["rev"] = REVS[label]
+        result["per_rev"][label] = data
+        print(f"statements {label} ({REVS[label]}): total={data.get('total_statements')} "
+              f"cats={data.get('by_category')}", flush=True)
     (work / "statements.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
 
-def cmd_restore() -> None:
-    _restore(Path("."))
+# ---------------------------------------------------------------------------
+# profile
+# ---------------------------------------------------------------------------
+
+SMALL = dict(days=40, preferences=12, goals=5, corrections=6, conflicts=5, forgets=3)
+
+
+def _prepare_pg_schema(work: Path, label: str) -> str:
+    """Build the PG login roles + a fresh RLS schema using the revision's own
+    tests/conftest.py, and return the app runtime URL.  Runs in the
+    revision's worktree so the harness matches the code under test."""
+    wt = WT[label]
+    code = (
+        "import os,sys\n"
+        "sys.path.insert(0,os.path.abspath('tests'));sys.path.insert(0,os.path.abspath('src'))\n"
+        "import conftest\n"
+        "from sqlalchemy import create_engine\n"
+        "from mirror_memory.core import rls\n"
+        "from psycopg import sql as psql\n"
+        "from sqlalchemy.engine import make_url\n"
+        "admin=os.environ['MM_DATABASE_URL']\n"
+        "ci=make_url(admin).set(drivername='postgresql').render_as_string(hide_password=False)\n"
+        "roles=((rls.owner_role(),False,None),(rls.app_role(),True,conftest.PG_TEST_ROLE_PASSWORDS['app']),"
+        "(rls.maintenance_role(),True,conftest.PG_TEST_ROLE_PASSWORDS['maintenance']))\n"
+        "import psycopg as P\n"
+        "for name,login,pw in roles:\n"
+        "    with P.connect(ci,autocommit=True) as c:\n"
+        "        ex=c.execute('SELECT 1 FROM pg_roles WHERE rolname=%s',(name,)).fetchone()\n"
+        "        if ex is None:\n"
+        "            stmt=(psql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(psql.Identifier(name),psql.Literal(pw)) if login else psql.SQL('CREATE ROLE {} NOLOGIN').format(psql.Identifier(name)))\n"
+        "            c.execute(stmt)\n"
+        "        elif login:\n"
+        "            c.execute(psql.SQL('ALTER ROLE {} WITH LOGIN PASSWORD {}').format(psql.Identifier(name),psql.Literal(pw)))\n"
+        "e=create_engine(admin); conftest._pg_fresh_schema(e); e.dispose()\n"
+        "print(conftest._pg_role_url('app'))\n"
+    )
+    env = mode_env(wt)
+    proc = subprocess.run([_PY, "-c", code], cwd=wt, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"schema prep failed for {label}:\n{proc.stderr[-1500:]}")
+    return proc.stdout.strip().splitlines()[-1]
+
+
+STATEMENTS_PROFILE = (
+    "import os,sys,cProfile,pstats,json,io\n"
+    "sys.path.insert(0,os.path.abspath('src'))\n"
+    "from mirror_memory.bench import longrun\n"
+    "from mirror_memory.config.loader import load_config\n"
+    "cfg=load_config('config/')\n"
+    "if hasattr(cfg,'deletion_log'):\n"
+    "    cfg.deletion_log.directory=os.environ['M5_DELDIR']\n"
+    "kwargs=json.loads(os.environ['M5_SCENARIO'])\n"
+    "prof=cProfile.Profile();prof.enable()\n"
+    "longrun.run_longrun(cfg,scenario_kwargs=kwargs,database_url=os.environ['M5_APP_URL'])\n"
+    "prof.disable()\n"
+    "buf=io.StringIO();pstats.Stats(prof,stream=buf).sort_stats('cumulative').print_stats(50)\n"
+    "open(os.environ['M5_PROFILE_OUT'],'w').write(buf.getvalue())\n"
+    "stats=pstats.Stats(prof);stats.sort_stats('cumulative')\n"
+    "top=[]\n"
+    "for func,(cc,nc,tt,ct,callers) in stats.stats.items():\n"
+    "    top.append({'func':func[2]+' ('+os.path.basename(func[0])+':'+str(func[1])+')','cum_s':round(ct,3),'calls':nc})\n"
+    "top.sort(key=lambda d:d['cum_s'],reverse=True)\n"
+    "open(os.environ['M5_PROFILE_JSON'],'w').write(json.dumps(top[:30]))\n"
+)
+
+
+def cmd_profile(work: Path) -> dict:
+    work.mkdir(parents=True, exist_ok=True)
+    ensure_worktrees()
+    result: dict = {"per_rev": {}, "scenario": SMALL}
+    for label in REV_ORDER:
+        wt = WT[label]
+        try:
+            app_url = _prepare_pg_schema(work, label)
+        except Exception as exc:  # noqa: BLE001 -- record, don't fabricate
+            result["per_rev"][label] = {"rev": REVS[label], "error": str(exc)[-800:]}
+            print(f"profile {label}: SKIPPED ({exc})", flush=True)
+            continue
+        env = mode_env(wt, {
+            "M5_APP_URL": app_url, "M5_DELDIR": str(work / f"del_{label}"),
+            "M5_SCENARIO": json.dumps(SMALL),
+            "M5_PROFILE_OUT": str(work / f"profile_{label}.txt"),
+            "M5_PROFILE_JSON": str(work / f"profile_{label}.json"),
+        })
+        t0 = time.monotonic()
+        proc = subprocess.run([_PY, "-c", STATEMENTS_PROFILE], cwd=wt, env=env,
+                              capture_output=True, text=True)
+        wall = time.monotonic() - t0
+        if proc.returncode != 0:
+            result["per_rev"][label] = {"rev": REVS[label], "error": proc.stderr[-1200:]}
+            print(f"profile {label}: FAILED\n{proc.stderr[-600:]}", flush=True)
+            continue
+        top = json.loads((work / f"profile_{label}.json").read_text(encoding="utf-8"))
+        result["per_rev"][label] = {"rev": REVS[label], "wall_s": round(wall, 3), "top_cumulative": top}
+        print(f"profile {label} ({REVS[label]}): wall {wall:.1f}s", flush=True)
+    (work / "profile.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["measure", "profile", "statements", "restore"])
+    ap.add_argument("command", choices=["measure", "statements", "profile", "cleanup", "worktrees"])
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--work", default="/tmp/m5_perf_diag")
     args = ap.parse_args()
     work = Path(args.work)
-    try:
-        if args.command == "measure":
-            cmd_measure(args.rounds, work)
-        elif args.command == "profile":
-            cmd_profile(work)
-        elif args.command == "statements":
-            cmd_statements(work)
-        else:
-            cmd_restore()
-    finally:
-        # always leave the worktree on the starting branch
-        if args.command != "restore":
-            _restore(work)
+    if args.command == "measure":
+        cmd_measure(args.rounds, work)
+    elif args.command == "statements":
+        cmd_statements(work)
+    elif args.command == "profile":
+        cmd_profile(work)
+    elif args.command == "cleanup":
+        cmd_cleanup()
+    else:
+        ensure_worktrees()
     return 0
 
 
