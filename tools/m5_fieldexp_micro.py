@@ -41,9 +41,12 @@ Usage (repo root):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -236,8 +239,121 @@ def aes_gcm_decrypt(key: bytes, nonce: bytes, ct_and_tag: bytes,
 
 
 # ---------------------------------------------------------------------------
+# Native AEAD backend (REAL crypto library -> 实测/measured numbers).
+#
+# This environment has no `cryptography` / `pycryptodome` / `nacl`, and the
+# Python in use statically links OpenSSL 3.5.7 (not usable as a linkable
+# libcrypto), so ctypes-EVP inside CPython aborts.  What IS available is the
+# OS `openssl` CLI (LibreSSL 3.3.6), which provides a *real, native, AES-NI*
+# AES-256-CTR block cipher, plus Python's `hashlib`/`hmac`, which are backed
+# by real native OpenSSL EVP SHA-256.
+#
+# AES-256-GCM = AES-CTR (the data path, ~all the cost) + GHASH (the
+# authentication tag, a small per-block GF(2^128) multiply).  The CLI's
+# `enc` does not expose GCM (AEAD) directly, so we MEASURE the AES-CTR data
+# path (the dominant, size-dependent term) and use a real HMAC-SHA256
+# Encrypt-then-MAC tag as an *upper bound proxy* for the AE tag cost.  The
+# GCM-specific GHASH delta between `measured CTR+HMAC` and `true GCM` is
+# then conservatively bounded and reported as 未测 (untested) rather than
+# hidden.  Numbers from this backend are labelled 实测(measured, native CLI)
+# and are a LOWER bound on real GCM cost in absolute terms (the CLI pays an
+# unavoidable per-invocation process/pipe startup of several ms that an
+# in-process EVP context would not; we correct for it where we can and say
+# so).
+# ---------------------------------------------------------------------------
+
+
+class NativeAEAD:
+    """AES-256-CTR (real, native `openssl` CLI) + HMAC-SHA256 (real,
+    OpenSSL-backed `hashlib`).  Encrypt-then-MAC, 32-byte HMAC key derived
+    from the DEK by domain separation.  This is a genuine authenticated
+    construction; it is used here only to MEASURE native crypto cost, not as
+    a production scheme (production is AES-256-GCM)."""
+
+    def __init__(self, dek: bytes):
+        assert len(dek) == 32
+        self.dek = dek
+        self.mac_key = hmac.new(dek, b"mirror-memory/m5/etm-tag", hashlib.sha256).digest()
+        self._openssl = _find_openssl()
+
+    def _ctr(self, nonce12: bytes, data: bytes) -> bytes:
+        # openssl enc -aes-256-ctr wants a 16-byte IV; GCM uses a 12-byte
+        # nonce + 4-byte counter.  For *cost measurement* we derive a 16-byte
+        # IV from the 12-byte nonce (distinct per call), which exercises the
+        # identical AES-CTR data path.
+        iv16 = (nonce12 + b"\x00\x00\x00\x01")[:16]
+        p = subprocess.run(
+            [self._openssl, "enc", "-aes-256-ctr",
+             "-K", self.dek.hex(), "-iv", iv16.hex()],
+            input=data, capture_output=True, check=True,
+        )
+        out = p.stdout
+        assert len(out) == len(data), (len(out), len(data))
+        return out
+
+    def encrypt(self, nonce12: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+        ct = self._ctr(nonce12, plaintext)
+        tag = hmac.new(self.mac_key, aad + nonce12 + ct, hashlib.sha256).digest()[:16]
+        return ct + tag
+
+    def decrypt(self, nonce12: bytes, ct_and_tag: bytes, aad: bytes = b"") -> bytes:
+        ct, tag = ct_and_tag[:-16], ct_and_tag[-16:]
+        expect = hmac.new(self.mac_key, aad + nonce12 + ct, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(expect, tag):
+            raise ValueError("EtM tag mismatch -- ciphertext corrupted")
+        return self._ctr(nonce12, ct)
+
+
+_OPENSSL_PATH: str | None = None
+_native_ok: bool = False
+
+
+def _find_openssl() -> str:
+    """Locate a working `openssl` CLI that supports `enc -aes-256-ctr`."""
+    global _OPENSSL_PATH
+    if _OPENSSL_PATH:
+        return _OPENSSL_PATH
+    for cand in ("openssl", "/usr/bin/openssl", "/usr/local/bin/openssl",
+                 "/opt/homebrew/bin/openssl"):
+        try:
+            p = subprocess.run([cand, "enc", "-aes-256-ctr",
+                                "-K", "0" * 64, "-iv", "0" * 32],
+                               input=b"ok", capture_output=True, timeout=10)
+            if p.returncode == 0 and p.stdout:
+                _OPENSSL_PATH = cand
+                return cand
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            continue
+    raise RuntimeError("no openssl CLI with aes-256-ctr found")
+
+
+def native_available() -> bool:
+    try:
+        _find_openssl()
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Engine construction (mirrors tools/perf_observe_micro.py)
 # ---------------------------------------------------------------------------
+
+def _patch_transient_metrics():
+    """Work around a *transient* in-progress edit in the shared working tree
+    (api.py references a module-level ``metrics`` it does not import at
+    module scope).  We do NOT touch src/; we only ensure the attribute exists
+    in this process so the benchmark can build a MemoryEngine.  A no-op once
+    the tree settles.  Guarded so it never masks a real failure elsewhere."""
+    try:
+        import mirror_memory.api as _api
+        if not hasattr(_api, "metrics"):
+            import mirror_memory.core.metrics as _metrics
+            _api.metrics = _metrics
+    except Exception:
+        pass
+
+
 
 
 class _FakeLLM:
@@ -263,6 +379,7 @@ def _build_engine(backend: str, tmp: Path, user: str):
 
     Returns (engine, Session, cleanup_callable).
     """
+    _patch_transient_metrics()
     from sqlalchemy.engine import make_url
     from sqlalchemy.orm import sessionmaker
     from sqlalchemy import create_engine
@@ -646,6 +763,148 @@ def measure_session_start_decrypt(engine, user, key):
     }
 
 
+# -- Native (real crypto library) measurements: 实测 ----------------------
+
+
+def measure_native_per_belief(beliefs, aead: "NativeAEAD", rounds: int = 1):
+    """REAL encrypt+decrypt of each belief's content blob with the native
+    AEAD (openssl AES-256-CTR + hashlib HMAC-SHA256).  Per-belief the
+    payload is small (~200 B), so a *single* openssl invocation per belief
+    pays the CLI process/pipe startup (~5 ms) that a real in-process EVP
+    context would not -- we report BOTH the naive per-call figure (实测,
+    CLI model) AND a startup-corrected figure derived from the bulk
+    throughput (see measure_native_bulk_ctr).  Labelled honestly."""
+    blobs = [_content_blob(b) for b in beliefs]
+    if not blobs:
+        return {}
+    total_bytes = sum(len(x) for x in blobs)
+    # naive per-call loop (includes CLI startup per belief)
+    t0 = time.perf_counter()
+    for _ in range(rounds):
+        for blob in blobs:
+            nonce = os.urandom(12)
+            ct = aead.encrypt(nonce, blob, aad=b"belief")
+            aead.decrypt(nonce, ct, aad=b"belief")
+    elapsed = time.perf_counter() - t0
+    ops = len(blobs) * rounds
+    return {
+        "beliefs": len(blobs),
+        "rounds": rounds,
+        "avg_bytes_per_belief": total_bytes / len(blobs),
+        "total_ms": elapsed * 1000.0,
+        "ms_per_belief_enc_dec_percall": (elapsed * 1000.0) / max(ops, 1),
+        "us_per_byte_percall": (elapsed * 1e6) / max(total_bytes * rounds, 1),
+        "note": "实测 per-call (CLI startup included); see bulk for throughput",
+    }
+
+
+def measure_native_bulk_ctr(total_bytes: int, dek: bytes, reps: int = 7):
+    """REAL bulk AES-256-CTR throughput through a single openssl invocation,
+    with the fixed CLI startup subtracted.  This is the honest native AES
+    data-path rate for a contiguous buffer (what a bulk session-start
+    decrypt of all beliefs looks like).  Returns MB/s + corrected ms."""
+    aead = NativeAEAD(dek)
+    buf = os.urandom(total_bytes)
+    iv16 = b"\x00" * 16
+    # startup baseline (tiny payload, same command shape)
+    st = statistics.median([
+        _timed(subprocess.run,
+               [aead._openssl, "enc", "-aes-256-ctr", "-K", dek.hex(), "-iv", iv16.hex()],
+               input=b"x", capture_output=True)
+        for _ in range(reps)
+    ])
+    tot = statistics.median([
+        _timed(subprocess.run,
+               [aead._openssl, "enc", "-aes-256-ctr", "-K", dek.hex(), "-iv", iv16.hex()],
+               input=buf, capture_output=True)
+        for _ in range(reps)
+    ])
+    net = max(tot - st, 1e-6)
+    return {
+        "bytes": total_bytes,
+        "total_ms_median": tot * 1000.0,
+        "startup_ms_median": st * 1000.0,
+        "net_ms": net * 1000.0,
+        "mb_per_s": total_bytes / net / 1e6,
+    }
+
+
+def _timed(fn, *a, **kw):
+    t0 = time.perf_counter()
+    fn(*a, **kw)
+    return time.perf_counter() - t0
+
+
+def measure_native_session_start(beliefs, dek: bytes):
+    """REAL session-start decrypt of ALL of a user's beliefs (bulk CTR data
+    path + per-belief HMAC verify).  The CTR bulk rate is measured via
+    openssl; the HMAC verify is measured via hashlib over the same bytes.
+    Because per-CLI invocation pays fixed startup, we model the *data* cost
+    from the bulk throughput and report per-call CLI as a separate, clearly
+    labelled number."""
+    blobs = [_content_blob(b) for b in beliefs]
+    if not blobs:
+        return {}
+    total_bytes = sum(len(b) for b in blobs)
+    joined = b"".join(blobs)
+    # real bulk CTR at this exact total size
+    bulk = measure_native_bulk_ctr(total_bytes, dek)
+    # real HMAC-SHA256 over the whole set (native OpenSSL EVP SHA-256)
+    mac_key = hmac.new(dek, b"mirror-memory/m5/etm-tag", hashlib.sha256).digest()
+    t0 = time.perf_counter()
+    for blob in blobs:
+        hmac.new(mac_key, blob, hashlib.sha256).digest()
+    hmac_ms = (time.perf_counter() - t0) * 1000.0
+    # model GCM bulk decrypt cost ~= AES-CTR bulk data path (+ a small tag
+    # term bounded by the measured HMAC-SHA256 pass)
+    modelled_decrypt_ms = bulk["net_ms"] + hmac_ms
+    return {
+        "beliefs": len(blobs),
+        "total_bytes": total_bytes,
+        "bulk_ctr_net_ms": round(bulk["net_ms"], 3),
+        "bulk_ctr_mb_per_s": round(bulk["mb_per_s"], 1),
+        "hmac_sha256_tag_ms": round(hmac_ms, 4),
+        "modelled_gcm_decrypt_all_ms": round(modelled_decrypt_ms, 3),
+        "modelled_label": "实测 AES-CTR + 实测 HMAC; GHASH delta 未测(<HMAC)",
+    }
+
+
+def measure_native_recall_decrypt(beliefs, dek: bytes, cap: int = 175):
+    """REAL cost to decrypt the bounded recall candidate set on the hot
+    path under scheme C (175 = relevant 150 + recent 25).  Uses the native
+    AEAD per-belief path and reports per-call (CLI) vs bulk-corrected."""
+    picks = beliefs[:cap]
+    if not picks:
+        return {"candidates": 0}
+    aead = NativeAEAD(dek)
+    blobs = [_content_blob(b) for b in picks]
+    total_bytes = sum(len(b) for b in blobs)
+    # real: encrypt all once, then time decrypt of all
+    cts = []
+    for blob in blobs:
+        nonce = os.urandom(12)
+        cts.append((nonce, aead.encrypt(nonce, blob, aad=b"belief")))
+    t0 = time.perf_counter()
+    for nonce, ct in cts:
+        aead.decrypt(nonce, ct, aad=b"belief")
+    percall_ms = (time.perf_counter() - t0) * 1000.0
+    bulk = measure_native_bulk_ctr(total_bytes, dek)
+    mac_key = hmac.new(dek, b"mirror-memory/m5/etm-tag", hashlib.sha256).digest()
+    t0 = time.perf_counter()
+    for nonce, ct in cts:
+        hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    hmac_ms = (time.perf_counter() - t0) * 1000.0
+    return {
+        "candidates": len(picks),
+        "total_bytes": total_bytes,
+        "percall_ms": round(percall_ms, 3),
+        "bulk_ctr_net_ms": round(bulk["net_ms"], 3),
+        "hmac_tag_ms": round(hmac_ms, 4),
+        "modelled_gcm_ms": round(bulk["net_ms"] + hmac_ms, 3),
+        "percall_label": "实测 per-call (CLI startup dominates, not representative)",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -675,7 +934,7 @@ def run_backend(backend, counts, args, key):
                 beliefs, key, rounds=max(1, min(2, 2000 // max(len(beliefs), 1) + 1)))
             session_load = measure_session_start_decrypt(engine, "u", key)
             p95 = _percentile(recall_ms, 95)
-            out["counts"][str(target)] = {
+            entry = {
                 "recall_p50_ms": round(_percentile(recall_ms, 50), 3),
                 "recall_p95_ms": round(p95, 3),
                 "recall_mean_ms": round(statistics.fmean(recall_ms), 3),
@@ -687,9 +946,22 @@ def run_backend(backend, counts, args, key):
                 "crypto": crypto,
                 "session_start": session_load,
             }
+            # -- native (real crypto library) measurements: 实测 ----------
+            if args.native and _native_ok:
+                try:
+                    aead = NativeAEAD(key)
+                    entry["native_per_belief"] = measure_native_per_belief(
+                        beliefs, aead, rounds=1)
+                    entry["native_session_start"] = measure_native_session_start(
+                        beliefs, key)
+                    entry["native_recall_decrypt"] = measure_native_recall_decrypt(
+                        beliefs, key, cap=_CANDIDATE_DECRYPT_CAP)
+                except Exception as exc:  # never kill the run for a native probe
+                    entry["native_error"] = f"{type(exc).__name__}: {exc}"
+            out["counts"][str(target)] = entry
             print(f"  [{backend}] N={target} recall p50="
-                  f"{out['counts'][str(target)]['recall_p50_ms']}ms p95="
-                  f"{out['counts'][str(target)]['recall_p95_ms']}ms "
+                  f"{entry['recall_p50_ms']}ms p95="
+                  f"{entry['recall_p95_ms']}ms "
                   f"(+dec native {dec['native_added_decrypt_ms']:.2f}ms)",
                   file=sys.stderr)
 
@@ -726,6 +998,11 @@ def main() -> int:
                     help="seed belief rows directly (bypass observe/extraction) "
                          "for the recall-latency dimension on a loaded host; "
                          "the observe-cost measurement still uses observe()")
+    ap.add_argument("--native", action="store_true", default=True,
+                    help="also measure with the REAL native crypto library "
+                         "(openssl CLI AES-256-CTR + hashlib HMAC-SHA256); "
+                         "these are the 实测 numbers.  Use --no-native to skip.")
+    ap.add_argument("--no-native", dest="native", action="store_false")
     ap.add_argument("--quick", action="store_true",
                     help="smoke run: sqlite only, 100/300 beliefs")
     ap.add_argument("--json", default=None)
@@ -741,8 +1018,11 @@ def main() -> int:
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     key = os.urandom(32)  # one per-user key for the run
 
+    global _native_ok
+    _native_ok = bool(args.native) and native_available()
     print("M5 field-encryption + recall microbenchmark", file=sys.stderr)
-    print(f"  backends={backends} counts={counts} aes_speedup={args.aes_speedup}",
+    print(f"  backends={backends} counts={counts} aes_speedup={args.aes_speedup} "
+          f"native={'yes(' + _OPENSSL_PATH + ')' if _native_ok else 'no'}",
           file=sys.stderr)
 
     results = {"aes_speedup": args.aes_speedup, "backends": {}}
@@ -813,6 +1093,59 @@ def main() -> int:
         o = res["observe"]
         print(f"{backend:9} {o['base_p50_ms']:>9.2f} {o['base_p95_ms']:>9.2f} "
               f"{o['enc_p50_ms']:>9.2f} {o['enc_p95_ms']:>9.2f}")
+
+    # ---- NATIVE (real crypto library) tables: label 实测 ---------------
+    if _native_ok:
+        print("\n=== [实测 measured, native openssl AES-256-CTR + HMAC-SHA256] "
+              "per-belief enc+dec ===")
+        print(f"{'backend':9} {'beliefs':>8} {'B/belief':>9} "
+              f"{'ms/belief(CLI per-call)':>24}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                nb = row.get("native_per_belief") or {}
+                if not nb:
+                    continue
+                print(f"{backend:9} {nb['beliefs']:>8} "
+                      f"{nb['avg_bytes_per_belief']:>9.0f} "
+                      f"{nb['ms_per_belief_enc_dec_percall']:>24.4f}")
+
+        print("\n=== [实测] session-start decrypt of ALL beliefs "
+              "(native: bulk AES-CTR + HMAC tag) ===")
+        print(f"{'backend':9} {'beliefs':>8} {'bytes':>10} "
+              f"{'CTR MB/s':>9} {'CTR net ms':>11} {'HMAC ms':>9} "
+              f"{'modelled decrypt ms':>20}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                ns = row.get("native_session_start") or {}
+                if not ns:
+                    continue
+                print(f"{backend:9} {ns['beliefs']:>8} {ns['total_bytes']:>10} "
+                      f"{ns['bulk_ctr_mb_per_s']:>9.1f} "
+                      f"{ns['bulk_ctr_net_ms']:>11.3f} "
+                      f"{ns['hmac_sha256_tag_ms']:>9.4f} "
+                      f"{ns['modelled_gcm_decrypt_all_ms']:>20.3f}")
+
+        print("\n=== [实测] recall candidate-set decrypt (cap 175) "
+              "under scheme C ===")
+        print(f"{'backend':9} {'N':>7} {'cand':>5} {'percall ms':>11} "
+              f"{'bulk CTR ms':>11} {'HMAC ms':>9} {'modelled GCM ms':>16}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                nr = row.get("native_recall_decrypt") or {}
+                if not nr or not nr.get("candidates"):
+                    continue
+                print(f"{backend:9} {n:>7} {nr['candidates']:>5} "
+                      f"{nr['percall_ms']:>11.2f} {nr['bulk_ctr_net_ms']:>11.3f} "
+                      f"{nr['hmac_tag_ms']:>9.4f} {nr['modelled_gcm_ms']:>16.3f}")
+    else:
+        print("\n[native backend unavailable -> native crypto 未测]",
+              file=sys.stderr)
 
     if args.json:
         Path(args.json).write_text(

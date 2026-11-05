@@ -1,22 +1,48 @@
 """CI adapter for the StateBench release gate (report-only).
 
 GitHub Actions cannot let the release gate turn CI red (see the m5 plan and
-docs/statebench.md).  This tool runs the deterministic StateBench track, records
-the provenance manifest, and evaluates ``bench.gate.check_release_gate`` while
-representing LLM-only tracks (extraction / answer) as ``not_run`` when the
-API-key secret is absent.
+docs/statebench.md).  This tool runs the StateBench v1.1 tracks, records the
+provenance manifest, evaluates ``bench.gate.check_release_gate`` with four-state
+per-track semantics, and writes distinct, non-overwriting artifacts:
 
-Contract:
+* **raw per-case results** — the full report JSON (per-case track outcomes);
+* **manifest** — commit, dataset SHA-256, config/prompt hashes, model;
+* **gate verdict** — the pass/fail verdict + per-check + per-track states;
+* **summary** — a Markdown block whose FIRST line is ``PASS: ...`` / ``FAIL: ...``.
 
-* A ``not_run`` track is **never** counted as a pass.  It is passed to the gate
-  as an unevaluated track (``score`` is ``None``) so ``check_release_gate``
-  emits ``evaluated: false`` / ``passed: false`` for it, and the overall
-  verdict is therefore not a pass.
-* The process exit code is always 0.  The verdict is emitted in the JSON
-  payload (``passed`` / ``summary``) and in a Markdown summary block whose
-  FIRST line is ``PASS: ...`` or ``FAIL: ...``.  The CI workflow consumes that
-  first line for ``$GITHUB_STEP_SUMMARY`` and keeps the job non-required /
-  ``continue-on-error`` so the workflow conclusion never turns CI red.
+Each artifact is written to its OWN path.  They never overwrite one another so
+a later write cannot erase an earlier one.
+
+Track states (four-state)
+-------------------------
+
+``pass`` / ``fail`` / ``not_run`` / ``error`` — evaluated per track and never
+merged:
+
+* ``not_run`` — a track whose prerequisite (e.g. ``MM_LLM_API_KEY``) is absent.
+  Never a pass.
+* ``error`` — a track whose execution raised.  Never a pass and never
+  relabelled as ``not_run``; surfaced loudly in the summary.
+* A completed track's result is never overwritten because a *different* track
+  errored.
+
+Forced vs production
+--------------------
+
+When the key is present this tool runs BOTH a forced and a production track
+pair.  Forced requires an every-turn K2 attempt and is checked against the
+full thresholds.  Production is reported as configured: its true coverage and
+failures are counted and compared to forced via the gap check.  A production
+throttle never lowers the forced thresholds, and a production ``not_run`` /
+``error`` is visible but does not erase the forced verdict.
+
+Dataset version
+---------------
+
+The report carries ``dataset_version`` (from the v1.1 dataset header, currently
+``1.2.0`` for ``statebench_v1_1.json``).  Some legacy docs call the file
+"v1.1"; the authoritative in-file version is emitted verbatim in the summary so
+v1 (``statebench_v1.json``) and v1.1 results are never confused.
 
 Usage::
 
@@ -36,58 +62,84 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from mirror_memory.bench.gate import check_release_gate
+from mirror_memory.bench.gate import (
+    TRACK_ERROR,
+    TRACK_NOT_RUN,
+    GateResult,
+    TrackVerdict,
+    check_release_gate,
+    evaluate_tracks,
+)
 from mirror_memory.bench.statebench_v1_1_runner import (
+    StateBenchV11Report,
     run_statebench_v1_1,
     write_statebench_v1_1_report,
 )
 
-
-LLM_TRACKS = ("extraction", "answer")
-
-# The state track is always evaluated (deterministic).  recall is evaluated by
-# the deterministic runner without a model.  The answer track requires an LLM
-# answerer, and the forced/production extraction tracks require an extractor
-# client.  We surface all three tracks explicitly so the summary states, per
-# track, whether it ran and whether its gate stands.
 TRACK_STATE = "state"
 TRACK_RECALL = "recall"
 TRACK_ANSWER = "answer"
+SCORED_TRACKS = (TRACK_STATE, TRACK_RECALL, TRACK_ANSWER)
 
 
-def _not_run_track() -> dict[str, Any]:
+def _not_run_track(reason: str = "prerequisite absent") -> dict[str, Any]:
     """A track that intentionally did not run -- never a pass."""
-    return {"total": None, "passed": None, "score": None, "not_run": True}
+    return {"total": None, "passed": None, "score": None, "not_run": True, "reason": reason}
 
 
-def build_gate_report(report: dict[str, Any], *, llm_enabled: bool) -> dict[str, Any]:
-    """Return a gate-facing report where missing LLM tracks are not_run.
+def _error_track(exc: BaseException) -> dict[str, Any]:
+    """A track whose execution raised -- never a pass, never ``not_run``."""
+    return {
+        "total": None,
+        "passed": None,
+        "score": None,
+        "error": f"{type(exc).__name__}: {exc}",
+    }
 
-    The deterministic track always fills ``state`` and ``recall``.  ``answer``
-    requires an LLM answerer; when LLM tracks are disabled we replace it with a
-    ``not_run`` marker whose ``score`` is ``None`` so the gate treats it as
-    unevaluated (fail-closed), not a pass.
+
+def build_gate_report(
+    report: dict[str, Any],
+    *,
+    llm_enabled: bool,
+    answer_not_run_reason: str = "prerequisite absent",
+) -> dict[str, Any]:
+    """Return a gate-facing report with explicit four-state track markers.
+
+    A deterministic run always fills ``state`` and ``recall``.  ``answer``
+    requires an LLM answerer; when absent it is replaced with a ``not_run``
+    marker (``score`` is ``None``) so the gate treats it as unevaluated
+    (fail-closed), not a pass.
     """
     gate_report = json.loads(json.dumps(report))  # deep copy
     tracks = gate_report.setdefault("tracks", {})
     if not llm_enabled:
-        # Explicitly mark the LLM-owned answer track as not_run.  The gate
-        # reads `score`; None -> unevaluated -> not a pass.
-        tracks[TRACK_ANSWER] = _not_run_track()
+        tracks[TRACK_ANSWER] = _not_run_track(answer_not_run_reason)
     return gate_report
 
 
 def _track_status(track: dict[str, Any] | None) -> str:
+    """Map a raw track payload to a display state string.
+
+    ``error`` takes precedence over ``not_run`` so an execution failure is
+    never displayed as a benign "did not run".
+    """
     if track is None:
-        return "not_run"
+        return TRACK_NOT_RUN
+    if track.get("error"):
+        return TRACK_ERROR
     if track.get("not_run"):
-        return "not_run"
+        return TRACK_NOT_RUN
     score = track.get("score")
-    return "not_run" if score is None else f"{score:.3f}"
+    if score is None:
+        return TRACK_NOT_RUN
+    return "evaluated"
+
+
+def _verdict_for_checks(result: GateResult, name: str) -> TrackVerdict | None:
+    return result.tracks.get(name)
 
 
 def _render_checks(checks: list[dict[str, Any]]) -> list[str]:
@@ -95,13 +147,11 @@ def _render_checks(checks: list[dict[str, Any]]) -> list[str]:
     for c in checks:
         value = c.get("value")
         if value is None:
-            # A None value with a failed check means the track did not run.
             value_s = "n/a" if c.get("evaluated") is False else "not_run"
         else:
             value_s = str(value)
         threshold = c.get("threshold", "")
         ok = c.get("passed")
-        # not_run (unevaluated) is never a pass
         pass_s = "pass" if ok is True else ("not_run" if c.get("evaluated") is False else "FAIL")
         lines.append(f"| {c.get('check')} | {value_s} | {threshold} | {pass_s} |")
     return lines
@@ -115,44 +165,103 @@ def render_summary(
     tracks: dict[str, Any],
     extraction_mode: str,
     dataset_sha256: str,
+    dataset_version: str,
     llm_enabled: bool,
     report_path: str,
     manifest_path: str,
+    verdict_path: str,
+    verdict_tracks: dict[str, TrackVerdict] | None = None,
 ) -> str:
     """Markdown summary.  First line is ``PASS: ...`` or ``FAIL: ...``."""
+    verdict_tracks = verdict_tracks or {}
+    errors = [name for name, v in verdict_tracks.items() if v.state == TRACK_ERROR]
+
     if passed:
         head = "PASS: all release gates cleared"
     else:
-        # First line must carry the failing items.
+        # First line must carry the failing items; surface errors first because
+        # they are infrastructure failures, not mere threshold misses.
         detail = "; ".join(failures) if failures else "gate did not pass"
+        if errors:
+            detail = f"track error(s) [{', '.join(errors)}]; " + detail
         head = f"FAIL: {detail}"
 
     lines = [head, ""]
+    lines.append(f"- dataset version: `{dataset_version}`")
     lines.append(f"- extraction mode: `{extraction_mode}`")
     lines.append(f"- LLM tracks enabled: `{llm_enabled}`")
     lines.append(f"- dataset sha256: `{dataset_sha256}`")
-    lines.append(f"- report: `{report_path}`")
+    lines.append(f"- raw report: `{report_path}`")
     lines.append(f"- manifest: `{manifest_path}`")
+    lines.append(f"- gate verdict: `{verdict_path}`")
     lines.append("")
-    lines.append("### Tracks")
+    lines.append("### Tracks (four-state)")
     lines.append("")
-    lines.append("| track | score | status |")
+    lines.append("| track | score | state |")
     lines.append("|---|---|---|")
-    for name in (TRACK_STATE, TRACK_RECALL, TRACK_ANSWER):
+    for name in SCORED_TRACKS:
         status = _track_status(tracks.get(name))
-        lines.append(f"| {name} | {status} | {'not_run' if status == 'not_run' else 'evaluated'} |")
+        verdict = verdict_tracks.get(name)
+        if verdict is not None:
+            # evaluate_tracks already applied the threshold: a below-threshold
+            # track is `fail`, not `pass`.
+            state_label = verdict.state
+            score_label = "n/a" if verdict.score is None else f"{verdict.score:.3f}"
+        else:
+            state_label = status
+            score_label = status
+        lines.append(f"| {name} | {score_label} | {state_label} |")
     lines.extend(_render_checks(checks))
     lines.append("")
+    if errors:
+        lines.append(
+            "> **Infrastructure error**: the track(s) above raised during "
+            "execution. This is NOT a `not_run` and NOT a pass; investigate "
+            "before reading any score."
+        )
+        lines.append("")
     lines.append(
-        "> A `not_run` track is never a pass. The workflow is report-only; "
-        "a FAIL gate here does not turn CI red."
+        "> A `not_run` track is never a pass; an `error` track is an "
+        "infrastructure failure, not a `not_run` and not a pass. The workflow "
+        "is report-only; a FAIL gate here does not turn CI red."
     )
     return "\n".join(lines)
 
 
+def _paths(output: Path) -> dict[str, Path]:
+    """Distinct, non-overwriting artifact paths derived from one output stem."""
+    return {
+        "report": output,
+        "manifest": output.with_name(f"{output.stem}.manifest.json"),
+        "verdict": output.with_name(f"{output.stem}.verdict.json"),
+        "summary": output.with_name(f"{output.stem}.summary.md"),
+    }
+
+
+def _run_track(
+    name: str,
+    runner: Callable[[], StateBenchV11Report],
+) -> tuple[StateBenchV11Report | None, dict[str, Any] | None, TrackVerdict | None]:
+    """Run one track in isolation.  Never raises: errors become ``error``.
+
+    Returns ``(report, raw_track_payload, verdict)``.  A successful run yields
+    the report; a raised exception yields an ``error`` payload and NO report,
+    and never touches any other track.
+    """
+    try:
+        report = runner()
+    except Exception as exc:  # noqa: BLE001 - isolate per-track failures
+        payload = _error_track(exc)
+        return None, payload, TrackVerdict(
+            track=name, state=TRACK_ERROR, reason=f"{type(exc).__name__}: {exc}",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return report, None, None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="StateBench release-gate CI adapter")
-    parser.add_argument("--output", required=True, help="Path for the gate report JSON")
+    parser.add_argument("--output", required=True, help="Path for the raw per-case report JSON")
     parser.add_argument(
         "--allow-llm",
         action="store_true",
@@ -167,15 +276,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config-path", default="config/")
     parser.add_argument("--database-url", default="sqlite://")
     parser.add_argument("--models", default=os.getenv("MM_LLM_MODEL", "deepseek-chat"))
-    parser.add_argument("--summary-out", default="", help="Write the Markdown summary to a file")
+    parser.add_argument("--summary-out", default="", help="Override the Markdown summary path")
+    parser.add_argument("--verdict-out", default="", help="Override the gate-verdict JSON path")
     args = parser.parse_args(argv)
 
-    api_key = os.getenv("MM_LLM_API_KEY")
-    # LLM tracks only run when permitted AND the key is actually present.
-    llm_enabled = bool(args.allow_llm and api_key)
-    llm_status = "not_run"  # never a pass by default
+    output = Path(args.output)
+    paths = _paths(output)
+    if args.summary_out:
+        paths["summary"] = Path(args.summary_out)
+    if args.verdict_out:
+        paths["verdict"] = Path(args.verdict_out)
 
-    report = run_statebench_v1_1(
+    api_key = os.getenv("MM_LLM_API_KEY")
+    llm_enabled = bool(args.allow_llm and api_key)
+
+    # --- deterministic track (always) --------------------------------------
+    base_report = run_statebench_v1_1(
         config_path=args.config_path,
         database_url=args.database_url,
         extraction_mode="deterministic",
@@ -183,13 +299,16 @@ def main(argv: list[str] | None = None) -> int:
         answerer=None,
         answerer_model="",
     )
-    report_dict = report.to_dict()
+    report = base_report
+    report_dict = base_report.to_dict()
 
+    # --- LLM tracks (isolated; degrade to not_run/error, never raise) ------
     production_report: dict[str, Any] | None = None
+    answer_not_run_reason = "prerequisite absent"
+    llm_verdict: TrackVerdict | None = None
+    forced_error_payload: dict[str, Any] | None = None
+
     if llm_enabled:
-        # The LLM tracks need a key.  We run the forced + production pair so the
-        # gate can evaluate extraction and answer, and the production gap.  Any
-        # failure to run degrades to not_run (report-only); it never raises.
         try:
             from mirror_memory.bench.run import _build_answerer, _build_extractor
 
@@ -197,82 +316,145 @@ def main(argv: list[str] | None = None) -> int:
             base_url = os.getenv("MM_LLM_BASE_URL")
             extractor = _build_extractor(args.models, api_key, base_url, extra_body)
             answerer = _build_answerer(args.models, api_key, base_url, extra_body)
-            forced_report = run_statebench_v1_1(
-                config_path=args.config_path,
-                database_url=args.database_url,
-                extraction_mode="forced",
-                llm_client=extractor,
-                answerer=answerer,
-                answerer_model=args.models,
+        except Exception as exc:  # noqa: BLE001 - building clients is an error
+            forced_error_payload = _error_track(exc)
+            llm_verdict = TrackVerdict(
+                track=TRACK_ANSWER, state=TRACK_ERROR,
+                reason=f"LLM client build failed: {type(exc).__name__}: {exc}",
+                error=f"{type(exc).__name__}: {exc}",
             )
-            production_report_obj = run_statebench_v1_1(
-                config_path=args.config_path,
-                database_url=args.database_url,
-                extraction_mode="production",
-                llm_client=extractor,
-                answerer=answerer,
-                answerer_model=args.models,
+            answer_not_run_reason = forced_error_payload["error"]
+        else:
+            # Run forced then production.  Each is isolated: if forced raises,
+            # production still runs; if production raises, forced's result
+            # stands.  Neither overwrites the other's already-computed verdict.
+            forced_report, forced_payload, forced_verdict = _run_track(
+                "forced",
+                lambda: run_statebench_v1_1(
+                    config_path=args.config_path,
+                    database_url=args.database_url,
+                    extraction_mode="forced",
+                    llm_client=extractor,
+                    answerer=answerer,
+                    answerer_model=args.models,
+                ),
             )
-            report = forced_report
-            report_dict = forced_report.to_dict()
-            production_report = production_report_obj.to_dict()
-            llm_status = "evaluated"
-        except Exception as exc:  # noqa: BLE001 - report-only, degrade to not_run
-            print(f"LLM tracks requested but did not run: {exc}", file=sys.stderr)
-            llm_status = "not_run"
+            production_report_obj, production_payload, production_verdict = _run_track(
+                "production",
+                lambda: run_statebench_v1_1(
+                    config_path=args.config_path,
+                    database_url=args.database_url,
+                    extraction_mode="production",
+                    llm_client=extractor,
+                    answerer=answerer,
+                    answerer_model=args.models,
+                ),
+            )
+            if forced_report is not None:
+                report = forced_report
+                report_dict = forced_report.to_dict()
+            elif production_report_obj is not None:
+                # Forced errored but production succeeded: keep forced's error
+                # visible via llm_verdict; never adopt production as if forced.
+                report_dict = base_report.to_dict()
+                forced_error_payload = forced_payload
+                llm_verdict = forced_verdict
+            if forced_payload is not None:
+                llm_verdict = forced_verdict
+            if production_report_obj is not None:
+                production_report = production_report_obj.to_dict()
+            elif production_payload is not None:
+                # Production errored; it must not erase forced's result.
+                production_report = None
 
+    # --- write raw report + manifest (path 1 & 2) --------------------------
     out, manifest = write_statebench_v1_1_report(
         report,
-        args.output,
+        paths["report"],
         config_dir=args.config_path,
         base_url=os.getenv("MM_LLM_BASE_URL", "") if llm_enabled else "",
         thinking="default",
         generation_params={"temperature": 0.0, "max_tokens": 800},
     )
+    # The manifest writer names it <stem>.manifest.json, which is exactly our
+    # canonical path, so no reconciliation is needed -- but keep the mapping
+    # explicit so a future rename cannot silently overwrite the report.
+    manifest = paths["manifest"] if Path(manifest) == paths["manifest"] else Path(manifest)
 
-    gate_report = build_gate_report(report_dict, llm_enabled=(llm_status == "evaluated"))
+    # --- build gate-facing report and four-state verdicts -------------------
+    gate_report = build_gate_report(
+        report_dict,
+        llm_enabled=llm_enabled and llm_verdict is None,
+        answer_not_run_reason=answer_not_run_reason,
+    )
+    derived = evaluate_tracks(gate_report)
+    if forced_error_payload is not None:
+        derived["forced"] = TrackVerdict(
+            track="forced", state=TRACK_ERROR,
+            reason=forced_error_payload.get("error", "forced track error"),
+            error=forced_error_payload.get("error", ""),
+        )
+    if llm_verdict is not None and TRACK_ANSWER in derived and derived[TRACK_ANSWER].state != TRACK_ERROR:
+        derived[TRACK_ANSWER] = llm_verdict
+
     result = check_release_gate(
         gate_report,
         manifest_path=manifest,
         production_report=production_report,
         forced=True,
+        track_verdicts=derived,
     )
 
-    # Report-only: never signal failure to the shell.
-    payload = {
+    dataset_version = report_dict.get("dataset_version", "")
+
+    # --- write gate verdict (path 3) ---------------------------------------
+    verdict_payload = {
         "passed": result.passed,
         "summary": result.summary,
         "failures": result.failures,
         "checks": result.checks,
-        "llm_tracks_enabled": llm_enabled,
         "tracks": {
-            name: _track_status(gate_report.get("tracks", {}).get(name))
-            for name in (TRACK_STATE, TRACK_RECALL, TRACK_ANSWER)
+            name: derived[name].to_dict()
+            for name in ("state", "recall", "answer", "forced", "production")
+            if name in derived
         },
-        "extraction_mode": gate_report.get("extraction_mode"),
+        "llm_tracks_enabled": llm_enabled,
+        "dataset_version": dataset_version,
         "dataset_sha256": gate_report.get("dataset_sha256"),
+        "extraction_mode": gate_report.get("extraction_mode"),
         "report": str(out),
         "manifest": str(manifest),
+        "dataset_version_label": "statebench_v1_1 (in-file version "
+        f"{dataset_version})",
     }
-    out_path = Path(args.output)
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["verdict"].parent.mkdir(parents=True, exist_ok=True)
+    paths["verdict"].write_text(
+        json.dumps(verdict_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
+    # --- write summary (path 4) --------------------------------------------
+    display_tracks: dict[str, Any] = dict(gate_report.get("tracks", {}))
+    if llm_verdict is not None and llm_verdict.state == TRACK_ERROR:
+        display_tracks[TRACK_ANSWER] = {"error": llm_verdict.error}
     summary = render_summary(
         passed=result.passed,
         failures=result.failures,
         checks=result.checks,
-        tracks=gate_report.get("tracks", {}),
+        tracks=display_tracks,
         extraction_mode=gate_report.get("extraction_mode", "deterministic"),
         dataset_sha256=gate_report.get("dataset_sha256", ""),
+        dataset_version=dataset_version,
         llm_enabled=llm_enabled,
         report_path=str(out),
         manifest_path=str(manifest),
+        verdict_path=str(paths["verdict"]),
+        verdict_tracks=derived,
     )
     print(summary)
-    if args.summary_out:
-        Path(args.summary_out).write_text(summary + "\n", encoding="utf-8")
+    paths["summary"].parent.mkdir(parents=True, exist_ok=True)
+    paths["summary"].write_text(summary + "\n", encoding="utf-8")
 
-    # Exit 0 always -- report-only.
+    # Exit 0 always -- report-only.  Errors are in the artifacts, not the exit.
     return 0
 
 

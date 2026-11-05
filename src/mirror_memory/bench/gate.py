@@ -18,6 +18,40 @@ First-stage thresholds (from the plan):
 ``forced`` means every turn got an extraction attempt (the throttle's
 cold-start and novelty escapes both firing); ``production`` is the engine as
 configured.  The gap between them is what throttling costs.
+
+Track semantics (four-state)
+----------------------------
+
+Every track is evaluated independently and ends in exactly one of four
+states:
+
+``pass``
+    The track ran and cleared its threshold.
+``fail``
+    The track ran and did not clear its threshold.
+``not_run``
+    The track was intentionally not attempted because a prerequisite was
+    absent (e.g. no ``MM_LLM_API_KEY``).  ``not_run`` is **never** a pass.
+``error``
+    The track was attempted but execution raised.  ``error`` is **never** a
+    pass and is **never** relabelled as ``not_run``; it stays visible as an
+    infrastructure failure so it cannot hide behind a missing-key story.
+
+Isolation rule: a completed track's result must not be overwritten because a
+*different* track failed.  The per-track evaluation below never touches a
+track it did not itself evaluate.
+
+Forced vs production
+--------------------
+
+``forced`` — the threshold-bearing track — is the only track allowed to
+demand an every-turn K2 attempt (full coverage + clean extraction health).
+``production`` is the engine as configured: it reports its *true* coverage and
+failures as-is.  A low production score is measured against the same fixed
+thresholds (it never relaxes them) and against the forced/production gap.  A
+production throttling does not lower the forced thresholds and a production
+`not_run`/`error` does not silently pass, but it also does not overwrite the
+forced result.
 """
 
 from __future__ import annotations
@@ -32,6 +66,45 @@ GATE_PRODUCTION_GAP = 0.05
 GATE_RECALL = 0.85
 GATE_ANSWER = 0.85
 
+# The four track states.  A track is exactly one of these.
+TRACK_PASS = "pass"
+TRACK_FAIL = "fail"
+TRACK_NOT_RUN = "not_run"
+TRACK_ERROR = "error"
+TRACK_STATES = frozenset({TRACK_PASS, TRACK_FAIL, TRACK_NOT_RUN, TRACK_ERROR})
+
+
+@dataclass
+class TrackVerdict:
+    """Independent verdict for one track.
+
+    ``state`` is one of the four ``TRACK_*`` values.  ``reason`` explains a
+    non-pass; ``error`` keeps the raised exception payload so an execution
+    failure is never mistaken for a clean ``not_run``.
+    """
+
+    track: str
+    state: str
+    score: float | None = None
+    threshold: float | None = None
+    reason: str = ""
+    error: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.state == TRACK_PASS
+
+    def to_dict(self) -> dict:
+        return {
+            "track": self.track,
+            "state": self.state,
+            "passed": self.passed,
+            "score": self.score,
+            "threshold": self.threshold,
+            "reason": self.reason,
+            "error": self.error,
+        }
+
 
 @dataclass
 class GateResult:
@@ -40,6 +113,7 @@ class GateResult:
     passed: bool
     checks: list[dict] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    tracks: dict[str, TrackVerdict] = field(default_factory=dict)
 
     @property
     def summary(self) -> str:
@@ -53,6 +127,7 @@ class GateResult:
             "passed": self.passed,
             "checks": self.checks,
             "failures": self.failures,
+            "tracks": {name: verdict.to_dict() for name, verdict in self.tracks.items()},
         }
 
 
@@ -100,12 +175,88 @@ def _unevaluated(name: str, threshold: float, *, at_least: bool = True) -> dict:
     }
 
 
+def _track_state_of(stats: Mapping[str, Any] | None, threshold: float | None = None) -> str:
+    """Classify a raw track payload into one four-state value.
+
+    Precedence is important: ``error`` wins over ``not_run`` so an execution
+    failure is never downgraded to a benign "did not run", and neither is ever
+    ``pass``.
+
+    When ``threshold`` is given and the track has a numeric score, the pass/fail
+    decision is made against it (a below-threshold track is ``fail`` even
+    though it ran).  Without a threshold, presence of a score is treated as a
+    run and an explicitly ``passed: false`` payload is ``fail``.
+    """
+    if stats is None:
+        return TRACK_NOT_RUN
+    if stats.get("error"):
+        return TRACK_ERROR
+    if stats.get("not_run"):
+        return TRACK_NOT_RUN
+    score = _score(stats)
+    if score is None:
+        return TRACK_NOT_RUN
+    if stats.get("passed") is False:
+        return TRACK_FAIL
+    if threshold is not None and score < threshold:
+        return TRACK_FAIL
+    return TRACK_PASS
+
+
+def evaluate_tracks(report: Any, *, thresholds: Mapping[str, float] | None = None) -> dict[str, TrackVerdict]:
+    """Evaluate each track independently into pass/fail/not_run/error.
+
+    This is the track-isolation primitive: every track is decided from its own
+    payload only.  A missing/empty/errored track never overwrites another.
+    """
+    thresholds = thresholds or {
+        "state": GATE_STATE_OVERALL,
+        "recall": GATE_RECALL,
+        "answer": GATE_ANSWER,
+    }
+    v11 = _v11_report(report)
+    verdicts: dict[str, TrackVerdict] = {}
+    raw_tracks = _field(report, "tracks") or {}
+    for name, threshold in thresholds.items():
+        if not v11 and name == "state":
+            stats = {"score": _field(report, "score")}
+        else:
+            # A legacy v1 report that simply does not declare a track (e.g. no
+            # ``answer`` key at all) has no such track -- do not manufacture a
+            # ``not_run`` verdict for a track the report never mentions.
+            if not v11 and name not in raw_tracks:
+                continue
+            stats = _track(report, name)
+        state = _track_state_of(stats, threshold)
+        score = _score(stats) if stats is not None else None
+        reason = ""
+        if state == TRACK_ERROR:
+            reason = str(stats.get("error") or "track execution failed")
+        elif state == TRACK_NOT_RUN:
+            reason = "track not run (prerequisite absent)"
+        elif state == TRACK_FAIL:
+            if score is not None and score < threshold:
+                reason = f"{name} {score:.3f} < {threshold}"
+            else:
+                reason = f"{name} marked failed"
+        verdicts[name] = TrackVerdict(
+            track=name,
+            state=state,
+            score=score,
+            threshold=threshold,
+            reason=reason,
+            error=str(stats.get("error") or "") if stats is not None else "",
+        )
+    return verdicts
+
+
 def check_release_gate(
     report: Any,
     *,
     manifest_path: str | Path | None = None,
     production_report: Any | None = None,
     forced: bool = True,
+    track_verdicts: Mapping[str, TrackVerdict] | None = None,
 ) -> GateResult:
     """Check a StateBench report against the release thresholds.
 
@@ -121,9 +272,16 @@ def check_release_gate(
     forced:
         Require a forced v1.1 run and its production comparison.  Legacy v1
         reports retain their original standalone gate behavior.
+    track_verdicts:
+        Optional pre-computed four-state verdicts (from ``evaluate_tracks`` or
+        the CI adapter).  When supplied, per-track pass/fail/not_run/error is
+        taken from here — this is how a ``not_run`` or ``error`` track stays
+        distinct from a measured ``fail``.  The legacy numerical checks below
+        still run against the report payload so the thresholds are unchanged.
     """
     checks: list[dict] = []
     failures: list[str] = []
+    tracks: dict[str, TrackVerdict] = dict(track_verdicts or {})
 
     v11 = _v11_report(report)
     state = _track(report, "state") if v11 else {
@@ -131,24 +289,56 @@ def check_release_gate(
         "by_category": _field(report, "by_category") or {},
     }
 
+    # Per-track four-state evaluation for the three scored tracks.  Dedicated
+    # verdicts supplied by the caller win; otherwise derive them here.
+    derived = evaluate_tracks(report)
+    for name, verdict in derived.items():
+        tracks.setdefault(name, verdict)
+
+    # --- track state gating -------------------------------------------------
+    # An `error` track is a hard failure (infrastructure), surfaced loudly.
+    # A `not_run` track is a failure (fail-closed) but labelled as such.
+    # `fail` is decided by the numerical thresholds below.
+    for name in ("state", "recall", "answer"):
+        verdict = tracks.get(name)
+        if verdict is None:
+            continue
+        if verdict.state == TRACK_ERROR:
+            failures.append(f"{name} track error: {verdict.error or verdict.reason}")
+        elif verdict.state == TRACK_NOT_RUN and not (v11 is False and name == "answer"):
+            # Legacy standalone v1 reports have no answer track at all; that is
+            # not a track failure for the legacy path.
+            failures.append(f"{name} not evaluated")
+
     def require(name: str, value: float | None, threshold: float, label: str) -> None:
         if value is None:
             checks.append(_unevaluated(name, threshold))
-            failures.append(f"{label} not evaluated")
+            # Only add the failure once (the state loop above may already have).
+            if f"{label} not evaluated" not in failures:
+                failures.append(f"{label} not evaluated")
             return
         checks.append(_check(name, value, threshold))
         if value < threshold:
             failures.append(f"{label} {value:.3f} < {threshold}")
 
-    require("state_overall", _score(state), GATE_STATE_OVERALL, "state overall")
-    for category, stats in (state.get("by_category") or {}).items():
-        require(
-            f"state_category[{category}]", _score(stats),
-            GATE_STATE_PER_CATEGORY, f"category {category}",
-        )
+    # Skip the numerical requirement for tracks explicitly marked not_run or
+    # error so a missing key is reported as `not_run`, not as `0.000 < 0.90`.
+    def track_blocked(name: str) -> bool:
+        verdict = tracks.get(name)
+        return verdict is not None and verdict.state in {TRACK_NOT_RUN, TRACK_ERROR}
+
+    if not track_blocked("state"):
+        require("state_overall", _score(state), GATE_STATE_OVERALL, "state overall")
+        for category, stats in (state.get("by_category") or {}).items():
+            require(
+                f"state_category[{category}]", _score(stats),
+                GATE_STATE_PER_CATEGORY, f"category {category}",
+            )
 
     for name, threshold in (("recall", GATE_RECALL), ("answer", GATE_ANSWER)):
         track = _track(report, name)
+        if track_blocked(name):
+            continue
         if v11 or track is not None:
             require(f"{name}_overall", _score(track), threshold, name)
 
@@ -195,7 +385,14 @@ def check_release_gate(
                 "passed": track_coverage_ok,
             })
             if not track_coverage_ok:
-                failures.append(f"{track_name} evaluated {evaluated or 0}/{len(expected_ids)} cases")
+                verdict = tracks.get(track_name)
+                # Coverage is only a failure if the track actually ran.  A
+                # not_run / error track is already reported distinctly above;
+                # do not double-report it as a coverage failure.
+                if verdict is None or verdict.state not in {TRACK_NOT_RUN, TRACK_ERROR}:
+                    failures.append(
+                        f"{track_name} evaluated {evaluated or 0}/{len(expected_ids)} cases"
+                    )
         mode = _field(report, "extraction_mode")
         mode_ok = mode == "forced"
         checks.append({"check": "forced_mode", "value": mode, "passed": mode_ok})
@@ -206,6 +403,10 @@ def check_release_gate(
         # The runner refuses a fully-failed run; the gate refuses any run
         # whose extraction was not clean, because a partially degraded run
         # still reports model-labelled numbers.
+        #
+        # These every-turn-K2 requirements apply to the FORCED track ONLY.
+        # A production run is measured as configured and never has to prove an
+        # every-turn attempt here.
         health = _field(report, "extraction_health") or {}
         attempts = health.get("k2_attempts")
         expected_turns = health.get("dataset_turns")
@@ -239,6 +440,11 @@ def check_release_gate(
             })
             if not clean:
                 failures.append(f"{count} {label}")
+
+        # Production comparison — evaluated independently of the forced track's
+        # own pass/fail.  A production error/not_run must be visible but must
+        # not erase the forced track's already-computed result.
+        production_verdict = tracks.get("production")
         if production_report is None:
             checks.append(_unevaluated("production_gap", GATE_PRODUCTION_GAP, at_least=False))
             failures.append("production gap not evaluated")
@@ -273,7 +479,7 @@ def check_release_gate(
         if not present:
             failures.append(f"missing manifest: {path}")
 
-    return GateResult(passed=not failures, checks=checks, failures=failures)
+    return GateResult(passed=not failures, checks=checks, failures=failures, tracks=tracks)
 
 
 def compare_forced_production(forced: Any, production: Any) -> dict:
@@ -333,3 +539,22 @@ def compare_forced_production(forced: Any, production: Any) -> dict:
         "threshold": GATE_PRODUCTION_GAP,
         "per_category_gap": per_category,
     }
+
+
+__all__ = [
+    "GATE_ANSWER",
+    "GATE_PRODUCTION_GAP",
+    "GATE_RECALL",
+    "GATE_STATE_OVERALL",
+    "GATE_STATE_PER_CATEGORY",
+    "GateResult",
+    "TRACK_ERROR",
+    "TRACK_FAIL",
+    "TRACK_NOT_RUN",
+    "TRACK_PASS",
+    "TRACK_STATES",
+    "TrackVerdict",
+    "check_release_gate",
+    "compare_forced_production",
+    "evaluate_tracks",
+]

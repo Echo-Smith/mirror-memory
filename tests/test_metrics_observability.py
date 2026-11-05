@@ -178,21 +178,13 @@ def test_prometheus_is_valid_exposition_shape():
 # ---------------------------------------------------------------------------
 
 
-def test_storage_stats_per_user_per_table(tmp_path, monkeypatch):
+def test_storage_stats_per_user_per_table(tmp_path):
+    """storage_stats is now TENANT-SCOPED (explicit WHERE), keyed by
+    (tenant_id, user_id); the privileged all-tenant report is separate."""
     from mirror_memory.api import MemoryEngine
     from mirror_memory.config.loader import load_config
     from mirror_memory.core.models import Evidence
-
-    # storage_stats() is an admin, on-demand system_scope call site; its
-    # allowlist registration is owned by the review file (Lead registers
-    # ``mirror_memory.core.metrics.storage_stats``).  Register it for THIS
-    # test so the storage path is exercised independently of that edit; the
-    # shim is a no-op once the real entry lands.
-    from mirror_memory.core import scope_registry as _sr
-
-    monkeypatch.setitem(
-        _sr.registry(), ("mirror_memory.core.metrics", "storage_stats"), {"test": True}
-    )
+    from mirror_memory.core.tenancy import fixture_write_scope
 
     cfg = load_config("config/")
     cfg.deletion_log.directory = str(tmp_path / "del")
@@ -202,7 +194,6 @@ def test_storage_stats_per_user_per_table(tmp_path, monkeypatch):
     from mirror_memory.bench import grant_bench_purpose
 
     grant_bench_purpose(eng, ["u-storage"])
-    from mirror_memory.core.tenancy import fixture_write_scope
 
     with fixture_write_scope(reason="metrics storage_stats test: seed one evidence row"):
         with eng._session() as s:
@@ -210,11 +201,16 @@ def test_storage_stats_per_user_per_table(tmp_path, monkeypatch):
                            source_type="message", session_id="s1"))
             s.commit()
 
-    stats = metrics.storage_stats(eng._engine)
-    assert "u-storage" in stats
-    assert "mm_evidence" in stats["u-storage"]
-    assert stats["u-storage"]["mm_evidence"]["rows"] >= 1
-    assert stats["u-storage"]["mm_evidence"]["bytes"] >= 100
+    tenant = eng._tenant
+    stats = metrics.storage_stats(eng._engine, tenant=tenant)
+    assert (tenant[0], "u-storage") in stats
+    cell = stats[(tenant[0], "u-storage")]
+    assert "mm_evidence" in cell
+    assert cell["mm_evidence"]["rows"] >= 1
+    assert cell["mm_evidence"]["bytes"] >= 100
+    # a DIFFERENT tenant sees nothing for this call (explicit filter)
+    other = metrics.storage_stats(eng._engine, tenant=("other-tenant", "x"))
+    assert (("other-tenant"), "u-storage") not in other
     assert "u-storage" not in metrics.render_prometheus()
 
 

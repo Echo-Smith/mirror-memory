@@ -177,9 +177,42 @@ extraction health (every dataset turn attempted, zero failed / empty / unparsed
 / schema-rejected calls). A run whose extraction degraded is measuring the
 fallback, so the gate rejects it rather than reporting model-labelled numbers.
 
-The gate is **fail-closed**: any track that is not evaluated is a failure, never
-a pass. In particular a track that did not run (`not_run`) does not clear its
-threshold.
+### Forced vs production semantics
+
+`check_release_gate` evaluates the **forced** and **production** tracks
+independently:
+
+- **forced** is the threshold-bearing track. Only the forced run is required to
+  prove an every-turn K2 attempt (full coverage + clean extraction health).
+- **production** is the engine as configured. Its *true* coverage and failures
+  are counted as-is and compared to forced through the fixed gap check
+  (`forced - production <= 0.05`). A production throttle never relaxes or edits
+  the forced thresholds; a low production score is measured against the same
+  fixed numbers.
+- A production `not_run` / `error` is surfaced, but it never overwrites the
+  forced track's already-computed verdict, and the forced track's failure never
+  overwrites a completed production run.
+
+### Four track states
+
+Every track is evaluated on its own and ends in exactly one of four states:
+
+| state | meaning | counts as pass? |
+|---|---|---|
+| `pass` | ran and cleared its threshold | yes |
+| `fail` | ran and did not clear its threshold | no |
+| `not_run` | not attempted; a prerequisite (e.g. API key) was absent | **never** |
+| `error` | attempted, but execution raised | **never** |
+
+`error` is an **infrastructure failure**, not a measurement failure and not a
+`not_run`; it is surfaced loudly and must never be read as a pass or silently
+downgraded to `not_run`. Isolation is enforced: a completed track's result is
+never overwritten because a *different* track errored.
+
+The gate is **fail-closed**: a `not_run` or `error` track does not clear its
+threshold. Only a `pass` on every required track (plus coverage, mode, health,
+manifest, and the production gap) clears the gate.
+
 
 Run it locally:
 
@@ -199,20 +232,39 @@ dispatch, and on pull requests that touch
 
 It is **report-only**. The workflow conclusion is never red: the gate step is
 `continue-on-error` and the verdict is surfaced as data, not as a CI failure.
-The `statebench-gate` artifact carries the JSON report, the provenance manifest
-(commit, dirty flag, dataset SHA-256, model, prompt/config hashes, generation
-params), and a Markdown summary.
+
+### Dataset version
+
+The runner loads `statebench_v1_1.json` (`statebench_v1_1_path()`), whose in-file
+`version` is `1.2.0` and whose `case_count` is 200. The legacy
+`statebench_v1.json` (`version 1.0.0`, 200 cases) is **not** used by the v1.1
+runner. The report carries `dataset_version`; the summary prints it explicitly
+so v1 and v1.1 results are never conflated.
+
+### Artifacts (four distinct, non-overwriting paths)
+
+The CI helper writes — and the workflow uploads — four separate artifacts, never
+overwriting one file with another:
+
+| artifact | contents |
+|---|---|
+| `statebench-gate.json` | raw per-case report (every case's track outcomes) |
+| `statebench-gate.manifest.json` | commit, dataset SHA-256, config/prompt hashes, model |
+| `statebench-gate.verdict.json` | gate verdict + per-check table + four-state per track |
+| `statebench-gate-summary.md` | Markdown summary (first line `PASS:` / `FAIL:`) |
 
 Read the run in `$GITHUB_STEP_SUMMARY`:
 
-- the **first line** is `PASS: ...` or `FAIL: <failing items>`;
+- the **first line** is `PASS: ...` or `FAIL: <failing items>` (infrastructure
+  `error`s are prefixed so they cannot hide);
 - a per-check table lists each check's value, threshold, and pass state;
-- a per-track table lists `state`, `recall`, and `answer` with `not_run`
-  shown explicitly.
+- a per-track table lists `state`, `recall`, and `answer` with their four-state
+  label (`pass` / `fail` / `not_run` / `error`) shown explicitly.
 
 LLM-required tracks (forced extraction and the answerer) run **only** when the
 `MM_LLM_API_KEY` secret is present. When it is absent those tracks are recorded
-as `not_run`, the report says so, and the gate treats them as failures. A
+as `not_run`, the report says so, and the gate treats them as failures. If a
+track is attempted and raises, it is recorded as `error` (not `not_run`). A
 `not_run` track is **not** a pass and must never be read as one.
 
 ## When an external "advantage" claim is permitted

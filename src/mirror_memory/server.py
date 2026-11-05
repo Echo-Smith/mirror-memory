@@ -80,6 +80,18 @@ class TenantAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Minimal, explicit exemptions (M5 fix): the admin metrics scrape and
+        # the liveness probe are NOT tenant resources.  They have their OWN
+        # auth (admin key for /metrics; none for /health) and must not be
+        # tenant-resolved -- otherwise an admin Bearer key is rejected by this
+        # middleware before the handler's admin check can run.  This bypasses
+        # tenant/purpose checks ONLY for these exact paths; every other route
+        # still requires a tenant key + purpose.
+        _path = scope.get("path") or ""
+        if _path in ("/metrics", "/health"):
+            await self.app(scope, receive, send)
+            return
+
         from starlette.responses import JSONResponse
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1")

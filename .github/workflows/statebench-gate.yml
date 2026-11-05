@@ -2,15 +2,28 @@ name: statebench-gate
 
 # Task 1 (M5): the StateBench v1.1 release gate, REPORT-ONLY.
 #
-# This workflow never turns CI red.  It runs the deterministic StateBench track,
-# records the provenance manifest, evaluates bench.gate.check_release_gate, and
-# writes a PASS/FAIL summary.  When the gate fails the first summary line is
-# "FAIL: <failing items>"; the job itself still concludes success because the
-# gate step is continue-on-error and the job is not a required check.
+# This workflow never turns CI red.  It runs the StateBench tracks, records the
+# provenance manifest, evaluates bench.gate.check_release_gate with four-state
+# per-track semantics (pass / fail / not_run / error), and writes a PASS/FAIL
+# summary.  When the gate fails the first summary line is "FAIL: <items>"; the
+# job itself still concludes success because the gate step is
+# continue-on-error and the job is not a required check.
+#
+# Four distinct, non-overwriting artifacts are produced and uploaded:
+#   artifacts/statebench-gate.json           raw per-case report
+#   artifacts/statebench-gate.manifest.json  commit, dataset sha, config hashes, model
+#   artifacts/statebench-gate.verdict.json   gate verdict + per-check + four-state tracks
+#   artifacts/statebench-gate-summary.md     Markdown summary (first line PASS:/FAIL:)
 #
 # LLM tracks (forced extraction + answerer) run ONLY when the MM_LLM_API_KEY
 # secret is present.  When it is absent those tracks are recorded as `not_run`,
-# which is NOT a pass (see tools/m5_statebench_ci.py and docs/statebench.md).
+# which is NOT a pass.  A track that raises is recorded as `error` (an
+# infrastructure failure), never `not_run` and never a pass (see
+# tools/m5_statebench_ci.py and docs/statebench.md).
+#
+# Dataset version: the report carries the in-file `dataset_version` of
+# statebench_v1_1.json (currently 1.2.0); it is printed in the summary so v1
+# (statebench_v1.json) and v1.1 results are never confused.
 #
 # Triggers: manual dispatch, a weekly schedule, and pull requests touching the
 # extraction / core / bench packages.
@@ -65,6 +78,7 @@ jobs:
           mkdir -p artifacts
           # --allow-llm permits the LLM tracks; they still run only when
           # MM_LLM_API_KEY is present (the helper checks the env itself).
+          # The helper writes four distinct files derived from --output.
           PYTHONPATH=src python tools/m5_statebench_ci.py \
             --allow-llm \
             --output artifacts/statebench-gate.json \
@@ -87,24 +101,51 @@ jobs:
 
       - name: Decision (report-only, never red)
         if: always()
-        # A separate non-required job would also work; here we surface the
-        # verdict as an output + annotation without failing.
+        # Surface the verdict, the four-state tracks, the dataset version, and
+        # any infrastructure error without failing the job.
         env:
-          GATE_JSON: artifacts/statebench-gate.json
+          VERDICT_JSON: artifacts/statebench-gate.verdict.json
         run: |
-          if [ -f "$GATE_JSON" ]; then
-            python -c "import json,os; d=json.load(open(os.environ['GATE_JSON'])); print('gate verdict:', 'PASS' if d.get('passed') else 'FAIL'); print('tracks:', d.get('tracks')); print('llm_tracks_enabled:', d.get('llm_tracks_enabled'))"
+          if [ -f "$VERDICT_JSON" ]; then
+            python - "$VERDICT_JSON" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print("gate verdict:", "PASS" if d.get("passed") else "FAIL")
+          print("dataset version:", d.get("dataset_version"), "->", d.get("dataset_version_label"))
+          tracks = d.get("tracks", {})
+          for name in ("state", "recall", "answer", "forced", "production"):
+              if name in tracks:
+                  print(f"  {name}: {tracks[name].get('state')}")
+          errors = [n for n, v in tracks.items() if v.get("state") == "error"]
+          if errors:
+              print("INFRASTRUCTURE ERROR in track(s):", ", ".join(errors))
+          PY
           else
-            echo "gate verdict: FAIL (no JSON produced)"
+            echo "gate verdict: FAIL (no verdict JSON produced)"
           fi
 
-      - name: Upload gate report + manifest
+      - name: Upload raw report + manifest
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: statebench-gate
+          name: statebench-gate-report
           path: |
             artifacts/statebench-gate.json
             artifacts/statebench-gate.manifest.json
-            artifacts/statebench-gate-summary.md
+          if-no-files-found: warn
+
+      - name: Upload gate verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: statebench-gate-verdict
+          path: artifacts/statebench-gate.verdict.json
+          if-no-files-found: warn
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: statebench-gate-summary
+          path: artifacts/statebench-gate-summary.md
           if-no-files-found: warn

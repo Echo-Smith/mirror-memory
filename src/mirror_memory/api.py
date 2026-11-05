@@ -48,6 +48,7 @@ ENTRY_EXPORT = "mirror_memory.api.MemoryEngine.export"
 
 
 from mirror_memory.core import provenance
+from mirror_memory.core import metrics
 from mirror_memory.core.deletion import DeletionEntry, DeletionLog, DeletionLogUnavailable
 
 # the __init__ default: builds the log from config unless an explicit
@@ -173,7 +174,15 @@ class MemoryEngine:
         self._sync_state = "normal"  # normal / catching_up / offline_grace / expired
         self._sync_attempt_failed = False
         self._sync_lock = threading.Lock()
-        self._llm_client = llm_client or self._build_llm(llm_api_key, llm_model, llm_base_url)
+        # M5 fix: instrument the client so EVERY generate() on ANY client is
+        # counted (the proxy counts the call and books usage-unknown when the
+        # provider gives none; a usage hook adds real tokens).  The engine
+        # hands this instrumented object to its ExtractionPipeline explicitly
+        # (see _get_pipeline), so we do NOT mutate the caller's config object
+        # -- doing so would leak the proxy across engines that share one config.
+        self._llm_client = metrics.instrument_llm_client(
+            llm_client or self._build_llm(llm_api_key, llm_model, llm_base_url)
+        )
         # M1 tenancy: the engine entry point pins an explicit tenant; every
         # session it opens is created inside that scope and therefore bound
         # to it at creation time (see core.tenancy).
@@ -212,11 +221,10 @@ class MemoryEngine:
         self._initializing = False
         self._init_tls = threading.local()
         self._pipeline = None  # lazy-initialized
-        # M5 task 2 (observability): per-entry cost + latency.  The LLM hook
-        # is installed lazily around each entry (see _metrics_llm_scope) so
-        # the same client can be shared; the SQL count rides the engine's own
-        # event listener, never an extra query.
-        self._metrics_tls = threading.local()
+        # M5 task 2 (observability): per-entry cost + latency.  Attribution
+        # lives in one module-level thread-local (core.metrics) so SQL and LLM
+        # counting are shared by every engine and never cross threads.  The
+        # SQL counter is a single process-wide cursor listener, not per engine.
         self._install_metrics_sql_listener()
         # M4: the independent deletion log.  An explicit instance wins;
         # otherwise the config decides (backend file|postgres).  None =>
@@ -474,74 +482,80 @@ class MemoryEngine:
     # -- observability (M5 task 2): per-entry cost + latency ----------------
 
     def _install_metrics_sql_listener(self) -> None:
-        """Count SQL statements per entry off the SAME cursor event the
-        auditor uses -- no extra query, no second code path.  The listener
-        is a no-op unless an entry opened a metrics scope on this thread, so
-        unrelated traffic (migrations, other engines' pools) is untouched."""
+        """Install the ONE process-wide SQL counter (M5 fix).
+
+        The listener is attached to the SQLAlchemy ``Engine`` CLASS exactly
+        once for the whole process -- never once per ``MemoryEngine`` -- and
+        reads the current entry from ``core.metrics``' THREAD-LOCAL context.
+        This fixes: every tenant engine counts (shared thread-local + one
+        listener), unrelated SQL on a thread with no open entry is a no-op,
+        and no closure is bound to a single engine instance.  Idempotent and
+        failure-safe: metrics never break engine construction."""
         try:
             from sqlalchemy import event
             from sqlalchemy.engine import Engine as _SAEngine
 
-            if getattr(type(self), "_metrics_sql_installed", False):
+            from mirror_memory.core import metrics
+
+            if metrics.sql_listener_installed():
                 return
 
             def _count(conn, cursor, statement, parameters, context, executemany):
-                entry = getattr(self._metrics_tls, "entry", None)
-                if entry is None:
-                    return
-                from mirror_memory.core import metrics
-                metrics.record_sql(entry)
+                metrics.record_sql_current()
 
             event.listen(_SAEngine, "after_cursor_execute", _count)
-            type(self)._metrics_sql_installed = True
+            metrics.mark_sql_listener_installed()
         except Exception:  # observability must never break engine construction
             logger.debug("metrics: SQL listener not installed", exc_info=True)
 
     @contextmanager
     def _metrics_llm_scope(self, entry: str):
-        """Attribute every LLM call made inside *entry* to that entry.
+        """Contribute real LLM token usage to *entry* (M5 fix).
 
-        Installs a per-call hook on the engine's LLM client (when it supports
-        one) so provider usage -- input/output tokens -- reaches metrics.
-        A client without usage (the test stub) yields ``unknown`` tokens."""
+        The CALL count is booked by the instrumented client proxy
+        (``metrics.instrument_llm_client`` installed at construction) for
+        every ``generate()`` on any client; here we additionally install a
+        usage hook ONLY to add the measured TOKENS (never a second call
+        count).  The hook reads the calling thread's current entry, so two
+        concurrent scopes on a shared client never cross-talk and nothing is
+        restored/leaked on exit.  A client without ``set_on_call`` still has
+        its calls counted by the proxy (as usage-unknown)."""
         from mirror_memory.core import metrics
 
         llm = self._llm_client
-        hook_installed = False
-        previous = None
-        if llm is not None and hasattr(llm, "set_on_call"):
-            previous = getattr(llm, "_on_call", None)
-
+        if llm is not None and hasattr(llm, "set_on_call") and not getattr(
+            llm, "_mm_usage_hook", False
+        ):
             def _hook(info: dict) -> None:
-                metrics.record_llm(
-                    entry,
+                metrics.record_llm_tokens(
+                    metrics.current_entry() or entry,
                     input_tokens=info.get("input_tokens"),
                     output_tokens=info.get("output_tokens"),
                 )
 
-            llm.set_on_call(_hook)
-            hook_installed = True
-        try:
-            yield
-        finally:
-            if hook_installed:
-                llm.set_on_call(previous)
+            try:
+                llm.set_on_call(_hook)
+                llm._mm_usage_hook = True
+            except Exception:  # never break an entry
+                logger.debug("metrics: LLM usage hook not installed", exc_info=True)
+        yield
 
     @contextmanager
     def _metrics_entry(self, entry: str):
-        """Time *entry*, record its latency, and mark this thread so the SQL
-        listener counts statements for it."""
+        """Time *entry* and mark this thread's current entry (M5 fix).
+
+        Uses the single module-level thread-local in ``core.metrics`` so the
+        global SQL listener and the LLM usage hook see the same entry.  Nested
+        scopes restore the previous entry exactly (including on exception)."""
         from mirror_memory.core import metrics
 
         started = time.monotonic()
-        previous = getattr(self._metrics_tls, "entry", None)
-        self._metrics_tls.entry = entry
-        try:
-            yield
-        finally:
-            self._metrics_tls.entry = previous
-            elapsed_ms = (time.monotonic() - started) * 1000.0
-            metrics.observe_latency(entry, elapsed_ms)
+        with metrics.entry_scope(entry):
+            try:
+                yield
+            finally:
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                metrics.observe_latency(entry, elapsed_ms)
 
     # -- purpose authorization (M3 batch-1 tasks 2/3) ------------------------
 
@@ -870,8 +884,8 @@ class MemoryEngine:
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
         from mirror_memory.core import metrics as _metrics
 
-        with self._metrics_entry(_metrics.ENTRY_OBSERVE):
-            with self._metrics_llm_scope(_metrics.ENTRY_OBSERVE):
+        with self._metrics_entry(_metrics.ENTRY_METABOLISM):
+            with self._metrics_llm_scope(_metrics.ENTRY_METABOLISM):
                 with self._session() as session:
                     self._authorize(session, user_id, purpose, "extract")
                     report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)

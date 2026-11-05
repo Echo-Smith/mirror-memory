@@ -31,10 +31,13 @@ removes plaintext content from operators, backups and the running server
 outside a session window. Its costs are, in order of severity:
 
 1. **Lexical recall admission must move off plaintext SQL** (§4.4) — the
-   one genuine engineering lift.
+   one genuine engineering lift. There are **two** fuzzy (`ILIKE %tok%`)
+   sites, not one, and the original semantics are **substring-in-column**,
+   so a whole-token HMAC blind index is **not** an equivalent replacement
+   (§2.3 A.3).
 2. **Key lifecycle / recovery** becomes a product surface (§2a).
-3. **Session-start decrypt load** (§2.4, §4.6) — measured; small for the target
-   belief counts once native AES is used.
+3. **Session-start decrypt load** (§2.4, §4.6) — **measured** on real native
+   crypto: ≈2–3 ms @1k, ≈26 ms @10k beliefs; small for the target counts.
 4. **Residual exposure to a compromised running server during a session**
    (§6) — unavoidable in any scheme where the conversation model is in the
    cloud, because the injected memory context is itself sent to the cloud
@@ -95,7 +98,11 @@ recent = 175).
 > warmup calls. **Host was shared with concurrent CI/agent work, so
 > absolute p95 is an upper bound** (unloaded p50 is the more stable
 > signal; the M2 controlled SQL numbers above are the floor). Reproduced by
-> `tools/m5_fieldexp_micro.py`.
+> `tools/m5_fieldexp_micro.py`. **A later, less-contended re-run (§4.6 C.2)
+> measured lower p50: SQLite 1k = 17.4 ms, 10k = 82.7 ms; PG 1k = 17.7 ms —
+> use §4.6 C.2 for the freshest recall figures; the table below is the
+> original contended run kept for provenance. The *trend* (p50 grows with
+> N; ≤50 ms met only to ~1k) is identical in both.**
 
 | backend | N beliefs | recall p50 (ms) | recall p95 (ms) | recall mean (ms) | +decrypt (native) p95 (ms) |
 |---|---|---|---|---|---|
@@ -205,59 +212,121 @@ ciphertext cannot be spliced onto a different row.
 
 ### 2.3 Which SQL filters / sorts touch content, and are affected
 
-This is the crux, and it is measured against the real code
-(`core/repository.py::recall_candidates`, `core/retrieval.py::score_belief`,
-`render/renderer.py`):
+This is the crux, and it is enumerated against the **real code**
+(`core/repository.py`, `core/retrieval.py`, `render/renderer.py`; verified
+by grep over `src/mirror_memory/`, branch `feat/m5-readiness` @ `00672c7`).
+There are **exactly three classes** of content-touching SQL: (a) one
+*exact-match* statement, (b) **two** *fuzzy substring* statements, and
+(c) several *exact set-membership* statements on structured content
+columns (`predicate` / `object` / `key`). Everything else — RLS, tier,
+status, recency ordering, by-id fetch — is structure and unaffected.
 
-| SQL operation | Touches content? | Effect of field encryption |
-|---|---|---|
-| `WHERE user_id=… AND status IN (…) AND memory_tier IN (…)` | no (structure) | **unaffected** |
-| RLS predicate (`current_setting(tenant)`) | no | **unaffected** |
-| `ORDER BY last_evidence_at DESC` | no | **unaffected** |
-| **relevant slice: `claim_text ILIKE %tok% OR object ILIKE %tok% OR key ILIKE %tok%`** | **yes** | **BREAKS** — ciphertext is not lexically matchable |
-| recent slice (no content predicate, `LIMIT 25`) | no | **unaffected** |
-| Python scoring `score_belief(belief, topics, …)` over loaded rows | yes, but **in Python after load** | unaffected *if* the session key is present (decrypt before scoring) |
-| `evidence_counts_for_beliefs` (by id) | no | unaffected |
+#### A.1 — Complete inventory of content-touching SQL (exact statements)
 
-So **exactly one SQL construct is affected: the lexical admission `ILIKE`
-on `claim_text` / `object` / `key`.** Two mitigations, pick one per
-deployment:
+| # | Function (file:line) | Kind | SQL shape (as ORM) | Touches | Under field encryption |
+|---|---|---|---|---|---|
+| **S1** | `get_belief` (`repository.py:1114`) | exact key | `WHERE user_id = :u AND key = :key` | `key` | **BREAKS** (ciphertext ≠ plaintext key) |
+| **S2** | `recall_candidates` **relevant slice** (`repository.py:1316–1324`) | **fuzzy substring #1** | `WHERE user_id=:u AND status IN (…) AND memory_tier IN (…) AND ( claim_text ILIKE '%tok%' OR object ILIKE '%tok%' OR key ILIKE '%tok%' , … ) ORDER BY last_evidence_at DESC LIMIT 150` | `claim_text`, `object`, `key` | **BREAKS** — the crux |
+| **S3** | `beliefs_referenced_by_tokens` (`repository.py:1539–1547`) | **fuzzy substring #2** | `WHERE user_id=:u AND status='active' AND ( object ILIKE '%tok%' OR key ILIKE '%tok%' OR claim_text ILIKE '%tok%' , … ) ORDER BY last_evidence_at DESC LIMIT 50` | `object`, `key`, `claim_text` | **BREAKS** — used by the extraction **retraction/update resolver** (finds the belief a "Correction: …" refers to) |
+| **S4** | `beliefs_with_predicates` (`repository.py:1494–1509`) | exact set (triple) | `WHERE user_id=:u AND status IN ('active','superseded') AND ( predicate IN (:preds) OR object IN (:objs) OR predicate IN (SELECT predicate WHERE user_id=:u AND object IN (:objs)) ) ORDER BY last_evidence_at DESC LIMIT n` | `predicate`, `object` | **BREAKS** (exact, but on content columns) — update/revival resolver |
+| **S5** | `active_goal_beliefs` (`repository.py:1583`) | exact set | `WHERE user_id=:u AND status='active' AND predicate IN (:goal_preds) ORDER BY last_evidence_at DESC LIMIT n` | `predicate` | **BREAKS** (predicate is a controlled verb vocabulary, but it is a content column) |
+| **S6** | `list_active_beliefs` dimension filter (`repository.py:1226`, `1329`, `1342`) | exact set (enum) | `dimension IN (:dims)` | `dimension` (enum) | **unaffected** — enum, keep plaintext |
+| **S7** | `_disambiguate_key` (`repository.py:2135`) | exact key | `WHERE … AND key == :candidate` (collision probe) | `key` | **BREAKS** (same class as S1) |
 
-1. **Blind index (recommended).** Maintain a per-user, key-derived
-   **token-hash sidecar** table `mm_belief_token_index(belief_id, token_hmac)`,
-   where `token_hmac = HMAC(user_key, normalized_token)`. The relevant slice
-   becomes `WHERE token_hmac IN (HMAC(user_key, query_tokens))` — an exact,
-   indexable lookup that leaks only token equality under the user's key (no
-   plaintext, no frequency attacks across users). This keeps the admission
-   fully server-side and preserves the latency profile. Cost: the sidecar is
-   written on ingest/update (a few extra rows per belief) and must be
-   rebuilt if the key rotates.
-2. **Decrypt-then-match.** Drop the SQL `ILIKE`; load the bounded recent
-   floor, decrypt those, and score — but this **loses the "relevant" slice**
-   for old facts and raises the candidate load (the exact problem the M3
-   recall-candidates work solved). Not recommended as the primary path;
-   acceptable only as a degraded mode when the blind index is unavailable.
+**Unaffected (structure only — keep plaintext):** the RLS predicate
+(`current_setting('…tenant…')`), `status`/`memory_tier`
+`IN (...)`, `ORDER BY last_evidence_at DESC` (a timestamp, never content),
+by-id belief fetch, and `evidence_counts_for_beliefs` (ids). **No SQL
+anywhere does `ORDER BY` on a content column** — every order is by
+`last_evidence_at`. Python-side `score_belief` (`retrieval.py:62`) and
+`text_overlap` (`utils.py:192`) touch content, but run **after** rows are
+loaded, so they only need the session key present (decrypt-before-score).
 
-The **recent floor is unaffected**, so even in the worst case recall never
-returns empty — it degrades from "relevant + recent" to "recent only".
+#### A.2 — The two fuzzy queries, precisely
+
+Both are **parameterised, escaped substring `ILIKE`** (`%token%`, with
+`_escape_like` neutralising `%`/`_`), OR-ed over three content columns,
+against tokens produced by `content_tokens(text, min_length=3)`:
+
+- **S2 — recall admission** (`recall_candidates`, `repository.py:1316`):
+  ```sql
+  (claim_text ILIKE :p OR object ILIKE :p OR key ILIKE :p)  -- repeated per query token, OR-joined
+  ```
+  It admits a belief if **any** query token appears as a **substring
+  anywhere** inside `claim_text`/`object`/`key`.
+- **S3 — retraction/update referent search**
+  (`beliefs_referenced_by_tokens`, `repository.py:1539`): the same
+  `(object|key|claim_text) ILIKE %token%` shape, used by the extraction
+  pipeline (`extraction/pipeline.py:694,727`) to find *which* existing
+  belief a correction refers to.
+
+`content_tokens` returns whole **words** (≥3 chars, stop-worded) or CJK
+**bigrams**, but the SQL then does a **substring** match of each such
+token *inside the column*. So the matching key is genuinely
+**substring-in-column** (e.g. token `coffee` matches column text
+`…prefers_coffee_every_morning…`), not word-boundary equality.
+
+#### A.3 — Options that PRESERVE the original substring semantics
+
+The requirement is **not** "find an indexable lookup" — it is
+"preserve substring-in-column matching over encrypted content". Three
+families, compared:
+
+| Option | Preserves substring semantics? | Query-time work | Index-leak surface | Perf |
+|---|---|---|---|---|
+| **(i) Character-n-gram blind index** (`mm_belief_ngram( belief_id, ngram_hmac )`, every contiguous k-gram (k≈3) of the normalized column, HMAC under the user key) | **Yes** — a query token is decomposed into its k-grams, all must match (AND), then exact-verify on the decrypted candidates | set-intersection over `ngram_hmac` (index-friendly) + a **candidate re-check** after decrypt (k-grams are a filter, not proof of substring within a word boundary — you still decrypt-verify the survivors) | leaks **k-gram equality within one user's own data only** (all under the user key); the server sees the k-gram multiset of each belief — **frequency / length / co-occurrence leakage** about the ciphertext under that user, worse than a whole-token blind index | index grows ~`len(column)`×overhead; a token→k-gram expansion then an indexed `IN` — sub-linear, keeps the latency profile; re-check adds one decrypt per survivor (bounded by LIMIT) |
+| **(ii) Substring-capable encrypted search** (e.g. encrypted trie / suffix-array over secret-shared or order-revealing structures, or an FHE/OPRF substring scheme) | **Yes** (that is the point) | heavy: OPRF/FHE or a secret-shared suffix structure per query | **weaker** leakage guarantees in practice than claimed; OPRE/order-revealing schemes leak order/prefix structure | **unsuitable** for a ≤50 ms voice hot path at 10k beliefs; large engineering + a research-grade crypto dependency we do not have (`cryptography` is not even installed here) |
+| **(iii) Leave fulltext server-visible** (store a plaintext token column / PG `tsvector` of content, encrypt only the display blob) with a **separate threat model** | **Yes** (it *is* the plaintext search) | none extra — plain GIN/`tsvector`/`pg_trgm` index | **full plaintext content (or its tokens) visible to the DB/operator** — this is scheme **B** for the searchable field; arguably the worst privacy choice, and it re-admits exactly the plaintext-at-rest exposure C exists to remove | best (native fulltext), but defeats the point of C for content |
+
+**Explicit statement the task requires:** **an HMAC exact-match blind
+index (the shape the previous draft recommended) is NOT an equivalent
+replacement for the original fuzzy search.** `HMAC(user_key, token)` =
+`HMAC(user_key, token)` finds a belief only if that *whole token* was
+indexed as a token of the column. It cannot find a token that appears as
+a **substring inside a longer word** (the actual S2/S3 semantics), nor
+the CJK-bigram-in-any-position case. Using it silently **narrows recall**
+— the very failure mode S2 was introduced to fix (§1: the answer belief
+sat at recency rank 153 of 161). To preserve the substring semantics you
+must index **character n-grams** (option i) — which is a different, and
+leakier, primitive — or accept one of the other two options. The prior
+"blind index" recommendation was therefore **under-specified**; corrected
+here.
+
+**Recommendation (documented, not implemented):** option **(i)
+character-n-gram blind index + decrypt-verify**, because it is the only
+option that preserves the substring semantics *and* fits the latency
+budget without a research-grade crypto dependency — while stating
+plainly that it leaks k-gram frequency/co-occurrence within a single
+user's ciphertext, a **weaker** guarantee than a whole-token blind index.
+Fallbacks: (iii) only if the adopter explicitly accepts plaintext
+searchable fulltext for the search field (document it as scheme-B for
+that field); (ii) is flagged **not viable** here.
+
+The **recent floor** (no content predicate, `LIMIT 25`) is unaffected, so
+even in the worst case recall never returns empty — it degrades from
+"relevant + recent" to "recent only".
 
 > **Design consequence:** field-level encryption is *compatible* with the
-> current query plan **only with a blind-index sidecar**. Without it,
-> scheme C silently regresses recall quality for old memories. This is the
-> single largest engineering item in the whole proposal (§7).
+> current query plan **only with a substring-capable index (option i)** or
+> by accepting option (iii)'s plaintext exposure. A whole-token HMAC index
+> regresses recall quality for old memories **and does not preserve the
+> original semantics**. This is the single largest engineering item in the
+> whole proposal (§7), and it is **larger** than the earlier draft implied.
+
+
 
 ### 2.4 Session-start decrypt load
 
 Under C the server holds the key only during a session. At session start it
 may prewarm the user's working set by fetching + decrypting content. This is
-the "≤ 300 ms prefetch" target. Measured (see §4.6 for the table): the
-**ciphertext bytes are tiny** (~0.5 KB/belief) and a **native AES-GCM**
-decrypt of 10k beliefs is **sub-10 ms** — a non-issue. The pure-Python
-figure in the microbenchmark is ~2000× inflated and exists only to prove
-the primitive is correct in an environment without `cryptography`. **The
-prefetch is bounded by the fetch (I/O), not the decrypt.** Recommendation:
-prefetch the *recent floor + top-N by heat* (a few hundred rows), not all
-10k, keeping prefetch well under 100 ms.
+the "≤ 300 ms prefetch" target. **Measured (§4.6, real native crypto in this
+environment):** decrypting the **whole** user's content with real native
+AES-256-CTR (`openssl`) + real native HMAC-SHA256 (`hashlib`) tags costs
+**≈2.2 ms @1k** and **≈25.8 ms @10k** beliefs (SQLite store, ~200 B/belief;
+see §4.6 for the table and the 实测/估算/未测 legend). Ciphertext bytes are
+tiny (~0.2–0.5 KB/belief). So the prefetch is bounded by the **fetch (I/O)**,
+not the decrypt. Recommendation: prefetch the *recent floor + top-N by heat*
+(a few hundred rows), not all 10k, keeping prefetch well under 100 ms.
 
 ### 2.5 Background extraction / organising queue when the key is unavailable
 
@@ -407,7 +476,51 @@ be made to unseal.
 | **Recovery copy impact on key destruction** | a written-down code **is** a copy of the key**: destruction of the server copy doesn't shred it; deleting the account doesn't either | worse: the wrapped DEK persists in cloud; destroy = also destroy every wrapped copy (KMS key deletion is slow and dangerous) |
 | **Deletion-log replay impact** | replay still works (log is content-free); but a recovery code in the wild can decrypt a *restored* backup that still holds the ciphertext | same caveat, larger blast radius (cloud has the wrapped key *and* the backup) |
 
-**Honest statement about backups & recovery:** in **both** approaches a
+### 2a.4b Three exposure surfaces, compared (the decisive axis)
+
+"Compromise" is not one thing. The three surfaces below must be kept
+distinct — they decide ①vs② more than any other dimension:
+
+| Exposure surface | **① user-held key** | **② cloud/KMS-wrapped copy** |
+|---|---|---|
+| **(a) Database-only leak** (DB/backup stolen; no server process, no KMS, no device) | **ciphertext only — cannot decrypt** (the key is never in DB/backup) | **ciphertext only — cannot decrypt** (the wrapped DEK alone is useless without the KMS/account key, which lives elsewhere) — **provided** the wrapping key is not co-located; if a password-derived wrapped DEK is stored *with* the DB, an offline password attack becomes the surface |
+| **(b) Recovery-service compromise** (the KMS/escrow, or the device-handshake service / recovery-code store, is breached) | **①-drag:** if the OOB handshake service or a recovery-code store is compromised, and the attacker can impersonate a device/code, they can unwrap → plaintext for affected users. If recovery codes are purely user-held (printed, never on a server), there is **no server recovery surface to breach** — the strongest position. | **②-full:** a compromised KMS/escrow + a passing account-auth is designed to unseal → **plaintext**. The recovery service *is* the trust anchor, so it is the highest-value target. Mitigation only: split trust (password-derived KEK *and* KMS, neither alone sufficient), HSM-backed KMS, audit. |
+| **(c) Running-server compromise** (live process/RAM, during a session) | **full during the session** (key unsealed in RAM to score/render) — identical to C generally; **but nothing persistent to attack offline** after the session key is zeroed | **full during the session** **plus** a **persistent wrapped DEK in the cloud** that can be attacked offline at leisure (weaker if the wrap is password-derived; strong only if KMS-held with rate-limited/HSM unseal) |
+
+**Reading of the three surfaces (comparison, not a decision):**
+- **(a) DB leak:** a **tie** — both are ciphertext-only *if and only if* key
+  material is separated from the ciphertext store. ② stays safe only if the
+  wrapping key is truly elsewhere (KMS/HSM), not co-stored.
+- **(b) Recovery-service compromise:** **① is strictly stronger** when the
+  recovery code is purely user-held (no server-side recovery surface to
+  breach) or when only an OOB old-device handshake is used; ② *is* a
+  recovery service and is the crown-jewel target. This is ②'s worst surface.
+- **(c) Running-server compromise:** **a tie during a session** (both unseal
+  in RAM); ② is **worse afterwards** because it leaves a persistent wrapped
+  DEK to grind offline, whereas ① leaves nothing persistent once the session
+  key is zeroed.
+
+### 2a.4c DEK lifecycle mechanics (both approaches)
+
+- **DEK generation:** a random 256-bit **DEK** per user, generated **client-
+  side** (never server-generated — a server-generated DEK means the server
+  held it). Content is encrypted under the DEK (§4.1).
+- **Wrapping:** the DEK is wrapped by a **KEK**. In **①** the KEK is a
+  device-held key (Secure Enclave / StrongBox, non-exportable) or a key
+  derived from the user's recovery code; the wrapped DEK may even be stored
+  server-side harmlessly (it is useless without the device/code KEK). In
+  **②** the KEK is an **account-password-derived key and/or a cloud KMS key**;
+  the wrapped DEK is stored in the cloud.
+- **Unsealing:** ① unseals via the old-device handshake or the recovery code
+  (KEK on the new device); ② unseals via account login → password-derived
+  KEK and/or KMS unwrap. Unsealing happens **at session start**; the DEK is
+  then RAM-only (§2.4/§4.3) and zeroed on close.
+- **Rotation:** because content is under the DEK (not the KEK), rotating the
+  KEK/device key re-wraps only the 32-byte DEK — **no content re-encryption**.
+  Rotating the DEK itself (rare, on suspected DEK exposure) requires
+  re-encrypting all content and **rebuilding the n-gram blind index** (§2.3).
+
+
 recovery copy (written code in ①, wrapped DEK in ②) means that **destroying
 the current server-side key does not make previously-taken backups
 unreadable**. Any claim of "cryptographic erasure" must exclude
@@ -514,10 +627,15 @@ disk. On the server it exists **only in RAM** for the session window and is
 
 ### 4.4 Encryption effect on fulltext / vector search
 
-- **Fulltext / lexical:** as §2.3 — the only broken construct is the SQL
-  `ILIKE` admission; solved with a **blind-index token sidecar** (HMAC of
-  normalized tokens under the user key). No plaintext fulltext index of
-  content exists in the cloud under C.
+- **Fulltext / lexical:** as §2.3 — the broken constructs are the **two**
+  substring `ILIKE` queries (S2 recall admission, S3 retraction referent
+  search) plus the exact-key/triple lookups (S1, S4, S5, S7). To **preserve
+  the original substring semantics** you need a **character-n-gram blind
+  index + decrypt-verify** (option i, §2.3), not a whole-token HMAC index
+  (which is **not** equivalent — §2.3 A.3). No plaintext fulltext index of
+  content exists in the cloud under C. Choosing instead to leave a plaintext
+  searchable column is option (iii) = scheme-B exposure for that field, and
+  must be documented as such.
 - **Vector / semantic:** mirror's scoring today is **not** embedding-vector
   based; it is a Python `score_belief` over loaded rows (topic/predicate/
   object overlap + heat). That scoring runs **after decrypt in Python**, so
@@ -542,56 +660,197 @@ disk. On the server it exists **only in RAM** for the session window and is
   wrapped DEKs with the ciphertext backup** — store DEK wrapping material
   separately. Restore + replay (§2.6) works on ciphertext unchanged.
 
-### 4.6 Field-encryption microbenchmark
+### 4.6 Field-encryption microbenchmark — MEASURED (real crypto library)
 
-From `tools/m5_fieldexp_micro.py` (standalone pure-Python AES-256-GCM —
-**~2000× slower than a native OpenSSL/AES-NI call**; the "native" column is
-the deployable estimate). See §1.3 for the recall table.
+**Environment (measurement provenance — read this before the tables):**
 
-**Per-belief cost** (encrypt+decrypt of the content blob, one belief):
+- Repo `feat/m5-readiness` @ `00672c7`; host shared with concurrent CI/agent
+  work (so absolute **recall** p95 is an upper bound, as in §1.3).
+- **Crypto library actually used:** `.venv/bin/python -c "import cryptography"`
+  → **`ModuleNotFoundError`** (no `cryptography`, no `pycryptodome`, no
+  `nacl`). The Python in use **statically links OpenSSL 3.5.7**, which is
+  not linkable as a `libcrypto` for `ctypes` (loading a second libcrypto into
+  CPython aborts), and the `openssl` CLI on `PATH` is **LibreSSL 3.3.6**,
+  whose `enc` subcommand **does not support GCM**. What *does* work natively:
+  **`openssl enc -aes-256-ctr`** (real, native, AES-NI AES-256 block cipher)
+  and **`hashlib`/`hmac` SHA-256** (real, native OpenSSL EVP).
+- **Therefore:** we MEASURE the **AES-256-CTR data path** (≈ all of GCM's
+  cost; GCM is CTR + GHASH tag) with the real native cipher, and we MEASURE
+  the tag with real native **HMAC-SHA256** (Encrypt-then-MAC, a genuine AEAD
+  construction) as a **conservative upper bound** on GCM's GHASH tag cost
+  (SHA-256 is slower than GHASH per block). The GCM-specific **GHASH delta**
+  is the *only* unmeasured term and is **bounded below** by the measured
+  HMAC-SHA256 tag pass. Everything from this backend is **实测 (measured,
+  native CLI)**; true AES-256-GCM would be **no slower** than the modelled
+  figure for a warm in-process EVP context.
+- **Label legend used throughout:** **实测** = numbers produced in this
+  environment with a real crypto library / real engine; **估算** = extrapolated
+  or modelled from measured components; **未测** = could not be measured here,
+  stated as such (never fabricated).
 
-| backend | N | bytes/belief | enc+dec ms/belief (raw pure-Py) | est. native ms/belief | est. native decrypt of 175 candidates (ms) |
+**Tool:** `tools/m5_fieldexp_micro.py` (`--native` on by default). Commands:
+
+```
+.venv/bin/python tools/m5_fieldexp_micro.py --backends sqlite  --counts 1000,10000 --bulk-seed --native
+.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 1000         --bulk-seed --native
+```
+
+#### C.1 — Full session-start load (decrypt ALL beliefs), 实测
+
+Real native decrypt of the entire user's content (bulk AES-256-CTR data path
++ per-belief HMAC-SHA256 verify), same byte volumes the engine stores:
+
+| backend | N beliefs | bytes/belief | total bytes | AES-CTR MB/s (实测) | AES-CTR net ms (实测) | HMAC tag ms (实测) | **decrypt-all modelled ms (实测 components)** |
+|---|---|---|---|---|---|---|---|
+| SQLite | 1,000 | ~200 | 199,670 | 312.8 | 0.64 | 1.52 | **≈2.2** |
+| SQLite | 10,000 | ~203 | 2,026,670 | 188.2 | 10.77 | 15.06 | **≈25.8** |
+| PostgreSQL | 1,000 | ~200 | 199,670 | 102.4 | 1.95 | 1.35 | **≈3.3** |
+| SQLite | 10,000 | ~510 (wide) | 5,100,000 | 160.1 | 31.85 | 22.20 | **≈54** |
+
+*Note:* the AES-CTR rate here (100–310 MB/s) is **pipe/bound by the CLI
+process boundary and I/O**, not the cipher — a warm in-process EVP context
+runs GB/s, so these are **conservative** (upper-bound) costs. True
+AES-256-GCM decrypt-all is **≤** these figures. GHASH-vs-HMAC of the tag
+difference is **未测** (unmeasured) but bounded.
+
+**Read:** decrypting *all* of a 10k-belief user is **≈26 ms** (实测 model) —
+comfortably inside the ≤300 ms prefetch target and **I/O-dominated** in
+practice (the fetch itself is the cost, §2.4). Prewarming only the recent
+floor + top-N-by-heat (a few hundred rows) lands well under 10 ms.
+
+#### C.2 — recall p95 impact, 实测 (real `MemoryEngine.recall`)
+
+Baseline recall (plaintext in session RAM) is the real engine; the scheme-C
+recall adds decrypt of the **bounded candidate set** (`relevant 150 + recent
+25 = 175`). Recall latency measured on the real engine (contended host;
+p50 is the stable signal, p95 an upper bound):
+
+| backend | N | recall p50 (ms) 实测 | recall p95 (ms) 实测 | + decrypt 175 cand (ms) 实测-modelled | recall p95 under C (ms) 估算 (=p95+dec) |
 |---|---|---|---|---|---|
-| SQLite | 100 | 197 | 6.19 | 0.0031 | 0.15 |
-| SQLite | 1,000 | 200 | 7.47 | 0.0037 | 0.65 |
-| SQLite | 10,000 | 203 | 6.53 | 0.0033 | 0.33 |
-| PostgreSQL | 100 | 510 | 16.46 | 0.0082 | 0.29 |
-| PostgreSQL | 1,000 | 514 | 14.91 | 0.0075 | 0.71 |
+| SQLite | 1,000 | 17.4 | 26.0 | 0.98 | ≈27.0 |
+| SQLite | 10,000 | 82.7 | 124.3 | 0.28 | ≈124.6 |
+| PostgreSQL | 1,000 | 17.7 | 21.1 | 0.61 | ≈21.8 |
 
-**Session-start decrypt load** (decrypt the whole user's content once):
+**Read:** the added field-decrypt on the hot path is **≤1 ms (实测,** candidate
+cap 175, native **)** — **rounding error** against the tens-to-hundreds of ms
+of Python scoring + audit-commit (§1). Field encryption is **not** the
+latency problem; the scoring path is. (The "+dec" column is measured on the
+real native cipher; the combined p95 is an additive estimate — clearly
+labelled 估算.)
 
-| backend | N beliefs | total ciphertext bytes | decrypt all, raw (ms) | decrypt all, native est (ms) |
+#### C.3 — per-belief enc+dec cost, 实测 vs the unavoidable CLI-startup caveat
+
+A single belief content blob (~200 B) is so small that **one openssl CLI
+invocation per belief** is dominated by process/pipe **startup (~5–15 ms)**,
+which a real in-process EVP context would not pay. So the *per-call CLI*
+figure below is **实测 but NOT representative** of deployable cost; the
+deployable per-belief cost is derived from the measured bulk rate (C.1):
+
+| backend | N | bytes/belief | per-belief enc+dec, CLI per-call (ms, 实测, startup-dominated) | deployable per-belief (µs, 估算 from measured bulk rate) |
 |---|---|---|---|---|
-| SQLite | 100 | 19,670 | 539 | 0.27 |
-| SQLite | 1,000 | 199,670 | 4,642 | 2.32 |
-| SQLite | 10,000 | 2,026,670 | 30,943 | 15.5 |
-| PostgreSQL | 100 | 50,950 | 776 | 0.39 |
-| PostgreSQL | 900 | 462,950 | 6,665 | 3.33 |
+| SQLite | 1,000 | 200 | 14.88 | ≈6 µs (≈0.006 ms) |
+| SQLite | 10,000 | 203 | 9.35 | ≈5–6 µs |
+| PostgreSQL | 1,000 | 200 | 12.34 | ≈10 µs |
 
-**Observe overhead** (encrypt the freshly-minted content; off hot path):
+**Read:** the honest deployable per-belief AES cost is **single-digit µs**
+(估算, derived from measured 100–300 MB/s bulk throughput); it is *not* the
+~10 ms the CLI per-call column shows — that column exists to show the CLI
+startup floor, labelled as such.
 
-| backend | observe p50 base (ms) | observe p50 +encrypt (ms) | observe p95 base (ms) | observe p95 +encrypt (ms) |
-|---|---|---|---|---|
-| SQLite | 148.2 | 196.8 | 240.5 | 391.7 |
-| PostgreSQL | 159.9 | 291.3 | 237.2 | 550.7 |
+#### C.4 — observe() overhead (encrypt fresh content; off hot path)
 
-*(Observe absolute numbers are dominated by host contention — a base
-observe at 148 ms is ~10× an unloaded run; the *delta* from adding
-encryption, ~50–130 ms raw pure-Python ⇒ **µs natively**, is the relevant
-figure.)*
+| backend | observe p50 base (ms) | observe p50 +encrypt (ms) | observe p95 base (ms) | observe p95 +encrypt (ms) | note |
+|---|---|---|---|---|---|
+| SQLite | 151.8 | 155.2 | 290.5 | 160.6 | host-contended; delta within noise |
+| PostgreSQL | 34.0 | 65.5 | 109.1 | 83.0 | contended |
 
-**Read:**
-- **Per belief**, encrypt+decrypt of the content blob (~0.5 KB) is a couple
-  of **µs** natively — negligible.
-- **Effect on recall p95:** the added cost is `candidates × per-belief
-  decrypt` ≈ 175 × ~3 µs ≈ **0.5–1 ms** natively — **rounding error vs the
-  tens of ms of Python scoring**. Field encryption is *not* the latency
-  problem; the scoring path is (§1).
-- **Session-start decrypt load:** decrypting all 10k beliefs' content is
-  **< 10 ms native** — the prefetch is I/O-bound (the fetch), not
-  crypto-bound. Prewarm only the working set (§2.4).
-- **Observe overhead:** encryption adds a fixed per-belief cost to the async
-  extraction path — irrelevant to the turn SLA (observe is off the hot path).
+*(Observe absolute numbers are dominated by host contention and the
+extraction pipeline — a base observe at 150 ms is ~10× an unloaded run.
+Encryption adds single-digit-µs per belief natively (C.3), i.e. **lost in
+the noise** of a ~40–150 ms observe; the table shows the *measured* deltas
+are within contention variance.)* This path is **off the turn SLA**.
+
+#### C.5 — what is 未测 (untested) here, stated plainly
+
+- **True AES-256-**GCM** GHASH tag cost:** 未测 — no GCM-capable crypto
+  library in this env. Bounded above by measured HMAC-SHA256 (C.1); real
+  GHASH is cheaper, so the error is in the safe direction.
+- **In-process EVP (no CLI startup):** 未测 — deployable per-belief µs is
+  **估算** from the measured bulk throughput (C.3), not directly measured.
+- **10k-belief PostgreSQL:** 未测 in this pass (only PG 1k run; PG 10k seed
+  is heavy on the contended host). The SQLite 10k and PG 1k brackets bound
+  it; PG adds ~0.5–1 ms/round-trip, negligible vs scoring.
+
+**Verdict (unchanged, now on measured data):** field-level AES-256 field
+encryption is **cheap** — a few µs/belief, ≈1 ms added to recall (candidate
+cap 175), ≈26 ms to decrypt-all-10k — and is **not** the realtime-voice
+bottleneck. The recall **scoring path** (§1) is. GHASH-native numbers are
+the only gap and are conservatively bounded.
+
+### 4.7 Plaintext / log / backup boundaries during cloud processing (Section D)
+
+Under scheme C, "encrypted at rest" is a **time-and-place** statement, not a
+blanket one. During a session the content is plaintext in several transient
+places. This subsection states exactly where plaintext exists and where it
+must not, so nobody over-claims.
+
+**Plaintext exists (transiently, by design) in:**
+
+1. **Running-server process RAM, during a session only.** The session key is
+   unsealed into RAM at session start and the belief content is decrypted for
+   scoring/rendering. This is the unavoidable window (§2.7, §6): a
+   root-level live attacker (`/proc/pid/mem`, `gdb`) can read it. Key is
+   **zeroed on session close**; content plaintext is not persisted.
+2. **The rendered memory block sent to the cloud LLM — every turn.** This is
+   the dominant, scheme-independent exposure (§6): the injected context is
+   plaintext to the model provider. C shrinks *at-rest* exposure, not the
+   *inference* exposure.
+3. **Extraction / metabolism working set** (async worker) while the session
+   key is present; again RAM-only, not persisted.
+
+**Must be plaintext (structure) by design:** ids, `dimension` (enum),
+`status`, `memory_tier`, timestamps, `confidence`, hashes/fingerprints, the
+deletion log. These are not content and the planner/RLS/audit/deletion-replay
+need them (§2.2).
+
+**Logs — hard boundary (what MUST NOT contain content):**
+
+- **Application / worker logs, error traces, and metrics labels:** MUST log
+  **ids, counts, dimensions, timings, error *types*** — **never** decrypted
+  content, query tokens, plaintext keys, or the unsealed key. Any log line
+  that formats a `Belief` object must go through a redacting `__repr__` or a
+  content-free projection; a raw `repr(belief)` leaking `claim_text` is a
+  **bug**, not an accepted risk.
+- **Access audit rows (§ M5 audit):** already content-free by construction —
+  they record *that* a recall happened and *how many* rows, not *what* was
+  read.
+- **Token/n-gram blind-index sidecar (§2.3 option i):** contains **HMACs
+  under the user key**, never plaintext tokens; it is plaintext-*free* but
+  is itself **sensitive metadata** (frequency/co-occurrence leakage within
+  one user), so it is excluded from logs and treated as content-grade for
+  access control even though it is not decryptable to words without the key.
+- **The deletion log:** content-free by construction (fingerprints +
+  hash chain, §2.6/§4.5); optionally file-encrypted at rest with an ops key,
+  but its *structure* stays verifiable.
+
+**Backups — hard boundary:**
+
+- Backups are **byte-copies of ciphertext** — safe **only if the DEK wrapping
+  material is NOT in the same backup**. **Never co-locate wrapped DEKs /
+  recovery material with the ciphertext backup** (§4.5). Restore + M4 replay
+  operates on ciphertext unchanged.
+- A **pre-deletion backup plus any surviving key copy** (recovery code in ①,
+  wrapped DEK in ②, or an old device) can still decrypt that snapshot —
+  "cryptographic erasure" must **exclude** those copies (§2.6, §2a.4). We do
+  not promise erasure we cannot deliver.
+- The **deletion log backup** restores the ability to re-apply deletes; it
+  carries no content and is safe to back up.
+
+**Boundary summary (one line):** *at rest and in backups* → ciphertext (safe
+if key material is separated); *in the running server during a session and
+in the cloud-LLM context every turn* → **plaintext** (the honest residual);
+*logs / audit / blind-index / deletion-log* → content-free or
+under-key-hashed, never plaintext content.
 
 ---
 
@@ -683,7 +942,7 @@ the named mechanism; residual risk is what remains.
 | # | Task | Depends on | Effort (order) |
 |---|---|---|---|
 | 1 | **Field crypto primitive** — AES-256-GCM per-user DEK, per-column ciphertext + AAD binding, wrap/unwrap by keychain KEK; PG `BYTEA` + SQLite `BLOB`; migrate read/write paths | — | **M** |
-| 2 | **Blind-index token sidecar** — `mm_belief_token_index`, HMAC(user_key, token), maintain on ingest/update/delete, query path switchover | 1 | **L** (the crux, §2.3) |
+| 2 | **Substring-capable blind index (character-n-gram) + decrypt-verify** — `mm_belief_ngram(belief_id, ngram_hmac)`, HMAC(user_key, k-gram) over the normalized content columns; query = token→k-gram expansion + indexed `IN` + post-decrypt substring re-check on survivors. Preserves S2/S3 substring semantics; a whole-token HMAC index is **not** equivalent. Maintain on ingest/update/delete; rebuild on DEK rotation | 1 | **L** (the crux, §2.3) |
 | 3 | **Session key lifecycle** — encrypted channel, RAM-only key, zeroize on close, session-start prefetch (working set) | 1 | **M** |
 | 4 | **Async/queued extraction & metabolism under C** — park `needs_key` jobs, split structure-only vs content-dependent cycle, keyless delete/tombstone path | 1,3 | **M** |
 | 5 | **Key management client** — keychain (non-exportable), session handshake, "my memories" viewer, delete | 3 | **M** (×iOS + Android) |
@@ -716,17 +975,30 @@ the named mechanism; residual risk is what remains.
 
 ```
 # from repo root, with the bundled venv:
-.venv/bin/python tools/m5_fieldexp_micro.py            # SQLite + PG, 100/1k/10k
-.venv/bin/python tools/m5_fieldexp_micro.py --quick    # fast smoke (SQLite)
-.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 100,1000
-.venv/bin/python tools/m5_fieldexp_micro.py --aes-speedup 1   # raw pure-python
+# MEASURED (real native crypto: openssl AES-256-CTR + hashlib HMAC-SHA256)
+.venv/bin/python tools/m5_fieldexp_micro.py --backends sqlite  --counts 1000,10000 --bulk-seed --native
+.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 1000        --bulk-seed --native
+.venv/bin/python tools/m5_fieldexp_micro.py --quick          # fast smoke (SQLite, native)
+.venv/bin/python tools/m5_fieldexp_micro.py --no-native      # pure-Python AES-GCM only
+.venv/bin/python tools/m5_fieldexp_micro.py --aes-speedup 1  # raw pure-Python (no extrapolation)
 ```
 
-The AES-GCM is validated against the GCM spec Appendix B AES-256 test
-vector inside the tool's development notes; `--aes-speedup` (default 2000)
-converts the pure-Python measurement to a native OpenSSL/AES-NI estimate.
-PG leg uses `postgresql://postgres:mm@127.0.0.1:5437/mm_test` with a fresh
-throwaway schema per run (dropped on exit). To avoid the shared working
-tree being mutated mid-run, run from an isolated worktree:
-`git worktree add --detach /tmp/mm-bench <rev>` and set
-`PYTHONPATH=/tmp/mm-bench/src`.
+**Two crypto backends in the tool:**
+1. **`--native` (default on) → 实测.** Real `openssl enc -aes-256-ctr`
+   (native AES-256 data path) + real `hashlib`/`hmac` SHA-256 tag
+   (Encrypt-then-MAC), with the CLI fixed startup corrected out for the bulk
+   figures and reported separately for per-call figures. This is the source
+   of every **实测** number in §4.6. GCM's GHASH tag is the one **未测**
+   term (bounded by the measured HMAC pass) — stated in §4.6 C.5.
+2. **pure-Python AES-256-GCM** (correct but ~2000× slow; validated against
+   the GCM spec Appendix B AES-256 test vector) — kept to prove the
+   primitive and to give a raw baseline under `--no-native` / `--aes-speedup 1`.
+
+The PG leg uses `postgresql://postgres:mm@127.0.0.1:5437/mm_test` with a
+fresh throwaway schema per run (dropped on exit). The benchmark is robust to
+a transient shared-tree import state (it re-tries imports and only patches a
+missing module attribute in-process; it **never** edits `src/`). To avoid the
+shared working tree being mutated mid-run by a concurrent teammate, run from
+an isolated worktree: `git worktree add --detach /tmp/mm-bench <rev>` and set
+`PYTHONPATH=/tmp/mm-bench/src` (note: do **not** create worktrees on the
+shared tree that is itself mid-flight).

@@ -62,7 +62,10 @@ from pathlib import Path
 REVS: dict[str, str] = {"M2": "403f38d", "M3": "aed0639", "M4": "d61e7b7"}
 REV_ORDER = ("M2", "M3", "M4")
 LONGRUN = "tests/test_longrun_bench.py"
-EXPECTED_TESTS = 18             # tests/test_longrun_bench.py has 18 tests
+EXPECTED_TESTS = 18             # full file: tests/test_longrun_bench.py has 18 tests
+#: When MEASURE_TEST is a single test id, a leg is valid iff 1 test passes.
+def _expected_tests() -> int:
+    return EXPECTED_TESTS if os.environ.get("MEASURE_TEST", "single") == "all" else 1
 SHORT = {"M2": "403", "M3": "aed", "M4": "d61"}
 WT_ROOT = Path("/tmp")
 WT = {label: WT_ROOT / f"mm-perf-{SHORT[label]}" for label in REV_ORDER}
@@ -144,7 +147,16 @@ def junit_counts(path: Path) -> dict[str, int]:
 
 def _run_pytest(wt: Path, env: dict[str, str], junit: Path, out: Path,
                 extra_args: list[str] | None = None) -> float:
-    cmd = [_PY, "-m", "pytest", LONGRUN, "-q", "-p", "no:cacheprovider",
+    # MEASURE_TEST (env) selects a representative subset instead of the full
+    # 18-test file: the full file runs the longrun scenario ~18x, which is
+    # fine on a quiet runner but multiplies wall time by 18 on a contended
+    # workstation.  ``test_year_survives_and_reports`` runs ONE full scenario
+    # and is what the statements/profile passes use, so it is the faithful
+    # unit for a wall-clock comparison.  Set MEASURE_TEST=all for the whole
+    # file (the CI-shaped run).
+    target = os.environ.get("MEASURE_TEST", "tests/test_longrun_bench.py::TestLongRun::test_year_survives_and_reports")
+    want = LONGRUN if target == "all" else target
+    cmd = [_PY, "-m", "pytest", want, "-q", "-p", "no:cacheprovider",
            f"--junitxml={junit}", *(extra_args or [])]
     start = time.monotonic()
     with open(out, "w", encoding="utf-8") as fh:
@@ -160,23 +172,32 @@ def _run_pytest(wt: Path, env: dict[str, str], junit: Path, out: Path,
 def cmd_measure(rounds: int, work: Path) -> dict:
     work.mkdir(parents=True, exist_ok=True)
     ensure_worktrees()
-    report: dict = {"mode": "A", "expected_tests": EXPECTED_TESTS, "rounds": []}
+    report: dict = {"mode": "A", "expected_tests": _expected_tests(), "order": "balanced/rotated",
+                    "rounds": []}
+    base_order = list(REV_ORDER)
     for r in range(1, rounds + 1):
-        row: dict = {}
-        for label in REV_ORDER:
+        # BALANCED / ROTATED order: shift the base order by (r-1) so each
+        # revision occupies a different POSITION each round.  This removes the
+        # last-run/position bias a fixed M2->M3->M4 order injects on a shared
+        # (contended) machine.
+        shift = (r - 1) % len(base_order)
+        order = base_order[shift:] + base_order[:shift]
+        row: dict = {"order": order}
+        for label in order:
             wt = WT[label]
             junit = work / f"measure_{label}_r{r}.xml"
             out = work / f"measure_{label}_r{r}.txt"
             secs = _run_pytest(wt, mode_env(wt), junit, out)
             counts = junit_counts(junit)
-            valid = counts["failed"] == 0 and counts["errors"] == 0 and counts["passed"] == EXPECTED_TESTS
-            row[label] = {"rev": REVS[label], "secs": round(secs, 1), **counts, "valid": valid}
-            print(f"round {r} {label} ({REVS[label]}): {row[label]['secs']}s "
-                  f"passed={counts['passed']} failed={counts['failed']} "
+            valid = counts["failed"] == 0 and counts["errors"] == 0 and counts["passed"] == _expected_tests()
+            row[label] = {"rev": REVS[label], "secs": round(secs, 1), "position": order.index(label),
+                          **counts, "valid": valid}
+            print(f"round {r} {label} ({REVS[label]}) [pos {order.index(label)}]: "
+                  f"{row[label]['secs']}s passed={counts['passed']} failed={counts['failed']} "
                   f"errors={counts['errors']} {'VALID' if valid else 'INVALID'}", flush=True)
         row["valid"] = all(row[t]["valid"] for t in REV_ORDER)
         report["rounds"].append(row)
-        print(f"round {r}: {'VALID' if row['valid'] else 'INVALID'}\n", flush=True)
+        print(f"round {r} order={order}: {'VALID' if row['valid'] else 'INVALID'}\n", flush=True)
     report["stats"] = _stats(report["rounds"])
     (work / "measure.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     _print_stats(report["stats"])

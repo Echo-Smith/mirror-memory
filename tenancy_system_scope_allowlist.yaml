@@ -132,12 +132,16 @@
   reviewed_at: "2026-11-04"
 
 - module: mirror_memory.core.metrics
-  function: storage_stats
+  function: storage_stats_all_tenants
   reason: >
-    M5 task 2: on-demand per-user storage report (row counts + estimated
-    bytes per mm_* table).  There is no request tenant to scope to -- it is
-    an admin/worker-only aggregate that GROUP BYs user_id across all
-    tenants.  NOT called from any request path; the returned user ids never
-    reach Prometheus.  New in this batch -- pending Echo-Smith review.
+    M5 §1: privileged ALL-TENANT storage capacity report (row counts +
+    estimated bytes per mm_* table, grouped by tenant+user).  Crosses tenants
+    BY DESIGN.  The ordinary per-tenant report is metrics.storage_stats, which
+    applies an EXPLICIT tenant filter and uses NO bypass.  This function runs
+    under system_scope only to satisfy the SQL auditor for an unpredicated
+    aggregate; it does NOT elevate DB privileges -- on PG+RLS the caller must
+    pass the maintenance/owner engine for a true all-tenant view (the app
+    engine only returns the RLS-filtered view).  Never on a request path; user
+    ids never reach Prometheus.  New in this batch -- pending Echo-Smith review.
   reviewer: Echo-Smith
   reviewed_at: "PENDING (M5 review)"
