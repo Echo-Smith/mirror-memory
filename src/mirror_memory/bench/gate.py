@@ -250,6 +250,42 @@ def evaluate_tracks(report: Any, *, thresholds: Mapping[str, float] | None = Non
     return verdicts
 
 
+def evaluate_production_track(production_report: Any) -> TrackVerdict:
+    """Four-state verdict for a *production* run's execution integrity.
+
+    Production is measured as configured, so a throttled run (some turns do not
+    fire K2) is the EXPECTED truthful state and is not an integrity error.  But
+    a real LLM call failure -- K2 failures, or zero calls when turns exist and a
+    client was supplied -- means the measured numbers came from the K1 fallback,
+    not the model.  That must be surfaced as ``error`` (never ``pass``, never a
+    silent ``not_run``) so it cannot be read as a clean production measurement.
+
+    A clean production run is ``pass`` (it ran truthfully).  Its actual scores
+    are compared to forced through the gap check, not this verdict.
+    """
+    health = _field(production_report, "extraction_health") or {}
+    attempts = health.get("k2_attempts")
+    failures = health.get("k2_failures") or 0
+    expected_turns = health.get("dataset_turns")
+    if failures:
+        return TrackVerdict(
+            track="production", state=TRACK_ERROR,
+            reason=f"{failures} production K2 call(s) failed -- measurement would be K1 fallback",
+            error=f"{failures} failed K2 calls",
+        )
+    if attempts == 0 and (expected_turns or 0) > 0:
+        return TrackVerdict(
+            track="production", state=TRACK_ERROR,
+            reason="production made zero K2 calls for a non-empty run -- measurement would be K1 fallback",
+            error="zero K2 calls",
+        )
+    return TrackVerdict(
+        track="production", state=TRACK_PASS,
+        score=_score(_track(production_report, "state")),
+        reason="",
+    )
+
+
 def check_release_gate(
     report: Any,
     *,
@@ -444,11 +480,18 @@ def check_release_gate(
         # Production comparison — evaluated independently of the forced track's
         # own pass/fail.  A production error/not_run must be visible but must
         # not erase the forced track's already-computed result.
-        production_verdict = tracks.get("production")
         if production_report is None:
             checks.append(_unevaluated("production_gap", GATE_PRODUCTION_GAP, at_least=False))
             failures.append("production gap not evaluated")
         else:
+            # Record the production track's own four-state verdict (execution
+            # integrity).  A real call failure or a zero-call run is `error`,
+            # never a pass; it is surfaced here and does NOT touch the forced
+            # verdict that was computed above.
+            prod_verdict = evaluate_production_track(production_report)
+            tracks.setdefault("production", prod_verdict)
+            if prod_verdict.state == TRACK_ERROR:
+                failures.append(f"production track error: {prod_verdict.error or prod_verdict.reason}")
             try:
                 gap = compare_forced_production(report, production_report)
             except ValueError as exc:
@@ -556,5 +599,6 @@ __all__ = [
     "TrackVerdict",
     "check_release_gate",
     "compare_forced_production",
+    "evaluate_production_track",
     "evaluate_tracks",
 ]

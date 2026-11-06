@@ -347,7 +347,22 @@ def _claim_and_process(session_factory: object, job: EvolutionJob, config: Memor
             job_row = session.get(EvolutionJob, job.id)
             if job_row is None:
                 return
-            _process_single_job(session, job_row, config, token)
+            # M5 §3: measure the REAL extraction task (one claimed job), with
+            # the entry scope open so its SQL and LLM usage are attributed.
+            from mirror_memory.core import metrics as _metrics
+
+            _started = time.monotonic()
+            with _metrics.entry_scope(
+                _metrics.ENTRY_EXTRACTION_WORKER,
+                engine=getattr(session.get_bind(), "engine", session.get_bind()),
+            ):
+                try:
+                    _process_single_job(session, job_row, config, token)
+                finally:
+                    _metrics.observe_latency(
+                        _metrics.ENTRY_EXTRACTION_WORKER,
+                        (time.monotonic() - _started) * 1000.0,
+                    )
         finally:
             session.close()
 
@@ -937,17 +952,16 @@ def _formulate(
     )
 
     user_content = f"[Beliefs]\n{beliefs_text or '(none yet)'}"
-    from mirror_memory.core import metrics as _metrics
 
     try:
+        # The client is instrumented once by ``evolution_worker``; the proxy
+        # books the call (and its usage / failure) under the extraction-worker
+        # entry, so no explicit counting is needed here.
         raw = llm.generate(
             system_prompt=system_prompt,
             payload_text=user_content,
         )
-        # M5 task 2: attribute this call to the extraction-worker entry.
-        _metrics.record_llm(_metrics.ENTRY_EXTRACTION_WORKER)
     except Exception:
-        _metrics.record_llm(_metrics.ENTRY_EXTRACTION_WORKER)
         logger.warning("evolution: formulate LLM call failed")
         return {"patterns": [], "support_policy": {}}
 
@@ -1069,6 +1083,18 @@ async def evolution_worker(
         The ``MemoryConfig`` providing session factory and worker
         parameters.
     """
+    # M5 §3: instrument the worker's LLM client ONCE (idempotent) so every
+    # ``generate()`` it makes is booked -- with usage classification and
+    # chained to any host callback -- under the extraction-worker entry.
+    from mirror_memory.core import metrics as _boot_metrics
+
+    if getattr(config, "llm_client", None) is not None:
+        try:
+            instrumented = _boot_metrics.instrument_llm_client(config.llm_client)
+            if instrumented is not config.llm_client:
+                config.llm_client = instrumented
+        except Exception:  # observability never breaks the worker
+            pass
     session_factory = config.session_factory
     poll_interval = config.worker.poll_interval_seconds
     # audit-retention maintenance and the deletion-log compaction run on
@@ -1081,20 +1107,14 @@ async def evolution_worker(
         purge_expired_audit,
     )
 
-    from mirror_memory.core import metrics as _metrics
-
     while not stop.is_set():
-        _tick_started = time.monotonic()
         try:
             await asyncio.to_thread(process_pending, session_factory, config)
         except Exception:
             logger.warning("evolution: worker will retry on next tick", exc_info=True)
-        finally:
-            # M5 task 2: the background-extraction tick is a latency entry.
-            _metrics.observe_latency(
-                _metrics.ENTRY_EXTRACTION_WORKER,
-                (time.monotonic() - _tick_started) * 1000.0,
-            )
+        # NOTE (M5 §3): the extraction entry is measured PER REAL JOB in
+        # ``_claim_and_process`` -- an idle tick that claimed nothing is not
+        # extraction work and must not enter the histogram.
         if next_due(compaction_state, config,
                     interval_seconds=config.deletion_log.prune_interval_seconds):
             try:

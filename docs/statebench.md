@@ -241,17 +241,28 @@ The runner loads `statebench_v1_1.json` (`statebench_v1_1_path()`), whose in-fil
 runner. The report carries `dataset_version`; the summary prints it explicitly
 so v1 and v1.1 results are never conflated.
 
-### Artifacts (four distinct, non-overwriting paths)
+### Artifacts (distinct, non-overwriting paths)
 
-The CI helper writes — and the workflow uploads — four separate artifacts, never
-overwriting one file with another:
+The CI helper writes — and the workflow uploads — the following files. No path
+overlaps another, so a failed track can never erase a completed one's evidence.
+`forced` and `production` are saved **separately**, each with its **own**
+manifest:
 
 | artifact | contents |
 |---|---|
-| `statebench-gate.json` | raw per-case report (every case's track outcomes) |
-| `statebench-gate.manifest.json` | commit, dataset SHA-256, config/prompt hashes, model |
-| `statebench-gate.verdict.json` | gate verdict + per-check table + four-state per track |
+| `statebench-gate.json` | raw per-case report of the gate subject (the deterministic base run, or the forced run when it succeeded) |
+| `statebench-gate.manifest.json` | commit, dataset SHA-256 + dataset_version, config/prompt hashes, model |
+| `statebench-gate.forced.json` | **forced** run raw per-case report (only when the LLM tracks ran) |
+| `statebench-gate.forced.manifest.json` | forced run's own provenance manifest |
+| `statebench-gate.production.json` | **production** run raw per-case report (only when the LLM tracks ran) |
+| `statebench-gate.production.manifest.json` | production run's own provenance manifest |
+| `statebench-gate.verdict.json` | gate verdict + per-check table + four-state verdict per track |
 | `statebench-gate-summary.md` | Markdown summary (first line `PASS:` / `FAIL:`) |
+
+A forced-track failure or error does **not** discard the production run's output,
+and a production failure does **not** discard the forced run's output: both are
+written before the gate is evaluated, and the failure is reported as that
+track's `error` in the verdict.
 
 Read the run in `$GITHUB_STEP_SUMMARY`:
 

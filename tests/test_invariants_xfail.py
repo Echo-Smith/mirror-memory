@@ -5,26 +5,31 @@ Context: the six runtime invariants I1–I6 are defined in
 test code) lives in ``docs/invariants.md``.
 
 **I4 (v2 wording).**  *The same ``source_event_id`` is globally unique within
-one scope (idempotency).*  v2 enforces this with a ``source_event_id`` column
-plus a claim-time ``UNIQUE`` constraint.
+one scope (idempotency).*  v2 enforces this at **CLAIM time** with a
+``source_event_id`` column plus a claim-time ``UNIQUE`` constraint.  ``Scope``
+is the trusted ``(tenant_id, app_id, subject_id)`` triple; ``source_event_id``
+is the caller's event identifier, written when the event is claimed.
 
-**What v1 actually has.**  v1 has **no** ``source_event_id`` column and no
-claim-time constraint on that name.  It achieves the *same behavioural
-guarantee* at the ingestion layer instead:
+**What v1 actually has — and where it falls short.**  v1 has **no**
+``source_event_id`` column and **no claim phase** for evidence.  Its closest
+analogue is ``mm_evidence.ref`` (the caller's source identifier, e.g. the
+pipeline's ``evidence_message_ids``) protected by
+``uq_mm_evidence_user_ref`` = UNIQUE(tenant_id, app_id, user_id, ref) with
+``record_evidence`` idempotent on ``(user_id, ref)``.  That gives:
 
-* ``mm_evidence.ref`` is the caller's identifier for the source (message id,
-  document path, event id) and is protected by a real database constraint,
-  ``uq_mm_evidence_user_ref`` = UNIQUE(tenant_id, app_id, user_id, ref);
-  ``record_evidence`` is idempotent on ``(user_id, ref)`` — re-observing the
-  same source returns the existing row, never a duplicate.  That is
-  scope-relative global uniqueness of a source identifier, i.e. I4's shape.
-* publish-time idempotency is additionally enforced by
-  ``mm_proposal_log.proposal_id`` (UNIQUE) and
-  ``mm_evolution_jobs`` UNIQUE(tenant_id, app_id, idempotency_key).
+* **serial** idempotency — equivalent (a repeat ``ref`` returns the same row);
+* **concurrent** ingestion — the DB constraint still yields exactly ONE row,
+  but ``record_evidence`` is a read-then-write (not an atomic upsert), so a
+  racing caller can lose on the constraint (``IntegrityError``) instead of
+  receiving the shared row.  **Partially equivalent** (result preserved,
+  graceful-dedup semantics not).
+* **scope** isolation — equivalent (per ``(tenant, app, user)``; no cross-user
+  or cross-tenant collision/leak).
 
-So the *behaviour* is present (and a real dual-leg test asserts it — see
-``tests/test_invariant_mapping.py::test_i4_v1_equivalent_source_ref_uniqueness``);
-only the *literal v2 column name/site* is missing.
+So I4's *behaviour is only partially present*, and its *literal claim-time
+``source_event_id`` shape is entirely absent*.  The dual-leg / concurrent /
+scope tests that pin the partial equivalence live in
+``tests/test_invariant_mapping.py``.
 
 **This file** holds the strict-xfail guard for the literal v2 shape.  It is
 CONDITIONAL: it asserts the v2 property **only through the mechanism v1 would
@@ -34,7 +39,8 @@ appears, the body passes and strict mode reports **XPASS** (a failure), forcing
 the mapping to be updated instead of silently drifting.  While the column is
 absent the body fails, so strict mode reports **XFAIL**.  There is deliberately
 **no unconditional ``pytest.fail``** — the pass/fail decision comes from the
-real assertion, not a hard-coded fail.
+real assertion, not a hard-coded fail.  A non-``source_event_id`` column or an
+unrelated unique constraint is NOT accepted as proof.
 """
 
 from __future__ import annotations
@@ -72,11 +78,12 @@ def _source_event_id_uniqueness_enforced() -> tuple[bool, str]:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "I4 in v2 shape (a unique source_event_id column) is not implemented in "
-        "v1; v1 carries the EQUIVALENT guarantee on mm_evidence.ref "
-        "(uq_mm_evidence_user_ref) and on proposal_id/idempotency_key. If the "
-        "source_event_id column ever gains in-scope uniqueness this body passes "
-        "-> XPASS -> failure, forcing docs/invariants.md to be updated."
+        "I4 in v2 shape (a claim-time-unique source_event_id column) is not "
+        "implemented in v1; v1 only PARTIALLY covers it via mm_evidence.ref "
+        "(uq_mm_evidence_user_ref) + serial/concurrent/scope tests in "
+        "test_invariant_mapping.py. If a source_event_id column ever gains "
+        "in-scope uniqueness this body passes -> XPASS -> failure, forcing "
+        "docs/invariants.md to be updated."
     ),
 )
 def test_i4_source_event_id_global_uniqueness():

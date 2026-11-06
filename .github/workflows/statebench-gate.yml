@@ -9,11 +9,20 @@ name: statebench-gate
 # job itself still concludes success because the gate step is
 # continue-on-error and the job is not a required check.
 #
-# Four distinct, non-overwriting artifacts are produced and uploaded:
-#   artifacts/statebench-gate.json           raw per-case report
-#   artifacts/statebench-gate.manifest.json  commit, dataset sha, config hashes, model
-#   artifacts/statebench-gate.verdict.json   gate verdict + per-check + four-state tracks
-#   artifacts/statebench-gate-summary.md     Markdown summary (first line PASS:/FAIL:)
+# Distinct, non-overwriting artifacts are produced and uploaded:
+#   artifacts/statebench-gate.json             raw per-case report (gate subject)
+#   artifacts/statebench-gate.manifest.json    commit, dataset sha, config hashes, model
+#   artifacts/statebench-gate.forced.json      FORCED run raw report (separate)
+#   artifacts/statebench-gate.forced.manifest.json   forced provenance manifest
+#   artifacts/statebench-gate.production.json  PRODUCTION run raw report (separate)
+#   artifacts/statebench-gate.production.manifest.json  production provenance manifest
+#   artifacts/statebench-gate.verdict.json     gate verdict + per-check + four-state tracks
+#   artifacts/statebench-gate-summary.md       Markdown summary (first line PASS:/FAIL:)
+#
+# Forced and production are always written to their own report+manifest pair so
+# a failure in one can never erase the other's evidence.  The production run
+# keeps its ACTUAL throttled coverage/extraction-health (it is never required to
+# attempt every turn); only forced must prove an every-turn K2 attempt.
 #
 # LLM tracks (forced extraction + answerer) run ONLY when the MM_LLM_API_KEY
 # secret is present.  When it is absent those tracks are recorded as `not_run`,
@@ -119,12 +128,16 @@ jobs:
           errors = [n for n, v in tracks.items() if v.get("state") == "error"]
           if errors:
               print("INFRASTRUCTURE ERROR in track(s):", ", ".join(errors))
+          for key in ("report", "manifest", "forced_report", "forced_manifest",
+                      "production_report", "production_manifest"):
+              if d.get(key):
+                  print(f"{key}: {d[key]}")
           PY
           else
             echo "gate verdict: FAIL (no verdict JSON produced)"
           fi
 
-      - name: Upload raw report + manifest
+      - name: Upload raw report + manifest (forced & production saved separately)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -132,6 +145,10 @@ jobs:
           path: |
             artifacts/statebench-gate.json
             artifacts/statebench-gate.manifest.json
+            artifacts/statebench-gate.forced.json
+            artifacts/statebench-gate.forced.manifest.json
+            artifacts/statebench-gate.production.json
+            artifacts/statebench-gate.production.manifest.json
           if-no-files-found: warn
 
       - name: Upload gate verdict

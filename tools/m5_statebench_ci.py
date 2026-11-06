@@ -229,12 +229,23 @@ def render_summary(
 
 
 def _paths(output: Path) -> dict[str, Path]:
-    """Distinct, non-overwriting artifact paths derived from one output stem."""
+    """Distinct, non-overwriting artifact paths derived from one output stem.
+
+    Forced and production reports are saved SEPARATELY, each with its own
+    manifest, plus the gate verdict and the summary.  No path overlaps another,
+    so a failed track can never erase a completed one's files.
+    """
+    stem = output.stem
+    parent = output.parent
     return {
         "report": output,
-        "manifest": output.with_name(f"{output.stem}.manifest.json"),
-        "verdict": output.with_name(f"{output.stem}.verdict.json"),
-        "summary": output.with_name(f"{output.stem}.summary.md"),
+        "manifest": output.with_name(f"{stem}.manifest.json"),
+        "forced_report": parent / f"{stem}.forced.json",
+        "forced_manifest": parent / f"{stem}.forced.manifest.json",
+        "production_report": parent / f"{stem}.production.json",
+        "production_manifest": parent / f"{stem}.production.manifest.json",
+        "verdict": output.with_name(f"{stem}.verdict.json"),
+        "summary": output.with_name(f"{stem}.summary.md"),
     }
 
 
@@ -278,6 +289,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default=os.getenv("MM_LLM_MODEL", "deepseek-chat"))
     parser.add_argument("--summary-out", default="", help="Override the Markdown summary path")
     parser.add_argument("--verdict-out", default="", help="Override the gate-verdict JSON path")
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=None,
+        help="Limit to the first N cases (subset, for fast tests; full dataset when omitted)",
+    )
     args = parser.parse_args(argv)
 
     output = Path(args.output)
@@ -298,15 +315,21 @@ def main(argv: list[str] | None = None) -> int:
         llm_client=None,
         answerer=None,
         answerer_model="",
+        max_cases=args.max_cases,
     )
     report = base_report
     report_dict = base_report.to_dict()
 
     # --- LLM tracks (isolated; degrade to not_run/error, never raise) ------
+    # Keep the report OBJECTS (not just dicts) so each can be written to its
+    # own path with its own manifest.
+    forced_report_obj: StateBenchV11Report | None = None
+    production_report_obj: StateBenchV11Report | None = None
     production_report: dict[str, Any] | None = None
     answer_not_run_reason = "prerequisite absent"
     llm_verdict: TrackVerdict | None = None
-    forced_error_payload: dict[str, Any] | None = None
+    forced_payload: dict[str, Any] | None = None
+    production_payload: dict[str, Any] | None = None
 
     if llm_enabled:
         try:
@@ -317,18 +340,18 @@ def main(argv: list[str] | None = None) -> int:
             extractor = _build_extractor(args.models, api_key, base_url, extra_body)
             answerer = _build_answerer(args.models, api_key, base_url, extra_body)
         except Exception as exc:  # noqa: BLE001 - building clients is an error
-            forced_error_payload = _error_track(exc)
+            forced_payload = _error_track(exc)
             llm_verdict = TrackVerdict(
                 track=TRACK_ANSWER, state=TRACK_ERROR,
                 reason=f"LLM client build failed: {type(exc).__name__}: {exc}",
                 error=f"{type(exc).__name__}: {exc}",
             )
-            answer_not_run_reason = forced_error_payload["error"]
+            answer_not_run_reason = forced_payload["error"]
         else:
             # Run forced then production.  Each is isolated: if forced raises,
             # production still runs; if production raises, forced's result
-            # stands.  Neither overwrites the other's already-computed verdict.
-            forced_report, forced_payload, forced_verdict = _run_track(
+            # stands.  Neither overwrites the other's already-computed result.
+            forced_report_obj, forced_payload, _forced_verdict = _run_track(
                 "forced",
                 lambda: run_statebench_v1_1(
                     config_path=args.config_path,
@@ -337,9 +360,10 @@ def main(argv: list[str] | None = None) -> int:
                     llm_client=extractor,
                     answerer=answerer,
                     answerer_model=args.models,
+                    max_cases=args.max_cases,
                 ),
             )
-            production_report_obj, production_payload, production_verdict = _run_track(
+            production_report_obj, production_payload, _production_verdict = _run_track(
                 "production",
                 lambda: run_statebench_v1_1(
                     config_path=args.config_path,
@@ -348,26 +372,24 @@ def main(argv: list[str] | None = None) -> int:
                     llm_client=extractor,
                     answerer=answerer,
                     answerer_model=args.models,
+                    max_cases=args.max_cases,
                 ),
             )
-            if forced_report is not None:
-                report = forced_report
-                report_dict = forced_report.to_dict()
-            elif production_report_obj is not None:
-                # Forced errored but production succeeded: keep forced's error
-                # visible via llm_verdict; never adopt production as if forced.
-                report_dict = base_report.to_dict()
-                forced_error_payload = forced_payload
-                llm_verdict = forced_verdict
-            if forced_payload is not None:
-                llm_verdict = forced_verdict
+            # Adopt the forced report as the gate's subject when it succeeded.
+            # If forced errored, keep the deterministic base report as the gate
+            # subject (it will fail for lack of forced mode) but surface the
+            # forced error distinctly via the four-state verdict downstream.
+            if forced_report_obj is not None:
+                report = forced_report_obj
+                report_dict = forced_report_obj.to_dict()
             if production_report_obj is not None:
                 production_report = production_report_obj.to_dict()
-            elif production_payload is not None:
-                # Production errored; it must not erase forced's result.
+            else:
+                # Production errored: forced's result stands; production's error
+                # is surfaced from production_payload below.
                 production_report = None
 
-    # --- write raw report + manifest (path 1 & 2) --------------------------
+    # --- write raw report + manifest (deterministic / gate subject) --------
     out, manifest = write_statebench_v1_1_report(
         report,
         paths["report"],
@@ -376,10 +398,35 @@ def main(argv: list[str] | None = None) -> int:
         thinking="default",
         generation_params={"temperature": 0.0, "max_tokens": 800},
     )
-    # The manifest writer names it <stem>.manifest.json, which is exactly our
-    # canonical path, so no reconciliation is needed -- but keep the mapping
-    # explicit so a future rename cannot silently overwrite the report.
     manifest = paths["manifest"] if Path(manifest) == paths["manifest"] else Path(manifest)
+
+    # --- write forced and production SEPARATELY (own report + own manifest) -
+    # Each track's evidence travels in its own file pair with its own manifest
+    # (commit, dataset_sha256, config/prompt hashes, model, dataset_version).
+    forced_report_path: str = ""
+    forced_manifest_path: str = ""
+    production_report_path: str = ""
+    production_manifest_path: str = ""
+    if forced_report_obj is not None:
+        fout, fman = write_statebench_v1_1_report(
+            forced_report_obj,
+            paths["forced_report"],
+            config_dir=args.config_path,
+            base_url=os.getenv("MM_LLM_BASE_URL", "") if llm_enabled else "",
+            thinking="default",
+            generation_params={"temperature": 0.0, "max_tokens": 800},
+        )
+        forced_report_path, forced_manifest_path = str(fout), str(fman)
+    if production_report_obj is not None:
+        pout, pman = write_statebench_v1_1_report(
+            production_report_obj,
+            paths["production_report"],
+            config_dir=args.config_path,
+            base_url=os.getenv("MM_LLM_BASE_URL", "") if llm_enabled else "",
+            thinking="default",
+            generation_params={"temperature": 0.0, "max_tokens": 800},
+        )
+        production_report_path, production_manifest_path = str(pout), str(pman)
 
     # --- build gate-facing report and four-state verdicts -------------------
     gate_report = build_gate_report(
@@ -388,11 +435,13 @@ def main(argv: list[str] | None = None) -> int:
         answer_not_run_reason=answer_not_run_reason,
     )
     derived = evaluate_tracks(gate_report)
-    if forced_error_payload is not None:
+    # Forced track verdict: an execution error (or a missing forced run) is
+    # surfaced as `error`, never silently folded into the scored tracks.
+    if forced_payload is not None:
         derived["forced"] = TrackVerdict(
             track="forced", state=TRACK_ERROR,
-            reason=forced_error_payload.get("error", "forced track error"),
-            error=forced_error_payload.get("error", ""),
+            reason=forced_payload.get("error", "forced track error"),
+            error=forced_payload.get("error", ""),
         )
     if llm_verdict is not None and TRACK_ANSWER in derived and derived[TRACK_ANSWER].state != TRACK_ERROR:
         derived[TRACK_ANSWER] = llm_verdict
@@ -404,26 +453,40 @@ def main(argv: list[str] | None = None) -> int:
         forced=True,
         track_verdicts=derived,
     )
+    # check_release_gate installs the production four-state verdict itself
+    # (from the production report's extraction health) into result.tracks.
+    # If production errored at the runner level, surface that instead.
+    if production_payload is not None:
+        result.tracks["production"] = TrackVerdict(
+            track="production", state=TRACK_ERROR,
+            reason=production_payload.get("error", "production track error"),
+            error=production_payload.get("error", ""),
+        )
+        if not any("production track error" in f for f in result.failures):
+            result.failures.append(
+                f"production track error: {production_payload.get('error', '')}"
+            )
+            result.passed = False
 
     dataset_version = report_dict.get("dataset_version", "")
 
-    # --- write gate verdict (path 3) ---------------------------------------
+    # --- write gate verdict (its own path) ---------------------------------
     verdict_payload = {
         "passed": result.passed,
         "summary": result.summary,
         "failures": result.failures,
         "checks": result.checks,
-        "tracks": {
-            name: derived[name].to_dict()
-            for name in ("state", "recall", "answer", "forced", "production")
-            if name in derived
-        },
+        "tracks": {name: verdict.to_dict() for name, verdict in result.tracks.items()},
         "llm_tracks_enabled": llm_enabled,
         "dataset_version": dataset_version,
         "dataset_sha256": gate_report.get("dataset_sha256"),
         "extraction_mode": gate_report.get("extraction_mode"),
         "report": str(out),
         "manifest": str(manifest),
+        "forced_report": forced_report_path,
+        "forced_manifest": forced_manifest_path,
+        "production_report": production_report_path,
+        "production_manifest": production_manifest_path,
         "dataset_version_label": "statebench_v1_1 (in-file version "
         f"{dataset_version})",
     }
@@ -432,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(verdict_payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    # --- write summary (path 4) --------------------------------------------
+    # --- write summary (its own path) --------------------------------------
     display_tracks: dict[str, Any] = dict(gate_report.get("tracks", {}))
     if llm_verdict is not None and llm_verdict.state == TRACK_ERROR:
         display_tracks[TRACK_ANSWER] = {"error": llm_verdict.error}
@@ -448,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         report_path=str(out),
         manifest_path=str(manifest),
         verdict_path=str(paths["verdict"]),
-        verdict_tracks=derived,
+        verdict_tracks=result.tracks,
     )
     print(summary)
     paths["summary"].parent.mkdir(parents=True, exist_ok=True)

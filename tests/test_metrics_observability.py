@@ -65,13 +65,37 @@ def test_record_sql_counts_by_entry():
     assert metrics.snapshot()["sql_statements_total.recall"] == 4
 
 
-def test_snapshot_backward_compatible_dict_of_int():
+def test_snapshot_carries_all_sections_and_keeps_counter_lookup():
+    """snapshot() returns ALL the data the library knows (§3 contract):
+
+    * every counter stays a TOP-LEVEL ``int`` (so ``.get(name, 0)`` and
+      iteration over counters keep working for existing callers);
+    * the other sections live under fixed ``_``-prefixed keys, which can never
+      collide with a counter name.
+    """
     metrics.inc("whatever_counter", 5)
+    metrics.observe_latency(metrics.ENTRY_OBSERVE, 3.0)
+    metrics.record_llm(metrics.ENTRY_OBSERVE, input_tokens=7, output_tokens=2)
+    metrics.set_gauge(metrics.REPLAY_ACTIVE, 1)
+
     snap = metrics.snapshot()
     assert isinstance(snap, dict)
+    # backward-compatible counter access
     assert snap.get("whatever_counter", 0) == 5
     assert snap.get("missing", 0) == 0
-    assert all(isinstance(v, int) for v in snap.values())
+    counters = {k: v for k, v in snap.items() if not k.startswith("_")}
+    assert all(isinstance(v, int) for v in counters.values())
+    # the other sections are present and typed
+    assert set(k for k in snap if k.startswith("_")) == {
+        "_gauges", "_latency", "_cost", "_storage", "_enabled"}
+    assert snap["_gauges"][metrics.REPLAY_ACTIVE] == 1.0
+    assert snap["_latency"]["observe"]["count"] == 1
+    assert snap["_cost"]["observe"]["calls"] == 1
+    assert snap["_cost"]["observe"]["llm_calls_per_call"] == 1.0
+    assert snap["_storage"] == {}
+    assert snap["_enabled"] is True
+    # storage is only included when the caller computed it on demand
+    assert metrics.snapshot(storage={("t", "a", "u"): {}})["_storage"] != {}
 
 
 def test_gauges_set_and_read():
@@ -179,8 +203,9 @@ def test_prometheus_is_valid_exposition_shape():
 
 
 def test_storage_stats_per_user_per_table(tmp_path):
-    """storage_stats is now TENANT-SCOPED (explicit WHERE), keyed by
-    (tenant_id, user_id); the privileged all-tenant report is separate."""
+    """storage_stats is scoped by the BOUND tenant context and keyed by
+    (tenant_id, app_id, user_id); there is no free tenant argument and no
+    cross-tenant report."""
     from mirror_memory.api import MemoryEngine
     from mirror_memory.config.loader import load_config
     from mirror_memory.core.models import Evidence
@@ -201,16 +226,17 @@ def test_storage_stats_per_user_per_table(tmp_path):
                            source_type="message", session_id="s1"))
             s.commit()
 
-    tenant = eng._tenant
-    stats = metrics.storage_stats(eng._engine, tenant=tenant)
-    assert (tenant[0], "u-storage") in stats
-    cell = stats[(tenant[0], "u-storage")]
+    tenant_id, app_id = eng._tenant
+    stats = metrics.storage_stats(eng._engine)
+    assert (tenant_id, app_id, "u-storage") in stats
+    cell = stats[(tenant_id, app_id, "u-storage")]
     assert "mm_evidence" in cell
     assert cell["mm_evidence"]["rows"] >= 1
     assert cell["mm_evidence"]["bytes"] >= 100
-    # a DIFFERENT tenant sees nothing for this call (explicit filter)
-    other = metrics.storage_stats(eng._engine, tenant=("other-tenant", "x"))
-    assert (("other-tenant"), "u-storage") not in other
+    # no free tenant argument, and no cross-tenant escape hatch
+    import inspect
+    assert "tenant" not in inspect.signature(metrics.storage_stats).parameters
+    assert not hasattr(metrics, "storage_stats_all_tenants")
     assert "u-storage" not in metrics.render_prometheus()
 
 

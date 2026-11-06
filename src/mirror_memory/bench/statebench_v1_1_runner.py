@@ -466,7 +466,23 @@ def run_statebench_v1_1(
         "k2_schema_rejections": sum(c.k2_schema_rejections for c in results),
         "dataset_turns": sum(len(c.turns) for c in cases),
     }
-    if extraction_mode != "deterministic":
+    # Forced vs production integrity.
+    #
+    # ``forced`` is the only mode that MUST prove an every-turn K2 attempt with
+    # clean extraction health.  A forced run that made no calls, skipped turns,
+    # or suffered failed calls is measuring the K1 fallback while wearing a
+    # model's name, so the runner refuses to emit it -- this is the guard that
+    # stops a rate-limited "forced" run from passing as a model measurement.
+    #
+    # ``production`` is the engine *as configured*.  By design the throttle
+    # fires on some turns and not others, so ``k2_attempts < dataset_turns`` is
+    # the EXPECTED, truthful state, not an error: the report must retain the
+    # ACTUAL coverage and extraction health so the gate can compare it against
+    # forced.  Raising here would discard that evidence and turn an honest
+    # throttled run into an opaque failure.  Real call failures are likewise
+    # retained in ``k2_failures`` and surfaced by the gate -- never raised away
+    # and never counted as a pass.
+    if extraction_mode == "forced":
         if health["k2_attempts"] == 0:
             raise RuntimeError(
                 f"extraction mode {extraction_mode!r} made no K2 calls -- the "

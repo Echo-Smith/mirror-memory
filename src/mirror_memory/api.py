@@ -246,6 +246,9 @@ class MemoryEngine:
             else self._build_deletion_log()
         )
         self._db_id: str | None = None
+        # The SQLAlchemy engine is created lazily by _initialize_db(); the
+        # metrics entry scope reads it before initialization on the first call.
+        self._engine = None
 
     def _build_deletion_log(self) -> "DeletionLog | None":
         """The deletion log from configuration (M4 task 1) -- the shared
@@ -482,75 +485,58 @@ class MemoryEngine:
     # -- observability (M5 task 2): per-entry cost + latency ----------------
 
     def _install_metrics_sql_listener(self) -> None:
-        """Install the ONE process-wide SQL counter (M5 fix).
+        """Attach the ONE process-wide SQL counter, atomically (M5 §3 patch).
 
-        The listener is attached to the SQLAlchemy ``Engine`` CLASS exactly
-        once for the whole process -- never once per ``MemoryEngine`` -- and
-        reads the current entry from ``core.metrics``' THREAD-LOCAL context.
-        This fixes: every tenant engine counts (shared thread-local + one
-        listener), unrelated SQL on a thread with no open entry is a no-op,
-        and no closure is bound to a single engine instance.  Idempotent and
-        failure-safe: metrics never break engine construction."""
+        * Installed on the SQLAlchemy ``Engine`` CLASS exactly once for the
+          process; concurrent engine construction cannot double-attach (the
+          install runs inside ``metrics.ensure_sql_listener``'s lock with a
+          double-check), which would otherwise count every statement twice.
+        * Each statement is attributed using the CONNECTION's engine plus this
+          thread's active entry scope, so SQL issued by an unrelated engine on
+          the same thread during an open scope is not miscounted.
+        * Failure-safe: metrics never break engine construction."""
         try:
             from sqlalchemy import event
             from sqlalchemy.engine import Engine as _SAEngine
 
             from mirror_memory.core import metrics
 
-            if metrics.sql_listener_installed():
-                return
+            def _install() -> None:
+                def _count(conn, cursor, statement, parameters, context, executemany):
+                    metrics.record_sql_current(getattr(conn, "engine", None))
 
-            def _count(conn, cursor, statement, parameters, context, executemany):
-                metrics.record_sql_current()
+                event.listen(_SAEngine, "after_cursor_execute", _count)
 
-            event.listen(_SAEngine, "after_cursor_execute", _count)
-            metrics.mark_sql_listener_installed()
+            metrics.ensure_sql_listener(_install)
         except Exception:  # observability must never break engine construction
             logger.debug("metrics: SQL listener not installed", exc_info=True)
 
     @contextmanager
     def _metrics_llm_scope(self, entry: str):
-        """Contribute real LLM token usage to *entry* (M5 fix).
+        """Scope marker for LLM accounting (M5 §3 patch).
 
-        The CALL count is booked by the instrumented client proxy
-        (``metrics.instrument_llm_client`` installed at construction) for
-        every ``generate()`` on any client; here we additionally install a
-        usage hook ONLY to add the measured TOKENS (never a second call
-        count).  The hook reads the calling thread's current entry, so two
-        concurrent scopes on a shared client never cross-talk and nothing is
-        restored/leaked on exit.  A client without ``set_on_call`` still has
-        its calls counted by the proxy (as usage-unknown)."""
-        from mirror_memory.core import metrics
-
-        llm = self._llm_client
-        if llm is not None and hasattr(llm, "set_on_call") and not getattr(
-            llm, "_mm_usage_hook", False
-        ):
-            def _hook(info: dict) -> None:
-                metrics.record_llm_tokens(
-                    metrics.current_entry() or entry,
-                    input_tokens=info.get("input_tokens"),
-                    output_tokens=info.get("output_tokens"),
-                )
-
-            try:
-                llm.set_on_call(_hook)
-                llm._mm_usage_hook = True
-            except Exception:  # never break an entry
-                logger.debug("metrics: LLM usage hook not installed", exc_info=True)
+        The counting itself now lives entirely in the instrumented client: the
+        proxy books one call per ``generate()`` and a CHAINED usage hook adds
+        the real tokens while still invoking the host's own callback.  Nothing
+        is installed, replaced or restored per scope here, so concurrent scopes
+        on a shared client cannot cross-talk and no hook leaks.  The context
+        manager is kept because entries pair it with the latency scope and
+        because it documents the boundary."""
         yield
 
     @contextmanager
     def _metrics_entry(self, entry: str):
-        """Time *entry* and mark this thread's current entry (M5 fix).
+        """Time *entry* over its WHOLE span and mark this thread's entry.
 
-        Uses the single module-level thread-local in ``core.metrics`` so the
-        global SQL listener and the LLM usage hook see the same entry.  Nested
-        scopes restore the previous entry exactly (including on exception)."""
+        The span deliberately includes database initialization and the sync
+        gate, because those are part of the call's real latency; the one-time
+        schema/init cost therefore shows up in the first sample only (documented
+        in ``docs/integration.md``).  SQL issued inside the span on THIS engine
+        is attributed to the entry; unrelated engines' SQL is not."""
         from mirror_memory.core import metrics
 
         started = time.monotonic()
-        with metrics.entry_scope(entry):
+        with metrics.entry_scope(entry, engine=self._engine):
             try:
                 yield
             finally:
@@ -729,24 +715,31 @@ class MemoryEngine:
         if len(text) > 50000:
             raise ValidationError("text exceeds maximum length of 50000 characters")
 
-        self._ensure_db()
-        self._sync_gate(read=False)
-        pipeline = self._get_pipeline()
         started = time.monotonic()
         from mirror_memory.core import metrics as _metrics
+        # The measured span covers the WHOLE entry: initialization and the
+        # sync gate are part of the call's real latency (their one-time cost
+        # lands in the first sample only), and SQL they issue on this engine is
+        # attributed to this entry.
         with self._metrics_entry(_metrics.ENTRY_OBSERVE):
-            with self._metrics_llm_scope(_metrics.ENTRY_OBSERVE):
-                with self._session() as session:
-                    self._authorize(session, user_id, purpose, "observe")
-                    claims = pipeline.observe(
-                        session,
-                        user_id=user_id,
-                        session_id=session_id,
-                        text=text,
-                        turn_count=turn_count,
-                        **kwargs,
-                    )
-                    session.commit()
+            self._ensure_db()
+            # Attribution scope: now that the engine exists, only SQL issued on
+            # THIS engine is counted (inside the timed span opened above).
+            with _metrics.entry_scope(_metrics.ENTRY_OBSERVE, engine=self._engine):
+                self._sync_gate(read=False)
+                pipeline = self._get_pipeline()
+                with self._metrics_llm_scope(_metrics.ENTRY_OBSERVE):
+                    with self._session() as session:
+                        self._authorize(session, user_id, purpose, "observe")
+                        claims = pipeline.observe(
+                            session,
+                            user_id=user_id,
+                            session_id=session_id,
+                            text=text,
+                            turn_count=turn_count,
+                            **kwargs,
+                        )
+                        session.commit()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "observe: user=%s session=%s claims=%d latency=%dms",
@@ -802,35 +795,37 @@ class MemoryEngine:
         if not user_id or not user_id.strip():
             raise ValidationError("user_id must be a non-empty string")
 
-        self._ensure_db()
-        self._sync_gate(read=True)
         from mirror_memory.render.renderer import render_memory_block_with_ids
 
         started = time.monotonic()
         from mirror_memory.core import metrics as _metrics
         with self._metrics_entry(_metrics.ENTRY_RECALL):
-            with self._session() as session:
-                authorized = self._authorize(session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
-                rule = provenance.visibility(session, user_id, authorized.purpose)
-                result, rendered_ids = render_memory_block_with_ids(
-                    session,
-                    user_id,
-                    config=self._config,
-                    language=language,
-                    user_message=query,
-                    tail_load=tail_load,
-                    trace_hook=trace_hook,
-                    now=now,
-                    visibility=rule,
-                )
-                # The access audit row (M3 batch-2 task 2) rides the same
-                # transaction as the read, together with the access telemetry
-                # (which beliefs reached the prompt -- the reheat signal).  The
-                # commit is mandatory: if the audit cannot be written the block
-                # is NOT returned (fail-closed).
-                self._audit(session, authorized, user_id=user_id, operation="recall",
-                            entry=ENTRY_RECALL, memory_ids=rendered_ids)
-                session.commit()
+            self._ensure_db()
+            with _metrics.entry_scope(_metrics.ENTRY_RECALL, engine=self._engine):
+                self._sync_gate(read=True)
+                with self._session() as session:
+                    authorized = self._authorize(
+                        session, user_id, purpose, "recall", audit_entry=ENTRY_RECALL)
+                    rule = provenance.visibility(session, user_id, authorized.purpose)
+                    result, rendered_ids = render_memory_block_with_ids(
+                        session,
+                        user_id,
+                        config=self._config,
+                        language=language,
+                        user_message=query,
+                        tail_load=tail_load,
+                        trace_hook=trace_hook,
+                        now=now,
+                        visibility=rule,
+                    )
+                    # The access audit row (M3 batch-2 task 2) rides the same
+                    # transaction as the read, together with the access telemetry
+                    # (which beliefs reached the prompt -- the reheat signal).  The
+                    # commit is mandatory: if the audit cannot be written the block
+                    # is NOT returned (fail-closed).
+                    self._audit(session, authorized, user_id=user_id, operation="recall",
+                                entry=ENTRY_RECALL, memory_ids=rendered_ids)
+                    session.commit()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "recall: user=%s chars=%d latency=%dms",
@@ -876,21 +871,24 @@ class MemoryEngine:
         if not user_id or not user_id.strip():
             raise ValidationError("user_id must be a non-empty string")
 
-        self._ensure_db()
-        # batch-2 patch 5, task 2: the cycle reads memory and proposes
-        # tier transitions -- gated like a read (expired / catching up
-        # refuse; offline deletions are untouched)
-        self._sync_gate(read=True)
         from mirror_memory.metabolism.planner import run_metabolism as run_cycle
         from mirror_memory.core import metrics as _metrics
 
         with self._metrics_entry(_metrics.ENTRY_METABOLISM):
-            with self._metrics_llm_scope(_metrics.ENTRY_METABOLISM):
-                with self._session() as session:
-                    self._authorize(session, user_id, purpose, "extract")
-                    report = run_cycle(session, user_id, self._config, dry_run=dry_run, now=now)
-                    session.commit()
-                    return report.as_dict()
+            self._ensure_db()
+            # batch-2 patch 5, task 2: the cycle reads memory and proposes tier
+            # transitions -- gated like a read (expired / catching up refuse;
+            # offline deletions are untouched).  Both run inside the span so the
+            # entry's latency covers its whole cost.
+            with _metrics.entry_scope(_metrics.ENTRY_METABOLISM, engine=self._engine):
+                self._sync_gate(read=True)
+                with self._metrics_llm_scope(_metrics.ENTRY_METABOLISM):
+                    with self._session() as session:
+                        self._authorize(session, user_id, purpose, "extract")
+                        report = run_cycle(
+                            session, user_id, self._config, dry_run=dry_run, now=now)
+                        session.commit()
+                        return report.as_dict()
 
     def panel(
         self,

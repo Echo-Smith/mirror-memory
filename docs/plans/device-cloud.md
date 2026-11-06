@@ -36,8 +36,9 @@ outside a session window. Its costs are, in order of severity:
    so a whole-token HMAC blind index is **not** an equivalent replacement
    (§2.3 A.3).
 2. **Key lifecycle / recovery** becomes a product surface (§2a).
-3. **Session-start decrypt load** (§2.4, §4.6) — **measured** on real native
-   crypto: ≈2–3 ms @1k, ≈26 ms @10k beliefs; small for the target counts.
+3. **Session-start decrypt load** (§2.4, §4.6) — **measured with real
+   AES-256-GCM** (`cryptography`): ≈4.4 ms @1k, ≈45 ms @10k beliefs (whole
+   content, field-by-field, ~0.55 µs/field); small for the target counts.
 4. **Residual exposure to a compromised running server during a session**
    (§6) — unavoidable in any scheme where the conversation model is in the
    cloud, because the injected memory context is itself sent to the cloud
@@ -319,14 +320,17 @@ even in the worst case recall never returns empty — it degrades from
 
 Under C the server holds the key only during a session. At session start it
 may prewarm the user's working set by fetching + decrypting content. This is
-the "≤ 300 ms prefetch" target. **Measured (§4.6, real native crypto in this
-environment):** decrypting the **whole** user's content with real native
-AES-256-CTR (`openssl`) + real native HMAC-SHA256 (`hashlib`) tags costs
-**≈2.2 ms @1k** and **≈25.8 ms @10k** beliefs (SQLite store, ~200 B/belief;
-see §4.6 for the table and the 实测/估算/未测 legend). Ciphertext bytes are
-tiny (~0.2–0.5 KB/belief). So the prefetch is bounded by the **fetch (I/O)**,
-not the decrypt. Recommendation: prefetch the *recent floor + top-N by heat*
-(a few hundred rows), not all 10k, keeping prefetch well under 100 ms.
+the "≤ 300 ms prefetch" target. **Measured with REAL native AES-256-GCM**
+(`cryptography.hazmat...AESGCM`, per-field 96-bit nonce + tag, AAD-bound;
+`cryptography 50.0.2` in `.venv` — see §4.6): decrypting the **whole** user's
+content field-by-field costs **≈4.4 ms @1k** and **≈46 ms @10k** beliefs on
+the SQLite store (800 fields @1k → 80,000 fields @10k, ~0.55 µs/field), and
+**≈4.2 ms @1k / ≈43.5 ms @10k** on PostgreSQL. Ciphertext per field is
+`plaintext + 16-byte tag` (tiny). So the prefetch is bounded by the **fetch
+(I/O)**, not the GCM decrypt. Recommendation: prefetch the *recent floor +
+top-N by heat* (a few hundred rows), not all 10k, keeping prefetch well under
+100 ms. (The earlier CTR+HMAC "≈2.2 / ≈25.8 ms" figures are now **downgraded
+to comparison/estimate** — they are not GCM measurements; §4.6.)
 
 ### 2.5 Background extraction / organising queue when the key is unavailable
 
@@ -660,132 +664,150 @@ disk. On the server it exists **only in RAM** for the session window and is
   wrapped DEKs with the ciphertext backup** — store DEK wrapping material
   separately. Restore + replay (§2.6) works on ciphertext unchanged.
 
-### 4.6 Field-encryption microbenchmark — MEASURED (real crypto library)
+### 4.6 Field-encryption microbenchmark — REAL AES-256-GCM (实测)
 
-**Environment (measurement provenance — read this before the tables):**
+**Environment / provenance (read before the tables):**
 
-- Repo `feat/m5-readiness` @ `00672c7`; host shared with concurrent CI/agent
-  work (so absolute **recall** p95 is an upper bound, as in §1.3).
-- **Crypto library actually used:** `.venv/bin/python -c "import cryptography"`
-  → **`ModuleNotFoundError`** (no `cryptography`, no `pycryptodome`, no
-  `nacl`). The Python in use **statically links OpenSSL 3.5.7**, which is
-  not linkable as a `libcrypto` for `ctypes` (loading a second libcrypto into
-  CPython aborts), and the `openssl` CLI on `PATH` is **LibreSSL 3.3.6**,
-  whose `enc` subcommand **does not support GCM**. What *does* work natively:
-  **`openssl enc -aes-256-ctr`** (real, native, AES-NI AES-256 block cipher)
-  and **`hashlib`/`hmac` SHA-256** (real, native OpenSSL EVP).
-- **Therefore:** we MEASURE the **AES-256-CTR data path** (≈ all of GCM's
-  cost; GCM is CTR + GHASH tag) with the real native cipher, and we MEASURE
-  the tag with real native **HMAC-SHA256** (Encrypt-then-MAC, a genuine AEAD
-  construction) as a **conservative upper bound** on GCM's GHASH tag cost
-  (SHA-256 is slower than GHASH per block). The GCM-specific **GHASH delta**
-  is the *only* unmeasured term and is **bounded below** by the measured
-  HMAC-SHA256 tag pass. Everything from this backend is **实测 (measured,
-  native CLI)**; true AES-256-GCM would be **no slower** than the modelled
-  figure for a warm in-process EVP context.
-- **Label legend used throughout:** **实测** = numbers produced in this
-  environment with a real crypto library / real engine; **估算** = extrapolated
-  or modelled from measured components; **未测** = could not be measured here,
-  stated as such (never fabricated).
+- Repo `feat/m5-readiness` @ `461e66d`; host shared with concurrent CI/agent
+  work (recall absolute p95 is an upper bound; p50 the stable signal).
+- **Crypto library actually used — the real thing:**
+  `cryptography 50.0.2` is installed in `.venv`;
+  `from cryptography.hazmat.primitives.ciphers.aead import AESGCM` works.
+  Every number in **C.1–C.4 is REAL native AES-256-GCM** produced by that
+  primitive: each content **field** is encrypted independently with its own
+  random **96-bit nonce** and its own **16-byte tag**, and **AAD = `row_id:
+  column`** (row `global_id`/`id` : column name), so a ciphertext cannot be
+  spliced onto another row or swapped across columns (verified: wrong row /
+  wrong column both raise `InvalidTag`).
+- **Label legend:** **实测** = produced here by the real `AESGCM` primitive
+  and/or the real `MemoryEngine`; **估算** = derived/extrapolated; **未测** =
+  could not be measured here (stated, never fabricated).
+- **What is prototype (not production):** the GCM field encryption lives in
+  `tools/m5_fieldexp_micro.py` as an **in-memory prototype** — no ORM column,
+  no migration, no storage integration reads/writes ciphertext. So every
+  *crypto* timing is real (真实调用了 AESGCM), but *the recall/observe path
+  does not actually run through GCM in production*: in C.3/C.4 the engine p95
+  / observe base is **real engine measurement**, and the **+GCM** column is a
+  **prototype-simulated add-on** (real GCM on the real field bytes, composed
+  with the real baseline) — labelled exactly that way, never presented as an
+  integrated end-to-end number.
 
-**Tool:** `tools/m5_fieldexp_micro.py` (`--native` on by default). Commands:
+**Tool + commands (short, repeated, spread reported):**
 
 ```
-.venv/bin/python tools/m5_fieldexp_micro.py --backends sqlite  --counts 1000,10000 --bulk-seed --native
-.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 1000         --bulk-seed --native
+# REAL native AES-256-GCM (cryptography.AESGCM), SQLite:
+.venv/bin/python tools/m5_fieldexp_micro.py --backends sqlite  --counts 1000,10000 \
+    --bulk-seed --no-native --gcm --gcm-runs 7 --gcm-field-sample 3000
+# REAL native AES-256-GCM, PostgreSQL:
+.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 1000,10000 \
+    --bulk-seed --no-native --gcm --gcm-runs 7 --gcm-field-sample 3000
 ```
 
-#### C.1 — Full session-start load (decrypt ALL beliefs), 实测
+The content columns per belief are the 8 from §2.2
+(`claim_text, value_json, evidence_json, subject, predicate, object,
+raw_predicate, key`), so **8 fields/belief** → 8,000 fields @1k, 80,000 @10k.
 
-Real native decrypt of the entire user's content (bulk AES-256-CTR data path
-+ per-belief HMAC-SHA256 verify), same byte volumes the engine stores:
+#### C.1 — Full-load: decrypt ALL belief fields, REAL AES-256-GCM (实测)
 
-| backend | N beliefs | bytes/belief | total bytes | AES-CTR MB/s (实测) | AES-CTR net ms (实测) | HMAC tag ms (实测) | **decrypt-all modelled ms (实测 components)** |
-|---|---|---|---|---|---|---|---|
-| SQLite | 1,000 | ~200 | 199,670 | 312.8 | 0.64 | 1.52 | **≈2.2** |
-| SQLite | 10,000 | ~203 | 2,026,670 | 188.2 | 10.77 | 15.06 | **≈25.8** |
-| PostgreSQL | 1,000 | ~200 | 199,670 | 102.4 | 1.95 | 1.35 | **≈3.3** |
-| SQLite | 10,000 | ~510 (wide) | 5,100,000 | 160.1 | 31.85 | 22.20 | **≈54** |
+Per run: encrypt every field of every belief once (build the in-memory
+ciphertext store), then time decrypting **every field**, repeated
+(`--gcm-runs`); p50 / min / max over runs reported.
 
-*Note:* the AES-CTR rate here (100–310 MB/s) is **pipe/bound by the CLI
-process boundary and I/O**, not the cipher — a warm in-process EVP context
-runs GB/s, so these are **conservative** (upper-bound) costs. True
-AES-256-GCM decrypt-all is **≤** these figures. GHASH-vs-HMAC of the tag
-difference is **未测** (unmeasured) but bounded.
+| backend | N beliefs | fields | **decrypt-all p50 ms (实测)** | min / max ms (spread) | µs/field (实测) | encrypt-all ms (实测) |
+|---|---|---|---|---|---|---|
+| SQLite | 1,000 | 8,000 | **4.44** | 4.29 / 5.31 | 0.578 | 14.5 |
+| SQLite | 10,000 | 80,000 | **46.41** | 44.72 / 48.04 | 0.581 | 195.6 |
+| PostgreSQL | 1,000 | 8,000 | **4.21** | 4.15 / 4.52 | 0.535 | 12.8 |
+| PostgreSQL | 10,000 | 80,000 | **43.50** | 42.70 / 45.69 | 0.547 | 229.8 |
 
-**Read:** decrypting *all* of a 10k-belief user is **≈26 ms** (实测 model) —
-comfortably inside the ≤300 ms prefetch target and **I/O-dominated** in
-practice (the fetch itself is the cost, §2.4). Prewarming only the recent
-floor + top-N-by-heat (a few hundred rows) lands well under 10 ms.
+**Read:** real GCM decrypt-all is **linear in field count at ~0.55 µs/field**
+— ≈4.4 ms @1k, ≈45 ms @10k. **PG 10k WAS measured** (not untested): 43.5 ms.
+The spend is per-field Python/AESGCM call overhead at these ~20–200-byte
+sizes, not bandwidth. Well inside the ≤300 ms prefetch budget; I/O dominates.
 
-#### C.2 — recall p95 impact, 实测 (real `MemoryEngine.recall`)
+#### C.2 — per-field decrypt cost, REAL GCM (实测)
 
-Baseline recall (plaintext in session RAM) is the real engine; the scheme-C
-recall adds decrypt of the **bounded candidate set** (`relevant 150 + recent
-25 = 175`). Recall latency measured on the real engine (contended host;
-p50 is the stable signal, p95 an upper bound):
+| backend | N | µs/field (sample, 实测) |
+|---|---|---|
+| SQLite | 1,000 | 0.511 |
+| SQLite | 10,000 | 0.527 |
+| PostgreSQL | 1,000 | 0.505 |
+| PostgreSQL | 10,000 | 0.530 |
 
-| backend | N | recall p50 (ms) 实测 | recall p95 (ms) 实测 | + decrypt 175 cand (ms) 实测-modelled | recall p95 under C (ms) 估算 (=p95+dec) |
+**≈0.5 µs per field** (independent nonce + tag + AAD), essentially flat with
+payload at these sizes — it is per-call cost, not throughput.
+
+#### C.3 — recall under C: engine baseline (REAL) + candidate-set decrypt (REAL GCM, Prototype-sim add-on)
+
+The recall hot path narrows to a bounded candidate set (`relevant 150 +
+recent 25 = 175` beliefs = 1,400 fields); production has no GCM integration,
+so we compose: **engine p95 = REAL `MemoryEngine.recall`** (plaintext in
+session RAM, measured) **+** the **REAL GCM** cost of decrypting 1,400
+fields (measured, prototype-only as an add-on). The composed "proto p95" is
+labelled **prototype simulation**, not an integrated end-to-end number.
+
+| backend | N | engine p50 ms (实测) | engine p95 ms (实测) | +GCM 175-cand p50 ms (实测) | proto recall p95 ms (估算 = p95+add, prototype-sim) |
 |---|---|---|---|---|---|
-| SQLite | 1,000 | 17.4 | 26.0 | 0.98 | ≈27.0 |
-| SQLite | 10,000 | 82.7 | 124.3 | 0.28 | ≈124.6 |
-| PostgreSQL | 1,000 | 17.7 | 21.1 | 0.61 | ≈21.8 |
+| SQLite | 1,000 | 10.56 | 15.74 | 0.749 | **16.49** |
+| SQLite | 10,000 | 43.32 | 65.52 | 0.809 | **66.32** |
+| PostgreSQL | 1,000 | 16.64 | 30.23 | 0.729 | **30.96** |
+| PostgreSQL | 10,000 | 36.99 | 72.46 | 0.800 | **73.26** |
 
-**Read:** the added field-decrypt on the hot path is **≤1 ms (实测,** candidate
-cap 175, native **)** — **rounding error** against the tens-to-hundreds of ms
-of Python scoring + audit-commit (§1). Field encryption is **not** the
-latency problem; the scoring path is. (The "+dec" column is measured on the
-real native cipher; the combined p95 is an additive estimate — clearly
-labelled 估算.)
+Candidate decrypt spread (min/max over runs): SQLite 1k 0.73/1.32,
+10k 0.79/1.11; PG 1k 0.72/0.90, 10k 0.77/1.15 ms. **Read:** the added GCM
+decrypt on the hot path is **< 1 ms** — rounding error against the tens-of-ms
+Python scoring + audit-commit that dominates recall. Field encryption is not
+the latency problem; the scoring path is (§1). The recall **safety scope and
+audit fail-closed behaviour are unchanged** (this prototype touches neither).
 
-#### C.3 — per-belief enc+dec cost, 实测 vs the unavoidable CLI-startup caveat
+#### C.4 — observe delta with real GCM (prototype add-on over real observe)
 
-A single belief content blob (~200 B) is so small that **one openssl CLI
-invocation per belief** is dominated by process/pipe **startup (~5–15 ms)**,
-which a real in-process EVP context would not pay. So the *per-call CLI*
-figure below is **实测 but NOT representative** of deployable cost; the
-deployable per-belief cost is derived from the measured bulk rate (C.1):
+observe() base is **real engine** cost; +GCM encrypts every content field of
+the freshly-minted belief with real AES-256-GCM in the harness (no production
+integration):
 
-| backend | N | bytes/belief | per-belief enc+dec, CLI per-call (ms, 实测, startup-dominated) | deployable per-belief (µs, 估算 from measured bulk rate) |
-|---|---|---|---|---|
-| SQLite | 1,000 | 200 | 14.88 | ≈6 µs (≈0.006 ms) |
-| SQLite | 10,000 | 203 | 9.35 | ≈5–6 µs |
-| PostgreSQL | 1,000 | 200 | 12.34 | ≈10 µs |
-
-**Read:** the honest deployable per-belief AES cost is **single-digit µs**
-(估算, derived from measured 100–300 MB/s bulk throughput); it is *not* the
-~10 ms the CLI per-call column shows — that column exists to show the CLI
-startup floor, labelled as such.
-
-#### C.4 — observe() overhead (encrypt fresh content; off hot path)
-
-| backend | observe p50 base (ms) | observe p50 +encrypt (ms) | observe p95 base (ms) | observe p95 +encrypt (ms) | note |
+| backend | observe base p50 ms (实测) | +GCM p50 ms (实测) | delta p50 ms (实测) | base p95 | +GCM p95 |
 |---|---|---|---|---|---|
-| SQLite | 151.8 | 155.2 | 290.5 | 160.6 | host-contended; delta within noise |
-| PostgreSQL | 34.0 | 65.5 | 109.1 | 83.0 | contended |
+| SQLite | 21.57 | 21.72 | **0.15** | 24.72 | 24.98 |
+| PostgreSQL | 21.27 | 28.67 | **7.40** | 22.25 | 66.62 |
 
-*(Observe absolute numbers are dominated by host contention and the
-extraction pipeline — a base observe at 150 ms is ~10× an unloaded run.
-Encryption adds single-digit-µs per belief natively (C.3), i.e. **lost in
-the noise** of a ~40–150 ms observe; the table shows the *measured* deltas
-are within contention variance.)* This path is **off the turn SLA**.
+**Read:** encrypting one belief's 8 fields is **≈4–5 µs** of GCM; the SQLite
+delta (0.15 ms) is within noise. The PG "+GCM" delta (7.4 ms) reflects host
+contention on the extra DB round-trips in that loop, not crypto — the crypto
+term is µs. Observe is **off the hot path** anyway.
 
-#### C.5 — what is 未测 (untested) here, stated plainly
+#### C.5 — what is 未测 (and what is NOT)
 
-- **True AES-256-**GCM** GHASH tag cost:** 未测 — no GCM-capable crypto
-  library in this env. Bounded above by measured HMAC-SHA256 (C.1); real
-  GHASH is cheaper, so the error is in the safe direction.
-- **In-process EVP (no CLI startup):** 未测 — deployable per-belief µs is
-  **估算** from the measured bulk throughput (C.3), not directly measured.
-- **10k-belief PostgreSQL:** 未测 in this pass (only PG 1k run; PG 10k seed
-  is heavy on the contended host). The SQLite 10k and PG 1k brackets bound
-  it; PG adds ~0.5–1 ms/round-trip, negligible vs scoring.
+- **Nothing in C.1–C.4 was estimated as measured.** All GCM crypto timings
+  are real `AESGCM` calls; engine/observe baselines are real `MemoryEngine`.
+- **未测:** *production-integrated* recall/observe that actually stores and
+  reads GCM ciphertext — that integration does **not exist** (by design, this
+  task is prototype-only). So the "proto p95" and "observe +GCM" are
+  **composed** (real baseline + real crypto add-on), explicitly **not** an
+  integrated measurement. Everything else (1k/10k full decrypt, µs/field,
+  PG 1k and **PG 10k**) is **measured** — PG 10k is **not** untested.
 
-**Verdict (unchanged, now on measured data):** field-level AES-256 field
-encryption is **cheap** — a few µs/belief, ≈1 ms added to recall (candidate
-cap 175), ≈26 ms to decrypt-all-10k — and is **not** the realtime-voice
-bottleneck. The recall **scoring path** (§1) is. GHASH-native numbers are
-the only gap and are conservatively bounded.
+#### C.6 — COMPARISON / ESTIMATE only — the earlier CTR+HMAC figures (NOT GCM)
+
+The previous revision measured **native AES-256-CTR (`openssl` CLI) +
+HMAC-SHA256 (`hashlib`)** as a stand-in for GCM, because `cryptography` was
+not installed then. **Those numbers are now DOWNGRADED to
+comparison/estimate — they are NOT AES-256-GCM measurements and must not be
+read as such.** In particular the earlier claim that "HMAC-SHA256 bounds
+GCM's GHASH cost" is **withdrawn** — no such bound is asserted here; the real
+GCM numbers in C.1–C.4 supersede it. (For reference only, the old CTR+HMAC
+*session-start decrypt-all* proxy was ≈2.2 ms @1k and ≈25.8 ms @10k on
+SQLite with the CLI, and its per-call CLI floor was startup-dominated; those
+figures are **对照/估算**, kept only to show the two approaches differ, and
+are replaced by the real GCM C.1 table above.)
+
+**Verdict (on REAL GCM data):** field-level AES-256-GCM is **cheap** —
+~0.55 µs/field, ≈4.4 ms (1k) / ≈45 ms (10k) to decrypt a user's whole
+content, **< 1 ms** added to a recall's bounded candidate set, and µs added
+to observe. It is **not** the realtime-voice bottleneck; the recall
+**scoring path** (§1) is. The only unmeasured item is a *production-
+integrated* recall path (prototype GP only) — the crypto itself is now
+measured with the real primitive.
 
 ### 4.7 Plaintext / log / backup boundaries during cloud processing (Section D)
 
@@ -974,25 +996,29 @@ the named mechanism; residual risk is what remains.
 ## Appendix A — Reproducing the numbers
 
 ```
-# from repo root, with the bundled venv:
-# MEASURED (real native crypto: openssl AES-256-CTR + hashlib HMAC-SHA256)
-.venv/bin/python tools/m5_fieldexp_micro.py --backends sqlite  --counts 1000,10000 --bulk-seed --native
-.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 1000        --bulk-seed --native
-.venv/bin/python tools/m5_fieldexp_micro.py --quick          # fast smoke (SQLite, native)
-.venv/bin/python tools/m5_fieldexp_micro.py --no-native      # pure-Python AES-GCM only
-.venv/bin/python tools/m5_fieldexp_micro.py --aes-speedup 1  # raw pure-Python (no extrapolation)
+# from repo root, with the bundled venv (cryptography 50.0.2 installed):
+# PRIMARY — REAL native AES-256-GCM (cryptography.hazmat...AESGCM)
+.venv/bin/python tools/m5_fieldexp_micro.py --backends sqlite   --counts 1000,10000 --bulk-seed --no-native --gcm --gcm-runs 7 --gcm-field-sample 3000
+.venv/bin/python tools/m5_fieldexp_micro.py --backends postgres --counts 1000,10000 --bulk-seed --no-native --gcm --gcm-runs 7 --gcm-field-sample 3000
+.venv/bin/python tools/m5_fieldexp_micro.py --quick           # fast smoke (SQLite, real GCM)
+# COMPARISON ONLY (not GCM): openssl AES-256-CTR + hashlib HMAC-SHA256
+.venv/bin/python tools/m5_fieldexp_micro.py --no-gcm
+# pure-Python AES-GCM reference (correctness only; ~2000x slow)
+.venv/bin/python tools/m5_fieldexp_micro.py --no-native --no-gcm --aes-speedup 1
 ```
 
-**Two crypto backends in the tool:**
-1. **`--native` (default on) → 实测.** Real `openssl enc -aes-256-ctr`
-   (native AES-256 data path) + real `hashlib`/`hmac` SHA-256 tag
-   (Encrypt-then-MAC), with the CLI fixed startup corrected out for the bulk
-   figures and reported separately for per-call figures. This is the source
-   of every **实测** number in §4.6. GCM's GHASH tag is the one **未测**
-   term (bounded by the measured HMAC pass) — stated in §4.6 C.5.
-2. **pure-Python AES-256-GCM** (correct but ~2000× slow; validated against
-   the GCM spec Appendix B AES-256 test vector) — kept to prove the
-   primitive and to give a raw baseline under `--no-native` / `--aes-speedup 1`.
+**Crypto backends in the tool (three, in order of authority):**
+1. **`--gcm` (default on) → 实测, PRIMARY.** Real `cryptography` **AESGCM**
+   (AES-256-GCM), per-field independent 96-bit nonce + 16-byte tag, AAD =
+   `row_id:column`, in-memory prototype (no production storage). This is the
+   source of every **实测 GCM** number in §4.6 C.1–C.4. There is **no**
+   "GHASH proxy" claim — GCM is measured directly.
+2. **`--native` (default on) → COMPARISON / ESTIMATE only, NOT GCM.** Real
+   `openssl enc -aes-256-ctr` + real `hashlib` HMAC-SHA256 tag. This was the
+   prior stand-in while `cryptography` was absent; it is now **对照/估算**,
+   superseded by (1), and is **not** claimed to bound GCM/GHASH.
+3. **pure-Python AES-256-GCM** (correct but ~2000× slow; validated against
+   the GCM spec Appendix B AES-256 test vector) — correctness reference.
 
 The PG leg uses `postgresql://postgres:mm@127.0.0.1:5437/mm_test` with a
 fresh throwaway schema per run (dropped on exit). The benchmark is robust to

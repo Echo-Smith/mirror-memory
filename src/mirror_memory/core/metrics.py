@@ -35,10 +35,13 @@ Privacy / label discipline (M5 task 2)
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from contextlib import contextmanager
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _counters: dict[str, int] = {}
@@ -65,6 +68,28 @@ def mark_sql_listener_installed() -> None:
     global _sql_listener_installed
     with _lock:
         _sql_listener_installed = True
+
+
+_listener_lock = threading.Lock()
+
+
+def ensure_sql_listener(install) -> bool:
+    """Install the process-wide cursor listener AT MOST ONCE, atomically.
+
+    ``install`` is called inside a dedicated lock with a double-check, so two
+    engines constructed concurrently on different threads cannot both attach a
+    listener (which would double-count every statement).  Returns True when
+    THIS call performed the installation.
+    """
+    global _sql_listener_installed
+    if _sql_listener_installed:
+        return False
+    with _listener_lock:
+        if _sql_listener_installed:
+            return False
+        install()
+        _sql_listener_installed = True
+        return True
 
 
 def set_enabled(value: bool) -> None:
@@ -101,33 +126,89 @@ def enabled() -> bool:
 
 _entry_tls = threading.local()
 
+#: Entries whose cost may be attributed.  Closed set -- an arbitrary string is
+#: never accepted as a label (it could smuggle content or an identifier onto
+#: the Prometheus wire).  ``UNKNOWN`` is the only extra token, and it is used
+#: for SQL with no entry scope rather than as a label from a call site.
+ENTRY_OBSERVE = "observe"
+ENTRY_RECALL = "recall"
+ENTRY_EXTRACTION_WORKER = "extraction_worker"
+#: The metabolism cycle is its OWN entry -- it must not be folded into
+#: ``observe`` (that would pollute observe's latency/token accounting).
+ENTRY_METABOLISM = "metabolism"
+
+ALLOWED_ENTRIES = frozenset(
+    {ENTRY_OBSERVE, ENTRY_RECALL, ENTRY_EXTRACTION_WORKER, ENTRY_METABOLISM}
+)
+
+
+def is_allowed_entry(entry: object) -> bool:
+    return isinstance(entry, str) and entry in ALLOWED_ENTRIES
+
 
 def current_entry() -> str | None:
     return getattr(_entry_tls, "entry", None)
 
 
+def current_engine_key() -> int | None:
+    """Identity of the SQLAlchemy engine that opened the active entry scope."""
+    return getattr(_entry_tls, "engine_key", None)
+
+
 @contextmanager
-def entry_scope(entry: str) -> Iterator[None]:
-    """Mark *entry* as the active attribution target on this thread for the
-    span of the ``with`` block.  Nested scopes restore the previous entry on
-    exit (including on exception)."""
+def entry_scope(entry: str, *, engine: object | None = None) -> Iterator[None]:
+    """Mark *entry* (and optionally *engine*) as the active attribution target
+    on this thread for the span of the ``with`` block.
+
+    ``engine`` is the SQLAlchemy ``Engine`` (or a ``MemoryEngine`` exposing
+    ``._engine``) whose SQL belongs to this entry.  The global cursor listener
+    only counts statements issued on THAT engine, so an unrelated engine's SQL
+    on the same thread during an active scope is not miscounted.  Nested
+    scopes restore the previous values exactly (also on exception).
+
+    An entry not in :data:`ALLOWED_ENTRIES` is rejected (``ValueError``) -- the
+    label set is closed, never caller-controlled.
+    """
+    if not is_allowed_entry(entry):
+        raise ValueError(
+            f"unknown metrics entry {entry!r}; allowed: {sorted(ALLOWED_ENTRIES)}"
+        )
+    engine_obj = engine
+    if engine_obj is not None and not hasattr(engine_obj, "dialect"):
+        engine_obj = getattr(engine_obj, "_engine", None)
     previous = getattr(_entry_tls, "entry", None)
+    previous_engine = getattr(_entry_tls, "engine_key", None)
     _entry_tls.entry = entry
+    _entry_tls.engine_key = id(engine_obj) if engine_obj is not None else None
     try:
         yield
     finally:
         _entry_tls.entry = previous
+        _entry_tls.engine_key = previous_engine
 
 
-def record_sql_current(n: int = 1) -> None:
-    """Count *n* SQL statements against the CURRENT entry, if any is active.
+def record_sql_current(engine: object | None = None, n: int = 1) -> None:
+    """Count *n* SQL statements against the CURRENT entry, if it applies.
 
-    This is what the single global cursor listener calls.  When no entry
-    scope is open on this thread it is a no-op -- so migrations, other
-    engines' pools, and unrelated SQL are never attributed."""
+    Called by the single process-wide cursor listener with the *connection's*
+    engine.  The count happens only when
+
+    * an entry scope is open on this thread (no scope -> no attribution), and
+    * the scope named an engine and it is the same engine that issued the
+      statement (so a different engine's SQL on the same thread is ignored).
+
+    A scope opened without an engine (e.g. a raw worker tick that is not tied
+    to a pooled Engine) counts regardless of the issuing engine."""
     entry = getattr(_entry_tls, "entry", None)
     if entry is None:
         return
+    scope_engine = getattr(_entry_tls, "engine_key", None)
+    if scope_engine is not None:
+        if engine is None:
+            return
+        issued_by = getattr(engine, "engine", engine)
+        if id(issued_by) != scope_engine:
+            return
     record_sql(entry, n)
 
 
@@ -135,6 +216,12 @@ class _LLMClientProxy:
     """Marker base so :func:`instrument_llm_client` is idempotent."""
 
     _inner: object
+
+
+#: Per-call usage capture for the CURRENT thread.  ``reported`` records whether
+#: the provider surfaced a usage object for the call in flight; ``inp``/``out``
+#: carry whatever it did surface (either may be None -> partial usage).
+_llm_tls = threading.local()
 
 
 def record_llm_tokens(
@@ -145,42 +232,89 @@ def record_llm_tokens(
 ) -> None:
     """Add MEASURED token counts for *entry* WITHOUT touching the call count.
 
-    The call itself is counted exactly once by the instrumented client proxy
-    (:func:`instrument_llm_client`) or by an explicit ``record_llm``.  A
-    provider usage hook calls THIS to contribute the real tokens; when a
-    provider surfaces no usage the proxy has already booked the call as
-    usage-unknown, so nothing is invented here."""
-    if not enabled():
+    The call itself is counted exactly once by the instrumented client proxy.
+    A provider usage hook contributes the real tokens through here; numbers
+    that were not surfaced are simply not added (the proxy books the call as
+    partial/unknown usage instead of guessing)."""
+    if not enabled() or not is_allowed_entry(entry):
         return
 
-    def _add(prefix: str, tok: int | str | None) -> bool:
+    def _add(prefix: str, tok: int | str | None) -> None:
         if isinstance(tok, bool) or not isinstance(tok, int):
-            return False
+            return
         inc(f"{prefix}.{entry}", int(tok))
-        return True
 
     _add(COST_INPUT_TOKENS_PREFIX, input_tokens)
     _add(COST_OUTPUT_TOKENS_PREFIX, output_tokens)
 
 
-def instrument_llm_client(client):
-    """Wrap an LLM client so EVERY ``generate()`` call is counted exactly
-    once, for ANY client (M5 fix for the "custom client counts 0" and
-    "concurrent hook cross-talk" defects).
+def _installed_hook(inner) -> bool:
+    return bool(getattr(inner, "_mm_metrics_hook", False))
 
-    * One ``llm_calls_total.<entry>`` increment per ``generate()`` -- entry
-      read from the calling thread's context (no shared mutable state, so no
-      cross-talk and no stale hook to restore).  If the provider surfaces no
-      usage, the call is also booked as ``llm_usage_unknown_total``.
-    * Real tokens, when available, are added by a usage hook the engine
-      installs via :func:`record_llm_tokens` (token-only, never a second call
-      count).
-    * The proxy forwards all other attribute access to the wrapped client, is
-      idempotent, and never raises from metric bookkeeping."""
+
+def _install_chained_hook(inner) -> None:
+    """Install ONE hook on *inner* that records usage AND still calls the
+    host's original callback.
+
+    The host's ``_on_call`` (if any) is saved exactly once and invoked by the
+    chain, so instrumentation never overwrites or loses a host callback.  The
+    hook reads the CALLING THREAD's entry at call time -- shared clients used
+    from several threads therefore attribute per thread, and a call made
+    outside any entry scope records nothing (it cannot be mis-attributed).
+    """
+    if not hasattr(inner, "set_on_call") or _installed_hook(inner):
+        return
+    original = getattr(inner, "_on_call", None)
+
+    def _chain(info: dict) -> None:
+        try:
+            inp = info.get("input_tokens")
+            out = info.get("output_tokens")
+            _llm_tls.reported = True
+            _llm_tls.input_tokens = inp
+            _llm_tls.output_tokens = out
+            entry = getattr(_entry_tls, "entry", None)
+            if entry is not None:
+                record_llm_tokens(entry, input_tokens=inp, output_tokens=out)
+        except Exception:  # metrics must never break a provider callback
+            logger.debug("metrics: usage hook failed", exc_info=True)
+        # ALWAYS forward to the host's own callback, if there was one.
+        if original is not None:
+            try:
+                original(info)
+            except Exception:
+                logger.debug("metrics: host LLM callback raised", exc_info=True)
+
+    try:
+        inner.set_on_call(_chain)
+        inner._mm_metrics_hook = True
+        inner._mm_metrics_original_on_call = original
+    except Exception:  # pragma: no cover - exotic client
+        logger.debug("metrics: could not install usage hook", exc_info=True)
+
+
+def instrument_llm_client(client):
+    """Wrap an LLM client so every ``generate()`` is counted exactly once,
+    whatever the client (M5 §3 patch).
+
+    Per call, on the CALLING THREAD:
+
+    * ``llm_calls_total.<entry>``   -- always, when an entry scope is open;
+    * ``llm_input_tokens`` / ``llm_output_tokens`` -- real numbers only;
+    * ``llm_usage_partial_total``   -- usage surfaced but only one side;
+    * ``llm_usage_unknown_total``   -- no usage surfaced at all;
+    * ``llm_calls_failed_total``    -- ``generate()`` raised.
+
+    A call made with no entry scope open records nothing (no attribution, no
+    cross-talk).  The proxy is transparent for every other attribute, forwards
+    ``set_on_call`` to the inner client (never replacing a host callback: it is
+    saved once and chained), is idempotent, and never raises from bookkeeping."""
     if client is None:
         return None
     if isinstance(client, _LLMClientProxy):
         return client
+
+    _install_chained_hook(client)
 
     class _Proxy(_LLMClientProxy):
         def __init__(self, inner):
@@ -192,21 +326,42 @@ def instrument_llm_client(client):
         def __setattr__(self, name, value):
             setattr(object.__getattribute__(self, "_inner"), name, value)
 
+        def set_on_call(self, hook):
+            """Forward to the inner client, keeping our chained hook in place.
+
+            A host that installs its own callback must keep working: we save it
+            as the new "original" that our chain forwards to, rather than
+            dropping either side."""
+            inner = object.__getattribute__(self, "_inner")
+            inner._mm_metrics_original_on_call = hook
+            if not _installed_hook(inner):
+                _install_chained_hook(inner)
+
         def generate(self, *args, **kwargs):
             inner = object.__getattribute__(self, "_inner")
             entry = getattr(_entry_tls, "entry", None)
+            _llm_tls.reported = False
+            _llm_tls.input_tokens = None
+            _llm_tls.output_tokens = None
+            ok = True
             try:
                 return inner.generate(*args, **kwargs)
+            except BaseException:
+                ok = False
+                raise
             finally:
-                if entry is not None and enabled():
+                if entry is not None and is_allowed_entry(entry) and enabled():
                     inc(f"{COST_LLM_CALLS_PREFIX}.{entry}")
-                    # If the inner client has NO usage hook, we cannot know
-                    # the tokens -> book the call as usage-unknown so the
-                    # token counters stay honest.
-                    if not getattr(inner, "_mm_usage_hook", False):
+                    if not ok:
+                        inc(f"{COST_LLM_CALLS_FAILED_PREFIX}.{entry}")
+                    elif not getattr(_llm_tls, "reported", False):
                         inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
+                    elif (_llm_tls.input_tokens is None
+                          or _llm_tls.output_tokens is None):
+                        inc(f"{COST_USAGE_PARTIAL_PREFIX}.{entry}")
 
     return _Proxy(client)
+
 
 #: A request (engine entry or worker job) was refused for having no purpose.
 MISSING_PURPOSE = "missing_purpose_refusals"
@@ -262,12 +417,32 @@ def gauge(name: str) -> float | None:
         return _gauges.get(name)
 
 
-def snapshot() -> dict[str, int]:
-    """The counter snapshot -- ``snapshot()`` keeps its historical shape
-    (``dict[str, int]``) so existing callers (``snapshot().get(name, 0)``)
-    keep working.  The richer view lives in :func:`report`."""
-    with _lock:
-        return dict(_counters)
+def snapshot(*, storage: dict | None = None) -> dict:
+    """Everything the library currently knows, in ONE mapping.
+
+    The historical contract is preserved: every counter name maps to an
+    ``int`` at the TOP LEVEL, so ``snapshot().get("missing_purpose_refusals", 0)``
+    and iteration over counter names keep working unchanged.
+
+    In addition the same mapping carries the other sections under fixed keys
+    that can never collide with a counter name (they start with ``_``):
+
+    ``_gauges``   {name: float}
+    ``_latency``  {entry: {count, p50, p95, p99}}
+    ``_cost``     {entry: per-call cost (see :func:`entry_cost`)}
+    ``_storage``  {(tenant, app, user): {table: {rows, bytes}}} -- only when the
+                  caller passes the on-demand ``storage=`` value, because
+                  computing it needs SQL (never on the request path).
+
+    ``_enabled`` records whether recording is on.
+    """
+    counters = dict(_counters)
+    counters["_gauges"] = gauges()
+    counters["_latency"] = latency_summaries()
+    counters["_cost"] = entry_costs()
+    counters["_storage"] = storage if storage is not None else {}
+    counters["_enabled"] = enabled()
+    return counters
 
 
 def gauges() -> dict[str, float]:
@@ -283,20 +458,18 @@ def gauges() -> dict[str, float]:
 # content or a user id into the metric name.
 # ---------------------------------------------------------------------------
 
-#: Entries whose cost we attribute.  Closed set.
-ENTRY_OBSERVE = "observe"
-ENTRY_RECALL = "recall"
-ENTRY_EXTRACTION_WORKER = "extraction_worker"
-#: The metabolism cycle is its OWN entry -- it must not be folded into
-#: ``observe`` (that would pollute observe's latency/token accounting).
-ENTRY_METABOLISM = "metabolism"
-
+# (`ENTRY_*` and `ALLOWED_ENTRIES` are defined once, above the entry scope.)
 COST_LLM_CALLS_PREFIX = "llm_calls_total"        # + ".<entry>"
 COST_INPUT_TOKENS_PREFIX = "llm_input_tokens"    # + ".<entry>"
 COST_OUTPUT_TOKENS_PREFIX = "llm_output_tokens"  # + ".<entry>"
-#: Calls whose provider surfaced no usage object -> counted separately so
-#: the token counters are never inflated by a guess.
+#: Calls whose provider surfaced NO usage object -> counted separately so the
+#: token counters are never inflated by a guess.
 COST_USAGE_UNKNOWN_PREFIX = "llm_usage_unknown_total"  # + ".<entry>"
+#: Calls where the provider surfaced usage but only one side (in OR out).  The
+#: side that was reported is still added to its token counter.
+COST_USAGE_PARTIAL_PREFIX = "llm_usage_partial_total"  # + ".<entry>"
+#: Calls where ``generate()`` raised (still counted as a call attempt).
+COST_LLM_CALLS_FAILED_PREFIX = "llm_calls_failed_total"  # + ".<entry>"
 
 #: SQL statements issued, by entry ("unknown" when no request context is
 #: active -- e.g. a manual DDL script).
@@ -320,7 +493,7 @@ def record_llm(
     counted under the ``unknown`` counter instead so the token totals mean
     "tokens we actually measured", never a fabricated number.
     """
-    if not enabled():
+    if not enabled() or not is_allowed_entry(entry):
         return
     inc(f"{COST_LLM_CALLS_PREFIX}.{entry}")
 
@@ -337,8 +510,12 @@ def record_llm(
 
 
 def record_sql(entry: str = UNKNOWN, n: int = 1) -> None:
-    """Record *n* SQL statements issued for *entry* (count only)."""
-    if not enabled():
+    """Record *n* SQL statements issued for *entry* (count only).
+
+    ``entry`` must be a closed-set entry name (or the ``unknown`` sentinel for
+    statements with no entry scope); anything else is dropped, never encoded
+    as a label."""
+    if not enabled() or (entry != UNKNOWN and not is_allowed_entry(entry)):
         return
     inc(f"{SQL_STATEMENTS_PREFIX}.{entry}", n)
 
@@ -369,8 +546,11 @@ def _bucket_index(ms: float) -> int:
 
 
 def observe_latency(entry: str, ms: float) -> None:
-    """Record one latency sample (milliseconds) for *entry*."""
-    if not enabled():
+    """Record one latency sample (milliseconds) for *entry*.
+
+    Only a closed-set entry is accepted: the entry becomes a Prometheus label,
+    so an arbitrary string is rejected rather than encoded onto the wire."""
+    if not enabled() or not is_allowed_entry(entry):
         return
     if ms < 0:
         ms = 0.0
@@ -470,15 +650,95 @@ def histogram_all() -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Storage growth (M5 task 2 requirement 3)
+# Per-call cost (M5 §3) -- AVERAGE cost of ONE entry invocation, as opposed to
+# the monotonically-growing aggregate counters.
 #
-# Row counts and estimated bytes PER USER, PER TABLE, by an ON-DEMAND SQL
-# pass -- never on the request path.  Call it from an admin endpoint, a
-# low-frequency worker tick, or a benchmark.  SQLite uses
-# ``length(CAST(col AS BLOB))``; PostgreSQL uses ``octet_length(col)``.
-# The aggregate read crosses tenants by design (a capacity report), so it
-# runs inside ``system_scope`` with a recorded reason; it is never reached
-# from an engine request path.
+# The denominator is the latency-histogram sample count for that entry, which
+# is exactly "how many times this entry ran" (each entry records one latency
+# sample per invocation, covering its whole span -- init and sync gate
+# included; see :meth:`MemoryEngine._metrics_entry`).
+# ---------------------------------------------------------------------------
+
+
+def entry_cost(entry: str) -> dict:
+    """Average cost of ONE invocation of *entry*.
+
+    Returns ``calls`` (invocations observed) plus per-call averages of LLM
+    calls, measured tokens, failed calls and SQL statements.  Averages are
+    ``None`` when the entry has not run yet -- never a fabricated zero.
+    Totals stay available through :func:`snapshot` (the counters).
+    """
+    if not is_allowed_entry(entry):
+        raise ValueError(
+            f"unknown metrics entry {entry!r}; allowed: {sorted(ALLOWED_ENTRIES)}"
+        )
+    calls = histogram(entry)["count"]
+
+    def _per_call(prefix: str) -> tuple[int, float | None]:
+        total = value(f"{prefix}.{entry}")
+        return total, (round(total / calls, 3) if calls else None)
+
+    llm_calls, llm_per = _per_call(COST_LLM_CALLS_PREFIX)
+    llm_failed, failed_per = _per_call(COST_LLM_CALLS_FAILED_PREFIX)
+    tok_in, in_per = _per_call(COST_INPUT_TOKENS_PREFIX)
+    tok_out, out_per = _per_call(COST_OUTPUT_TOKENS_PREFIX)
+    usage_unknown, unknown_per = _per_call(COST_USAGE_UNKNOWN_PREFIX)
+    usage_partial, partial_per = _per_call(COST_USAGE_PARTIAL_PREFIX)
+    sql, sql_per = _per_call(SQL_STATEMENTS_PREFIX)
+    return {
+        "entry": entry,
+        "calls": calls,
+        "llm_calls": llm_calls,
+        "llm_calls_per_call": llm_per,
+        "llm_calls_failed": llm_failed,
+        "llm_calls_failed_per_call": failed_per,
+        "input_tokens": tok_in,
+        "input_tokens_per_call": in_per,
+        "output_tokens": tok_out,
+        "output_tokens_per_call": out_per,
+        "usage_unknown_calls": usage_unknown,
+        "usage_unknown_per_call": unknown_per,
+        "usage_partial_calls": usage_partial,
+        "usage_partial_per_call": partial_per,
+        "sql_statements": sql,
+        "sql_statements_per_call": sql_per,
+    }
+
+
+def entry_costs() -> dict[str, dict]:
+    """Per-call cost for every closed-set entry (zeros/None when never run)."""
+    return {e: entry_cost(e) for e in sorted(ALLOWED_ENTRIES)}
+
+
+def totals() -> dict[str, int]:
+    """The monotonically-growing aggregate counters (the raw totals).
+
+    This is what :func:`snapshot` exposes at its top level; :func:`entry_cost`
+    turns the same numbers into per-invocation averages."""
+    with _lock:
+        return dict(_counters)
+
+
+# ---------------------------------------------------------------------------
+# Storage growth (M5 task 2 requirement 3; §2 patch)
+#
+# Row counts and estimated bytes PER (tenant, app, user), PER TABLE, by an
+# ON-DEMAND SQL pass -- never on the request path.
+#
+# AUTHORIZATION (the important part): the tenant identity is NOT a free
+# caller parameter.  It is taken from the BOUND tenancy context
+# (``core.tenancy.current_tenant()``), which only the engine entry / server
+# middleware can open.  With no bound context the call FAILS CLOSED
+# (``TenantContextMissing``); the caller cannot ask for another tenant's
+# numbers by passing one.  The SQL additionally carries the explicit
+# ``WHERE tenant_id = :t AND app_id = :a`` predicate, and on PostgreSQL+RLS
+# the row-security policy applies on top -- defence in depth, not a bypass.
+#
+# There is deliberately NO cross-tenant storage API: a capacity report that
+# crosses tenants would need its own verifiable admin authorization and a
+# dedicated privileged connection, which the library does not have.  Do not
+# reintroduce one via a logical scope (``system_scope``) -- that is not a
+# database grant.
 # ---------------------------------------------------------------------------
 
 #: Columns whose on-disk size dominates a row; a cheap per-table estimate
@@ -491,25 +751,49 @@ _ESTIMATE_COLUMNS: dict[str, tuple[str, ...]] = {
     "mm_belief_events": ("reason",),
 }
 
+#: The composite grouping key: a user id alone is NOT identity (two apps in
+#: the same tenant may both have user ``u1``) -- the key carries all three so
+#: those rows can never overwrite each other in the result map.
+StorageKey = tuple[str, str, str]
 
-def _storage_rows(engine, *, where: tuple[str, tuple[dict, ...]] | None):
-    """Shared body: one aggregate per tenant table, optionally filtered.
 
-    ``where`` is ``(sql_fragment, params_list)`` where the fragment is a
-    trailing predicate appended to the WHERE clause (e.g.
-    ``"WHERE tenant_id = :t AND app_id = :a"``), or ``None`` for the
-    explicitly-privileged all-tenant report.  Identifiers (table/column) come
-    from the DB catalog, never from user input; only VALUES are bound.
+def _q(engine, name: str) -> str:
+    """Quote one reflected identifier with the engine's own preparer."""
+    return engine.dialect.identifier_preparer.quote(name)
+
+
+def storage_stats(engine) -> dict[StorageKey, dict[str, dict[str, int]]]:
+    """Per-(tenant, app, user), per-table row counts + estimated bytes.
+
+    The tenant is resolved from the BOUND context (``current_tenant()``) and
+    the query is explicitly filtered to it.  No tenant argument is accepted:
+    a caller cannot widen or redirect the report.
+
+    Returns ``{(tenant_id, app_id, user_id): {table: {"rows", "bytes"}}}``.
+    User ids appear ONLY in this library value (and in :func:`report`'s
+    ``storage`` section) -- never in a Prometheus label.
+
+    Raises
+    ------
+    TenantContextMissing
+        When no tenant context is bound (fail-closed; no default tenant).
     """
     from sqlalchemy import inspect as _inspect
     from sqlalchemy import text as _text
 
-    out: dict[tuple[str, str], dict[str, dict[str, int]]] = {}
+    from mirror_memory.core.tenancy import current_tenant
+
+    tenant_id, app_id = current_tenant()  # raises when unbound -> fail-closed
+    if not tenant_id or not app_id:  # defensive: scope guarantees non-empty
+        raise ValueError("storage_stats requires a bound, non-empty tenant context")
+
     inspector = _inspect(engine)
-    tables = set(inspector.get_table_names())
+    tables = sorted(inspector.get_table_names())
     groups = ("tenant_id", "app_id", "user_id")
+
+    out: dict[StorageKey, dict[str, dict[str, int]]] = {}
     with engine.connect() as conn:
-        for table in sorted(tables):
+        for table in tables:
             if not table.startswith("mm_"):
                 continue
             cols = {c["name"] for c in inspector.get_columns(table)}
@@ -519,77 +803,44 @@ def _storage_rows(engine, *, where: tuple[str, tuple[dict, ...]] | None):
             if size_cols:
                 if engine.dialect.name == "postgresql":
                     size_expr = " + ".join(
-                        f"COALESCE(octet_length({c}), 0)" for c in size_cols
+                        f"COALESCE(octet_length({_q(engine, c)}), 0)" for c in size_cols
                     )
                 else:
                     size_expr = " + ".join(
-                        f"COALESCE(length(CAST({c} AS BLOB)), 0)" for c in size_cols
+                        f"COALESCE(length(CAST({_q(engine, c)} AS BLOB)), 0)"
+                        for c in size_cols
                     )
-                cols_sql = (
-                    f"tenant_id, app_id, user_id, COUNT(*) AS n, "
+                select_sql = (
+                    f"{_q(engine, 'tenant_id')}, {_q(engine, 'app_id')}, "
+                    f"{_q(engine, 'user_id')}, COUNT(*) AS n, "
                     f"COALESCE(SUM({size_expr}), 0) AS b"
                 )
             else:
-                cols_sql = "tenant_id, app_id, user_id, COUNT(*) AS n, 0 AS b"
-            frag = where[0] if where else ""
-            params = where[1] if where else ()
-            group_sql = "GROUP BY tenant_id, app_id, user_id"
-            sql = f"SELECT {cols_sql} FROM {table} {frag} {group_sql}"
-            for tenant_id, app_id, user_id, n, b in conn.execute(_text(sql), params):
-                key = (str(tenant_id), str(user_id))
+                select_sql = (
+                    f"{_q(engine, 'tenant_id')}, {_q(engine, 'app_id')}, "
+                    f"{_q(engine, 'user_id')}, COUNT(*) AS n, 0 AS b"
+                )
+            sql = (
+                f"SELECT {select_sql} FROM {_q(engine, table)} "
+                f"WHERE {_q(engine, 'tenant_id')} = :t "
+                f"AND {_q(engine, 'app_id')} = :a "
+                f"GROUP BY {_q(engine, 'tenant_id')}, {_q(engine, 'app_id')}, "
+                f"{_q(engine, 'user_id')}"
+            )
+            for row_tenant, row_app, user_id, n, b in conn.execute(
+                _text(sql), {"t": tenant_id, "a": app_id}
+            ):
+                # Defence in depth: the explicit predicate already pins these,
+                # and on PG+RLS the policy does too.  If a row from another
+                # tenant ever appears, refuse loudly instead of reporting it.
+                if str(row_tenant) != tenant_id or str(row_app) != app_id:
+                    raise RuntimeError(
+                        "storage_stats read a row outside the bound tenant "
+                        "(tenant/app mismatch) -- refusing to report it"
+                    )
+                key: StorageKey = (str(row_tenant), str(row_app), str(user_id))
                 out.setdefault(key, {})[table] = {"rows": int(n), "bytes": int(b)}
     return out
-
-
-def storage_stats(engine, *, tenant: tuple[str, str]) -> dict[tuple[str, str], dict[str, dict[str, int]]]:
-    """Per-(tenant, user), per-table row counts + estimated bytes for ONE
-    tenant, with an EXPLICIT ``WHERE tenant_id = :t AND app_id = :a`` filter.
-
-    This is the safe default: it runs on the ordinary engine, and the filter
-    is applied in SQL, so it returns only the caller's tenant even when RLS
-    is switched off (SQLite).  Under PostgreSQL + RLS both the explicit
-    predicate AND the row-security policy apply -- defence in depth.
-
-    Returns ``{(tenant_id, user_id): {table: {"rows": int, "bytes": int}}}``.
-    User ids live ONLY in this library return value and in
-    :func:`report`'s ``storage`` section -- never in a Prometheus label.
-    """
-    tenant_id, app_id = tenant
-    if not tenant_id or not app_id:
-        raise ValueError("storage_stats requires a non-empty (tenant_id, app_id)")
-    where = (
-        "WHERE tenant_id = :t AND app_id = :a",
-        {"t": tenant_id, "a": app_id},
-    )
-    return _storage_rows(engine, where=where)
-
-
-def storage_stats_all_tenants(engine) -> dict[tuple[str, str], dict[str, dict[str, int]]]:
-    """Per-(tenant, user) storage for an EXPLICITLY PRIVILEGED report.
-
-    This crosses tenants BY DESIGN (a capacity report).  Two independent
-    requirements make it *verifiable* rather than a silent escalation:
-
-    1. It runs inside ``system_scope(reason=...)`` -- the ONE sanctioned
-       cross-tenant bypass.  That scope is (a) recorded by the SQL auditor
-       with its reason, (b) subject to the ``tools/check_system_scope.py``
-       allowlist, so this call site is registered and reviewable.  It is a
-       LOGICAL scope, not a DB GRANT.
-    2. ``system_scope`` does NOT elevate database privileges.  On PostgreSQL
-       + RLS this function therefore returns only what the CALLER's engine
-       can see: to get a true all-tenant reading the caller MUST pass the
-       maintenance/owner engine (``core.rls.maintenance_engine_for``) which
-       carries the real elevated DB role.  Passing the ordinary app engine
-       yields the app role's (RLS-filtered) view -- no silent privilege gain.
-       On SQLite there is no RLS, so the ordinary engine is fine.
-
-    Returns the same shape as :func:`storage_stats` (keys carry tenant+user,
-    so a shared ``user_id`` across tenants is never conflated).
-    """
-    from mirror_memory.core.tenancy import system_scope
-
-    with system_scope(reason="metrics.storage_stats_all_tenants: privileged capacity report"):
-        return _storage_rows(engine, where=None)
 
 
 # ---------------------------------------------------------------------------
@@ -598,17 +849,17 @@ def storage_stats_all_tenants(engine) -> dict[tuple[str, str], dict[str, dict[st
 
 
 def report(*, storage: dict | None = None) -> dict:
-    """Everything the library knows: counters, gauges, latency summaries,
-    and (only when explicitly computed) storage stats.
+    """Alias kept for callers that used the older split shape.
 
-    ``storage`` is passed in by the caller that just ran :func:`storage_stats`
-    -- the request path never computes it.
-    """
+    Returns ``{"counters", "gauges", "latency", "cost", "storage"}``; the same
+    data is available from :func:`snapshot` directly."""
+    snap = snapshot(storage=storage)
     return {
-        "counters": snapshot(),
-        "gauges": gauges(),
-        "latency": latency_summaries(),
-        "storage": storage if storage is not None else {},
+        "counters": {k: v for k, v in snap.items() if not k.startswith("_")},
+        "gauges": snap["_gauges"],
+        "latency": snap["_latency"],
+        "cost": snap["_cost"],
+        "storage": snap["_storage"],
     }
 
 
@@ -623,6 +874,10 @@ def reset_for_tests() -> None:
         _hist_sums.clear()
         _enabled = True
     _entry_tls.entry = None
+    _entry_tls.engine_key = None
+    _llm_tls.reported = False
+    _llm_tls.input_tokens = None
+    _llm_tls.output_tokens = None
 
 
 # ---------------------------------------------------------------------------
@@ -635,9 +890,11 @@ def reset_for_tests() -> None:
 
 _DYNAMIC_PREFIXES = (
     COST_LLM_CALLS_PREFIX,
+    COST_LLM_CALLS_FAILED_PREFIX,
     COST_INPUT_TOKENS_PREFIX,
     COST_OUTPUT_TOKENS_PREFIX,
     COST_USAGE_UNKNOWN_PREFIX,
+    COST_USAGE_PARTIAL_PREFIX,
     SQL_STATEMENTS_PREFIX,
 )
 
@@ -646,17 +903,39 @@ _HELP = {
     COST_INPUT_TOKENS_PREFIX: "Measured LLM input (prompt) tokens, by entry.",
     COST_OUTPUT_TOKENS_PREFIX: "Measured LLM output (completion) tokens, by entry.",
     COST_USAGE_UNKNOWN_PREFIX: "LLM calls with no provider usage object, by entry.",
+    COST_USAGE_PARTIAL_PREFIX: "LLM calls with partial provider usage (one side only), by entry.",
+    COST_LLM_CALLS_FAILED_PREFIX: "LLM calls that raised, by entry.",
     SQL_STATEMENTS_PREFIX: "SQL statements issued, by entry.",
 }
 
 
+def escape_label_value(value: str) -> str:
+    """Encode a Prometheus label VALUE (backslash, double-quote, newline).
+
+    Label values may never smuggle a newline or a quote into the exposition.
+    Combined with the closed-set entry check this is the whole defence: the
+    only labels emitted are ``entry`` (closed set), ``reason`` (a fixed token
+    set) and ``le`` (a number or ``+Inf``)."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+
+
 def _emit_counter_family(lines: list[str], family: str, samples: dict[str, int]) -> None:
-    if not samples:
+    """Emit one family; samples whose label is not in the closed entry set are
+    dropped (they can never have been recorded, but defence in depth)."""
+    safe = {e: v for e, v in samples.items() if is_allowed_entry(e) or e == UNKNOWN}
+    if not safe:
         return
     lines.append(f"# HELP {family} {_HELP.get(family, '')}".rstrip())
     lines.append(f"# TYPE {family} counter")
-    for entry, val in sorted(samples.items()):
-        lines.append(f'{family}{{entry="{entry}"}} {val}')
+    for entry, val in sorted(safe.items()):
+        lines.append(
+            f'{family}{{entry="{escape_label_value(entry)}"}} {val}'
+        )
 
 
 def render_prometheus() -> str:
@@ -690,7 +969,10 @@ def render_prometheus() -> str:
         lines.append("# HELP mirror_memory_tombstones_rejected_total Rejected tombstone batches by reason.")
         lines.append("# TYPE mirror_memory_tombstones_rejected_total counter")
         for reason, v in sorted(rejected.items()):
-            lines.append(f'mirror_memory_tombstones_rejected_total{{reason="{reason}"}} {v}')
+            lines.append(
+                f'mirror_memory_tombstones_rejected_total'
+                f'{{reason="{escape_label_value(reason)}"}} {v}'
+            )
 
     # Cost counters grouped by dynamic family.
     for prefix in _DYNAMIC_PREFIXES:

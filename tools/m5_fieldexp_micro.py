@@ -598,6 +598,180 @@ def _load_beliefs(engine, user):
     return rows
 
 
+# ===========================================================================
+# REAL native AES-256-GCM field-encryption prototype (cryptography >= 50).
+#
+# This is a PROTOTYPE / in-memory measurement harness ONLY.  It is NOT wired
+# into production storage: no ORM column, no migration, no engine path reads
+# or writes ciphertext.  It exists solely to MEASURE the real cost of
+# per-field AES-256-GCM (independent 96-bit nonce + independent tag per
+# field, AAD = row_id:column) with the actual `cryptography` primitive, so
+# the doc can quote REAL GCM numbers instead of CTR+HMAC proxy/estimates.
+#
+# IMPORTANT honesty: `cryptography`'s AESGCM.encrypt returns `ciphertext ||
+# tag` (tag = last 16 bytes) — one independent tag per field, because each
+# field is encrypted with its own random 96-bit nonce and its own call.
+# ===========================================================================
+
+try:  # pragma: no cover - import guard
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+    _GCM_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _AESGCM = None
+    _GCM_AVAILABLE = False
+
+
+def gcm_available() -> bool:
+    return _GCM_AVAILABLE
+
+
+class FieldGCM:
+    """Per-field AES-256-GCM.  Each content field value is encrypted
+    independently: own 96-bit nonce, own 16-byte tag, AAD binds
+    ``row_id:column`` so a ciphertext cannot be moved between rows or
+    swapped across columns.  Prototype only (in-memory)."""
+
+    def __init__(self, dek: bytes | None = None):
+        assert _GCM_AVAILABLE, "cryptography AESGCM not importable"
+        self.dek = dek or _AESGCM.generate_key(256)
+        self._aead = _AESGCM(self.dek)
+
+    @staticmethod
+    def _aad(row_id: str, column: str) -> bytes:
+        return f"{row_id}:{column}".encode("utf-8")
+
+    def encrypt_field(self, row_id: str, column: str, value: bytes) -> tuple[bytes, bytes]:
+        nonce = os.urandom(12)  # independent 96-bit nonce per field
+        ct = self._aead.encrypt(nonce, value, self._aad(row_id, column))
+        return nonce, ct  # ct already includes the 16-byte tag
+
+    def decrypt_field(self, row_id: str, column: str, nonce: bytes, ct_tag: bytes) -> bytes:
+        return self._aead.decrypt(nonce, ct_tag, self._aad(row_id, column))
+
+    # ---- belief-level helpers (field split, all in memory) ---------------
+
+    def encrypt_belief(self, belief, columns=_CONTENT_COLUMNS) -> list[tuple[str, bytes, bytes]]:
+        """Encrypt each content column of one belief as an INDEPENDENT field.
+        Returns [(column, nonce, ct_tag), ...] (in-memory record).  The AAD
+        row id is `global_id` when present else `id`, matching
+        `_belief_row_id` so encrypt and decrypt agree."""
+        row_id = _belief_row_id(belief)
+        out = []
+        for col in columns:
+            v = getattr(belief, col, "") or ""
+            if not isinstance(v, str):
+                v = str(v)
+            nonce, ct = self.encrypt_field(row_id, col, v.encode("utf-8"))
+            out.append((col, nonce, ct))
+        return out
+
+    def decrypt_belief(self, row_id: str, fields: list[tuple[str, bytes, bytes]]) -> dict[str, bytes]:
+        return {
+            col: self.decrypt_field(row_id, col, nonce, ct)
+            for (col, nonce, ct) in fields
+        }
+
+
+def _belief_row_id(belief) -> str:
+    return str(getattr(belief, "global_id", "") or getattr(belief, "id", ""))
+
+
+def measure_gcm_full_load(beliefs, runs: int = 5):
+    """REAL measurement: encrypt ALL fields of ALL beliefs once (build the
+    in-memory ciphertext store), then time decrypting EVERY field, repeated
+    `runs` times; report per-run total ms → p50 / min / max (spread), plus
+    fields count and total decrypt-only cost.  This is the honest
+    'session-start decrypt-all' cost under real AES-256-GCM."""
+    if not beliefs:
+        return {}
+    g = FieldGCM()
+    # build ciphertext store (encrypt-all, measured separately as overhead)
+    t0 = time.perf_counter()
+    store = []  # list of (row_id, [(col, nonce, ct)])
+    for b in beliefs:
+        store.append((_belief_row_id(b), g.encrypt_belief(b)))
+    enc_all_ms = (time.perf_counter() - t0) * 1000.0
+    fields = sum(len(f) for _, f in store)
+    # decrypt-all, repeated
+    per_run = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        for row_id, fs in store:
+            g.decrypt_belief(row_id, fs)
+        per_run.append((time.perf_counter() - t0) * 1000.0)
+    return {
+        "beliefs": len(beliefs),
+        "fields": fields,
+        "runs": runs,
+        "encrypt_all_ms": round(enc_all_ms, 3),
+        "decrypt_all_ms_p50": round(_percentile(per_run, 50), 3),
+        "decrypt_all_ms_min": round(min(per_run), 3),
+        "decrypt_all_ms_max": round(max(per_run), 3),
+        "decrypt_all_ms_median_mean": round(statistics.fmean(per_run), 3),
+        "us_per_field_decrypt": round(statistics.fmean(per_run) * 1000.0 / max(fields, 1), 4),
+        "per_run_ms": [round(x, 3) for x in per_run],
+    }
+
+
+def measure_gcm_per_field(beliefs, sample: int = 2000):
+    """REAL measurement: µs per single-field decrypt, over a bounded sample
+    of real content fields (independent nonce + AAD each)."""
+    if not beliefs:
+        return {}
+    g = FieldGCM()
+    # collect up to `sample` individual fields from real beliefs
+    enc = []  # (row_id, col, nonce, ct)
+    for b in beliefs:
+        rid = _belief_row_id(b)
+        for col in _CONTENT_COLUMNS:
+            v = getattr(b, col, "") or ""
+            nonce, ct = g.encrypt_field(rid, col, str(v).encode("utf-8"))
+            enc.append((rid, col, nonce, ct))
+            if len(enc) >= sample:
+                break
+        if len(enc) >= sample:
+            break
+    t0 = time.perf_counter()
+    for rid, col, nonce, ct in enc:
+        g.decrypt_field(rid, col, nonce, ct)
+    dt = time.perf_counter() - t0
+    return {
+        "fields_decrypted": len(enc),
+        "us_per_field_decrypt": round(dt * 1e6 / max(len(enc), 1), 4),
+        "total_ms": round(dt * 1000.0, 3),
+    }
+
+
+def measure_gcm_candidate_decrypt(beliefs, cap: int = _CANDIDATE_DECRYPT_CAP, runs: int = 50):
+    """REAL measurement (prototype): decrypt the bounded recall candidate
+    set — up to `cap` beliefs × all their content FIELDS — with real
+    AES-256-GCM, repeated `runs` times.  This is the per-recall decrypt add,
+    MEASURED on real fields; it is subtracted from nothing — it is a real
+    crypto cost.  It is 'prototype' in the sense that production does not
+    actually store ciphertext, not in the sense that the timing is fake."""
+    picks = beliefs[:cap]
+    if not picks:
+        return {"candidates": 0}
+    g = FieldGCM()
+    store = [(_belief_row_id(b), g.encrypt_belief(b)) for b in picks]
+    fields = sum(len(f) for _, f in store)
+    per_run = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        for row_id, fs in store:
+            g.decrypt_belief(row_id, fs)
+        per_run.append((time.perf_counter() - t0) * 1000.0)
+    return {
+        "candidates": len(picks),
+        "fields": fields,
+        "runs": runs,
+        "decrypt_ms_p50": round(_percentile(per_run, 50), 4),
+        "decrypt_ms_min": round(min(per_run), 4),
+        "decrypt_ms_max": round(max(per_run), 4),
+        "us_per_field": round(statistics.fmean(per_run) * 1000.0 / max(fields, 1), 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Measurement routines
 # ---------------------------------------------------------------------------
@@ -731,6 +905,46 @@ def measure_observe_overhead(engine, user, key, repeats):
                 aes_gcm_decrypt(key, nonce, ct)
         with_enc.append((time.perf_counter() - t0) * 1000.0)
     return base, with_enc
+
+
+def measure_observe_gcm_overhead(engine, user, g: "FieldGCM", repeats: int):
+    """REAL-GCM observe delta (PROTOTYPE): measure observe() alone, then
+    observe() + encrypt every content FIELD of the freshly-minted belief with
+    real AES-256-GCM (per-field nonce + tag + AAD).  The observe() call
+    itself is real engine cost; the GCM encryption is a real crypto cost
+    bolted on in the harness (NO production integration).  Returns
+    (base_ms_list, enc_ms_list) and the median delta."""
+    from sqlalchemy import select
+
+    from mirror_memory.core.models import Belief
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+
+    base, enc = [], []
+    for i in range(repeats):
+        txt = f"I additionally like matcha grade {3 * repeats + i} weekly."
+        t0 = time.perf_counter()
+        with tenant_scope("default", "default"), \
+                fixture_write_scope("m5 observe gcm base"):
+            engine.observe(user_id=user, session_id=f"gb{i % 5}",
+                           text=txt, purpose="api")
+        base.append((time.perf_counter() - t0) * 1000.0)
+
+    for i in range(repeats):
+        txt = f"I additionally like sencha grade {4 * repeats + i} weekly."
+        t0 = time.perf_counter()
+        with tenant_scope("default", "default"), \
+                fixture_write_scope("m5 observe gcm enc"):
+            engine.observe(user_id=user, session_id=f"ge{i % 5}",
+                           text=txt, purpose="api")
+            with engine._session() as session:
+                row = session.scalars(
+                    select(Belief).where(Belief.user_id == user)
+                    .order_by(Belief.id.desc()).limit(1)
+                ).first()
+            if row is not None:
+                g.encrypt_belief(row)  # real AES-256-GCM, all fields
+        enc.append((time.perf_counter() - t0) * 1000.0)
+    return base, enc
 
 
 def measure_session_start_decrypt(engine, user, key):
@@ -958,6 +1172,28 @@ def run_backend(backend, counts, args, key):
                         beliefs, key, cap=_CANDIDATE_DECRYPT_CAP)
                 except Exception as exc:  # never kill the run for a native probe
                     entry["native_error"] = f"{type(exc).__name__}: {exc}"
+            # -- REAL native AES-256-GCM prototype measurements: 实测 ------
+            if args.gcm and gcm_available():
+                try:
+                    entry["gcm_full_load"] = measure_gcm_full_load(
+                        beliefs, runs=args.gcm_runs)
+                    entry["gcm_per_field"] = measure_gcm_per_field(
+                        beliefs, sample=args.gcm_field_sample)
+                    entry["gcm_candidate_decrypt"] = measure_gcm_candidate_decrypt(
+                        beliefs, cap=_CANDIDATE_DECRYPT_CAP,
+                        runs=max(10, args.gcm_runs * 4))
+                    # PROTOTYPE recall simulation: real engine recall p95 +
+                    # REAL GCM candidate-set decrypt (measured).  The engine
+                    # p95 is real; the add-on is a deterministic real-GCM
+                    # cost (not a production-integrated path).
+                    cd = entry["gcm_candidate_decrypt"]
+                    add = cd.get("decrypt_ms_p50", 0.0)
+                    entry["recall_p95_proto_plus_gcm"] = round(p95 + add, 3)
+                    entry["recall_p95_proto_note"] = (
+                        "engine p95 (real) + GCM candidate-set decrypt p50 "
+                        "(real GCM, prototype-only; production not integrated)")
+                except Exception as exc:
+                    entry["gcm_error"] = f"{type(exc).__name__}: {exc}"
             out["counts"][str(target)] = entry
             print(f"  [{backend}] N={target} recall p50="
                   f"{entry['recall_p50_ms']}ms p95="
@@ -974,6 +1210,25 @@ def run_backend(backend, counts, args, key):
             "enc_p50_ms": round(_percentile(obs_enc, 50), 3),
             "enc_p95_ms": round(_percentile(obs_enc, 95), 3),
         }
+        # REAL-GCM observe delta (prototype; harness-side GCM, not integrated)
+        if args.gcm and gcm_available():
+            try:
+                g = FieldGCM()
+                gb, ge = measure_observe_gcm_overhead(
+                    engine, "u", g, repeats=max(4, args.observe_repeats))
+                out["observe_gcm"] = {
+                    "base_p50_ms": round(_percentile(gb, 50), 3),
+                    "base_p95_ms": round(_percentile(gb, 95), 3),
+                    "enc_p50_ms": round(_percentile(ge, 50), 3),
+                    "enc_p95_ms": round(_percentile(ge, 95), 3),
+                    "delta_p50_ms": round(_percentile(ge, 50) - _percentile(gb, 50), 3),
+                    "note": "PROTOTYPE: real AES-256-GCM field encryption "
+                            "bolted onto observe() in the harness; observe() "
+                            "itself is real engine cost; no production "
+                            "crypto integration exists",
+                }
+            except Exception as exc:
+                out["observe_gcm_error"] = f"{type(exc).__name__}: {exc}"
         return out
     finally:
         cleanup()
@@ -1003,6 +1258,16 @@ def main() -> int:
                          "(openssl CLI AES-256-CTR + hashlib HMAC-SHA256); "
                          "these are the 实测 numbers.  Use --no-native to skip.")
     ap.add_argument("--no-native", dest="native", action="store_false")
+    ap.add_argument("--gcm", action="store_true", default=True,
+                    help="also measure with REAL native AES-256-GCM via the "
+                         "`cryptography` AESGCM primitive (per-field nonce + "
+                         "tag + AAD).  These are the primary 实测 GCM numbers. "
+                         "Use --no-gcm to skip.")
+    ap.add_argument("--no-gcm", dest="gcm", action="store_false")
+    ap.add_argument("--gcm-runs", type=int, default=5,
+                    help="repeated runs for GCM full-load median/spread")
+    ap.add_argument("--gcm-field-sample", type=int, default=2000,
+                    help="how many individual fields to time for µs/field")
     ap.add_argument("--quick", action="store_true",
                     help="smoke run: sqlite only, 100/300 beliefs")
     ap.add_argument("--json", default=None)
@@ -1094,10 +1359,10 @@ def main() -> int:
         print(f"{backend:9} {o['base_p50_ms']:>9.2f} {o['base_p95_ms']:>9.2f} "
               f"{o['enc_p50_ms']:>9.2f} {o['enc_p95_ms']:>9.2f}")
 
-    # ---- NATIVE (real crypto library) tables: label 实测 ---------------
+    # ---- NATIVE CTR+HMAC tables: COMPARISON / ESTIMATE ONLY (not GCM) ---
     if _native_ok:
-        print("\n=== [实测 measured, native openssl AES-256-CTR + HMAC-SHA256] "
-              "per-belief enc+dec ===")
+        print("\n=== [COMPARISON/ESTIMATE — NOT GCM] native openssl "
+              "AES-256-CTR + HMAC-SHA256 per-belief enc+dec ===")
         print(f"{'backend':9} {'beliefs':>8} {'B/belief':>9} "
               f"{'ms/belief(CLI per-call)':>24}")
         for backend, res in results["backends"].items():
@@ -1111,11 +1376,11 @@ def main() -> int:
                       f"{nb['avg_bytes_per_belief']:>9.0f} "
                       f"{nb['ms_per_belief_enc_dec_percall']:>24.4f}")
 
-        print("\n=== [实测] session-start decrypt of ALL beliefs "
-              "(native: bulk AES-CTR + HMAC tag) ===")
+        print("\n=== [COMPARISON/ESTIMATE — NOT GCM] session-start decrypt "
+              "of ALL beliefs (CTR+HMAC proxy) ===")
         print(f"{'backend':9} {'beliefs':>8} {'bytes':>10} "
               f"{'CTR MB/s':>9} {'CTR net ms':>11} {'HMAC ms':>9} "
-              f"{'modelled decrypt ms':>20}")
+              f"{'proxy decrypt ms':>17}")
         for backend, res in results["backends"].items():
             if "error" in res:
                 continue
@@ -1127,12 +1392,12 @@ def main() -> int:
                       f"{ns['bulk_ctr_mb_per_s']:>9.1f} "
                       f"{ns['bulk_ctr_net_ms']:>11.3f} "
                       f"{ns['hmac_sha256_tag_ms']:>9.4f} "
-                      f"{ns['modelled_gcm_decrypt_all_ms']:>20.3f}")
+                      f"{ns['modelled_gcm_decrypt_all_ms']:>17.3f}")
 
-        print("\n=== [实测] recall candidate-set decrypt (cap 175) "
-              "under scheme C ===")
+        print("\n=== [COMPARISON/ESTIMATE — NOT GCM] recall candidate-set "
+              "decrypt (cap 175), CTR+HMAC proxy ===")
         print(f"{'backend':9} {'N':>7} {'cand':>5} {'percall ms':>11} "
-              f"{'bulk CTR ms':>11} {'HMAC ms':>9} {'modelled GCM ms':>16}")
+              f"{'bulk CTR ms':>11} {'HMAC ms':>9} {'proxy ms':>10}")
         for backend, res in results["backends"].items():
             if "error" in res:
                 continue
@@ -1142,10 +1407,80 @@ def main() -> int:
                     continue
                 print(f"{backend:9} {n:>7} {nr['candidates']:>5} "
                       f"{nr['percall_ms']:>11.2f} {nr['bulk_ctr_net_ms']:>11.3f} "
-                      f"{nr['hmac_tag_ms']:>9.4f} {nr['modelled_gcm_ms']:>16.3f}")
+                      f"{nr['hmac_tag_ms']:>9.4f} {nr['modelled_gcm_ms']:>10.3f}")
     else:
         print("\n[native backend unavailable -> native crypto 未测]",
               file=sys.stderr)
+
+    # ---- REAL native AES-256-GCM (cryptography AESGCM): PRIMARY 实测 ----
+    if args.gcm and gcm_available():
+        print("\n=== [实测 REAL AES-256-GCM via cryptography.AESGCM] "
+              "full-load decrypt ALL fields ===")
+        print(f"{'backend':9} {'N':>7} {'fields':>8} {'p50 ms':>9} "
+              f"{'min ms':>8} {'max ms':>8} {'us/field':>9} {'enc_all ms':>11}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                fl = row.get("gcm_full_load") or {}
+                if not fl:
+                    continue
+                print(f"{backend:9} {n:>7} {fl['fields']:>8} "
+                      f"{fl['decrypt_all_ms_p50']:>9.3f} "
+                      f"{fl['decrypt_all_ms_min']:>8.3f} "
+                      f"{fl['decrypt_all_ms_max']:>8.3f} "
+                      f"{fl['us_per_field_decrypt']:>9.4f} "
+                      f"{fl['encrypt_all_ms']:>11.3f}")
+
+        print("\n=== [实测 REAL GCM] per-field decrypt "
+              "(µs/field) + candidate-set decrypt ===")
+        print(f"{'backend':9} {'N':>7} {'us/field(sample)':>17} "
+              f"{'cand':>5} {'cand fields':>11} {'cand p50 ms':>12} "
+              f"{'cand min/max':>14}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                pf = row.get("gcm_per_field") or {}
+                cd = row.get("gcm_candidate_decrypt") or {}
+                if not pf or not cd:
+                    continue
+                print(f"{backend:9} {n:>7} {pf['us_per_field_decrypt']:>17.4f} "
+                      f"{cd['candidates']:>5} {cd['fields']:>11} "
+                      f"{cd['decrypt_ms_p50']:>12.4f} "
+                      f"{str(cd['decrypt_ms_min']) + '/' + str(cd['decrypt_ms_max']):>14}")
+
+        print("\n=== [PROTOTYPE SIM + REAL engine] recall p95 under C ===")
+        print("  engine p95 = REAL MemoryEngine.recall; +GCM = REAL GCM")
+        print("  candidate-set decrypt (prototype: no prod crypto integration)")
+        print(f"{'backend':9} {'N':>7} {'engine p50':>10} {'engine p95':>10} "
+              f"{'+GCM cand p50':>13} {'proto p95':>10}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                cd = row.get("gcm_candidate_decrypt") or {}
+                if not cd:
+                    continue
+                print(f"{backend:9} {n:>7} {row['recall_p50_ms']:>10.2f} "
+                      f"{row['recall_p95_ms']:>10.2f} "
+                      f"{cd['decrypt_ms_p50']:>13.4f} "
+                      f"{row.get('recall_p95_proto_plus_gcm', 0):>10.2f}")
+
+        print("\n=== [PROTOTYPE SIM + REAL engine] observe delta with real GCM ===")
+        print(f"{'backend':9} {'base p50':>9} {'+GCM p50':>9} "
+              f"{'delta p50':>9} {'base p95':>9} {'+GCM p95':>9}")
+        for backend, res in results["backends"].items():
+            og = res.get("observe_gcm")
+            if not og:
+                continue
+            print(f"{backend:9} {og['base_p50_ms']:>9.2f} {og['enc_p50_ms']:>9.2f} "
+                  f"{og['delta_p50_ms']:>9.2f} {og['base_p95_ms']:>9.2f} "
+                  f"{og['enc_p95_ms']:>9.2f}")
+    else:
+        if args.gcm:
+            print("\n[REAL AES-256-GCM unavailable -> GCM 未测], "
+                  "cryptography AESGCM not importable", file=sys.stderr)
 
     if args.json:
         Path(args.json).write_text(

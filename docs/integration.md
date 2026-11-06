@@ -294,27 +294,79 @@ versions = engine.belief_history(user_id="u1", belief_id=123, purpose=None)
   not found. Requires the `explain` operation. Same exceptions/blocking/
   thread-safety as `explain`.
 
-## 8. `metrics.snapshot()`
+## 8. `metrics.snapshot()` and per-call cost
 
 ```python
 from mirror_memory.core import metrics
-counters = metrics.snapshot()   # -> dict[str, int]
+
+snap = metrics.snapshot()               # everything the library knows
+snap.get("missing_purpose_refusals", 0) # counters stay top-level ints
+snap["_latency"]["observe"]["p95"]      # latency section
+snap["_cost"]["observe"]                # per-call cost section
+
+metrics.entry_cost("observe")           # just the per-call cost for one entry
+metrics.snapshot(storage=stored)        # include on-demand storage stats
 ```
 
-- **What it is**: a process-local snapshot of the counter registry
-  (copy of `_counters`, taken under the metrics lock). It is **not** a
-  `MemoryEngine` method — it is a module-level function in
-  `core/metrics`. Gauges are read separately via `metrics.gauges()`.
-- **Parameters**: none.
-- **Returns**: `dict[str, int]` (a copy; mutating it does not affect the
-  registry).
-- **Exceptions**: none for a normal read.
-- **Blocking**: no — in-process, no I/O, no query.
-- **Thread-safety**: yes (guarded by the module lock).
-- **Privacy contract**: counters never carry memory content, user text, or
-  user ids; purpose is the only label dimension, and user ids appear only in
-  storage statistics returned by the library DB interface, never in
-  Prometheus labels. Keep scrape labels within that contract.
+- **What it is**: process-local telemetry (module-level in `core/metrics`, not
+  a `MemoryEngine` method). Taken under the metrics lock.
+- **Shape (v0.2.x)**: every **counter** stays a top-level `int`, so
+  `snapshot().get(name, 0)` and iteration over counter names are unchanged.
+  The other sections live under fixed `_`-prefixed keys (they can never
+  collide with a counter name):
+  - `_gauges`: `{name: float}`;
+  - `_latency`: `{entry: {count, p50, p95, p99}}` — fixed exponential buckets,
+    p50/p95/p99 interpolated from bucket edges;
+  - `_cost`: `{entry: per-call cost}` (see below);
+  - `_storage`: `{(tenant_id, app_id, user_id): {table: {rows, bytes}}}` —
+    **only** when the caller passes the on-demand `storage=` value, because
+    computing it needs SQL (never on the request path);
+  - `_enabled`: whether recording is on (`metrics.set_enabled`).
+- **Per-call cost vs aggregate**: the counters are **totals** that grow
+  monotonically (`metrics.totals()` / the top-level ints). `entry_cost(entry)`
+  divides them by the number of invocations observed for that entry and adds
+  per-call averages for LLM calls, measured tokens, failed calls, partial and
+  unknown usage, and SQL statements. Averages are `None` when the entry has
+  never run — never a fabricated zero.
+- **Entry labels are a closed set**: `observe`, `recall`, `extraction_worker`,
+  `metabolism`. Anything else is rejected at record time / dropped from the
+  exposition, and label values are escaped. This is what keeps content and
+  identifiers off the wire.
+- **Measurement boundary**: each entry records ONE latency sample per
+  invocation covering its **whole span — including database initialization and
+  the sync gate**. The one-time initialization cost therefore lands in the
+  first sample only; treat p99 on a cold process accordingly. The background
+  worker records one sample per **real extraction job** it claims, not per
+  idle poll tick.
+- **Blocking**: no — in-process; no query unless you pass `storage=`.
+- **Thread-safety**: yes (module lock; attribution is per-thread).
+- **Privacy contract**: counters, gauges, latency and cost never carry memory
+  content, user text, user ids or tenant ids. User/tenant ids appear only in
+  the storage section returned by the library (never in a Prometheus label).
+  `/metrics` exposes only `entry` / `reason` / `le` labels.
+
+### 8.1 `metrics.storage_stats(engine)` (on-demand, admin/worker only)
+
+```python
+with tenant_scope("tenant-a", "app-1"):      # the bound context is the authz
+    stats = metrics.storage_stats(eng._engine)
+```
+
+- **Authorization**: the tenant is taken from the **bound tenancy context**
+  (`core.tenancy.current_tenant()`), never from a caller argument. With no
+  bound context the call raises `TenantContextMissing` (fail closed) — it does
+  **not** fall back to a default tenant, and it cannot be pointed at another
+  tenant. The SQL also carries an explicit
+  `WHERE tenant_id = :t AND app_id = :a`, and PostgreSQL+RLS applies on top.
+- **Returns**: `{(tenant_id, app_id, user_id): {table: {"rows", "bytes"}}}` —
+  all three key parts, so the same `user_id` under another app or tenant can
+  never overwrite a row in the map.
+- **No cross-tenant variant exists**: a capacity report across tenants would
+  need its own verifiable administrator authorization and a dedicated
+  privileged connection, which the library does not provide. Do not
+  reintroduce one behind `system_scope`.
+- **Blocking**: yes — one aggregate query per table; call it from admin tooling
+  or a low-frequency worker task, never from a request path.
 
 ## 9. Deployment constraints: sync routes and transport
 
