@@ -67,7 +67,9 @@ from typing import Any, Callable
 
 from mirror_memory.bench.gate import (
     TRACK_ERROR,
+    TRACK_FAIL,
     TRACK_NOT_RUN,
+    TRACK_PASS,
     GateResult,
     TrackVerdict,
     check_release_gate,
@@ -82,7 +84,34 @@ from mirror_memory.bench.statebench_v1_1_runner import (
 TRACK_STATE = "state"
 TRACK_RECALL = "recall"
 TRACK_ANSWER = "answer"
+TRACK_FORCED = "forced"
+TRACK_PRODUCTION = "production"
 SCORED_TRACKS = (TRACK_STATE, TRACK_RECALL, TRACK_ANSWER)
+# Every track that can appear in the verdict / summary, in display order.
+ALL_TRACKS = (TRACK_STATE, TRACK_RECALL, TRACK_ANSWER, TRACK_FORCED, TRACK_PRODUCTION)
+
+# Failure phase tags so a client-construction failure is never conflated with a
+# track-run failure.
+PHASE_CLIENT_INIT = "client_init"
+PHASE_RUN = "run"
+
+
+def _error_verdict(
+    track: str, exc: BaseException, *, phase: str,
+) -> TrackVerdict:
+    """Build an ``error`` verdict that names the failure phase.
+
+    ``phase='client_init'`` means the extractor/answerer client could not be
+    constructed; ``phase='run'`` means the track started and then raised.  Both
+    are ``error`` (never pass, never not_run), but the reason must tell them
+    apart so an operator knows whether to fix credentials/config or the run.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    if phase == PHASE_CLIENT_INIT:
+        reason = f"client construction/init failed: {detail}"
+    else:
+        reason = f"track run failed: {detail}"
+    return TrackVerdict(track=track, state=TRACK_ERROR, reason=reason, error=detail)
 
 
 def _not_run_track(reason: str = "prerequisite absent") -> dict[str, Any]:
@@ -199,16 +228,23 @@ def render_summary(
     lines.append("")
     lines.append("| track | score | state |")
     lines.append("|---|---|---|")
-    for name in SCORED_TRACKS:
-        status = _track_status(tracks.get(name))
+    # Render every track that has a verdict or a raw payload, so a `not_run`
+    # forced AND production (no key) are BOTH visible -- neither stands in for
+    # the other.
+    rendered: list[str] = []
+    for name in ALL_TRACKS:
+        if name in verdict_tracks:
+            rendered.append(name)
+        elif name in tracks:
+            rendered.append(name)
+    for name in rendered:
         verdict = verdict_tracks.get(name)
         if verdict is not None:
-            # evaluate_tracks already applied the threshold: a below-threshold
-            # track is `fail`, not `pass`.
             state_label = verdict.state
             score_label = "n/a" if verdict.score is None else f"{verdict.score:.3f}"
         else:
-            state_label = status
+            status = _track_status(tracks.get(name))
+            state_label = status if status in (TRACK_NOT_RUN, TRACK_ERROR) else "evaluated"
             score_label = status
         lines.append(f"| {name} | {score_label} | {state_label} |")
     lines.extend(_render_checks(checks))
@@ -326,12 +362,24 @@ def main(argv: list[str] | None = None) -> int:
     forced_report_obj: StateBenchV11Report | None = None
     production_report_obj: StateBenchV11Report | None = None
     production_report: dict[str, Any] | None = None
-    answer_not_run_reason = "prerequisite absent"
-    llm_verdict: TrackVerdict | None = None
-    forced_payload: dict[str, Any] | None = None
-    production_payload: dict[str, Any] | None = None
+    answer_not_run_reason = "prerequisite absent (MM_LLM_API_KEY absent)"
+    # Four-state verdicts for the LLM-owned tracks, set explicitly so a missing
+    # key yields TWO separate `not_run` tracks (forced AND production), and a
+    # client-construction failure is distinct from a track-run failure.
+    forced_verdict: TrackVerdict | None = None
+    production_verdict: TrackVerdict | None = None
+    answer_verdict: TrackVerdict | None = None
+    init_phase = PHASE_RUN  # default; set to client_init if construction fails
 
-    if llm_enabled:
+    if not llm_enabled:
+        # A. No key: forced AND production are EACH explicitly not_run.  They
+        # are separate tracks -- one must never stand in for the other.
+        no_llm = "not_run: MM_LLM_API_KEY absent (LLM tracks disabled)"
+        forced_verdict = TrackVerdict(track=TRACK_FORCED, state=TRACK_NOT_RUN, reason=no_llm)
+        production_verdict = TrackVerdict(track=TRACK_PRODUCTION, state=TRACK_NOT_RUN, reason=no_llm)
+        answer_verdict = TrackVerdict(track=TRACK_ANSWER, state=TRACK_NOT_RUN, reason=no_llm)
+        answer_not_run_reason = no_llm
+    else:
         try:
             from mirror_memory.bench.run import _build_answerer, _build_extractor
 
@@ -339,19 +387,19 @@ def main(argv: list[str] | None = None) -> int:
             base_url = os.getenv("MM_LLM_BASE_URL")
             extractor = _build_extractor(args.models, api_key, base_url, extra_body)
             answerer = _build_answerer(args.models, api_key, base_url, extra_body)
-        except Exception as exc:  # noqa: BLE001 - building clients is an error
-            forced_payload = _error_track(exc)
-            llm_verdict = TrackVerdict(
-                track=TRACK_ANSWER, state=TRACK_ERROR,
-                reason=f"LLM client build failed: {type(exc).__name__}: {exc}",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            answer_not_run_reason = forced_payload["error"]
+        except Exception as exc:  # noqa: BLE001 - client construction failure
+            # B. Construction failure: the client itself could not be built, so
+            # every LLM-owned track that needs it is `error` (client-init), not
+            # not_run and not pass.
+            init_phase = PHASE_CLIENT_INIT
+            forced_verdict = _error_verdict(TRACK_FORCED, exc, phase=PHASE_CLIENT_INIT)
+            production_verdict = _error_verdict(TRACK_PRODUCTION, exc, phase=PHASE_CLIENT_INIT)
+            answer_verdict = _error_verdict(TRACK_ANSWER, exc, phase=PHASE_CLIENT_INIT)
+            answer_not_run_reason = forced_verdict.error
         else:
-            # Run forced then production.  Each is isolated: if forced raises,
-            # production still runs; if production raises, forced's result
-            # stands.  Neither overwrites the other's already-computed result.
-            forced_report_obj, forced_payload, _forced_verdict = _run_track(
+            # Run forced then production.  Each is isolated: a run failure in
+            # one never discards the other's completed result.
+            forced_report_obj, forced_payload, _ = _run_track(
                 "forced",
                 lambda: run_statebench_v1_1(
                     config_path=args.config_path,
@@ -363,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_cases=args.max_cases,
                 ),
             )
-            production_report_obj, production_payload, _production_verdict = _run_track(
+            production_report_obj, production_payload, _ = _run_track(
                 "production",
                 lambda: run_statebench_v1_1(
                     config_path=args.config_path,
@@ -375,19 +423,24 @@ def main(argv: list[str] | None = None) -> int:
                     max_cases=args.max_cases,
                 ),
             )
-            # Adopt the forced report as the gate's subject when it succeeded.
-            # If forced errored, keep the deterministic base report as the gate
-            # subject (it will fail for lack of forced mode) but surface the
-            # forced error distinctly via the four-state verdict downstream.
+            # B. Track-run failures carry a RUN-phase reason.
+            if forced_payload is not None:
+                forced_verdict = TrackVerdict(
+                    track=TRACK_FORCED, state=TRACK_ERROR,
+                    reason=f"track run failed: {forced_payload.get('error', '')}",
+                    error=forced_payload.get("error", ""),
+                )
+            if production_payload is not None:
+                production_verdict = TrackVerdict(
+                    track=TRACK_PRODUCTION, state=TRACK_ERROR,
+                    reason=f"track run failed: {production_payload.get('error', '')}",
+                    error=production_payload.get("error", ""),
+                )
             if forced_report_obj is not None:
                 report = forced_report_obj
                 report_dict = forced_report_obj.to_dict()
             if production_report_obj is not None:
                 production_report = production_report_obj.to_dict()
-            else:
-                # Production errored: forced's result stands; production's error
-                # is surfaced from production_payload below.
-                production_report = None
 
     # --- write raw report + manifest (deterministic / gate subject) --------
     out, manifest = write_statebench_v1_1_report(
@@ -401,8 +454,9 @@ def main(argv: list[str] | None = None) -> int:
     manifest = paths["manifest"] if Path(manifest) == paths["manifest"] else Path(manifest)
 
     # --- write forced and production SEPARATELY (own report + own manifest) -
-    # Each track's evidence travels in its own file pair with its own manifest
-    # (commit, dataset_sha256, config/prompt hashes, model, dataset_version).
+    # C. A successful track's per-case report + its own manifest are written
+    # even when the OTHER track errored / not_run.  Forced and production each
+    # have their own file pair; neither overwrites the other.
     forced_report_path: str = ""
     forced_manifest_path: str = ""
     production_report_path: str = ""
@@ -431,20 +485,40 @@ def main(argv: list[str] | None = None) -> int:
     # --- build gate-facing report and four-state verdicts -------------------
     gate_report = build_gate_report(
         report_dict,
-        llm_enabled=llm_enabled and llm_verdict is None,
+        llm_enabled=llm_enabled and init_phase != PHASE_CLIENT_INIT and answer_verdict is None,
         answer_not_run_reason=answer_not_run_reason,
     )
     derived = evaluate_tracks(gate_report)
-    # Forced track verdict: an execution error (or a missing forced run) is
-    # surfaced as `error`, never silently folded into the scored tracks.
-    if forced_payload is not None:
-        derived["forced"] = TrackVerdict(
-            track="forced", state=TRACK_ERROR,
-            reason=forced_payload.get("error", "forced track error"),
-            error=forced_payload.get("error", ""),
+    # Explicit forced / production verdicts override the derived ones.  When a
+    # track *ran* (even throttled), its real verdict is what the gate computes
+    # from the report; explicit verdicts are only for not_run / error cases.
+    if forced_verdict is not None:
+        derived[TRACK_FORCED] = forced_verdict
+    if production_verdict is not None:
+        derived[TRACK_PRODUCTION] = production_verdict
+    if answer_verdict is not None:
+        derived[TRACK_ANSWER] = answer_verdict
+    # When forced actually RAN (no explicit error/not_run verdict) surface its
+    # own four-state so the forced track is visible in the verdict and summary,
+    # not just implicit in the gate subject.  Its state score is measured against
+    # the fixed overall threshold (forced is the threshold-bearing track).
+    if forced_verdict is None and forced_report_obj is not None:
+        from mirror_memory.bench.gate import GATE_STATE_OVERALL
+
+        f_state_track = (forced_report_obj.to_dict().get("tracks") or {}).get("state") or {}
+        f_score = f_state_track.get("score")
+        f_state = (
+            TRACK_PASS if (f_score is not None and f_score >= GATE_STATE_OVERALL)
+            else TRACK_FAIL
         )
-    if llm_verdict is not None and TRACK_ANSWER in derived and derived[TRACK_ANSWER].state != TRACK_ERROR:
-        derived[TRACK_ANSWER] = llm_verdict
+        forced_verdict = TrackVerdict(
+            track=TRACK_FORCED, state=f_state, score=f_score,
+            threshold=GATE_STATE_OVERALL,
+            reason="" if f_state == TRACK_PASS
+            else f"forced state {f_score:.3f} < {GATE_STATE_OVERALL}"
+            if f_score is not None else "forced state not evaluated",
+        )
+        derived[TRACK_FORCED] = forced_verdict
 
     result = check_release_gate(
         gate_report,
@@ -453,20 +527,28 @@ def main(argv: list[str] | None = None) -> int:
         forced=True,
         track_verdicts=derived,
     )
-    # check_release_gate installs the production four-state verdict itself
-    # (from the production report's extraction health) into result.tracks.
-    # If production errored at the runner level, surface that instead.
-    if production_payload is not None:
-        result.tracks["production"] = TrackVerdict(
-            track="production", state=TRACK_ERROR,
-            reason=production_payload.get("error", "production track error"),
-            error=production_payload.get("error", ""),
-        )
-        if not any("production track error" in f for f in result.failures):
-            result.failures.append(
-                f"production track error: {production_payload.get('error', '')}"
-            )
-            result.passed = False
+    # Ensure forced / production always appear in the final verdict tracks, and
+    # that an error / not_run on either is reflected in the gate failures so the
+    # summary first line is honest.
+    def _ensure_track(name: str, verdict: TrackVerdict | None) -> None:
+        if verdict is None:
+            return
+        if name not in result.tracks:
+            result.tracks[name] = verdict
+        if verdict.state == TRACK_ERROR:
+            msg = f"{name} track error: {verdict.reason}"
+            if not any(msg in f for f in result.failures):
+                result.failures.append(msg)
+                result.passed = False
+        elif verdict.state == TRACK_NOT_RUN:
+            msg = f"{name} not run"
+            if not any(msg in f for f in result.failures):
+                result.failures.append(msg)
+                result.passed = False
+
+    _ensure_track(TRACK_FORCED, forced_verdict)
+    _ensure_track(TRACK_PRODUCTION, production_verdict)
+    _ensure_track(TRACK_ANSWER, answer_verdict)
 
     dataset_version = report_dict.get("dataset_version", "")
 
@@ -496,14 +578,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --- write summary (its own path) --------------------------------------
-    display_tracks: dict[str, Any] = dict(gate_report.get("tracks", {}))
-    if llm_verdict is not None and llm_verdict.state == TRACK_ERROR:
-        display_tracks[TRACK_ANSWER] = {"error": llm_verdict.error}
+    # The summary renders its track table from result.tracks (which now always
+    # includes forced / production as not_run or error where applicable), so a
+    # no-key run shows BOTH forced and production as not_run.
     summary = render_summary(
         passed=result.passed,
         failures=result.failures,
         checks=result.checks,
-        tracks=display_tracks,
+        tracks=gate_report.get("tracks", {}),
         extraction_mode=gate_report.get("extraction_mode", "deterministic"),
         dataset_sha256=gate_report.get("dataset_sha256", ""),
         dataset_version=dataset_version,

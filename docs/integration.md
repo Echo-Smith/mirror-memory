@@ -294,56 +294,66 @@ versions = engine.belief_history(user_id="u1", belief_id=123, purpose=None)
   not found. Requires the `explain` operation. Same exceptions/blocking/
   thread-safety as `explain`.
 
-## 8. `metrics.snapshot()` and per-call cost
+## 8. `metrics.snapshot()`, `snapshot_full()` and per-call cost
 
 ```python
 from mirror_memory.core import metrics
 
-snap = metrics.snapshot()               # everything the library knows
-snap.get("missing_purpose_refusals", 0) # counters stay top-level ints
-snap["_latency"]["observe"]["p95"]      # latency section
-snap["_cost"]["observe"]                # per-call cost section
-
-metrics.entry_cost("observe")           # just the per-call cost for one entry
-metrics.snapshot(storage=stored)        # include on-demand storage stats
+counters = metrics.snapshot()          # -> dict[str, int]  (historical shape)
+full = metrics.snapshot_full(storage=stored)   # everything, one call
+cost = metrics.entry_cost("observe")           # per-call averages
+recent = metrics.recent_costs("observe")       # ACTUAL per-call records
 ```
 
-- **What it is**: process-local telemetry (module-level in `core/metrics`, not
-  a `MemoryEngine` method). Taken under the metrics lock.
-- **Shape (v0.2.x)**: every **counter** stays a top-level `int`, so
-  `snapshot().get(name, 0)` and iteration over counter names are unchanged.
-  The other sections live under fixed `_`-prefixed keys (they can never
-  collide with a counter name):
-  - `_gauges`: `{name: float}`;
-  - `_latency`: `{entry: {count, p50, p95, p99}}` — fixed exponential buckets,
-    p50/p95/p99 interpolated from bucket edges;
-  - `_cost`: `{entry: per-call cost}` (see below);
-  - `_storage`: `{(tenant_id, app_id, user_id): {table: {rows, bytes}}}` —
-    **only** when the caller passes the on-demand `storage=` value, because
-    computing it needs SQL (never on the request path);
-  - `_enabled`: whether recording is on (`metrics.set_enabled`).
-- **Per-call cost vs aggregate**: the counters are **totals** that grow
-  monotonically (`metrics.totals()` / the top-level ints). `entry_cost(entry)`
-  divides them by the number of invocations observed for that entry and adds
-  per-call averages for LLM calls, measured tokens, failed calls, partial and
-  unknown usage, and SQL statements. Averages are `None` when the entry has
-  never run — never a fabricated zero.
-- **Entry labels are a closed set**: `observe`, `recall`, `extraction_worker`,
-  `metabolism`. Anything else is rejected at record time / dropped from the
-  exposition, and label values are escaped. This is what keeps content and
-  identifiers off the wire.
-- **Measurement boundary**: each entry records ONE latency sample per
-  invocation covering its **whole span — including database initialization and
-  the sync gate**. The one-time initialization cost therefore lands in the
-  first sample only; treat p99 on a cold process accordingly. The background
-  worker records one sample per **real extraction job** it claims, not per
-  idle poll tick.
+- **`snapshot()`** keeps its historical contract exactly: a plain
+  `dict[str, int]` of counters, nothing else. Every existing caller
+  (`.get(name, 0)`, iteration over counter names) is unaffected.
+- **`snapshot_full(storage=...)`** is the complete telemetry interface, with
+  fixed sections that never collide with counter names:
+  - `counters` — identical to `snapshot()`;
+  - `gauges` — `{name: float}`;
+  - `latency` — `{entry: {count, p50, p95, p99}}` (fixed exponential buckets);
+  - `cost` — `{entry: per-call averages}` (see `entry_cost` below);
+  - `recent` — `{entry: [per-call records]}` (see `recent_costs` below);
+  - `storage` — `{(tenant_id, app_id, user_id): {table: {rows, bytes}}}`,
+    ONLY when the caller passes the on-demand `storage=` value (it needs SQL);
+  - `enabled` — whether recording is on (`metrics.set_enabled`).
+  `metrics.report(storage=...)` returns the same data.
+- **`entry_cost(entry)`** — the AVERAGE cost of one invocation (LLM calls,
+  measured tokens, failed/partial/unknown usage, SQL statements, divided by
+  the invocation count). `None` averages for an entry that never ran — never
+  a fabricated zero.
+- **`recent_costs(entry)`** — the ACTUAL per-call records (bounded ring, last
+  256 invocations, oldest first): `duration_ms` plus that invocation's own
+  `llm_calls` / `llm_failed` / token / usage-unknown / usage-partial /
+  `sql_statements` deltas. This is real per-observe cost data, not an average.
+  Library value only; never emitted to Prometheus; no content or identifiers.
+- **Measurement boundary**: one latency sample per invocation covering the
+  whole span — including database initialization and the sync gate. During
+  cold start the entry scope binds to the engine as soon as it exists
+  (`metrics.bind_scope_engine`), so initialization SQL genuinely belonging to
+  THIS engine is attributed, while SQL of unrelated engines on the same thread
+  never is (an unbound scope attributes nothing — `engine=None` never means
+  "all engines"). The one-time initialization cost lands in the first sample.
+  The background worker records one sample per REAL claimed extraction job,
+  not per idle poll tick.
+- **LLM call accounting** (via the instrumented client proxy): calls are
+  `llm_calls_total`; provider failures are `llm_calls_failed_total` — this
+  includes `ok=False` calls that were swallowed into a fallback return; usage
+  is `llm_input_tokens` / `llm_output_tokens` when really reported,
+  `llm_usage_partial_total` when only one side was reported,
+  `llm_usage_unknown_total` when neither side was. The host's own
+  `set_on_call` callback is preserved (chained, never replaced); replacing or
+  clearing it through the proxy — or through the raw client reference — is
+  honoured without losing either side.
 - **Blocking**: no — in-process; no query unless you pass `storage=`.
 - **Thread-safety**: yes (module lock; attribution is per-thread).
-- **Privacy contract**: counters, gauges, latency and cost never carry memory
-  content, user text, user ids or tenant ids. User/tenant ids appear only in
-  the storage section returned by the library (never in a Prometheus label).
-  `/metrics` exposes only `entry` / `reason` / `le` labels.
+- **Privacy contract**: counters, gauges, latency, cost and recent records
+  never carry memory content, user text, user ids or tenant ids. User/tenant
+  ids appear only in the storage section returned by the library (never in a
+  Prometheus label). All dynamic Prometheus labels are closed sets
+  (`entry`, tombstone `reason` — unknown reasons bucketed to `other`) and
+  label values are escaped. `/metrics` exposes only `entry` / `reason` / `le`.
 
 ### 8.1 `metrics.storage_stats(engine)` (on-demand, admin/worker only)
 
@@ -367,6 +377,39 @@ with tenant_scope("tenant-a", "app-1"):      # the bound context is the authz
   reintroduce one behind `system_scope`.
 - **Blocking**: yes — one aggregate query per table; call it from admin tooling
   or a low-frequency worker task, never from a request path.
+
+## 9a. Tenant trust boundary and the PostgreSQL app-role/RLS prerequisite
+
+**Where the tenant identity comes from — and what it is allowed to trust.**
+
+- `tenant_scope(tenant_id, app_id)` is a **trusted in-process boundary**, not
+  an authentication mechanism. It is opened by (a) the engine entry point with
+  the engine's own pinned `(tenant_id, app_id)`, (b) the server's tenant-key
+  middleware AFTER a Bearer key has been matched to a registered tenant, or
+  (c) a maintenance/administration path that is deliberately cross-tenant
+  (`system_scope`, allowlisted). Application code must never open
+  `tenant_scope` with a value that originates from a client-supplied header,
+  payload field, or envelope claim.
+- Everything tenant-scoped reads its identity from this context
+  (`core.tenancy.current_tenant()`). `metrics.storage_stats(engine)` is an
+  example: it refuses to run unbound (`TenantContextMissing`, fail closed) and
+  takes **no tenant argument**, so a caller cannot widen or redirect the
+  report.
+- **PostgreSQL prerequisite**: the trust boundary is only as strong as the
+  database login behind it. The hosted shape runs tenant work through the
+  **app role** (`core.rls.app_role()`) with row-level security ENABLE+FORCE on
+  every tenant table and both tenant policies installed
+  (`MM_DATABASE_URL` + `MM_PG_RLS=1`; the owner login is only for
+  migrations/DDL). A deployment that points tenant work at the owner/superuser
+  login silently loses the second line of defence — the in-process context
+  still scopes every statement, but a context bug would no longer be caught by
+  the database. The RLS posture is verified at startup (`prepare_runtime_engine`)
+  and by the dedicated RLS tests.
+- On SQLite there is no RLS; the in-process context (and the engine's own
+  explicit predicates) is the only defence. SQLite is the end-side/embedded
+  shape — treat the process boundary as the security boundary.
+- Two engines may share one PostgreSQL pool (the server does); tenants are
+  separated by the per-transaction tenant GUC + RLS, never by separate pools.
 
 ## 9. Deployment constraints: sync routes and transport
 

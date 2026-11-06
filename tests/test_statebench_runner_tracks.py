@@ -34,11 +34,9 @@ from mirror_memory.config.loader import load_config
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CI_TOOL = _REPO_ROOT / "tools" / "m5_statebench_ci.py"
 
-# A small deterministic subset keeps these tests fast (subset, not all 200).
-_SUBSET_IDS = [
-    "sb-replacement-001", "sb-replacement-002", "sb-replacement-003",
-    "sb-replacement-004", "sb-replacement-005", "sb-replacement-006",
-]
+# A small deterministic subset (first N cases) keeps these tests fast.  These
+# are a SUBSET, not the full 200-case dataset -- the coverage check therefore
+# fails by design; the tests assert track-level behaviour, not full coverage.
 _MAX_CASES = 6
 
 
@@ -355,4 +353,220 @@ class TestCIAdapterRealRunner:
         by_check = {c["check"]: c for c in verdict["checks"]}
         assert by_check["forced_mode"]["passed"] is True
         assert by_check["k2_attempted_every_turn"]["passed"] is True
+        assert verdict["passed"] is False
+
+
+# ===========================================================================
+# §3 A — no key: forced AND production are EACH explicitly not_run
+# ===========================================================================
+
+class TestNoKeyBothTracksNotRun:
+    def test_forced_and_production_are_separate_not_run(self, tmp_path, monkeypatch):
+        """With no API key, forced and production each carry their OWN not_run
+        verdict -- one must not stand in for the other (A)."""
+        module = _load_ci_tool()
+        monkeypatch.delenv("MM_LLM_API_KEY", raising=False)
+        out = tmp_path / "gate.json"
+        code = module.main(["--output", str(out), "--max-cases", str(_MAX_CASES)])
+        assert code == 0
+
+        verdict = json.loads(out.with_name("gate.verdict.json").read_text())
+        tracks = verdict["tracks"]
+        assert tracks["forced"]["state"] == TRACK_NOT_RUN
+        assert tracks["production"]["state"] == TRACK_NOT_RUN
+        assert tracks["answer"]["state"] == TRACK_NOT_RUN
+        # Each is its own entry: distinct reason keys are present for both.
+        assert "forced" in tracks and "production" in tracks
+        # Neither is a pass.
+        assert verdict["passed"] is False
+
+        summary = out.with_name("gate.summary.md").read_text()
+        assert summary.splitlines()[0].startswith("FAIL:")
+        # Both not_run rows appear in the summary track table.
+        assert "| forced |" in summary and "| production |" in summary
+        forced_row = next(l for l in summary.splitlines() if l.startswith("| forced |"))
+        prod_row = next(l for l in summary.splitlines() if l.startswith("| production |"))
+        assert "not_run" in forced_row
+        assert "not_run" in prod_row
+
+        # The verdict self-reports false and no forced/production file pair is
+        # fabricated (they genuinely never ran).
+        assert verdict["forced_report"] == ""
+        assert verdict["production_report"] == ""
+
+
+# ===========================================================================
+# §3 B — client-construction failure vs track-run failure are distinct
+# ===========================================================================
+
+class TestConstructionVsRunFailure:
+    def test_construction_failure_is_error_with_init_phase(
+        self, tmp_path, monkeypatch,
+    ):
+        """A client-construction failure marks the LLM tracks `error` naming
+        client construction/init -- never not_run, never pass (B)."""
+        module = _load_ci_tool()
+        monkeypatch.setenv("MM_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("MM_LLM_MODEL", "fake-model")
+        monkeypatch.delenv("MM_LLM_BASE_URL", raising=False)
+
+        import mirror_memory.bench.run as run_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("bad credentials: cannot init client")
+
+        monkeypatch.setattr(run_mod, "_build_extractor", _boom)
+
+        out = tmp_path / "gate.json"
+        code = module.main(["--output", str(out), "--allow-llm", "--max-cases", str(_MAX_CASES)])
+        assert code == 0
+        verdict = json.loads(out.with_name("gate.verdict.json").read_text())
+        tracks = verdict["tracks"]
+        # Every LLM-owned track is an `error` (construction), never not_run.
+        for name in ("forced", "production", "answer"):
+            assert tracks[name]["state"] == TRACK_ERROR, (name, tracks[name])
+        # The reason explicitly names the construction/init phase.
+        assert "client construction" in tracks["forced"]["reason"].lower() \
+            or "client_init" in tracks["forced"]["reason"].lower() \
+            or "init" in tracks["forced"]["reason"].lower()
+        assert "not_run" not in tracks["forced"]["reason"].lower()
+        assert verdict["passed"] is False
+        summary = out.with_name("gate.summary.md").read_text()
+        assert summary.splitlines()[0].startswith("FAIL:")
+        assert "Infrastructure error" in summary or "error" in summary.lower()
+
+    def test_run_failure_is_error_with_run_phase(self, tmp_path, monkeypatch):
+        """A track that starts then raises is `error` naming a run failure --
+        distinct from a construction failure (B)."""
+        module = _load_ci_tool()
+        monkeypatch.setenv("MM_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("MM_LLM_MODEL", "fake-model")
+        monkeypatch.delenv("MM_LLM_BASE_URL", raising=False)
+
+        import mirror_memory.bench.run as run_mod
+        # Construction succeeds (working client built), the RUN fails.
+        monkeypatch.setattr(run_mod, "_build_extractor", lambda *a, **k: _FailingLLM())
+        monkeypatch.setattr(run_mod, "_build_answerer", lambda *a, **k: (lambda q, c: ""))
+
+        out = tmp_path / "gate.json"
+        code = module.main(["--output", str(out), "--allow-llm", "--max-cases", str(_MAX_CASES)])
+        assert code == 0
+        verdict = json.loads(out.with_name("gate.verdict.json").read_text())
+        tracks = verdict["tracks"]
+        assert tracks["forced"]["state"] == TRACK_ERROR
+        # Forced ran then its every-K2 call failed -> run-failure reason.
+        reason = tracks["forced"]["reason"].lower()
+        assert "run failed" in reason
+        # It must NOT be labelled a construction failure.
+        assert "client construction" not in reason
+
+
+# ===========================================================================
+# §3 D — verdict / summary / files must be mutually consistent
+# ===========================================================================
+
+class TestArtifactConsistency:
+    def test_success_verdict_summary_files_consistent(self, tmp_path, monkeypatch):
+        """A successful forced+production run: verdict four-state, summary first
+        line + checks, and each written file's dataset_version / manifest must
+        agree (D)."""
+        module = _load_ci_tool()
+        monkeypatch.setenv("MM_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("MM_LLM_MODEL", "fake-model")
+        monkeypatch.delenv("MM_LLM_BASE_URL", raising=False)
+
+        import mirror_memory.bench.run as run_mod
+        monkeypatch.setattr(run_mod, "_build_extractor", lambda *a, **k: _WorkingLLM())
+        monkeypatch.setattr(run_mod, "_build_answerer", lambda *a, **k: (lambda q, c: ""))
+
+        out = tmp_path / "gate.json"
+        code = module.main(["--output", str(out), "--allow-llm", "--max-cases", str(_MAX_CASES)])
+        assert code == 0
+
+        verdict = json.loads(out.with_name("gate.verdict.json").read_text())
+        summary = out.with_name("gate.summary.md").read_text()
+        vversion = verdict["dataset_version"]
+
+        # --- verdict <-> summary first line consistency ---------------------
+        first = summary.splitlines()[0]
+        assert first.startswith("PASS:" if verdict["passed"] else "FAIL:")
+
+        # --- verdict four-state is a valid state for every track ------------
+        valid = {"pass", "fail", "not_run", "error"}
+        for name, v in verdict["tracks"].items():
+            assert v["state"] in valid, (name, v)
+
+        # --- each written file's dataset_version matches the verdict --------
+        assert verdict["forced_report"] and verdict["production_report"]
+        forced_rep = json.loads(Path(verdict["forced_report"]).read_text())
+        prod_rep = json.loads(Path(verdict["production_report"]).read_text())
+        assert forced_rep["dataset_version"] == vversion
+        assert prod_rep["dataset_version"] == vversion
+        assert forced_rep["extraction_mode"] == "forced"
+        assert prod_rep["extraction_mode"] == "production"
+
+        # --- each manifest carries provenance and matches its mode ----------
+        for rep_path, man_path, mode in (
+            (verdict["forced_report"], verdict["forced_manifest"], "forced"),
+            (verdict["production_report"], verdict["production_manifest"], "production"),
+        ):
+            man = json.loads(Path(man_path).read_text())
+            assert man["commit"]
+            assert man["dataset_sha256"]
+            assert man["extractor_model"] == "fake-working-model"
+            assert man["config_hashes"]
+            assert mode in man["notes"]
+            # Manifest's dataset hash matches the report's dataset hash prefix.
+            rep = json.loads(Path(rep_path).read_text())
+            assert man["dataset_sha256"] == rep["dataset_sha256"][:16]
+
+        # --- per-check table exists and every check has a pass column -------
+        assert "| check | value | threshold | pass |" in summary
+        # verdict checks and summary checks tell the same story for forced mode
+        by_check = {c["check"]: c for c in verdict["checks"]}
+        assert "forced_mode" in by_check and by_check["forced_mode"]["passed"] is True
+
+    def test_production_error_preserves_forced_files_and_consistency(
+        self, tmp_path, monkeypatch,
+    ):
+        """When production errors, forced's report+manifest are complete and the
+        verdict/summary stay mutually consistent (C + D)."""
+        module = _load_ci_tool()
+        monkeypatch.setenv("MM_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("MM_LLM_MODEL", "fake-model")
+        monkeypatch.delenv("MM_LLM_BASE_URL", raising=False)
+
+        import mirror_memory.bench.run as run_mod
+        monkeypatch.setattr(run_mod, "_build_extractor", lambda *a, **k: _WorkingLLM())
+        monkeypatch.setattr(run_mod, "_build_answerer", lambda *a, **k: (lambda q, c: ""))
+
+        real_run = module.run_statebench_v1_1
+
+        def _run(**kwargs):
+            mode = kwargs.get("extraction_mode", "deterministic")
+            if mode == "production":
+                return real_run(**{**kwargs, "llm_client": _FailingLLM()})
+            if mode == "forced":
+                return real_run(**{**kwargs, "llm_client": _WorkingLLM()})
+            return real_run(**kwargs)
+
+        monkeypatch.setattr(module, "run_statebench_v1_1", _run)
+
+        out = tmp_path / "gate.json"
+        code = module.main(["--output", str(out), "--allow-llm", "--max-cases", str(_MAX_CASES)])
+        assert code == 0
+        verdict = json.loads(out.with_name("gate.verdict.json").read_text())
+        summary = out.with_name("gate.summary.md").read_text()
+
+        # Production error is visible; forced succeeded and files are complete.
+        assert verdict["tracks"]["production"]["state"] == TRACK_ERROR
+        assert verdict["forced_report"] and Path(verdict["forced_report"]).exists()
+        assert verdict["forced_manifest"] and Path(verdict["forced_manifest"]).exists()
+        forced_rep = json.loads(Path(verdict["forced_report"]).read_text())
+        forced_man = json.loads(Path(verdict["forced_manifest"]).read_text())
+        assert forced_rep["dataset_version"] == verdict["dataset_version"]
+        assert forced_man["commit"]
+        assert forced_rep["extraction_mode"] == "forced"
+        # First line reflects the failure and verdict.passed agrees.
+        assert summary.splitlines()[0].startswith("FAIL:")
         assert verdict["passed"] is False

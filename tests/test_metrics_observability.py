@@ -65,13 +65,15 @@ def test_record_sql_counts_by_entry():
     assert metrics.snapshot()["sql_statements_total.recall"] == 4
 
 
-def test_snapshot_carries_all_sections_and_keeps_counter_lookup():
-    """snapshot() returns ALL the data the library knows (§3 contract):
+def test_snapshot_is_pure_counters_and_snapshot_full_has_the_rest():
+    """§ patch-3 contract:
 
-    * every counter stays a TOP-LEVEL ``int`` (so ``.get(name, 0)`` and
-      iteration over counters keep working for existing callers);
-    * the other sections live under fixed ``_``-prefixed keys, which can never
-      collide with a counter name.
+    * ``snapshot()`` keeps its HISTORICAL ``dict[str, int]`` semantics -- every
+      key is a counter name, every value an int; no extra sections;
+    * gauges / latency / per-call cost / recent per-call records / on-demand
+      storage are on the SEPARATE full interface (``snapshot_full`` /
+      ``report``), so old callers are untouched and new consumers get
+      everything in one place.
     """
     metrics.inc("whatever_counter", 5)
     metrics.observe_latency(metrics.ENTRY_OBSERVE, 3.0)
@@ -80,22 +82,40 @@ def test_snapshot_carries_all_sections_and_keeps_counter_lookup():
 
     snap = metrics.snapshot()
     assert isinstance(snap, dict)
-    # backward-compatible counter access
     assert snap.get("whatever_counter", 0) == 5
     assert snap.get("missing", 0) == 0
-    counters = {k: v for k, v in snap.items() if not k.startswith("_")}
-    assert all(isinstance(v, int) for v in counters.values())
-    # the other sections are present and typed
-    assert set(k for k in snap if k.startswith("_")) == {
-        "_gauges", "_latency", "_cost", "_storage", "_enabled"}
-    assert snap["_gauges"][metrics.REPLAY_ACTIVE] == 1.0
-    assert snap["_latency"]["observe"]["count"] == 1
-    assert snap["_cost"]["observe"]["calls"] == 1
-    assert snap["_cost"]["observe"]["llm_calls_per_call"] == 1.0
-    assert snap["_storage"] == {}
-    assert snap["_enabled"] is True
-    # storage is only included when the caller computed it on demand
-    assert metrics.snapshot(storage={("t", "a", "u"): {}})["_storage"] != {}
+    assert all(isinstance(v, int) for v in snap.values())
+    assert not any(k.startswith("_") for k in snap)
+
+    full = metrics.snapshot_full(storage={("t", "a", "u"): {}})
+    assert full["counters"] == snap
+    assert full["gauges"][metrics.REPLAY_ACTIVE] == 1.0
+    assert full["latency"]["observe"]["count"] == 1
+    assert full["cost"]["observe"]["calls"] == 1
+    assert full["cost"]["observe"]["llm_calls_per_call"] == 1.0
+    assert isinstance(full["recent"]["observe"], list)
+    assert full["storage"] == {("t", "a", "u"): {}}
+    assert full["enabled"] is True
+    # report() is the same data
+    assert metrics.report(storage={})["latency"]["observe"]["count"] == 1
+
+
+def test_recent_costs_are_actual_per_call_records():
+    """Each invocation appends ONE record with its own duration and counter
+    deltas -- actual per-call data, not just cross-call averages."""
+    metrics.record_sql("recall")
+    with metrics.entry_scope(metrics.ENTRY_RECALL):
+        pass
+    with metrics.entry_scope(metrics.ENTRY_RECALL):
+        metrics.record_llm(metrics.ENTRY_RECALL, input_tokens=4, output_tokens=1)
+    recs = metrics.recent_costs(metrics.ENTRY_RECALL)
+    assert len(recs) == 2
+    assert recs[1]["llm_calls"] == 1
+    assert recs[1]["input_tokens"] == 4
+    assert recs[1]["output_tokens"] == 1
+    assert recs[0]["llm_calls"] == 0
+    assert all("duration_ms" in r for r in recs)
+    assert metrics.recent_costs(metrics.ENTRY_METABOLISM) == []
 
 
 def test_gauges_set_and_read():

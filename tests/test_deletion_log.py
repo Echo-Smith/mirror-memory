@@ -544,3 +544,74 @@ def _compute_child_hash(path, seq: int) -> str:
     """The hash the child's seq-11 entry carries (the parent reads the
     file the child wrote -- the identity check, not a recomputation)."""
     return _last_hash(path)
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 3: the genesis empty-file race (root cause of the observed
+# DeletionLogUnavailable startup flake).  ``ensure_genesis`` used to skip the
+# write when the log PATH existed -- but ``open("a+b")`` creates an empty file
+# before the genesis line is written, so a concurrent racer could observe
+# "exists", skip its own write, and then fail startup with "no genesis".
+# The fix decides on the file CONTENT under the lock; this test pins the
+# empty-but-existing window deterministically.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_genesis_writes_into_empty_existing_file(tmp_path):
+    """An empty-but-EXISTING log file (the concurrent-create window) must get
+    its genesis written by ensure_genesis -- has_genesis must then be True."""
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    log = FileDeletionLog(tmp_path)
+    db_id = "c27e62c2" * 4  # 32-hex db_id shape
+    path = log._path_for(db_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # simulate the racing window: the file was created (open("a+b")) but the
+    # genesis line was not written yet
+    path.write_bytes(b"")
+    assert not log.has_genesis(db_id)
+
+    log.ensure_genesis(db_id)
+
+    assert log.has_genesis(db_id), (
+        "ensure_genesis skipped writing because the empty file already "
+        "existed -- the concurrent-create race is back"
+    )
+    # a second call stays idempotent: still exactly one genesis entry
+    log.ensure_genesis(db_id)
+    entries = list(log._iter_entries(path))
+    genesis = [e for e in entries if e.scope == "genesis"]
+    assert len(genesis) == 1
+
+
+def test_ensure_genesis_concurrent_racers_produce_one_genesis(tmp_path):
+    """Two threads racing ensure_genesis on the same db must serialise on the
+    file lock and end with exactly ONE genesis entry (no duplicates, no
+    'no genesis' failures)."""
+    import threading
+
+    from mirror_memory.core.deletion import FileDeletionLog
+
+    log = FileDeletionLog(tmp_path)
+    db_id = "d41d98aa" * 4
+    path = log._path_for(db_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")  # start in the racing window
+
+    failures: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def racer():
+        try:
+            barrier.wait(timeout=5)
+            log.ensure_genesis(db_id)
+            assert log.has_genesis(db_id)
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    t1 = threading.Thread(target=racer)
+    t2 = threading.Thread(target=racer)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert not failures, failures[:2]
+    entries = list(log._iter_entries(path))
+    assert len([e for e in entries if e.scope == "genesis"]) == 1

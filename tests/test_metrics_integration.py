@@ -204,7 +204,7 @@ def test_sql_concurrent_threads_attributed_by_entry(tmp_path):
 
     def run(entry):
         try:
-            with metrics.entry_scope(entry):
+            with metrics.entry_scope(entry, engine=eng._engine):
                 barrier.wait(timeout=5)
                 from sqlalchemy import text
                 for _ in range(3):

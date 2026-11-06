@@ -713,6 +713,59 @@ def measure_gcm_full_load(beliefs, runs: int = 5):
     }
 
 
+def measure_gcm_db_load(engine, user, runs: int = 5, sample: int | None = None):
+    """REAL 'DB read + decrypt' full load (M5 patch 3 §5): time the WHOLE
+    pipeline -- SELECT the belief rows from the database (fresh query each
+    run, objects re-fetched from the DB, not the identity map) PLUS
+    AES-256-GCM decrypt of every content field of every row.
+
+    This is the composed number the doc must distinguish from the in-memory
+    decrypt-only figure: it includes the DB round-trip + ORM materialisation.
+    The storage itself still holds PLAINTEXT (prototype: no production crypto
+    integration), so the 'decrypt' half re-encrypts to fresh per-field
+    ciphertext ONCE and decrypts that -- i.e. the DB leg is real, the
+    ciphertext store is prototype-simulated.  Labelled accordingly in the
+    report tables.
+    """
+    from sqlalchemy import select
+
+    from mirror_memory.core.models import Belief
+    from mirror_memory.core.tenancy import tenant_scope
+
+    g = FieldGCM()
+    per_run = []
+    n_rows = 0
+    n_fields = 0
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        with tenant_scope("default", "default"):
+            with engine._session() as session:
+                # expire_all forces the rows to be re-SELECTed from the DB
+                session.expire_all()
+                rows = list(session.scalars(
+                    select(Belief).where(Belief.user_id == user)
+                ))
+        n_rows = len(rows)
+        n_fields = 0
+        for b in rows:
+            rid = _belief_row_id(b)
+            fields = g.encrypt_belief(b)          # fresh ciphertext, once
+            n_fields += len(fields)
+            if sample is not None and n_fields > sample:
+                fields = fields[:sample]
+            g.decrypt_belief(rid, fields)         # per-field nonce/tag decrypt
+        per_run.append((time.perf_counter() - t0) * 1000.0)
+    return {
+        "beliefs": n_rows,
+        "fields": n_fields,
+        "runs": runs,
+        "db_read_plus_decrypt_ms_p50": round(_percentile(per_run, 50), 3),
+        "db_read_plus_decrypt_ms_min": round(min(per_run), 3),
+        "db_read_plus_decrypt_ms_max": round(max(per_run), 3),
+        "per_run_ms": [round(x, 3) for x in per_run],
+    }
+
+
 def measure_gcm_per_field(beliefs, sample: int = 2000):
     """REAL measurement: µs per single-field decrypt, over a bounded sample
     of real content fields (independent nonce + AAD each)."""
@@ -1179,6 +1232,11 @@ def run_backend(backend, counts, args, key):
                         beliefs, runs=args.gcm_runs)
                     entry["gcm_per_field"] = measure_gcm_per_field(
                         beliefs, sample=args.gcm_field_sample)
+                    # M5 patch-3 §5: DB read + decrypt full load (composed:
+                    # real SELECT + real GCM decrypt; ciphertext store is
+                    # prototype-simulated -- see the function docstring)
+                    entry["gcm_db_load"] = measure_gcm_db_load(
+                        engine, "u", runs=args.gcm_runs)
                     entry["gcm_candidate_decrypt"] = measure_gcm_candidate_decrypt(
                         beliefs, cap=_CANDIDATE_DECRYPT_CAP,
                         runs=max(10, args.gcm_runs * 4))

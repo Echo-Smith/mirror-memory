@@ -38,6 +38,8 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
+from collections import deque
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -180,36 +182,71 @@ def entry_scope(entry: str, *, engine: object | None = None) -> Iterator[None]:
     previous_engine = getattr(_entry_tls, "engine_key", None)
     _entry_tls.entry = entry
     _entry_tls.engine_key = id(engine_obj) if engine_obj is not None else None
+    # Per-call cost capture: baseline of this entry's counters at scope start;
+    # deltas at scope end become ONE per-call record (bounded ring, §2
+    # "actual per-call cost, not only cross-call averages").
+    baseline = {p: value(f"{p}.{entry}") for p in _COST_CAPTURE_PREFIXES}
+    started = time.monotonic()
     try:
         yield
     finally:
         _entry_tls.entry = previous
         _entry_tls.engine_key = previous_engine
+        try:
+            _record_recent_cost(entry, baseline, started)
+        except Exception:  # never break the entry
+            logger.debug("metrics: recent-cost capture failed", exc_info=True)
 
 
 def record_sql_current(engine: object | None = None, n: int = 1) -> None:
     """Count *n* SQL statements against the CURRENT entry, if it applies.
 
     Called by the single process-wide cursor listener with the *connection's*
-    engine.  The count happens only when
+    engine.  The count happens only when BOTH hold:
 
-    * an entry scope is open on this thread (no scope -> no attribution), and
-    * the scope named an engine and it is the same engine that issued the
-      statement (so a different engine's SQL on the same thread is ignored).
-
-    A scope opened without an engine (e.g. a raw worker tick that is not tied
-    to a pooled Engine) counts regardless of the issuing engine."""
+    * an entry scope is open on this thread (no scope -> no attribution), AND
+    * the scope is bound to an engine AND that is the engine which issued the
+      statement.  A scope with NO engine binding (cold start, before
+      ``MemoryEngine._engine`` exists) attributes NOTHING -- ``engine=None``
+      never means "all engines"; unrelated SQL on the same thread is never
+      counted.  ``metrics.bind_scope_engine`` binds the scope once the engine
+      exists, so genuine engine-initialisation SQL IS attributed.
+    """
     entry = getattr(_entry_tls, "entry", None)
     if entry is None:
         return
     scope_engine = getattr(_entry_tls, "engine_key", None)
-    if scope_engine is not None:
-        if engine is None:
-            return
-        issued_by = getattr(engine, "engine", engine)
-        if id(issued_by) != scope_engine:
-            return
+    if scope_engine is None:
+        return                      # unbound scope: never "all engines"
+    if engine is None:
+        return
+    issued_by = getattr(engine, "engine", engine)
+    if id(issued_by) != scope_engine:
+        return                      # another engine's SQL on this thread
     record_sql(entry, n)
+
+
+def bind_scope_engine(engine: object | None) -> bool:
+    """Bind the CURRENT entry scope to *engine* (once it exists).
+
+    Cold start: an entry is opened before ``MemoryEngine._engine`` exists, so
+    the scope initially carries no engine and attributes no SQL.  As soon as
+    the engine is constructed, the engine calls this to bind the scope -- from
+    that point, its SQL (schema creation, RLS posture, the entry's own work)
+    IS attributed to the entry.  Binding only upgrades an UNBOUND scope; it
+    never re-binds a scope that another engine already owns, and it does
+    nothing when no scope is active.  Returns True when binding happened."""
+    if getattr(_entry_tls, "entry", None) is None:
+        return False
+    if getattr(_entry_tls, "engine_key", None) is not None:
+        return False
+    engine_obj = engine
+    if engine_obj is not None and not hasattr(engine_obj, "dialect"):
+        engine_obj = getattr(engine_obj, "_engine", None)
+    if engine_obj is None:
+        return False
+    _entry_tls.engine_key = id(engine_obj)
+    return True
 
 
 class _LLMClientProxy:
@@ -248,67 +285,105 @@ def record_llm_tokens(
     _add(COST_OUTPUT_TOKENS_PREFIX, output_tokens)
 
 
+#: Lock guarding hook installation on a shared client (concurrent
+#: ``instrument_llm_client`` calls must not install two chains).
+_llm_install_lock = threading.Lock()
+
+
 def _installed_hook(inner) -> bool:
     return bool(getattr(inner, "_mm_metrics_hook", False))
 
 
+def _chain_installed(inner) -> bool:
+    """True when OUR chain is the client's current ``_on_call``.
+
+    A host holding the RAW client can call ``set_on_call`` directly and
+    overwrite the chain; the proxy detects that on the next call and
+    re-asserts itself while adopting the host's callback."""
+    return getattr(inner, "_on_call", None) is getattr(inner, "_mm_metrics_chain", None)
+
+
 def _install_chained_hook(inner) -> None:
     """Install ONE hook on *inner* that records usage AND still calls the
-    host's original callback.
+    host's CURRENT callback (read dynamically at call time).
 
-    The host's ``_on_call`` (if any) is saved exactly once and invoked by the
-    chain, so instrumentation never overwrites or loses a host callback.  The
-    hook reads the CALLING THREAD's entry at call time -- shared clients used
-    from several threads therefore attribute per thread, and a call made
-    outside any entry scope records nothing (it cannot be mis-attributed).
+    Lifecycle rules (M5 patch 3):
+
+    * the host callback is stored in ``_mm_metrics_host_on_call`` -- never
+      captured in a closure -- so replacing or clearing it later (through the
+      proxy) is picked up on the next call and nothing goes stale;
+    * installation is idempotent and lock-guarded: two threads instrumenting
+      the same shared client install exactly one chain;
+    * if the host bypasses the proxy and calls ``set_on_call`` on the RAW
+      client, our chain is overwritten -- the proxy detects that (by identity
+      comparison) on the next ``generate()`` and re-asserts the chain while
+      adopting whatever the host installed.  The host's callback keeps
+      working; usage accounting resumes.
     """
-    if not hasattr(inner, "set_on_call") or _installed_hook(inner):
+    if not hasattr(inner, "set_on_call"):
         return
-    original = getattr(inner, "_on_call", None)
+    with _llm_install_lock:
+        if _installed_hook(inner) and _chain_installed(inner):
+            return
+        # A host callback installed between our install and now (raw-reference
+        # replacement) is adopted as the host callback, not lost.
+        host_current = getattr(inner, "_on_call", None)
+        if host_current is not None and host_current is not getattr(
+            inner, "_mm_metrics_chain", None
+        ):
+            inner._mm_metrics_host_on_call = host_current
 
-    def _chain(info: dict) -> None:
-        try:
-            inp = info.get("input_tokens")
-            out = info.get("output_tokens")
-            _llm_tls.reported = True
-            _llm_tls.input_tokens = inp
-            _llm_tls.output_tokens = out
-            entry = getattr(_entry_tls, "entry", None)
-            if entry is not None:
-                record_llm_tokens(entry, input_tokens=inp, output_tokens=out)
-        except Exception:  # metrics must never break a provider callback
-            logger.debug("metrics: usage hook failed", exc_info=True)
-        # ALWAYS forward to the host's own callback, if there was one.
-        if original is not None:
+        def _chain(info: dict) -> None:
             try:
-                original(info)
-            except Exception:
-                logger.debug("metrics: host LLM callback raised", exc_info=True)
+                _llm_tls.reported = True
+                _llm_tls.ok = info.get("ok", True)
+                _llm_tls.input_tokens = info.get("input_tokens")
+                _llm_tls.output_tokens = info.get("output_tokens")
+                entry = getattr(_entry_tls, "entry", None)
+                if entry is not None:
+                    record_llm_tokens(entry, input_tokens=_llm_tls.input_tokens,
+                                      output_tokens=_llm_tls.output_tokens)
+            except Exception:  # metrics must never break a provider callback
+                logger.debug("metrics: usage hook failed", exc_info=True)
+            # Forward to the host's CURRENT callback, read dynamically -- a
+            # replacement or clearing done through the proxy is honoured here.
+            host_cb = getattr(inner, "_mm_metrics_host_on_call", None)
+            if host_cb is not None:
+                try:
+                    host_cb(info)
+                except Exception:
+                    logger.debug("metrics: host LLM callback raised", exc_info=True)
 
-    try:
-        inner.set_on_call(_chain)
-        inner._mm_metrics_hook = True
-        inner._mm_metrics_original_on_call = original
-    except Exception:  # pragma: no cover - exotic client
-        logger.debug("metrics: could not install usage hook", exc_info=True)
+        try:
+            inner.set_on_call(_chain)
+            inner._mm_metrics_hook = True
+            inner._mm_metrics_chain = _chain
+            if not hasattr(inner, "_mm_metrics_host_on_call"):
+                inner._mm_metrics_host_on_call = None
+        except Exception:  # pragma: no cover - exotic client
+            logger.debug("metrics: could not install usage hook", exc_info=True)
 
 
 def instrument_llm_client(client):
     """Wrap an LLM client so every ``generate()`` is counted exactly once,
-    whatever the client (M5 §3 patch).
+    whatever the client (M5 patch 3).
 
     Per call, on the CALLING THREAD:
 
     * ``llm_calls_total.<entry>``   -- always, when an entry scope is open;
+    * ``llm_calls_failed_total``    -- ``generate()`` raised, OR the provider
+      reported ``ok=False`` (e.g. the built-in ``OpenAILLM`` swallowed an
+      error and returned its ``fallback`` -- that is still a failed call);
     * ``llm_input_tokens`` / ``llm_output_tokens`` -- real numbers only;
     * ``llm_usage_partial_total``   -- usage surfaced but only one side;
-    * ``llm_usage_unknown_total``   -- no usage surfaced at all;
-    * ``llm_calls_failed_total``    -- ``generate()`` raised.
+    * ``llm_usage_unknown_total``   -- no usage surfaced at all.
 
     A call made with no entry scope open records nothing (no attribution, no
-    cross-talk).  The proxy is transparent for every other attribute, forwards
-    ``set_on_call`` to the inner client (never replacing a host callback: it is
-    saved once and chained), is idempotent, and never raises from bookkeeping."""
+    cross-talk).  ``set_on_call`` through the proxy sets or clears the HOST
+    callback without touching the metrics chain; a host that replaces the
+    callback on the RAW client reference is detected and adopted on the next
+    call.  The proxy is transparent for every other attribute, idempotent, and
+    never raises from bookkeeping."""
     if client is None:
         return None
     if isinstance(client, _LLMClientProxy):
@@ -327,38 +402,56 @@ def instrument_llm_client(client):
             setattr(object.__getattribute__(self, "_inner"), name, value)
 
         def set_on_call(self, hook):
-            """Forward to the inner client, keeping our chained hook in place.
+            """Set or clear the HOST callback without disturbing metrics.
 
-            A host that installs its own callback must keep working: we save it
-            as the new "original" that our chain forwards to, rather than
-            dropping either side."""
+            The metrics chain stays installed; the chain forwards to whatever
+            host callback is current at call time (``None`` clears it)."""
             inner = object.__getattribute__(self, "_inner")
-            inner._mm_metrics_original_on_call = hook
-            if not _installed_hook(inner):
+            inner._mm_metrics_host_on_call = hook
+            if not _installed_hook(inner) or not _chain_installed(inner):
+                # chain missing (never installed, or clobbered by a raw
+                # set_on_call while a host callback exists) -> (re)install
                 _install_chained_hook(inner)
 
         def generate(self, *args, **kwargs):
             inner = object.__getattribute__(self, "_inner")
             entry = getattr(_entry_tls, "entry", None)
+            # Lifecycle: if the host replaced our chain through the RAW client
+            # reference, adopt its callback and re-assert the chain.
+            if _installed_hook(inner) and not _chain_installed(inner):
+                inner._mm_metrics_host_on_call = getattr(inner, "_on_call", None)
+                _install_chained_hook(inner)
             _llm_tls.reported = False
+            _llm_tls.ok = True
             _llm_tls.input_tokens = None
             _llm_tls.output_tokens = None
-            ok = True
+            raised = False
             try:
                 return inner.generate(*args, **kwargs)
             except BaseException:
-                ok = False
+                raised = True
                 raise
             finally:
                 if entry is not None and is_allowed_entry(entry) and enabled():
                     inc(f"{COST_LLM_CALLS_PREFIX}.{entry}")
-                    if not ok:
+                    failed = raised or not getattr(_llm_tls, "ok", True)
+                    if failed:
+                        # includes ok=False + fallback-return (the built-in
+                        # OpenAILLM swallows provider errors into a fallback)
                         inc(f"{COST_LLM_CALLS_FAILED_PREFIX}.{entry}")
                     elif not getattr(_llm_tls, "reported", False):
                         inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
-                    elif (_llm_tls.input_tokens is None
-                          or _llm_tls.output_tokens is None):
-                        inc(f"{COST_USAGE_PARTIAL_PREFIX}.{entry}")
+                    else:
+                        inp = getattr(_llm_tls, "input_tokens", None)
+                        out = getattr(_llm_tls, "output_tokens", None)
+                        if inp is None and out is None:
+                            # provider surfaced a usage object with NO token
+                            # counts on either side -> unknown, never zero
+                            inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
+                        elif inp is None or out is None:
+                            # exactly one side reported -> partial; the side
+                            # that WAS reported is still added to its counter
+                            inc(f"{COST_USAGE_PARTIAL_PREFIX}.{entry}")
 
     return _Proxy(client)
 
@@ -385,6 +478,24 @@ TOMBSTONES_EXPORT_SKIPPED = "tombstones_export_skipped"
 #: batch's from_cursor/from_chain_hash did not continue the stored
 #: channel) -- the whole sender log is re-fetched with entry-level dedup.
 TOMBSTONES_RESCANS = "tombstones_rescans"
+
+
+#: Closed set of tombstone-batch rejection reasons (the ``reason`` label).
+#: Anything else is bucketed under ``other`` -- a raw string from an exception
+#: never becomes a label value.
+ALLOWED_REASONS = frozenset(
+    {"apply", "format", "hash", "sender", "sequence", "tenant", "user"}
+)
+
+
+def record_tombstone_rejection(reason: str, n: int = 1) -> None:
+    """Count one rejected tombstone batch by reason (closed label set).
+
+    A reason outside :data:`ALLOWED_REASONS` is counted under ``other`` so a
+    new or unexpected reason stays visible without ever putting an
+    unconstrained string on the Prometheus wire."""
+    label = reason if reason in ALLOWED_REASONS else "other"
+    inc(TOMBSTONES_REJECTED_PREFIX + label, n)
 
 
 def inc(name: str, n: int = 1) -> None:
@@ -417,32 +528,45 @@ def gauge(name: str) -> float | None:
         return _gauges.get(name)
 
 
-def snapshot(*, storage: dict | None = None) -> dict:
-    """Everything the library currently knows, in ONE mapping.
+def snapshot() -> dict[str, int]:
+    """The counter snapshot -- HISTORICAL ``dict[str, int]`` contract.
 
-    The historical contract is preserved: every counter name maps to an
-    ``int`` at the TOP LEVEL, so ``snapshot().get("missing_purpose_refusals", 0)``
-    and iteration over counter names keep working unchanged.
+    Every counter name maps to an ``int``; there are no other keys, so
+    ``snapshot().get(name, 0)`` and iteration over counter names keep working
+    for every existing caller.
 
-    In addition the same mapping carries the other sections under fixed keys
-    that can never collide with a counter name (they start with ``_``):
-
-    ``_gauges``   {name: float}
-    ``_latency``  {entry: {count, p50, p95, p99}}
-    ``_cost``     {entry: per-call cost (see :func:`entry_cost`)}
-    ``_storage``  {(tenant, app, user): {table: {rows, bytes}}} -- only when the
-                  caller passes the on-demand ``storage=`` value, because
-                  computing it needs SQL (never on the request path).
-
-    ``_enabled`` records whether recording is on.
+    Gauges, latency distributions, per-call costs, recent per-call records and
+    the (optional, on-demand) storage section live on the SEPARATE full
+    interface :func:`snapshot_full` (or :func:`report`).
     """
-    counters = dict(_counters)
-    counters["_gauges"] = gauges()
-    counters["_latency"] = latency_summaries()
-    counters["_cost"] = entry_costs()
-    counters["_storage"] = storage if storage is not None else {}
-    counters["_enabled"] = enabled()
-    return counters
+    with _lock:
+        return dict(_counters)
+
+
+def snapshot_full(*, storage: dict | None = None) -> dict:
+    """The complete telemetry snapshot: everything the library knows.
+
+    Sections (fixed keys, never colliding with counter names):
+
+    ``counters``  {name: int} -- identical to :func:`snapshot`;
+    ``gauges``    {name: float};
+    ``latency``   {entry: {count, p50, p95, p99}} (fixed-bucket distributions);
+    ``cost``      {entry: per-call cost averages} (:func:`entry_cost`);
+    ``recent``    {entry: [per-call cost records]} (:func:`recent_costs`);
+    ``storage``   {(tenant, app, user): {table: {rows, bytes}}} -- ONLY when
+                  the caller passes the on-demand ``storage=`` value (it needs
+                  SQL; never computed on the request path);
+    ``enabled``   whether recording is on.
+    """
+    return {
+        "counters": snapshot(),
+        "gauges": gauges(),
+        "latency": latency_summaries(),
+        "cost": entry_costs(),
+        "recent": {e: recent_costs(e) for e in sorted(ALLOWED_ENTRIES)},
+        "storage": storage if storage is not None else {},
+        "enabled": enabled(),
+    }
 
 
 def gauges() -> dict[str, float]:
@@ -710,6 +834,74 @@ def entry_costs() -> dict[str, dict]:
     return {e: entry_cost(e) for e in sorted(ALLOWED_ENTRIES)}
 
 
+#: Counter prefixes captured into each per-call cost record.
+_COST_CAPTURE_PREFIXES = (
+    COST_LLM_CALLS_PREFIX,
+    COST_LLM_CALLS_FAILED_PREFIX,
+    COST_INPUT_TOKENS_PREFIX,
+    COST_OUTPUT_TOKENS_PREFIX,
+    COST_USAGE_UNKNOWN_PREFIX,
+    COST_USAGE_PARTIAL_PREFIX,
+    SQL_STATEMENTS_PREFIX,
+)
+
+#: Bounded ring of the most recent per-call cost records per entry.  Fixed
+#: capacity -- memory is bounded no matter the traffic.  Records carry ONLY
+#: durations and counter deltas: no content, no user/tenant ids, no timestamps
+#: beyond monotonic-clock arithmetic (never exposed).
+_RECENT_RING_SIZE = 256
+_recent_costs: dict[str, deque] = {}
+
+
+def _record_recent_cost(entry: str, baseline: dict[str, int], started: float) -> None:
+    """Append ONE per-call cost record (duration + counter deltas).
+
+    Skipped entirely when recording is disabled -- with metrics off, no ring
+    entry is produced (see the instrumentation-residue note in
+    ``docs/reports``: the proxy/scope/listener structure remains, only the
+    recording stops)."""
+    if not enabled():
+        return
+    duration_ms = (time.monotonic() - started) * 1000.0
+    record = {"duration_ms": round(duration_ms, 3)}
+    for prefix in _COST_CAPTURE_PREFIXES:
+        name = prefix.split("_total")[0].replace("llm_", "").replace("sql_", "")
+        total = value(f"{prefix}.{entry}")
+        delta = total - baseline.get(prefix, 0)
+        key = {
+            "calls": "llm_calls", "failed": "llm_failed",
+            "input": "input_tokens", "output": "output_tokens",
+            "usage_unknown": "usage_unknown", "usage_partial": "usage_partial",
+            "statements": "sql_statements",
+        }.get(name, name)
+        record[key] = delta
+    ring = _recent_costs.get(entry)
+    if ring is None:
+        ring = deque(maxlen=_RECENT_RING_SIZE)
+        _recent_costs[entry] = ring
+    ring.append(record)
+
+
+def recent_costs(entry: str) -> list[dict]:
+    """The most recent PER-CALL cost records for *entry* (oldest first).
+
+    Each record: ``duration_ms`` plus the counter deltas that occurred during
+    that one invocation (``llm_calls``, ``llm_failed``, ``input_tokens``,
+    ``output_tokens``, ``usage_unknown``, ``usage_partial``,
+    ``sql_statements``).  Bounded to the last
+    ``{_RECENT_RING_SIZE}`` invocations.  These are ACTUAL per-call figures --
+    not the cross-call averages of :func:`entry_cost` -- and they carry no
+    content and no user/tenant identifiers.  Empty for an entry that has not
+    run.  Library value only; never emitted to Prometheus.
+    """
+    if not is_allowed_entry(entry):
+        raise ValueError(
+            f"unknown metrics entry {entry!r}; allowed: {sorted(ALLOWED_ENTRIES)}"
+        )
+    ring = _recent_costs.get(entry)
+    return [dict(r) for r in ring] if ring else []          # oldest first
+
+
 def totals() -> dict[str, int]:
     """The monotonically-growing aggregate counters (the raw totals).
 
@@ -849,18 +1041,8 @@ def storage_stats(engine) -> dict[StorageKey, dict[str, dict[str, int]]]:
 
 
 def report(*, storage: dict | None = None) -> dict:
-    """Alias kept for callers that used the older split shape.
-
-    Returns ``{"counters", "gauges", "latency", "cost", "storage"}``; the same
-    data is available from :func:`snapshot` directly."""
-    snap = snapshot(storage=storage)
-    return {
-        "counters": {k: v for k, v in snap.items() if not k.startswith("_")},
-        "gauges": snap["_gauges"],
-        "latency": snap["_latency"],
-        "cost": snap["_cost"],
-        "storage": snap["_storage"],
-    }
+    """The full telemetry report (same data as :func:`snapshot_full`)."""
+    return snapshot_full(storage=storage)
 
 
 def reset_for_tests() -> None:
@@ -873,6 +1055,7 @@ def reset_for_tests() -> None:
         _histograms.clear()
         _hist_sums.clear()
         _enabled = True
+        _recent_costs.clear()
     _entry_tls.entry = None
     _entry_tls.engine_key = None
     _llm_tls.reported = False
@@ -961,10 +1144,15 @@ def render_prometheus() -> str:
         lines.append(f"{pname} {counters.get(name, 0)}")
 
     # Tombstone rejections by reason: label is the reason token only.
-    rejected = {
-        k[len(TOMBSTONES_REJECTED_PREFIX):]: v
-        for k, v in counters.items() if k.startswith(TOMBSTONES_REJECTED_PREFIX)
-    }
+    rejected: dict[str, int] = {}
+    for k, v in counters.items():
+        if k.startswith(TOMBSTONES_REJECTED_PREFIX):
+            reason = k[len(TOMBSTONES_REJECTED_PREFIX):]
+            # Closed set: anything unrecognised is reported under "other" so
+            # the count stays visible but no raw string reaches the wire.
+            if reason not in ALLOWED_REASONS:
+                reason = "other"
+            rejected[reason] = rejected.get(reason, 0) + v
     if rejected:
         lines.append("# HELP mirror_memory_tombstones_rejected_total Rejected tombstone batches by reason.")
         lines.append("# TYPE mirror_memory_tombstones_rejected_total counter")

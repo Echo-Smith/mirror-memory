@@ -156,7 +156,14 @@ def test_100_concurrent_alternating_keys(tmp_path, app_url):
         t.start()
     for t in threads:
         t.join()
-    assert len(results) == 20
+    # M5 patch 3: surface worker exceptions in THIS assertion (previously the
+    # count check fired first and hid them -- the full-suite PG flake showed
+    # 11/20 with the cause invisible).  Diagnosis aid only.
+    if len(results) != 20:
+        pytest.fail(
+            f"only {len(results)}/20 workers completed; "
+            f"worker exceptions: {errors[:6]!r}"
+        )
     for key, expected, got in results:
         assert expected in got, (key, got)
         other = "B-ONLY" if expected == "A-ONLY" else "A-ONLY"

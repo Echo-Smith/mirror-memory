@@ -335,6 +335,11 @@ class MemoryEngine:
 
         if self._shared_engine is not None:
             self._engine = self._shared_engine
+            # M5 patch 3: bind the engine into the active metrics entry scope
+            # as soon as it exists, so cold-start SQL that genuinely belongs to
+            # THIS engine (watermark read, posture, create_all) is attributed
+            # to the entry -- while unrelated engines' SQL never is.
+            metrics.bind_scope_engine(self._engine)
             if self._schema_ready:
                 # The owner of the shared engine ran the schema / posture /
                 # single-tenant checks once; a per-tenant wrapper only binds.
@@ -354,6 +359,7 @@ class MemoryEngine:
                 return
         else:
             self._engine = build_engine(self._database_url)
+            metrics.bind_scope_engine(self._engine)
         if is_postgres(self._engine) and rls_enabled():
             # The app role never runs DDL: the owner-side upgrade_database
             # created the schema, and the engine refuses to serve unless
@@ -1578,7 +1584,7 @@ class MemoryEngine:
         try:
             validate_batch(batch, expected_tenant=expected)
         except TombstoneBatchRejected as exc:
-            metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
+            metrics.record_tombstone_rejection(exc.reason)
             raise
 
         from mirror_memory.core.deletion import GENESIS_HASH
@@ -1627,7 +1633,7 @@ class MemoryEngine:
                                 f"user {entry.user_id!r}, unknown to tenant "
                                 f"{tuple(self._tenant)!r}: the whole batch is refused")
             except TombstoneBatchRejected as exc:
-                metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + exc.reason)
+                metrics.record_tombstone_rejection(exc.reason)
                 raise
 
             # NOTE: the dedup lookup covers EVERY origin (a hub relays
@@ -1705,7 +1711,7 @@ class MemoryEngine:
                 session.commit()
             except Exception as exc:
                 session.rollback()
-                metrics.inc(metrics.TOMBSTONES_REJECTED_PREFIX + "apply")
+                metrics.record_tombstone_rejection("apply")
                 raise TombstoneBatchRejected(
                     "apply",
                     f"applying tombstone batch failed ({type(exc).__name__}: {exc}); "

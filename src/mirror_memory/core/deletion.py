@@ -345,24 +345,30 @@ class FileDeletionLog(DeletionLog):
 
     def _ensure_file(self, db_id: str) -> Path:
         path = self._path_for(db_id)
-        if not path.exists():
-            # create the file under the lock, then write the GENESIS entry
-            # (seq 0): its presence is what binds this file to that database
-            # life.  The open("a+b") itself creates the file, so the
-            # emptiness check must happen INSIDE the lock.
-            with self._locked(path) as fh:
+        # M5 patch 3 (flake root cause): the genesis decision is made INSIDE
+        # the lock on the file's CONTENT, never on ``path.exists()``.  The
+        # previous fast-path skipped the write when the path existed -- but
+        # ``open("a+b")`` below creates an EMPTY file before the genesis line
+        # is written, so a concurrent ``ensure_genesis`` could observe
+        # "exists" during that window, skip its own write, and then fail
+        # startup with DeletionLogUnavailable ("no genesis").  Under the lock
+        # the emptiness check is atomic with the write and idempotent: two
+        # racers serialise, the first writes, the second sees a non-empty
+        # file and skips.  Genesis content is unchanged; the file remains
+        # hash-chained and fail-closed.
+        with self._locked(path) as fh:
+            fh.seek(0)
+            existing = fh.read().strip()
+            if not existing:
+                genesis = _genesis_entry(db_id)
+                genesis.seq = 0
+                genesis.prev_hash = GENESIS_HASH
+                genesis.hash = genesis.compute_hash()
                 fh.seek(0)
-                existing = fh.read().strip()
-                if not existing:
-                    genesis = _genesis_entry(db_id)
-                    genesis.seq = 0
-                    genesis.prev_hash = GENESIS_HASH
-                    genesis.hash = genesis.compute_hash()
-                    fh.seek(0)
-                    fh.write((json.dumps(self._line(genesis), sort_keys=True,
-                                         ensure_ascii=False) + "\n").encode())
-                    fh.flush()
-                    os.fsync(fh.fileno())
+                fh.write((json.dumps(self._line(genesis), sort_keys=True,
+                                     ensure_ascii=False) + "\n").encode())
+                fh.flush()
+                os.fsync(fh.fileno())
         return path
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:

@@ -209,6 +209,23 @@ Every track is evaluated on its own and ends in exactly one of four states:
 downgraded to `not_run`. Isolation is enforced: a completed track's result is
 never overwritten because a *different* track errored.
 
+### Per-track edges (no key / construction failure / run failure)
+
+- **No API key**: `forced` **and** `production` are each their **own** `not_run`
+  track — both appear in `verdict.json` and in the summary table; one never
+  stands in for the other. (The `answer` track is likewise `not_run`.)
+- **Client-construction failure**: if the extractor/answerer client cannot be
+  built, every LLM-owned track is `error` whose reason says
+  `client construction/init failed: ...`. It is never `not_run` and never pass.
+- **Track-run failure**: if a track starts and then raises, that track is
+  `error` whose reason says `track run failed: ...`. This is distinct from a
+  construction failure so an operator can tell a credentials/config problem
+  from a run problem.
+
+In both failure modes the *other* track's completed per-case report and its own
+manifest are still written (forced and production each have their own file
+pair), so one track’s failure never discards the other’s evidence.
+
 The gate is **fail-closed**: a `not_run` or `error` track does not clear its
 threshold. Only a `pass` on every required track (plus coverage, mode, health,
 manifest, and the production gap) clears the gate.

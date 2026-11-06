@@ -58,7 +58,8 @@ evidence and no ``source_event_id`` column.  What v1 guarantees is a
 **partial equivalence**, not "equivalent".
 
 The tests below execute the guarantee that DOES exist (and pass only when it
-holds).  The v2-only shape is guarded in ``test_invariants_xfail.py``.
+holds).  The v2-only shape is guarded as a **structural warning** (not a
+behaviour test) in ``test_invariants_xfail.py``.
 """
 
 from __future__ import annotations
@@ -330,3 +331,116 @@ def test_i4_same_ref_other_tenant_does_not_collide_or_leak(conc_backend):
     assert a_visible[0].tenant_id == "tenant-a"
 
     assert a_id != b_id, "same ref in different tenants must NOT collide"
+
+
+# ---------------------------------------------------------------------------
+# STRUCTURAL WARNING counterexamples (NOT behaviour tests)
+#
+# These drive the *structural* checker
+# ``test_invariants_xfail.source_event_id_uniqueness_shape`` against fabricated
+# table shapes.  Their whole point is that a structural warning must NOT be
+# fooled into reporting I4's claim-time behaviour as implemented by (a) a bare
+# column name or (b) a *superset* unique constraint that contains the target
+# column but has extra columns.  A superset is WEAKER than the exact in-scope
+# identity and must be judged "does not meet the target".
+# ---------------------------------------------------------------------------
+
+
+def _fabricated_evidence_table(*, columns, unique_sets, name="mm_evidence_fake"):
+    """Build a throwaway ``Table`` mirroring the Evidence shape for the checker.
+
+    ``columns`` is the full column list; ``unique_sets`` is a list of column-name
+    iterables, each becoming one ``UniqueConstraint``.
+    """
+    from sqlalchemy import Column, MetaData, String, Table, UniqueConstraint
+
+    md = MetaData()
+    cols = [Column(c, String(64), primary_key=(i == 0)) for i, c in enumerate(columns)]
+    t = Table(name, md, *cols)
+    for uset in unique_sets:
+        t.append_constraint(UniqueConstraint(*[t.c[c] for c in uset]))
+    return t
+
+
+def test_i4_structural_warning_accepts_exact_target_shape():
+    """Positive control: the checker DOES accept the exact v2 shape — so the
+    counterexample below is meaningful (the checker is not just always-False)."""
+    from tests.test_invariants_xfail import source_event_id_uniqueness_shape
+
+    table = _fabricated_evidence_table(
+        columns=["id", "tenant_id", "app_id", "user_id", "source_event_id"],
+        unique_sets=[("tenant_id", "app_id", "user_id", "source_event_id")],
+    )
+    present, why = source_event_id_uniqueness_shape(table)
+    assert present is True, why
+
+
+def test_i4_structural_warning_rejects_superset_constraint():
+    """COUNTEREXAMPLE: a composite unique constraint that CONTAINS
+    ``source_event_id`` but has EXTRA columns must be judged NOT implementing
+    the target — a superset constraint must never pass the structural warning.
+
+    This is the guard against claiming equivalence from "an arbitrary superset
+    unique constraint": adding ``observed_at`` (or any extra column) makes the
+    constraint weaker (many rows may share one ``source_event_id`` as the extra
+    column varies), so the exact in-scope identity is NOT enforced.
+    """
+    from tests.test_invariants_xfail import source_event_id_uniqueness_shape
+
+    superset = _fabricated_evidence_table(
+        columns=["id", "tenant_id", "app_id", "user_id", "source_event_id", "observed_at"],
+        unique_sets=[
+            ("tenant_id", "app_id", "user_id", "source_event_id", "observed_at"),
+        ],
+    )
+    present, why = source_event_id_uniqueness_shape(superset)
+    assert present is False, (
+        "a SUPERSET unique constraint containing source_event_id plus an extra "
+        f"column must NOT be accepted as implementing I4 (got {present}: {why})"
+    )
+    assert "extra column" in why.lower(), why
+
+
+def test_i4_structural_warning_rejects_superset_even_with_target_also_present():
+    """A table that has BOTH the exact target constraint AND a superset one must
+    still be accepted (the exact one is present), proving the check keys on the
+    exact shape rather than merely rejecting anything with extras."""
+    from tests.test_invariants_xfail import source_event_id_uniqueness_shape
+
+    both = _fabricated_evidence_table(
+        columns=["id", "tenant_id", "app_id", "user_id", "source_event_id", "observed_at"],
+        unique_sets=[
+            ("tenant_id", "app_id", "user_id", "source_event_id"),
+            ("tenant_id", "app_id", "user_id", "source_event_id", "observed_at"),
+        ],
+    )
+    present, why = source_event_id_uniqueness_shape(both)
+    assert present is True, why
+
+
+def test_i4_structural_warning_rejects_bare_column_and_missing_scope():
+    """Negative controls: a bare ``source_event_id`` column with no unique
+    constraint, and a constraint missing the scope/subject columns, are both
+    rejected — a field name is not proof of the behaviour."""
+    from tests.test_invariants_xfail import source_event_id_uniqueness_shape
+
+    # bare column, no unique constraint at all
+    bare = _fabricated_evidence_table(
+        columns=["id", "tenant_id", "app_id", "user_id", "source_event_id"],
+        unique_sets=[],
+    )
+    assert source_event_id_uniqueness_shape(bare)[0] is False
+
+    # constraint exists but omits the scope (no tenant/app) -> not scope-scoped
+    no_scope = _fabricated_evidence_table(
+        columns=["id", "user_id", "source_event_id"],
+        unique_sets=[("user_id", "source_event_id")],
+    )
+    assert source_event_id_uniqueness_shape(no_scope)[0] is False
+
+    # constraint omits the subject dimension -> not the in-scope identity
+    no_subject = _fabricated_evidence_table(
+        columns=["id", "tenant_id", "app_id", "source_event_id"],
+        unique_sets=[("tenant_id", "app_id", "source_event_id")],
+    )
+    assert source_event_id_uniqueness_shape(no_subject)[0] is False

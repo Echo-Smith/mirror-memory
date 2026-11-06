@@ -182,13 +182,35 @@ def test_unrelated_engine_sql_is_not_counted_inside_a_scope(tmp_path):
     assert metrics.snapshot()["sql_statements_total.recall"] == 2
 
 
-def test_scope_without_engine_counts_regardless():
+def test_scope_without_engine_counts_nothing():
+    """``engine=None`` never means "all engines": an unbound scope attributes
+    NO SQL (cold start before ``MemoryEngine._engine`` exists), so unrelated
+    engines on the same thread can never be miscounted.  ``bind_scope_engine``
+    upgrades the scope once the engine exists."""
     _ensure_listener()
     eng = create_engine("sqlite://")
     with metrics.entry_scope(metrics.ENTRY_EXTRACTION_WORKER):
         with eng.connect() as c:
             c.execute(text("SELECT 1"))
+        # still unbound: the unrelated-engine statement was NOT counted
+        assert not any(k.startswith("sql_statements_total")
+                       for k in metrics.snapshot())
+        # binding the scope to THIS engine makes its own SQL count
+        assert metrics.bind_scope_engine(eng) is True
+        with eng.connect() as c:
+            c.execute(text("SELECT 1"))
     assert metrics.snapshot()["sql_statements_total.extraction_worker"] == 1
+
+
+def test_bind_scope_engine_only_upgrades_unbound():
+    eng = create_engine("sqlite://")
+    other = create_engine("sqlite://")
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE, engine=eng):
+        # already bound -> a later bind must NOT re-bind to another engine
+        assert metrics.bind_scope_engine(other) is False
+        with other.connect() as c:
+            c.execute(text("SELECT 1"))
+    assert metrics.snapshot().get("sql_statements_total.observe", 0) == 0
 
 
 def test_sql_outside_scope_is_not_counted():
