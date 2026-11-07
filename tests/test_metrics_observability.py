@@ -16,6 +16,7 @@ per-user/per-table and on-demand, and the histogram quantiles are sane.
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -317,3 +318,109 @@ def test_metrics_never_leaks_user_ids_through_endpoint(tmp_path):
             assert "CONFIDENTIAL-BREAKUP-DETAIL-7712" not in r.text
     finally:
         del os.environ["MM_ADMIN_API_KEY"]
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 4 §2: per-call cost is LOCAL to the call scope, never a global
+# difference.  These pin the properties a global-baseline implementation
+# cannot hold: nesting produces ONE record, threads never cross-contaminate,
+# and an exception still produces exactly one record.
+# ---------------------------------------------------------------------------
+
+
+def test_nested_scopes_produce_exactly_one_outer_record():
+    """A real entry spans init + gate + work as nested scopes; the caller sees
+    ONE complete record that includes the nested work -- not two records and
+    not a second record holding only the inner deltas."""
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        metrics.record_sql("observe", 2)
+        with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+            metrics.record_sql("observe", 3)
+        metrics.record_llm(metrics.ENTRY_OBSERVE, input_tokens=5,
+                           output_tokens=1)
+    recs = metrics.recent_costs(metrics.ENTRY_OBSERVE)
+    assert len(recs) == 1, recs
+    r = recs[0]
+    assert r["sql_statements"] == 5, r
+    assert r["llm_calls"] == 1
+    assert r["input_tokens"] == 5
+    assert r["output_tokens"] == 1
+
+
+def test_exception_still_produces_exactly_one_record():
+    with pytest.raises(RuntimeError):
+        with metrics.entry_scope(metrics.ENTRY_RECALL):
+            metrics.record_sql("recall", 4)
+            raise RuntimeError("boom")
+    recs = metrics.recent_costs(metrics.ENTRY_RECALL)
+    assert len(recs) == 1
+    assert recs[0]["sql_statements"] == 4
+
+
+def test_same_entry_concurrent_threads_do_not_cross_contaminate():
+    """Two threads in the SAME entry, interleaved on a barrier: each record
+    holds only its own thread's counts (a global-baseline implementation
+    would see the union and produce overlapping/wrong deltas)."""
+    barrier = threading.Barrier(2, timeout=10)
+    per_thread_sql = {0: 7, 1: 3}
+
+    def run(idx):
+        with metrics.entry_scope(metrics.ENTRY_EXTRACTION_WORKER):
+            barrier.wait()
+            for _ in range(per_thread_sql[idx]):
+                metrics.record_sql("extraction_worker")
+            barrier.wait()
+
+    ts = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    recs = metrics.recent_costs(metrics.ENTRY_EXTRACTION_WORKER)
+    assert len(recs) == 2, recs
+    assert sorted(r["sql_statements"] for r in recs) == [3, 7]
+
+
+def test_deterministic_interleave_keeps_each_call_isolated():
+    """Strictly alternating steps from two threads in one entry: every step
+    lands on the issuing thread's own frame."""
+    steps = []
+    lock = threading.Lock()
+    gate = threading.Semaphore(0)
+    turn = {"t": 0}
+
+    def run(idx):
+        with metrics.entry_scope(metrics.ENTRY_METABOLISM):
+            for _ in range(3):
+                while turn["t"] != idx:
+                    pass
+                metrics.record_sql("metabolism")
+                with lock:
+                    turn["t"] = 1 - idx
+                if idx == 1:
+                    gate.release()
+
+    t0 = threading.Thread(target=run, args=(0,))
+    t1 = threading.Thread(target=run, args=(1,))
+    t0.start(); t1.start()
+    gate.acquire(timeout=10)
+    t0.join(timeout=10); t1.join(timeout=10)
+    steps.append(None)
+    recs = metrics.recent_costs(metrics.ENTRY_METABOLISM)
+    assert len(recs) == 2, recs
+    for r in recs:
+        assert r["sql_statements"] == 3, recs          # 3 each, never 6/0
+
+
+def test_record_keys_match_documented_cost_keys():
+    """The record's keys are the documented cost keys -- no drift between the
+    emitted counter names and the per-call record shape."""
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        pass
+    rec = metrics.recent_costs(metrics.ENTRY_OBSERVE)[0]
+    assert set(rec) == {"duration_ms"} | set(metrics._COST_FRAME_KEYS)
+    # documented API surface names
+    cost = metrics.entry_cost(metrics.ENTRY_OBSERVE)
+    for doc_key in ("llm_calls", "llm_calls_failed", "input_tokens",
+                    "output_tokens", "usage_unknown_calls", "sql_statements"):
+        assert doc_key in cost, (doc_key, sorted(cost))

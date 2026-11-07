@@ -348,6 +348,14 @@ class MemoryEngine:
                 self._db_id, self._applied_seq = schema_migration.read_watermark(
                     self._engine
                 ) or (None, 0)
+                # M5 patch 4: the shared-engine fast path must ALSO bind the
+                # deletion log.  Skipping it left every per-tenant wrapper with
+                # an uninitialized log, so its first delete would hit the new
+                # fail-closed append guard.  The applied-watermark proof is
+                # read above and passed exactly as on the normal path.
+                if self._deletion_log is not None and self._db_id:
+                    self._deletion_log.ensure_genesis(
+                        self._db_id, applied=self._applied_seq)
                 # batch-2 patch 6/7, task 2: binding is NOT the whole
                 # story -- the sync channel is per-engine, so a
                 # sync-enabled wrapper runs the same startup catch-up the
@@ -380,7 +388,11 @@ class MemoryEngine:
         # M4 batch-1 patch task 2: bind this log to the database life by
         # writing the genesis entry if it is not there yet
         if self._deletion_log is not None:
-            self._deletion_log.ensure_genesis(self._db_id)
+            # M5 patch 4: pass the watermark as the first-creation proof --
+            # applied == 0 alone authorizes minting a genesis; applied > 0
+            # with a missing/empty log fails closed (history was lost).
+            self._deletion_log.ensure_genesis(self._db_id,
+                                              applied=self._applied_seq)
         # M4: startup check against the deletion log.  Equal -> normal; the
         # main DB behind its log (a restored backup) -> replay now, in this
         # process, before any entry serves; the log behind the main DB ->

@@ -34,6 +34,7 @@ entry applies as a no-op and advances the watermark).
 from __future__ import annotations
 
 import contextlib
+import threading
 import fcntl
 import hashlib
 import json
@@ -53,6 +54,15 @@ GENESIS_HASH = "0" * 64
 class DeletionLogUnavailable(RuntimeError):
     """No deletion log is configured: deletions are refused (fail-closed)
     -- an unlogged deletion cannot be replayed after a restore."""
+
+
+class DeletionLogCorrupted(DeletionLogUnavailable):
+    """The log store exists but cannot be trusted as this database's
+    history: a pre-existing EMPTY or TRUNCATED log while the watermark
+    records applied deletions, malformed lines, or a file without its
+    genesis.  Fail-closed -- recovery/adoption is an explicit operator
+    flow (deletion-adopt / restore the log), never an automatic
+    re-initialization."""
 
 
 class LogChainBroken(RuntimeError):
@@ -179,6 +189,31 @@ class DeletionLog:
         """(last seq, last hash); (0, GENESIS) for an empty log."""
         raise NotImplementedError
 
+    def _has_genesis_indexed(self, db_id: str) -> bool:
+        """Genesis presence via the stat-guarded index -- O(1) for an
+        unchanged file, one parse only when the file actually changed.
+
+        The append path must never rescan the whole log (M5 patch 4); the
+        index already holds every seq, and seq 0 is the genesis.
+
+        A COMPACTED log legitimately no longer carries the seq-0 line: prune
+        replaces the retired prefix with a CHECKPOINT entry that records the
+        chain hash and proves the lineage continues from the pruned genesis.
+        So a checkpoint is accepted as evidence of an initialized log, which
+        is exactly what it is."""
+        path = self._path_for(db_id)
+        try:
+            if path.stat().st_size == 0:
+                return False
+        except FileNotFoundError:
+            return False
+        idx = self._index_for(db_id)
+        for seq, entry in idx.items():
+            if entry[2] == "genesis":
+                return True
+        # compacted: a checkpoint carries the lineage of the pruned genesis
+        return self._index_checkpoint.get(db_id, 0) > 0
+
     def has_genesis(self, db_id: str) -> bool:  # pragma: no cover - interface
         """Does this log carry the genesis entry (seq 0) for *db_id*?  Its
         absence means the log was created for a DIFFERENT database."""
@@ -209,9 +244,15 @@ class DeletionLog:
         genesis has already served a database life."""
         raise NotImplementedError
 
-    def ensure_genesis(self, db_id: str) -> None:  # pragma: no cover - interface
-        """Write the genesis entry if this log has none for *db_id*
-        (called when the watermark row is minted)."""
+    def ensure_genesis(self, db_id: str, *, applied: int = 0) -> None:  # pragma: no cover - interface
+        """Write the genesis entry if this log has none for *db_id*.
+
+        *applied* is the main database's watermark (applied deletions) and
+        is the FIRST-CREATION proof: a brand-new database life has applied
+        == 0, so minting a genesis is safe -- nothing was ever deleted.
+        With applied > 0 a missing/empty log means history was LOST
+        (truncated, deleted, interrupted mid-life) and must never be
+        silently re-initialized: fail closed instead."""
         raise NotImplementedError
 
     def verify_chain(self, db_id: str) -> None:
@@ -343,36 +384,174 @@ class FileDeletionLog(DeletionLog):
             finally:
                 fcntl.flock(fh, fcntl.LOCK_UN)
 
-    def _ensure_file(self, db_id: str) -> Path:
-        path = self._path_for(db_id)
-        # M5 patch 3 (flake root cause): the genesis decision is made INSIDE
-        # the lock on the file's CONTENT, never on ``path.exists()``.  The
-        # previous fast-path skipped the write when the path existed -- but
-        # ``open("a+b")`` below creates an EMPTY file before the genesis line
-        # is written, so a concurrent ``ensure_genesis`` could observe
-        # "exists" during that window, skip its own write, and then fail
-        # startup with DeletionLogUnavailable ("no genesis").  Under the lock
-        # the emptiness check is atomic with the write and idempotent: two
-        # racers serialise, the first writes, the second sees a non-empty
-        # file and skips.  Genesis content is unchanged; the file remains
-        # hash-chained and fail-closed.
-        with self._locked(path) as fh:
-            fh.seek(0)
-            existing = fh.read().strip()
-            if not existing:
-                genesis = _genesis_entry(db_id)
-                genesis.seq = 0
-                genesis.prev_hash = GENESIS_HASH
-                genesis.hash = genesis.compute_hash()
-                fh.seek(0)
-                fh.write((json.dumps(self._line(genesis), sort_keys=True,
-                                     ensure_ascii=False) + "\n").encode())
+    def _binding_path(self, db_id: str) -> Path:
+        """A tiny sidecar that records "a log file existed for this db_id".
+
+        Why it is needed (M5 patch 4, the headline scenario): a restored
+        backup brings its OLD watermark back -- typically ``applied == 0`` --
+        so the watermark alone can never distinguish "brand-new database"
+        from "restored backup whose log was truncated".  The sidecar is
+        written once, in the log store, *before* the log file; it survives a
+        truncation of the log file itself, so an empty log file next to an
+        existing binding is provably NOT a first creation."""
+        return self.directory / f"{db_id}.bound"
+
+    def _mark_bound(self, db_id: str) -> None:
+        """Durably record that this log store owns *db_id*.
+
+        Idempotent and race-safe across THREADS and PROCESSES: the marker is
+        written to a uniquely named temp file, fsynced, then published with
+        an exclusive ``os.link`` (which fails with FileExistsError for the
+        loser instead of clobbering the winner).  A publish that already
+        happened is a success, not an error."""
+        path = self._binding_path(db_id)
+        if path.exists():
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        tmp = self.directory / f".{db_id}.bound.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(db_id + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
+            try:
+                os.link(tmp, path)        # atomic publish, fails if present
+            except FileExistsError:
+                pass                      # another racer published first
+            except OSError:
+                # filesystems without hard links: best-effort atomic rename
+                if not path.exists():
+                    os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+
+    def is_bound(self, db_id: str) -> bool:
+        """True when this log store has EVER held a log for *db_id*."""
+        return self._binding_path(db_id).exists()
+
+    def _write_genesis(self, fh, db_id: str) -> None:
+        """Write the genesis entry (seq 0) to a freshly created log file at
+        the current position; flush + fsync so the birth certificate is
+        durable before anything else can observe the file."""
+        genesis = _genesis_entry(db_id)
+        genesis.seq = 0
+        genesis.prev_hash = GENESIS_HASH
+        genesis.hash = genesis.compute_hash()
+        fh.seek(0)
+        fh.write((json.dumps(self._line(genesis), sort_keys=True,
+                             ensure_ascii=False) + "\n").encode())
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    def ensure_genesis(self, db_id: str, *, applied: int = 0) -> None:
+        """Bind the log to this database life (M5 patch 4, task 1).
+
+        Creation protocol -- only a PROVABLE first creation initializes:
+
+        * the file does not exist AND the watermark is ``applied == 0``
+          (a brand-new database life that never deleted anything): create
+          it with O_CREAT|O_EXCL -- the winner of the exclusive create is
+          the provable creator -- and write the genesis under the lock;
+        * the file exists but is EMPTY (a concurrent creation that was
+          interrupted between create and write, i.e. the patch-3 race
+          window) and ``applied == 0``: re-initialize -- nothing was ever
+          deleted, so the empty residue can hold only a genesis;
+        * ANY other state is NOT initialized:
+            - file missing with ``applied > 0``: the log was lost after
+              deletions happened -- fail closed (``DeletionLogCorrupted``);
+            - file EMPTY with ``applied > 0``: the log was truncated --
+              fail closed, never mint new history over it;
+            - file has content but no genesis: corrupted/foreign -- fail
+              closed;
+            - file has content with genesis: a live log -- untouched (a
+              subsequent reconcile verifies the chain).
+
+        Multi-process coordination is the O_EXCL create plus the per-file
+        ``flock``: racers serialise, exactly one genesis ever lands, and a
+        crash mid-creation is recovered from the ``applied == 0`` proof on
+        the next start.  Every initialization write is fsynced."""
+        path = self._path_for(db_id)
+        if applied > 0 and not path.exists():
+            raise DeletionLogCorrupted(
+                f"no deletion log file exists for database {db_id[:8]}... "
+                f"but the watermark records {applied} applied deletion(s): "
+                "the log was lost or never written for this database life.  "
+                "Refusing to mint new history -- restore the log (or a "
+                "backup of it) and adopt the database, or retire this "
+                "history deliberately with a new deployment line.")
+        was_bound = self.is_bound(db_id)
+        # the binding is written before the file: if a crash happens after
+        # this point, the next start sees "bound but no/empty log" and refuses
+        # instead of minting a fresh history over a lost one.
+        self._mark_bound(db_id)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            # exclusive create won: we are the provable creator
+            with os.fdopen(fd, "a+b") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                try:
+                    self._write_genesis(fh, db_id)
+                finally:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+            return
+        # the file pre-exists: decide on CONTENT + applied under the lock
+        with self._locked(path) as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size == 0:
+                if applied > 0 or was_bound:
+                    # bound + empty (or applied > 0): history was lost.  A
+                    # restored backup carries its OLD watermark (often 0), so
+                    # the binding -- not the watermark -- is the proof.
+                    raise DeletionLogCorrupted(
+                        f"the deletion log for database {db_id[:8]}... is "
+                        f"EMPTY (0 bytes) but this log store has already "
+                        f"been bound to that database and its watermark is "
+                        f"{applied}: the log was truncated, or a restore "
+                        "brought back a database whose log is gone.  "
+                        "Refusing to treat an empty log as a new one -- "
+                        "restore the log and adopt, or retire this history "
+                        "deliberately.")
+                # crash between create and write, nothing ever deleted:
+                # safe to (re-)initialize the genesis
+                self._write_genesis(fh, db_id)
+                return
+            if not self.has_genesis(db_id):
+                raise DeletionLogCorrupted(
+                    f"the deletion log for database {db_id[:8]}... has "
+                    "content but no genesis entry: it is corrupted or was "
+                    "not created by this engine.  Refusing to start -- "
+                    "restore/adopt the log explicitly.")
+            # a live log: untouched here; reconcile verifies the chain
+        return
+
+    def _ensure_file(self, db_id: str) -> Path:
+        """DEPRECATED creation helper kept for the adopt/backfill paths that
+        legitimately mint a brand-new log store (applied == 0 proof is the
+        caller's responsibility there).  O(1): decides on the stat size,
+        never reads the file."""
+        path = self._path_for(db_id)
+        with self._locked(path) as fh:
+            if os.fstat(fh.fileno()).st_size == 0:
+                self._write_genesis(fh, db_id)
         return path
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:
-        path = self._ensure_file(entry.db_id)
+        # M5 patch 4: an append must never (re-)create a log for a database
+        # life it has no genesis for -- startup reconciliation guarantees the
+        # genesis exists; a vanished log is corruption, not a fresh start.
+        # The check uses the stat-guarded INDEX (segment 0), never a full parse
+        # of the file, so appends stay O(1) in log length.
+        if not self._has_genesis_indexed(entry.db_id):
+            raise DeletionLogUnavailable(
+                f"cannot append: no deletion log with a genesis entry "
+                f"exists for database {entry.db_id[:8]}...  The log was "
+                "lost or never initialized -- reconcile/adopt first; "
+                "deletions stay refused (fail-closed).")
+        path = self._path_for(entry.db_id)
         # the instant is part of the hashed payload (and travels in the
         # tombstone): stamp it before the hash, like the PG backend does
         entry.created_at = entry.created_at or datetime.utcnow()
@@ -417,12 +596,22 @@ class FileDeletionLog(DeletionLog):
 
     def _iter_entries(self, path: Path) -> Iterator[DeletionEntry]:
         with open(path, "rb") as fh:
-            for line in fh:
+            for lineno, line in enumerate(fh, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                record = json.loads(line)
-                if record.get("header"):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    # a torn/truncated write or manual tampering: fail
+                    # closed with an actionable corruption error
+                    raise DeletionLogCorrupted(
+                        f"{path.name} line {lineno} is not valid JSON "
+                        f"(the log was truncated or corrupted mid-write): "
+                        f"{exc}.  Restore/adopt the log explicitly; the "
+                        "chain cannot be trusted past this point."
+                    ) from exc
+                if not isinstance(record, dict) or record.get("header"):
                     continue
                 yield DeletionEntry(
                     db_id=record["db_id"],
@@ -472,9 +661,6 @@ class FileDeletionLog(DeletionLog):
                     out.append((entry.db_id, entry.created_at))
                     break
         return out
-
-    def ensure_genesis(self, db_id: str) -> None:
-        self._ensure_file(db_id)
 
     def head(self, db_id: str) -> tuple[int, str]:
         self._index_for(db_id)  # refresh if the file changed on disk
@@ -647,7 +833,11 @@ class PgDeletionLog(DeletionLog):
 
     def append(self, entry: DeletionEntry) -> DeletionEntry:
         self._ensure_schema()
-        self.ensure_genesis(entry.db_id)
+        if not self.has_genesis(entry.db_id):
+            raise DeletionLogUnavailable(
+                f"cannot append: no genesis entry exists in the deletion "
+                f"log table for database {entry.db_id[:8]}...  reconcile/"
+                "adopt first; deletions stay refused (fail-closed).")
         entry.created_at = entry.created_at or datetime.utcnow()
         with self._engine.begin() as conn:
             # serialise appends per database life so prev_hash is exact
@@ -787,7 +977,17 @@ class PgDeletionLog(DeletionLog):
                  "prev": prev, "hash": chain[0]})
         return int(removed or 0)
 
-    def ensure_genesis(self, db_id: str) -> None:
+    def ensure_genesis(self, db_id: str, *, applied: int = 0) -> None:
+        # M5 patch 4: the same first-creation proof as the file backend --
+        # a missing genesis with applied > 0 means the table's history was
+        # lost (rows deleted); never mint a fresh one over it.
+        if not self.has_genesis(db_id) and applied > 0:
+            raise DeletionLogCorrupted(
+                f"the deletion-log table has no genesis entry for database "
+                f"{db_id[:8]}... while the watermark records {applied} "
+                "applied deletion(s): the table's history was lost or "
+                "cleared.  Refusing to mint new history -- restore the "
+                "log table and adopt, or retire this history deliberately.")
         if self.has_genesis(db_id):
             return
         genesis = _genesis_entry(db_id)

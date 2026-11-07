@@ -239,6 +239,94 @@ Consequences an embedder must state to its users:
   message can back several beliefs, so a row only becomes garbage once its
   last link is gone") and pinned by the deletion tests.
 
+### 5a. Deletion-log first creation vs. corruption (fail-closed)
+
+The log is the ONLY record that makes a restore safe.  A log that is missing
+or damaged while a database life has history must therefore **never** be
+silently re-initialized: a fresh genesis would erase the evidence and deleted
+content could come back.  Startup distinguishes three states.
+
+**1. Provable first creation — initialized automatically.**  Both must hold:
+
+- the watermark is `applied_seq == 0`, **and**
+- neither the log file nor the log store's binding marker for this `db_id`
+  exists yet.
+
+Creation then uses an exclusive `O_CREAT|O_EXCL` open (the winner of that
+exclusive create is the provable creator) plus the per-file `flock`, writes
+the genesis under the lock, and `fsync`s it.  Threads and processes racing
+this are serialised by those two primitives — exactly one genesis ever lands.
+
+**2. Interrupted creation — recovered automatically, but only with proof.**
+A crash between the create and the genesis write leaves a zero-byte file.
+That is recoverable **only** when the watermark is `applied == 0` *and* the
+binding marker does not exist (nothing was ever deleted, so an empty file can
+hold nothing but a genesis).
+
+**3. Anything else — refused (`DeletionLogCorrupted`, a subclass of
+`DeletionLogUnavailable`), and the file is left untouched:**
+
+| state | why it is refused |
+|---|---|
+| no log file, `applied > 0` | the log was lost after deletions happened |
+| empty log, but the store **is bound** to this `db_id` | truncated — or a restore brought back a database whose log is gone |
+| content but no genesis entry | corrupted or not written by this engine |
+| a line that is not valid JSON | truncated/tampered mid-write; the chain cannot be trusted past it |
+
+**Why `applied == 0` alone is not proof.**  A restored backup carries the
+watermark it had when the backup was taken — very often `applied_seq = 0`,
+even though deletions happened after it.  Judging "new database" by the
+watermark alone therefore re-initializes the log over a lost history and the
+deleted rows come back.  The **binding marker** (`<db_id>.bound`, written to
+the log store *before* the log file, fsynced, published with an exclusive
+`os.link`) survives a truncation of the log file itself, so "bound but empty"
+is provably not a first creation.
+
+**Operator recovery is explicit, never automatic.**  To get a database life
+working again the operator either restores the log (and the database) with
+`python -m mirror_memory.deletion_adopt`, or deliberately retires the old
+history with a new deployment line.  There is no flag that "just re-creates"
+a log: silently minting history is the failure mode this section prevents.
+
+**Appends are fail-closed too.**  `append()` refuses to write into a log that
+has no genesis instead of creating one.  The genesis check on that path reads
+the stat-guarded index (seq 0), so an append never rescans the whole file —
+appending stays O(1) in log length.
+
+**Durability / ordering.**  Order is binding marker → log file → genesis
+(written under `flock`, then `fsync`ed) → the deletion entry (appended under
+the same lock, then `fsync`ed) → the main-DB commit.  A crash at any point
+leaves a state that the next startup classifies above without guessing.
+
+### 5b. Per-call cost is scope-local
+
+`metrics.recent_costs(entry)` returns one record per *outermost* invocation.
+Counters are incremented on the active call's own frame — never derived by
+subtracting global totals — so two threads in the same entry, or a nested
+span (engine init + sync gate inside one call), can neither leak into each
+other nor produce a second record.  An invocation that raises still produces
+exactly one record.  See §8 for the full metrics contract.
+
+### 5c. LLM `set_on_call` — last write wins
+
+The host may set or clear its callback through the instrumented proxy **or**
+through the raw client reference it kept.  Whichever happened last is the one
+in effect on the next `generate()`:
+
+- `raw.set_on_call(A)` → `proxy.set_on_call(B)` → `B` runs (A is superseded);
+- `raw.set_on_call(A)` → `proxy.set_on_call(None)` → nothing runs (the clear
+  is last) and metrics keep recording;
+- `proxy.set_on_call(A)` → `raw.set_on_call(None)` → nothing runs, and the
+  metrics chain is re-asserted on that same call.
+
+Writes are ordered by an internal sequence under a lock, so the decision is
+real write order, never a guess about which reference the host used.  The
+metrics chain is never lost on either path, and calls made outside any entry
+scope record nothing.  **Thread-safety boundary**: installation and the
+"latest write" bookkeeping are process-wide and lock-guarded; the *attribution*
+of a call is per-thread (a thread-local frame), so concurrent calls on a
+shared client attribute to their own entries.
+
 ## 6. Export
 
 ### `export_page` / `export`

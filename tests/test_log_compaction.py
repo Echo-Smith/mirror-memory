@@ -49,6 +49,8 @@ class _FakeLLM:
 def _log_with_entries(tmp_path, n: int = 5) -> tuple[FileDeletionLog, str]:
     log = FileDeletionLog(tmp_path / "deletions")
     db_id = "d" * 32
+    # M5 patch 4: appends are fail-closed without an initialized genesis.
+    log.ensure_genesis(db_id, applied=0)
     for i in range(1, n + 1):
         log.append(DeletionEntry(
             db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
@@ -140,6 +142,7 @@ def test_prune_pass_deletes_exactly_the_retired_entries(tmp_path):
     now = datetime.utcnow()
     log = FileDeletionLog(tmp_path / "deletions")
     db_id = "d" * 32
+    log.ensure_genesis(db_id, applied=0)   # M5 patch 4: fail-closed appends
     for i in range(1, 5):
         created = now - timedelta(days=40) if i <= 2 else now
         log.append(DeletionEntry(

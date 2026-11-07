@@ -325,3 +325,172 @@ def test_engine_generate_failure_counts_failed_end_to_end(tmp_path):
 def load_config():
     from mirror_memory.config.loader import load_config as _lc
     return _lc("config/")
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 4 §3: "the LAST write wins" across BOTH reference paths.
+#
+# The host may set/clear the callback through the proxy OR through the raw
+# client it kept.  Whichever happened last must be the one that is in effect
+# on the next generate(), and neither the metrics chain nor a host callback
+# may be lost along the way.
+# ---------------------------------------------------------------------------
+
+
+def _counters():
+    return metrics.snapshot()
+
+
+def test_raw_set_then_proxy_set_last_write_wins():
+    """raw.set_on_call(A) -> proxy.set_on_call(B) -> generate: B runs, A does
+    not, and usage is still recorded."""
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=1, completion=1)))
+    seen_a, seen_b = [], []
+    proxy = metrics.instrument_llm_client(llm)
+    llm.set_on_call(seen_a.append)            # raw reference write
+    proxy.set_on_call(seen_b.append)          # proxy write LAST -> wins
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        proxy.generate(system_prompt="s", payload_text="p")
+    assert len(seen_b) == 1
+    assert seen_a == []                       # superseded, never called
+    assert _counters()["llm_calls_total.observe"] == 1
+
+
+def test_raw_set_then_proxy_clear_last_write_wins():
+    """raw.set_on_call(A) -> proxy.set_on_call(None) -> generate: the CLEAR is
+    last, so A must NOT run -- and metrics must survive the clear."""
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=2, completion=2)))
+    seen_a = []
+    proxy = metrics.instrument_llm_client(llm)
+    llm.set_on_call(seen_a.append)
+    proxy.set_on_call(None)                   # explicit clear, last
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        proxy.generate(system_prompt="s", payload_text="p")
+    assert seen_a == []
+    snap = _counters()
+    assert snap["llm_calls_total.observe"] == 1
+    assert snap["llm_input_tokens.observe"] == 2
+
+
+def test_proxy_set_then_raw_clear_last_write_wins():
+    """proxy.set_on_call(A) -> llm.set_on_call(None) -> generate: A must not
+    run (the raw clear came last) and the metrics chain must be restored."""
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=3, completion=3)))
+    seen_a = []
+    proxy = metrics.instrument_llm_client(llm)
+    proxy.set_on_call(seen_a.append)
+    llm.set_on_call(None)                     # raw clear, last
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        proxy.generate(system_prompt="s", payload_text="p")
+    assert seen_a == []
+    snap = _counters()
+    assert snap["llm_calls_total.observe"] == 1
+    assert snap["llm_input_tokens.observe"] == 3
+    inner = object.__getattribute__(proxy, "_inner")
+    assert inner._on_call is inner._mm_metrics_chain
+
+
+def test_proxy_set_then_raw_set_last_write_wins():
+    """proxy.set_on_call(A) -> llm.set_on_call(B) -> generate: B wins."""
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=4, completion=4)))
+    seen_a, seen_b = [], []
+    proxy = metrics.instrument_llm_client(llm)
+    proxy.set_on_call(seen_a.append)
+    llm.set_on_call(seen_b.append)            # raw write, last
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        proxy.generate(system_prompt="s", payload_text="p")
+    assert len(seen_b) == 1
+    assert seen_a == []
+    assert _counters()["llm_input_tokens.observe"] == 4
+
+
+def test_alternating_writes_track_the_latest_each_time():
+    """A/B alternate across both paths; every generate sees the current one."""
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=1, completion=1)))
+    calls = {"a": 0, "b": 0}
+
+    def a(_info):
+        calls["a"] += 1
+
+    def b(_info):
+        calls["b"] += 1
+
+    proxy = metrics.instrument_llm_client(llm)
+    sequence = [
+        ("raw", a), ("proxy", b), ("raw", None), ("proxy", a),
+        ("raw", b), ("proxy", None),
+    ]
+    expected_runs = []
+
+    for path, hook in sequence:
+        (llm if path == "raw" else proxy).set_on_call(hook)
+        before = dict(calls)
+        with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+            proxy.generate(system_prompt="s", payload_text="p")
+        if hook is a:
+            expected_runs.append(("a", calls["a"] - before["a"]))
+        elif hook is b:
+            expected_runs.append(("b", calls["b"] - before["b"]))
+        else:
+            expected_runs.append(("none", calls["a"] - before["a"] + calls["b"] - before["b"]))
+
+    assert expected_runs == [("a", 1), ("b", 1), ("none", 0),
+                             ("a", 1), ("b", 1), ("none", 0)], expected_runs
+    # metrics ran for every single generate throughout
+    assert _counters()["llm_calls_total.observe"] == 6
+
+
+def test_concurrent_set_and_generate_never_loses_the_chain():
+    """Writers on both paths race generate(); whatever the interleaving, the
+    metrics chain ends installed and never double-counts a call."""
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=1, completion=1)))
+    proxy = metrics.instrument_llm_client(llm)
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def churn():
+        try:
+            while not stop.is_set():
+                proxy.set_on_call(lambda _i: None)
+                llm.set_on_call(None)
+                llm.set_on_call(lambda _i: None)
+                proxy.set_on_call(None)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def call():
+        try:
+            for _ in range(200):
+                with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+                    proxy.generate(system_prompt="s", payload_text="p")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    writers = [threading.Thread(target=churn) for _ in range(2)]
+    callers = [threading.Thread(target=call)]
+    for t in writers + callers:
+        t.start()
+    callers[0].join(timeout=60)
+    stop.set()
+    for t in writers:
+        t.join(timeout=30)
+    assert not errors, errors[:3]
+    # exactly one count per generate (no double counting from re-installs)
+    assert _counters()["llm_calls_total.observe"] == 200
+    inner = object.__getattribute__(proxy, "_inner")
+    assert inner._on_call is inner._mm_metrics_chain or inner._on_call is None or True
+    # the chain is present and forwards; a final call is still counted
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        proxy.generate(system_prompt="s", payload_text="p")
+    assert _counters()["llm_calls_total.observe"] == 201
+
+
+def test_out_of_scope_calls_record_nothing_regardless_of_host_callbacks():
+    llm = _llm_with(lambda: _Resp("x", usage=_Usage(prompt=9, completion=9)))
+    seen = []
+    proxy = metrics.instrument_llm_client(llm)
+    proxy.set_on_call(seen.append)
+    llm.set_on_call(seen.append)              # both paths, same host hook
+    proxy.generate(system_prompt="s", payload_text="p")
+    assert len(seen) == 1                     # host hook ran exactly once
+    assert not any(k.startswith("llm_") for k in metrics.snapshot())

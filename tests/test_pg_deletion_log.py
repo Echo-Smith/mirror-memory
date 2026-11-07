@@ -76,6 +76,8 @@ def test_pg_log_chain_head_and_reads(log_db_url):
     log = PgDeletionLog(log_db_url)
     db_id = _db_id()
     assert log.head(db_id) == (0, GENESIS_HASH)
+    # M5 patch 4: appends are fail-closed without a genesis entry
+    log.ensure_genesis(db_id, applied=0)
     e1 = log.append(DeletionEntry(
         db_id=db_id, tenant_id="t", app_id="a", user_id="u",
         scope="belief", scope_key="9",
@@ -161,6 +163,9 @@ def test_embedded_and_cloud_logs_share_the_entry_format(log_db_url, tmp_path):
     )
     file_log = FileDeletionLog(tmp_path / "deletions")
     pg_log = PgDeletionLog(log_db_url)
+    # M5 patch 4: both backends refuse appends without an initialized genesis
+    file_log.ensure_genesis(entry.db_id, applied=0)
+    pg_log.ensure_genesis(entry.db_id, applied=0)
     fe = file_log.append(entry)
     pe = pg_log.append(entry)
     assert fe.hash == pe.hash
@@ -179,6 +184,7 @@ def test_prune_runs_on_the_maintenance_connection(log_db_url):
 
     log = PgDeletionLog(log_db_url)
     db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)   # M5 patch 4: fail-closed appends
     for i in range(1, 5):
         log.append(DeletionEntry(
             db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",

@@ -87,6 +87,9 @@ def test_file_log_chain_head_and_tamper_detection(tmp_path):
     log = FileDeletionLog(tmp_path / "deletions")
     db_id = "a" * 32
     assert log.head(db_id) == (0, GENESIS_HASH), "an unopened life is empty"
+    # M5 patch 4: appends are fail-closed without an initialized genesis --
+    # the engine's startup reconcile guarantees it; tests mirror that.
+    log.ensure_genesis(db_id, applied=0)
     e1 = log.append(DeletionEntry(
         db_id=db_id, tenant_id="t", app_id="a", user_id="u",
         scope="belief", scope_key="5",
@@ -118,6 +121,7 @@ def test_file_log_is_fsynced_and_never_the_main_db(tmp_path):
     and every append is durable (the fsync call is on the log file)."""
     log = FileDeletionLog(tmp_path / "deletions")
     db_id = "c" * 32
+    log.ensure_genesis(db_id, applied=0)
     log.append(DeletionEntry(db_id=db_id, tenant_id="t", app_id="a", user_id="u",
                              scope="session", scope_key="s1", fingerprints=[],
                              generation=1, purpose="p"))

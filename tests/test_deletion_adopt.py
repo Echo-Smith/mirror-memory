@@ -229,17 +229,30 @@ def test_genesis_entry_is_written_and_required(tmp_path):
         reconcile(lambda: sessionmaker(bind=eng)(), log)
     eng.dispose()
 
-    # the log opens with the GENESIS entry (seq 0, scope "genesis"); the
-    # first real entry is seq 1 chained to it
+    # M5 patch 4: appending to a log that has no genesis is REFUSED.  The old
+    # behaviour (chain onto the legacy seq 1 without a genesis) let a log
+    # acquire history it could never be reconciled against; the safe answer is
+    # to fail closed and send the operator through the explicit adopt flow.
+    with pytest.raises(DeletionLogUnavailable, match="genesis"):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id="u",
+            scope="user", scope_key="", fingerprints=[], generation=1,
+            purpose="p",
+        ))
+    # and the legacy file was left exactly as it was -- not rewritten
+    lines = (log._path_for(db_id)).read_text().splitlines()
+    assert json.loads(lines[0])["header"] is True
+    assert len(lines) == 2
+
+    # a properly initialized log does accept appends, chained to the genesis
+    ok_id = "e" * 32
+    log.ensure_genesis(ok_id, applied=0)
     entry = log.append(DeletionEntry(
-        db_id=db_id, tenant_id="t", app_id="a", user_id="u",
+        db_id=ok_id, tenant_id="t", app_id="a", user_id="u",
         scope="user", scope_key="", fingerprints=[], generation=1, purpose="p",
     ))
-    # the append chains onto the legacy entry (seq 1): no genesis was
-    # written, which is exactly what the reconciliation must refuse
-    assert entry.seq == 2
-    assert json.loads((log._path_for(db_id)).read_text().splitlines()[0])[
-        "header"] is True
+    assert entry.seq == 1
+    assert entry.prev_hash != GENESIS_HASH
 
 
 def test_config_validation_for_log_backends(tmp_path):

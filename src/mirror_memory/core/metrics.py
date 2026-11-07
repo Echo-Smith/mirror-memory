@@ -180,20 +180,31 @@ def entry_scope(entry: str, *, engine: object | None = None) -> Iterator[None]:
         engine_obj = getattr(engine_obj, "_engine", None)
     previous = getattr(_entry_tls, "entry", None)
     previous_engine = getattr(_entry_tls, "engine_key", None)
+    # Per-call local counters (M5 patch 4): every metric is incremented on the
+    # active frame itself, never derived from a global baseline subtraction --
+    # two threads in the same entry, or a nested span, cannot leak each
+    # other's numbers.
+    frame = _new_cost_frame(entry)
+    frame["outer"] = getattr(_entry_tls, "frame", None)
     _entry_tls.entry = entry
     _entry_tls.engine_key = id(engine_obj) if engine_obj is not None else None
-    # Per-call cost capture: baseline of this entry's counters at scope start;
-    # deltas at scope end become ONE per-call record (bounded ring, §2
-    # "actual per-call cost, not only cross-call averages").
-    baseline = {p: value(f"{p}.{entry}") for p in _COST_CAPTURE_PREFIXES}
+    # Counters always land on the OUTERMOST frame of this thread's current
+    # span, so a nested scope (init + gate inside one call) contributes to
+    # the single record that survives, with no fold-up bookkeeping.
+    _entry_tls.frame = frame if frame.get("outer") is None else frame["outer"]
     started = time.monotonic()
     try:
         yield
     finally:
         _entry_tls.entry = previous
         _entry_tls.engine_key = previous_engine
+        outer = frame.get("outer")
+        _entry_tls.frame = outer
         try:
-            _record_recent_cost(entry, baseline, started)
+            if outer is None:
+                # outermost scope for this thread -> exactly ONE record, which
+                # already includes the nested spans (init + sync gate).
+                _record_recent_cost(frame, started)
         except Exception:  # never break the entry
             logger.debug("metrics: recent-cost capture failed", exc_info=True)
 
@@ -294,6 +305,31 @@ def _installed_hook(inner) -> bool:
     return bool(getattr(inner, "_mm_metrics_hook", False))
 
 
+#: Monotonic counter ordering every host-callback write, so the LAST writer
+#: wins regardless of whether it came through the proxy or the raw reference
+#: (M5 patch 4 §3).  Guarded by ``_llm_install_lock``.
+_host_seq_lock = threading.Lock()
+_host_seq_counter = {"n": 0}
+
+
+def _next_host_seq() -> int:
+    with _host_seq_lock:
+        _host_seq_counter["n"] += 1
+        return _host_seq_counter["n"]
+
+
+def _note_host_write(inner, hook) -> int:
+    """Record *hook* as the host's latest callback and return its sequence.
+
+    Both write paths (proxy ``set_on_call`` and raw-reference ``set_on_call``)
+    go through here, so "last set wins" is decided by real write order, never
+    by guessing which reference the host used."""
+    seq = _next_host_seq()
+    inner._mm_metrics_host_on_call = hook
+    inner._mm_metrics_host_seq = seq
+    return seq
+
+
 def _chain_installed(inner) -> bool:
     """True when OUR chain is the client's current ``_on_call``.
 
@@ -325,13 +361,19 @@ def _install_chained_hook(inner) -> None:
     with _llm_install_lock:
         if _installed_hook(inner) and _chain_installed(inner):
             return
-        # A host callback installed between our install and now (raw-reference
-        # replacement) is adopted as the host callback, not lost.
+        # A host callback present on the raw client is adopted ONLY when it is
+        # a write we have not already accounted for.  ``_mm_metrics_synced``
+        # remembers the raw value we last synchronised with; when it still
+        # matches, the raw client has not been written since -- so a LATER
+        # proxy write (e.g. an explicit clear) stays in effect.
         host_current = getattr(inner, "_on_call", None)
-        if host_current is not None and host_current is not getattr(
-            inner, "_mm_metrics_chain", None
-        ):
-            inner._mm_metrics_host_on_call = host_current
+        if host_current is not getattr(inner, "_mm_metrics_chain", None):
+            if not hasattr(inner, "_mm_metrics_synced"):
+                inner._mm_metrics_synced = host_current
+                _note_host_write(inner, host_current)
+            elif host_current is not inner._mm_metrics_synced:
+                inner._mm_metrics_synced = host_current
+                _note_host_write(inner, host_current)
 
         def _chain(info: dict) -> None:
             try:
@@ -407,7 +449,11 @@ def instrument_llm_client(client):
             The metrics chain stays installed; the chain forwards to whatever
             host callback is current at call time (``None`` clears it)."""
             inner = object.__getattribute__(self, "_inner")
-            inner._mm_metrics_host_on_call = hook
+            with _llm_install_lock:
+                _note_host_write(inner, hook)
+                # the proxy write is now authoritative; the raw client may
+                # still hold an older value, so do not re-adopt it.
+                inner._mm_metrics_synced = getattr(inner, "_on_call", None)
             if not _installed_hook(inner) or not _chain_installed(inner):
                 # chain missing (never installed, or clobbered by a raw
                 # set_on_call while a host callback exists) -> (re)install
@@ -416,10 +462,15 @@ def instrument_llm_client(client):
         def generate(self, *args, **kwargs):
             inner = object.__getattribute__(self, "_inner")
             entry = getattr(_entry_tls, "entry", None)
-            # Lifecycle: if the host replaced our chain through the RAW client
-            # reference, adopt its callback and re-assert the chain.
+            # Lifecycle: the host wrote to the raw client (setting OR clearing
+            # its callback).  That write is the latest one, so it is adopted
+            # verbatim -- including ``None``, which must really clear it --
+            # and the metrics chain is re-asserted.
             if _installed_hook(inner) and not _chain_installed(inner):
-                inner._mm_metrics_host_on_call = getattr(inner, "_on_call", None)
+                raw_now = getattr(inner, "_on_call", None)
+                if raw_now is not getattr(inner, "_mm_metrics_synced", object()):
+                    inner._mm_metrics_synced = raw_now
+                    _note_host_write(inner, raw_now)
                 _install_chained_hook(inner)
             _llm_tls.reported = False
             _llm_tls.ok = True
@@ -434,13 +485,16 @@ def instrument_llm_client(client):
             finally:
                 if entry is not None and is_allowed_entry(entry) and enabled():
                     inc(f"{COST_LLM_CALLS_PREFIX}.{entry}")
+                    _bump_current("llm_calls")
                     failed = raised or not getattr(_llm_tls, "ok", True)
                     if failed:
                         # includes ok=False + fallback-return (the built-in
                         # OpenAILLM swallows provider errors into a fallback)
                         inc(f"{COST_LLM_CALLS_FAILED_PREFIX}.{entry}")
+                        _bump_current("llm_calls_failed")
                     elif not getattr(_llm_tls, "reported", False):
                         inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
+                        _bump_current("usage_unknown")
                     else:
                         inp = getattr(_llm_tls, "input_tokens", None)
                         out = getattr(_llm_tls, "output_tokens", None)
@@ -448,10 +502,18 @@ def instrument_llm_client(client):
                             # provider surfaced a usage object with NO token
                             # counts on either side -> unknown, never zero
                             inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
+                            _bump_current("usage_unknown")
                         elif inp is None or out is None:
                             # exactly one side reported -> partial; the side
                             # that WAS reported is still added to its counter
                             inc(f"{COST_USAGE_PARTIAL_PREFIX}.{entry}")
+                            _bump_current("usage_partial")
+                        else:
+                            # both sides reported: count them on the frame too
+                            if isinstance(inp, int) and not isinstance(inp, bool):
+                                _bump_current("input_tokens", int(inp))
+                            if isinstance(out, int) and not isinstance(out, bool):
+                                _bump_current("output_tokens", int(out))
 
     return _Proxy(client)
 
@@ -620,17 +682,20 @@ def record_llm(
     if not enabled() or not is_allowed_entry(entry):
         return
     inc(f"{COST_LLM_CALLS_PREFIX}.{entry}")
+    _bump_current("llm_calls")
 
-    def _add(prefix: str, tok: int | str | None) -> bool:
+    def _add(prefix: str, tok: int | str | None, frame_key: str) -> bool:
         if isinstance(tok, bool) or not isinstance(tok, int):
             return False
         inc(f"{prefix}.{entry}", int(tok))
+        _bump_current(frame_key, int(tok))
         return True
 
-    got_in = _add(COST_INPUT_TOKENS_PREFIX, input_tokens)
-    got_out = _add(COST_OUTPUT_TOKENS_PREFIX, output_tokens)
+    got_in = _add(COST_INPUT_TOKENS_PREFIX, input_tokens, "input_tokens")
+    got_out = _add(COST_OUTPUT_TOKENS_PREFIX, output_tokens, "output_tokens")
     if not (got_in and got_out):
         inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
+        _bump_current("usage_unknown")
 
 
 def record_sql(entry: str = UNKNOWN, n: int = 1) -> None:
@@ -642,6 +707,7 @@ def record_sql(entry: str = UNKNOWN, n: int = 1) -> None:
     if not enabled() or (entry != UNKNOWN and not is_allowed_entry(entry)):
         return
     inc(f"{SQL_STATEMENTS_PREFIX}.{entry}", n)
+    _bump_current("sql_statements", n)
 
 
 # ---------------------------------------------------------------------------
@@ -834,52 +900,69 @@ def entry_costs() -> dict[str, dict]:
     return {e: entry_cost(e) for e in sorted(ALLOWED_ENTRIES)}
 
 
-#: Counter prefixes captured into each per-call cost record.
-_COST_CAPTURE_PREFIXES = (
-    COST_LLM_CALLS_PREFIX,
-    COST_LLM_CALLS_FAILED_PREFIX,
-    COST_INPUT_TOKENS_PREFIX,
-    COST_OUTPUT_TOKENS_PREFIX,
-    COST_USAGE_UNKNOWN_PREFIX,
-    COST_USAGE_PARTIAL_PREFIX,
-    SQL_STATEMENTS_PREFIX,
+#: Per-call cost record keys -> the counter they tally.  The recording path
+#: increments these on the ACTIVE FRAME, so the record's keys and the emitted
+#: counter names can never drift apart (patch 4 §2: "output keys documented").
+_COST_FRAME_KEYS = (
+    "llm_calls",
+    "llm_calls_failed",
+    "input_tokens",
+    "output_tokens",
+    "usage_unknown",
+    "usage_partial",
+    "sql_statements",
 )
 
 #: Bounded ring of the most recent per-call cost records per entry.  Fixed
 #: capacity -- memory is bounded no matter the traffic.  Records carry ONLY
-#: durations and counter deltas: no content, no user/tenant ids, no timestamps
-#: beyond monotonic-clock arithmetic (never exposed).
+#: durations and counts: no content, no user/tenant ids, no wall-clock
+#: timestamps (the duration is monotonic-clock arithmetic, never exposed).
 _RECENT_RING_SIZE = 256
 _recent_costs: dict[str, deque] = {}
+_recent_costs_lock = threading.Lock()
 
 
-def _record_recent_cost(entry: str, baseline: dict[str, int], started: float) -> None:
-    """Append ONE per-call cost record (duration + counter deltas).
+def _new_cost_frame(entry: str) -> dict:
+    """A fresh local per-call accumulator for one scope."""
+    frame = {"entry": entry}
+    for key in _COST_FRAME_KEYS:
+        frame[key] = 0
+    frame["outer"] = None
+    return frame
 
-    Skipped entirely when recording is disabled -- with metrics off, no ring
-    entry is produced (see the instrumentation-residue note in
-    ``docs/reports``: the proxy/scope/listener structure remains, only the
-    recording stops)."""
+
+def _bump_current(key: str, n: int = 1) -> None:
+    """Record *n* on the ACTIVE frame (no frame -> nothing to attribute).
+
+    Only the INNERMOST frame is bumped: an outer span must not double-count
+    work its nested span already recorded... except that the outer record is
+    the one that survives, so the inner frame folds UP into it on exit
+    (see :func:`_fold_frame`)."""
+    frame = getattr(_entry_tls, "frame", None)
+    if frame is None:
+        return
+    frame[key] = frame.get(key, 0) + n
+
+
+def _record_recent_cost(frame: dict, started: float) -> None:
+    """Append ONE per-call cost record: the finished outermost frame.
+
+    Skipped entirely when recording is disabled -- with metrics off no ring
+    entry is produced (the proxy/scope/listener STRUCTURE remains; only
+    recording stops -- measured as residual instrumentation)."""
     if not enabled():
         return
+    entry = frame["entry"]
     duration_ms = (time.monotonic() - started) * 1000.0
     record = {"duration_ms": round(duration_ms, 3)}
-    for prefix in _COST_CAPTURE_PREFIXES:
-        name = prefix.split("_total")[0].replace("llm_", "").replace("sql_", "")
-        total = value(f"{prefix}.{entry}")
-        delta = total - baseline.get(prefix, 0)
-        key = {
-            "calls": "llm_calls", "failed": "llm_failed",
-            "input": "input_tokens", "output": "output_tokens",
-            "usage_unknown": "usage_unknown", "usage_partial": "usage_partial",
-            "statements": "sql_statements",
-        }.get(name, name)
-        record[key] = delta
-    ring = _recent_costs.get(entry)
-    if ring is None:
-        ring = deque(maxlen=_RECENT_RING_SIZE)
-        _recent_costs[entry] = ring
-    ring.append(record)
+    for key in _COST_FRAME_KEYS:
+        record[key] = int(frame.get(key, 0))
+    with _recent_costs_lock:
+        ring = _recent_costs.get(entry)
+        if ring is None:
+            ring = deque(maxlen=_RECENT_RING_SIZE)
+            _recent_costs[entry] = ring
+        ring.append(record)
 
 
 def recent_costs(entry: str) -> list[dict]:
@@ -1058,6 +1141,7 @@ def reset_for_tests() -> None:
         _recent_costs.clear()
     _entry_tls.entry = None
     _entry_tls.engine_key = None
+    _entry_tls.frame = None
     _llm_tls.reported = False
     _llm_tls.input_tokens = None
     _llm_tls.output_tokens = None

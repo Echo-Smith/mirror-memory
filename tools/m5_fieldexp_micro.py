@@ -766,6 +766,146 @@ def measure_gcm_db_load(engine, user, runs: int = 5, sample: int | None = None):
     }
 
 
+# ===========================================================================
+# --gcm-db-ct: REAL CIPHERTEXT-ON-DISK measurement (M5 patch-4 §5.1).
+#
+# Distinct from measure_gcm_db_load() above: that one SELECTs PLAINTEXT rows
+# from the belief table and decrypts a fresh in-memory re-encryption (the DB
+# leg is real, the ciphertext store is simulated).  THIS path stores REAL
+# ciphertext IN THE DATABASE -- a prototype table written write-ahead of the
+# measurement -- then times the honest "SELECT the stored ciphertext rows +
+# decrypt every field" full load.  The DB genuinely holds `ct` blobs and the
+# decrypt reads them back from the DB; no re-encryption happens inside the
+# timed loop.
+#
+# PROTOTYPE TABLE, NOT PRODUCTION STORAGE: this table is created only for the
+# benchmark, in the benchmark's own schema (or the SQLite temp DB), and is
+# DROPPED at the end of the run.  No ORM model, migration, or engine path
+# references it.  It demonstrates the storage shape (per-field independent
+# nonce + tag + AAD=row:col), nothing more.
+# ===========================================================================
+
+_DB_CT_TABLE = "m5p4_gcm_ct"
+
+
+def _db_ct_create(conn, backend: str) -> None:
+    """Create the prototype ciphertext table via raw SQL (both dialects)."""
+    from sqlalchemy import text
+
+    blob = "BLOB" if backend == "sqlite" else "BYTEA"
+    nonce = "BLOB" if backend == "sqlite" else "BYTEA"
+    conn.execute(text(f'DROP TABLE IF EXISTS {_DB_CT_TABLE}'))
+    conn.execute(text(
+        f"CREATE TABLE {_DB_CT_TABLE} ("
+        f"  row_id VARCHAR(64) NOT NULL,"
+        f"  col VARCHAR(64) NOT NULL,"
+        f"  nonce {nonce} NOT NULL,"
+        f"  ct {blob} NOT NULL"
+        f")"
+    ))
+
+
+def _db_ct_insert(conn, rows) -> int:
+    """INSERT real ciphertext rows (row_id, col, nonce, ct).  Real
+    independent per-field nonce/tag, already produced by FieldGCM."""
+    from sqlalchemy import text
+
+    n = 0
+    for row_id, col, nonce, ct in rows:
+        conn.execute(
+            text(f"INSERT INTO {_DB_CT_TABLE} (row_id, col, nonce, ct) "
+                 f"VALUES (:r, :c, :n, :ct)"),
+            {"r": row_id, "c": col, "n": nonce, "ct": ct},
+        )
+        n += 1
+    return n
+
+
+def measure_gcm_db_ct_load(engine, beliefs, runs: int = 5):
+    """REAL 'SELECT stored ciphertext + per-field decrypt' full load.
+
+    Build the prototype table, INSERT the 8 content fields of every belief as
+    REAL AES-256-GCM ciphertext (own nonce+tag, AAD=row:col), then for each of
+    `runs` iterations SELECT ALL ciphertext rows back from the DB and decrypt
+    every field.  Reports p50/min/max over runs, plus rows/fields/bytes and a
+    proof the decrypt round-trips correctly (checks vs the plaintext).
+
+    The timed loop covers BOTH the DB read and the decrypt -- this is the
+    number distinct from gcm_db_load (plaintext SELECT + in-memory decrypt).
+    """
+    if not beliefs:
+        return {}
+    backend = "sqlite" if engine._engine.dialect.name == "sqlite" else "postgres"
+    g = FieldGCM()
+    # encrypt all fields ONCE (outside the timed loop) -> real ciphertext rows
+    ct_rows = []
+    plain = {}  # (row_id, col) -> plaintext bytes, for correctness check
+    for b in beliefs:
+        rid = _belief_row_id(b)
+        for col in _CONTENT_COLUMNS:
+            v = getattr(b, col, "") or ""
+            if not isinstance(v, str):
+                v = str(v)
+            vb = v.encode("utf-8")
+            nonce, ct = g.encrypt_field(rid, col, vb)
+            ct_rows.append((rid, col, nonce, ct))
+            plain[(rid, col)] = vb
+    # store real ciphertext in the DB
+    raw = engine._engine
+    with raw.begin() as conn:
+        _db_ct_create(conn, backend)
+        inserted = _db_ct_insert(conn, ct_rows)
+
+    # timed loop: SELECT ciphertext + decrypt every field, fresh from the DB
+    per_run = []
+    n_rows = n_fields = n_bytes = 0
+    sample_check_ok = None
+    try:
+        for _ in range(runs):
+            t0 = time.perf_counter()
+            from sqlalchemy import text as _sqltext
+            with raw.connect() as conn:
+                res = conn.execute(
+                    _sqltext("SELECT row_id, col, nonce, ct FROM " + _DB_CT_TABLE)  # noqa: S608
+                ).fetchall()
+            n_rows = len({r[0] for r in res})
+            n_fields = len(res)
+            n_bytes = 0
+            first_checked = 0
+            for row_id, col, nonce, ct in res:
+                n_bytes += len(ct or b"")
+                got = g.decrypt_field(str(row_id), str(col), bytes(nonce), bytes(ct))
+                if first_checked < 8:  # verify correctness on a few
+                    if got != plain.get((str(row_id), str(col))):
+                        sample_check_ok = False
+                    else:
+                        sample_check_ok = True if sample_check_ok is None else sample_check_ok
+                    first_checked += 1
+            per_run.append((time.perf_counter() - t0) * 1000.0)
+    finally:
+        from sqlalchemy import text as _sqltext2
+        with raw.begin() as conn:
+            conn.execute(_sqltext2("DROP TABLE IF EXISTS " + _DB_CT_TABLE))  # noqa: S608
+
+    return {
+        "backend": backend,
+        "beliefs": n_rows,
+        "fields_stored": inserted,
+        "fields_per_run": n_fields,
+        "ct_bytes": n_bytes,
+        "runs": runs,
+        "load_ms_p50": round(_percentile(per_run, 50), 3),
+        "load_ms_min": round(min(per_run), 3),
+        "load_ms_max": round(max(per_run), 3),
+        "us_per_field": round(statistics.fmean(per_run) * 1000.0 / max(n_fields, 1), 4),
+        "decrypt_roundtrip_ok": sample_check_ok,
+        "per_run_ms": [round(x, 3) for x in per_run],
+        "note": "PROTOTYPE table (dropped after run); DB stores REAL AES-256-GCM "
+                "per-field ciphertext (own nonce+tag, AAD=row:col). Timed = "
+                "SELECT all ct rows + decrypt every field; NOT production storage.",
+    }
+
+
 def measure_gcm_per_field(beliefs, sample: int = 2000):
     """REAL measurement: µs per single-field decrypt, over a bounded sample
     of real content fields (independent nonce + AAD each)."""
@@ -1237,6 +1377,11 @@ def run_backend(backend, counts, args, key):
                     # prototype-simulated -- see the function docstring)
                     entry["gcm_db_load"] = measure_gcm_db_load(
                         engine, "u", runs=args.gcm_runs)
+                    if args.gcm_db_ct:
+                        # patch-4 5.1: REAL ciphertext-in-DB load (prototype
+                        # table, dropped inside the function after measuring).
+                        entry["gcm_db_ct"] = measure_gcm_db_ct_load(
+                            engine, beliefs, runs=args.gcm_db_ct_runs)
                     entry["gcm_candidate_decrypt"] = measure_gcm_candidate_decrypt(
                         beliefs, cap=_CANDIDATE_DECRYPT_CAP,
                         runs=max(10, args.gcm_runs * 4))
@@ -1326,6 +1471,14 @@ def main() -> int:
                     help="repeated runs for GCM full-load median/spread")
     ap.add_argument("--gcm-field-sample", type=int, default=2000,
                     help="how many individual fields to time for µs/field")
+    ap.add_argument("--gcm-db-ct", action="store_true", default=False,
+                    help="M5 patch-4 5.1: ALSO run the REAL ciphertext-on-disk "
+                         "load (prototype table of real per-field AES-256-GCM "
+                         "ciphertext; SELECT all ct rows + decrypt every field). "
+                         "Distinct from gcm_db_load (plaintext SELECT + in-memory "
+                         "decrypt). Drops its tables after the run.")
+    ap.add_argument("--gcm-db-ct-runs", type=int, default=5,
+                    help="repeated runs for the ciphertext-DB load p50/min/max")
     ap.add_argument("--quick", action="store_true",
                     help="smoke run: sqlite only, 100/300 beliefs")
     ap.add_argument("--json", default=None)
@@ -1489,6 +1642,26 @@ def main() -> int:
                       f"{fl['decrypt_all_ms_max']:>8.3f} "
                       f"{fl['us_per_field_decrypt']:>9.4f} "
                       f"{fl['encrypt_all_ms']:>11.3f}")
+
+        print("\n=== [实测 REAL CIPHERTEXT-IN-DB] SELECT stored ct rows + "
+              "decrypt every field (prototype table, dropped after run) ===")
+        print("  distinct from gcm_db_load: the DB holds REAL GCM ciphertext "
+              "here; timed = SELECT all ct + decrypt")
+        print(f"{'backend':9} {'N':>7} {'fields':>7} {'ct bytes':>9} "
+              f"{'p50 ms':>8} {'min ms':>8} {'max ms':>8} {'us/field':>9} "
+              f"{'roundtrip':>9}")
+        for backend, res in results["backends"].items():
+            if "error" in res:
+                continue
+            for n, row in res["counts"].items():
+                dc = row.get("gcm_db_ct") or {}
+                if not dc:
+                    continue
+                print(f"{backend:9} {n:>7} {dc['fields_per_run']:>7} "
+                      f"{dc['ct_bytes']:>9} {dc['load_ms_p50']:>8.3f} "
+                      f"{dc['load_ms_min']:>8.3f} {dc['load_ms_max']:>8.3f} "
+                      f"{dc['us_per_field']:>9.4f} "
+                      f"{str(dc['decrypt_roundtrip_ok']):>9}")
 
         print("\n=== [实测 REAL GCM] per-field decrypt "
               "(µs/field) + candidate-set decrypt ===")

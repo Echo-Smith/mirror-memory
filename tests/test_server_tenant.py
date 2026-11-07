@@ -129,41 +129,62 @@ def test_cross_tenant_id_returns_404(tmp_path, app_url):
 
 
 def test_100_concurrent_alternating_keys(tmp_path, app_url):
+    """20 concurrent requests through ONE application lifespan.
+
+    M5 patch 4 (root-caused flake): the previous version wrapped EVERY worker
+    in its own ``with TestClient(app)``.  Each of those enters the FastAPI
+    lifespan, and that lifespan mutates module-global state in server.py
+    (``_app_state.clear()/update()`` on entry, ``_engine = None`` +
+    ``_tenant_engines.clear()`` + pool dispose on exit).  With 20 concurrent
+    lifespans one worker could read ``_app_state`` in the clear/update window
+    (``KeyError: 'config'``) or read the module-global ``_engine`` after
+    another worker's exit had nulled it (``AttributeError: NoneType``),
+    which is exactly the historic "only 11/20 completed" symptom.
+
+    The transport is shared, so the lifespan must be shared too: ONE
+    ``TestClient`` owns the lifespan and the workers drive it concurrently.
+    Worker failures are collected in ``errors`` and reported.
+    """
     _seed(app_url, ("tA", "app"), "key-A", "A-ONLY")
     _seed(app_url, ("tB", "app"), "key-B", "B-ONLY")
     app = create_app(config=load_config("config/"), database_url=app_url)
     results = []
+    errors = []
     lock = threading.Lock()
+    barrier = threading.Barrier(20, timeout=30)
 
-    def worker(i):
-        key = "key-A" if i % 2 == 0 else "key-B"
-        expected = "A-ONLY" if key == "key-A" else "B-ONLY"
-        with TestClient(app) as client:
-            r = client.post(
-                "/observe",
-                json={"user_id": "u1", "session_id": f"s{i}",
-                      "text": f"turn {i}"},
-                headers={"Authorization": f"Bearer {key}", "X-MM-Purpose": "test"},
-            )
-            b = client.get("/beliefs", params={"user_id": "u1"},
-                           headers={"Authorization": f"Bearer {key}", "X-MM-Purpose": "test"})
-            got = [x["claim_text"] for x in b.json()["beliefs"]]
-            with lock:
-                results.append((key, expected, set(got)))
+    # ONE lifespan for the whole concurrent block (see docstring).
+    with TestClient(app) as client:
+        def worker(i):
+            key = "key-A" if i % 2 == 0 else "key-B"
+            expected = "A-ONLY" if key == "key-A" else "B-ONLY"
+            try:
+                barrier.wait()          # maximise real overlap
+                r = client.post(
+                    "/observe",
+                    json={"user_id": "u1", "session_id": f"s{i}",
+                          "text": f"turn {i}"},
+                    headers={"Authorization": f"Bearer {key}", "X-MM-Purpose": "test"},
+                )
+                assert r.status_code == 200, (i, r.status_code, r.text[:200])
+                b = client.get("/beliefs", params={"user_id": "u1"},
+                               headers={"Authorization": f"Bearer {key}",
+                                        "X-MM-Purpose": "test"})
+                got = [x["claim_text"] for x in b.json()["beliefs"]]
+                with lock:
+                    results.append((key, expected, set(got)))
+            except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+                with lock:
+                    errors.append(f"worker {i} ({key}): {type(exc).__name__}: {exc}")
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    # M5 patch 3: surface worker exceptions in THIS assertion (previously the
-    # count check fired first and hid them -- the full-suite PG flake showed
-    # 11/20 with the cause invisible).  Diagnosis aid only.
-    if len(results) != 20:
-        pytest.fail(
-            f"only {len(results)}/20 workers completed; "
-            f"worker exceptions: {errors[:6]!r}"
-        )
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+
+    assert not errors, f"{len(errors)}/20 workers failed: {errors[:6]}"
+    assert len(results) == 20, f"only {len(results)}/20 workers completed"
     for key, expected, got in results:
         assert expected in got, (key, got)
         other = "B-ONLY" if expected == "A-ONLY" else "A-ONLY"
