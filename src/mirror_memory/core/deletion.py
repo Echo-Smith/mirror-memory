@@ -289,8 +289,23 @@ class FileDeletionLog(DeletionLog):
     flock serialises appends so the hash chain cannot interleave.  The
     chain is verified on first open (startup) and refuses to run broken."""
 
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, *, witness_dir: str | Path | None = None):
         self.directory = Path(directory)
+        # The witness lives in its OWN directory by default (a sibling), so a
+        # truncation/restore of the log directory alone cannot take it along.
+        from mirror_memory.core.witness import DeletionLogWitness
+
+        # Default: a dedicated witness root BESIDE (not inside) the log tree,
+        # so "restore the log directory" does not silently roll the witness
+        # back with it.  Deployments that can mount a separate volume should
+        # point MM_DELETION_WITNESS_DIR at it (documented in §5a).
+        self.witness = DeletionLogWitness(
+            witness_dir if witness_dir is not None
+            else Path(os.environ.get(
+                "MM_DELETION_WITNESS_DIR",
+                str(self.directory.parent / f"{self.directory.name}-witness"),
+            )).expanduser()
+        )
         self._verified: set[str] = set()
         # Per-db_id position index: seq -> (hash, origin_hash, scope).
         # Built on first use and refreshed whenever the file's
@@ -472,14 +487,26 @@ class FileDeletionLog(DeletionLog):
         crash mid-creation is recovered from the ``applied == 0`` proof on
         the next start.  Every initialization write is fsynced."""
         path = self._path_for(db_id)
-        if applied > 0 and not path.exists():
-            raise DeletionLogCorrupted(
-                f"no deletion log file exists for database {db_id[:8]}... "
-                f"but the watermark records {applied} applied deletion(s): "
-                "the log was lost or never written for this database life.  "
-                "Refusing to mint new history -- restore the log (or a "
-                "backup of it) and adopt the database, or retire this "
-                "history deliberately with a new deployment line.")
+        if not path.exists():
+            # A witness that records a real head proves a log DID exist for
+            # this life -- including when the restored main DB brings back
+            # applied_seq == 0.  This is the exact hole a watermark-only or
+            # file-existence-only rule leaves open.
+            witnessed = self.witness.exists(db_id)
+            if witnessed or applied > 0:
+                detail = (
+                    "the deletion-log witness records a head for this "
+                    "database life"
+                    if witnessed
+                    else f"the watermark records {applied} applied deletion(s)"
+                )
+                raise DeletionLogCorrupted(
+                    f"no deletion log file exists for database {db_id[:8]}... "
+                    f"but {detail}: the log was lost or never written for "
+                    "this database life.  Refusing to mint new history -- "
+                    "restore the log (or a backup of it) and adopt the "
+                    "database, or retire this history deliberately with a "
+                    "new deployment line.")
         was_bound = self.is_bound(db_id)
         # the binding is written before the file: if a crash happens after
         # this point, the next start sees "bound but no/empty log" and refuses
@@ -497,12 +524,17 @@ class FileDeletionLog(DeletionLog):
                     self._write_genesis(fh, db_id)
                 finally:
                     fcntl.flock(fh, fcntl.LOCK_UN)
+            # the log is durable; publish the witness for the genesis head
+            self._index_invalidate(db_id)
+            head_seq, head_hash = self.head(db_id)
+            self.witness.record(self._witness_state(
+                db_id, tail_seq=head_seq, tail_hash=head_hash))
             return
         # the file pre-exists: decide on CONTENT + applied under the lock
         with self._locked(path) as fh:
             size = os.fstat(fh.fileno()).st_size
             if size == 0:
-                if applied > 0 or was_bound:
+                if applied > 0 or was_bound or self.witness.exists(db_id):
                     # bound + empty (or applied > 0): history was lost.  A
                     # restored backup carries its OLD watermark (often 0), so
                     # the binding -- not the watermark -- is the proof.
@@ -518,6 +550,10 @@ class FileDeletionLog(DeletionLog):
                 # crash between create and write, nothing ever deleted:
                 # safe to (re-)initialize the genesis
                 self._write_genesis(fh, db_id)
+                self._index_invalidate(db_id)
+                head_seq, head_hash = self.head(db_id)
+                self.witness.record(self._witness_state(
+                    db_id, tail_seq=head_seq, tail_hash=head_hash))
                 return
             if not self.has_genesis(db_id):
                 raise DeletionLogCorrupted(
@@ -525,8 +561,82 @@ class FileDeletionLog(DeletionLog):
                     "content but no genesis entry: it is corrupted or was "
                     "not created by this engine.  Refusing to start -- "
                     "restore/adopt the log explicitly.")
-            # a live log: untouched here; reconcile verifies the chain
+            # a live log: verify it against the WITNESS before anything reads
+            # it.  This is the completeness check the file alone cannot make.
+            self.verify_witness(db_id, applied=applied)
         return
+
+    def verify_witness(self, db_id: str, *, applied: int = 0) -> None:
+        """Prove the log is at least as complete as the last observed state.
+
+        Ordering guarantees ``witness.tail_seq <= log.head_seq`` in every
+        healthy history (the witness advances only AFTER the log bytes are
+        durable).  So:
+
+        * witness tail > log head  -> entries were LOST (truncation, rollback,
+          or a log file replaced by an older copy): ``WitnessAhead``.
+        * the tail HASHES differ at the same seq -> the history diverges:
+          refuse.
+        * witness tail < log head  -> the log is AHEAD of the witness (a crash
+          between the log fsync and the witness update, or a crash right after
+          appends).  Nothing is lost: the witness is advanced to the log head.
+        * no witness yet -> legacy deployment (or a first creation that was
+          interrupted before the witness landed).  Only claimed when nothing
+          was ever deleted; with ``applied > 0`` the missing witness is a
+          refused state, never back-filled silently.
+        """
+        from mirror_memory.core.witness import WitnessAhead, WitnessError
+
+        try:
+            state = self.witness.read(db_id)
+        except WitnessError as exc:
+            raise DeletionLogCorrupted(
+                f"the deletion-log witness for database {db_id[:8]}... cannot "
+                f"be trusted ({exc}).  Refusing to serve: an unauthenticated "
+                "witness cannot prove the history is intact.  An operator may "
+                "retire it explicitly (deletion-adopt --retire-witness) after "
+                "verifying the log by other means."
+            ) from exc
+        head_seq, head_hash = self.head(db_id)
+        if state is None:
+            if applied > 0:
+                raise DeletionLogCorrupted(
+                    f"database {db_id[:8]}... has no deletion-log witness but "
+                    f"its watermark records {applied} applied deletion(s): the "
+                    "witness store was lost or this deployment predates it.  "
+                    "Refusing to back-fill it silently -- an operator must run "
+                    "deletion-adopt --reconcile-witness after verifying the "
+                    "log, so a truncated history is never blessed as intact."
+                )
+            # Nothing was ever deleted -- but never bless a BROKEN chain:
+            # the witness must only be back-filled for a log whose chain
+            # verifies end to end (genesis..head).
+            self.verify_chain(db_id)
+            self.witness.record(self._witness_state(
+                db_id, tail_seq=head_seq, tail_hash=head_hash))
+            return
+        if state.tail_seq > head_seq:
+            raise WitnessAhead(
+                f"the deletion log for database {db_id[:8]}... stops at seq "
+                f"{head_seq} but the witness already recorded seq "
+                f"{state.tail_seq}: {state.tail_seq - head_seq} entr"
+                f"{'y' if state.tail_seq - head_seq == 1 else 'ies'} were "
+                "lost (truncated, rolled back, or replaced by an older "
+                "copy).  Refusing to serve -- restore the log (or a backup of "
+                "it) and run deletion-adopt, or retire this history "
+                "deliberately.")
+        if state.tail_seq == head_seq and state.tail_hash != head_hash:
+            raise DeletionLogCorrupted(
+                f"the deletion log for database {db_id[:8]}... disagrees with "
+                f"the witness at seq {head_seq}: the entry hash "
+                f"{head_hash[:12]}... does not match the recorded "
+                f"{state.tail_hash[:12]}...  The history diverged.  Refusing "
+                "to serve.")
+        if state.tail_seq < head_seq:
+            # the log is AHEAD: nothing lost, advance the witness (this also
+            # heals a crash between the log fsync and the witness write)
+            self.witness.record(self._witness_state(
+                db_id, tail_seq=head_seq, tail_hash=head_hash))
 
     def _ensure_file(self, db_id: str) -> Path:
         """DEPRECATED creation helper kept for the adopt/backfill paths that
@@ -570,7 +680,38 @@ class FileDeletionLog(DeletionLog):
             os.fsync(fh.fileno())
             self._index_record_write(entry.db_id, entry.seq, entry.hash,
                                      entry.origin_hash, entry.scope)
+            # ORDERING (M5 patch 5): the log bytes are durable (fsync above)
+            # BEFORE the witness advances, and we publish the witness while
+            # STILL holding the append lock using the tail we just computed --
+            # so no re-read of the file, and no stat race with a concurrent
+            # append, can put a wrong head into the witness.
+            self.witness.record(self._witness_state(
+                entry.db_id, tail_seq=entry.seq, tail_hash=entry.hash))
         return entry
+
+    def _witness_state(self, db_id: str, *, tail_seq: int, tail_hash: str):
+        """The witness payload for the log's CURRENT state."""
+        from mirror_memory.core.witness import WitnessState
+
+        idx = self._index_for(db_id)
+        genesis = idx.get(0)
+        # checkpoint_seq is MONOTONIC: a stale in-memory view must never roll
+        # the recorded checkpoint backwards.
+        recorded = 0
+        try:
+            prior = self.witness.read(db_id)
+            if prior is not None:
+                recorded = prior.checkpoint_seq
+        except Exception:              # an unreadable witness is judged later
+            recorded = 0
+        return WitnessState(
+            db_id=db_id,
+            genesis_hash=genesis[0] if genesis is not None else GENESIS_HASH,
+            tail_seq=tail_seq,
+            tail_hash=tail_hash,
+            checkpoint_seq=max(recorded, self._index_checkpoint.get(db_id, 0)),
+            updated_at=datetime.utcnow().isoformat(),
+        )
 
     @staticmethod
     def _line(entry: DeletionEntry) -> dict:
@@ -740,7 +881,30 @@ class FileDeletionLog(DeletionLog):
                                      ensure_ascii=False) + "\n").encode())
             fh.flush()
             os.fsync(fh.fileno())
+            # the truncate/write/fsync happened; make the DIRECTORY entry
+            # durable too so a crash cannot resurrect the pre-prune inode
+            self._fsync_dir()
+        # the rewritten file keeps the same HEAD (pruning only drops the
+        # retired prefix), so the witness is re-published for that head --
+        # which also records the new checkpoint seq.
+        self._index_invalidate(db_id)
+        head_seq, head_hash = self.head(db_id)
+        self.witness.record(self._witness_state(
+            db_id, tail_seq=head_seq, tail_hash=head_hash))
         return removed
+
+    def _fsync_dir(self) -> None:
+        """fsync the log DIRECTORY (makes creates/renames durable)."""
+        try:
+            fd = os.open(self.directory, os.O_RDONLY)
+        except OSError:                  # pragma: no cover - exotic FS
+            return
+        try:
+            os.fsync(fd)
+        except OSError:                  # pragma: no cover - not supported
+            pass
+        finally:
+            os.close(fd)
 
     def verify_chain(self, db_id: str) -> None:
         path = self._path_for(db_id)
@@ -774,6 +938,14 @@ class PgDeletionLog(DeletionLog):
             create_engine(maintenance_url) if maintenance_url else None
         )
         self._verified: set[str] = set()
+        # M5 patch 5: the integrity witness, in its own table of the LOG
+        # database (never part of a main-DB pg_dump) and MAC'd with a key held
+        # in a FILE (MM_DELETION_WITNESS_KEY), so writing the table alone
+        # cannot forge a witness.
+        from mirror_memory.core.witness import PgDeletionLogWitness
+
+        self.witness = PgDeletionLogWitness(
+            lambda: self._engine, _ensure=self._ensure_schema)
 
     def _ensure_schema(self) -> None:
         with self._engine.begin() as conn:
@@ -851,7 +1023,67 @@ class PgDeletionLog(DeletionLog):
             entry.prev_hash = row[1] if row else GENESIS_HASH
             entry.hash = entry.compute_hash()
             self._insert(conn, entry)
+        # ORDERING (M5 patch 5): the log row is COMMITTED before the witness
+        # advances, so a crash in between leaves witness.tail < log.head
+        # (recoverable), never the reverse.
+        self.witness.record(self._witness_state(entry.db_id))
         return entry
+
+    def _witness_state(self, db_id: str):
+        from mirror_memory.core.witness import WitnessState
+
+        tail_seq, tail_hash = self.head(db_id)
+        genesis = None
+        with self._engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT hash FROM mm_deletion_log WHERE db_id = :db AND seq = 0"),
+                {"db": db_id}).first()
+            if row is not None:
+                genesis = row[0]
+        return WitnessState(
+            db_id=db_id,
+            genesis_hash=genesis or GENESIS_HASH,
+            tail_seq=tail_seq,
+            tail_hash=tail_hash,
+            checkpoint_seq=self.checkpoint_seq(db_id),
+            updated_at=datetime.utcnow().isoformat(),
+        )
+
+    def verify_witness(self, db_id: str, *, applied: int = 0) -> None:
+        """Prove the log table is at least as complete as the last observed
+        state (the same rule as the file backend)."""
+        from mirror_memory.core.witness import WitnessAhead, WitnessError
+
+        try:
+            state = self.witness.read(db_id)
+        except WitnessError as exc:
+            raise DeletionLogCorrupted(
+                f"the deletion-log witness for database {db_id[:8]}... cannot "
+                f"be trusted ({exc}).  Refusing to serve.") from exc
+        head_seq, head_hash = self.head(db_id)
+        if state is None:
+            if applied > 0:
+                raise DeletionLogCorrupted(
+                    f"database {db_id[:8]}... has no deletion-log witness row "
+                    f"but its watermark records {applied} applied deletion(s): "
+                    "the witness table was lost or cleared.  Refusing to "
+                    "back-fill it silently -- run deletion-adopt "
+                    "--reconcile-witness after verifying the log.")
+            self.witness.record(self._witness_state(db_id))
+            return
+        if state.tail_seq > head_seq:
+            raise WitnessAhead(
+                f"the deletion log table for database {db_id[:8]}... stops at "
+                f"seq {head_seq} but the witness recorded seq {state.tail_seq}: "
+                f"{state.tail_seq - head_seq} entries were LOST (table cleared "
+                "or rolled back).  Refusing to serve -- restore the log "
+                "database and run deletion-adopt, or retire this history.")
+        if state.tail_seq == head_seq and state.tail_hash != head_hash:
+            raise DeletionLogCorrupted(
+                f"the deletion log table for database {db_id[:8]}... diverges "
+                f"from the witness at seq {head_seq}.  Refusing to serve.")
+        if state.tail_seq < head_seq:
+            self.witness.record(self._witness_state(db_id))
 
     def read_from(self, db_id: str, after_seq: int) -> Iterator[DeletionEntry]:
         self._ensure_schema()
@@ -981,13 +1213,17 @@ class PgDeletionLog(DeletionLog):
         # M5 patch 4: the same first-creation proof as the file backend --
         # a missing genesis with applied > 0 means the table's history was
         # lost (rows deleted); never mint a fresh one over it.
-        if not self.has_genesis(db_id) and applied > 0:
+        witnessed = self.witness.exists(db_id)
+        if not self.has_genesis(db_id) and (applied > 0 or witnessed):
             raise DeletionLogCorrupted(
                 f"the deletion-log table has no genesis entry for database "
-                f"{db_id[:8]}... while the watermark records {applied} "
-                "applied deletion(s): the table's history was lost or "
-                "cleared.  Refusing to mint new history -- restore the "
-                "log table and adopt, or retire this history deliberately.")
+                f"{db_id[:8]}... while "
+                + ("the witness records a head for this database life"
+                   if witnessed else
+                   f"the watermark records {applied} applied deletion(s)")
+                + ": the table's history was lost or cleared.  Refusing to "
+                "mint new history -- restore the log table and adopt, or "
+                "retire this history deliberately.")
         if self.has_genesis(db_id):
             return
         genesis = _genesis_entry(db_id)
@@ -1008,6 +1244,8 @@ class PgDeletionLog(DeletionLog):
                 ), {"db": db_id, "tenant": genesis.tenant_id, "app": genesis.app_id,
                     "user": genesis.user_id, "prev": genesis.prev_hash,
                     "hash": genesis.hash, "created": genesis.created_at})
+        # the log row is committed; publish the witness for the new head
+        self.witness.record(self._witness_state(db_id))
 
 
 def new_db_id() -> str:

@@ -206,3 +206,105 @@ def test_prune_runs_on_the_maintenance_connection(log_db_url):
     # idempotent: pruning through the same point again removes nothing
     assert with_maint.prune(db_id, 2) == 0
     with_maint.verify_chain(db_id)
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 5: the PG deletion log's own integrity witness.  The log table lives
+# in its own database, so the witness must not be weaker: it is a separate
+# table there, authenticated with a key held in a FILE.
+# ---------------------------------------------------------------------------
+
+
+def _pg_witness_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("MM_DELETION_WITNESS_KEY", str(tmp_path / "witness.key"))
+
+
+def test_pg_witness_records_each_append(log_db_url, tmp_path, monkeypatch):
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    assert log.witness.read(db_id).tail_seq == 0
+
+    for i in range(1, 3):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+
+    state = log.witness.read(db_id)
+    assert state.tail_seq == log.head(db_id)[0] == 2
+    log.verify_witness(db_id, applied=2)       # healthy: passes
+
+
+def test_pg_witness_catches_a_truncated_log_table(log_db_url, tmp_path, monkeypatch):
+    """The cloud-deployment equivalent of the file-backend truncation test:
+    rows are removed from mm_deletion_log behind the engine's back."""
+    from mirror_memory.core.witness import WitnessAhead
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[], generation=i,
+            purpose="p"))
+
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log WHERE db_id = :db AND seq > 1"),
+                {"db": db_id})
+    finally:
+        admin.dispose()
+
+    with pytest.raises(WitnessAhead) as excinfo:
+        log.verify_witness(db_id, applied=3)
+    assert "lost" in str(excinfo.value).lower()
+
+
+def test_pg_witness_missing_row_with_deletions_is_refused(
+        log_db_url, tmp_path, monkeypatch):
+    """A cleared witness table with deletions on record must refuse, never
+    back-fill silently."""
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    log.witness.retire(db_id)
+
+    with pytest.raises(DeletionLogCorrupted):
+        log.verify_witness(db_id, applied=1)
+    assert log.witness.read(db_id) is None
+
+
+def test_pg_witness_tampered_row_is_refused(log_db_url, tmp_path, monkeypatch):
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "UPDATE mm_deletion_log_witness SET tail_seq = 0 "
+                "WHERE db_id = :db"), {"db": db_id})
+    finally:
+        admin.dispose()
+
+    with pytest.raises(DeletionLogCorrupted):
+        log.verify_witness(db_id, applied=1)

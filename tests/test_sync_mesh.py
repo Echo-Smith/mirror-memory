@@ -572,14 +572,22 @@ def test_receiver_restore_repulls_to_the_same_state(tmp_path):
 # --- M4 batch-2 patch 2, task 2: full-machine restore of a SENDER -----
 
 def _backup_device(d: "_Device", backup_db: str, backup_log_dir) -> None:
-    """Full-machine backup: the main DB (SQLite backup API) AND the
-    deletion-log directory together."""
+    """Full-machine backup: the main DB (SQLite backup API), the
+    deletion-log directory AND the deletion-log witness together.
+
+    The witness (M5 patch 5) is what detects a log that lost entries, so a
+    "whole machine" backup has to include it -- restoring the log WITHOUT its
+    witness is exactly the truncation-looking state the engine refuses."""
     src = d.engine._engine.raw_connection()
     dest = create_engine(f"sqlite:///{backup_db}").raw_connection()
     src.connection.backup(dest.connection)
     dest.close()
     src.close()
     shutil.copytree(d.log_dir, backup_log_dir, dirs_exist_ok=True)
+    witness_dir = d.log.witness.directory
+    if witness_dir.exists():
+        shutil.copytree(witness_dir, Path(str(backup_log_dir) + "-witness"),
+                        dirs_exist_ok=True)
 
 
 def _restore_device(d: "_Device", backup_db: str, backup_log_dir) -> None:
@@ -590,6 +598,12 @@ def _restore_device(d: "_Device", backup_db: str, backup_log_dir) -> None:
     shutil.copyfile(backup_db, str(d.url).replace("sqlite:///", ""))
     shutil.rmtree(d.log_dir, ignore_errors=True)
     shutil.copytree(backup_log_dir, d.log_dir)
+    # the witness is part of the machine state (see _backup_device)
+    witness_dir = d.log.witness.directory
+    backup_witness = Path(str(backup_log_dir) + "-witness")
+    if backup_witness.exists():
+        shutil.rmtree(witness_dir, ignore_errors=True)
+        shutil.copytree(backup_witness, witness_dir)
     d.db = create_engine(d.url)
     d.F = sessionmaker(bind=d.db)
     d.engine = MemoryEngine(

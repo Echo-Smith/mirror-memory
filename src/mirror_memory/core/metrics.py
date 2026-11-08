@@ -381,10 +381,10 @@ def _install_chained_hook(inner) -> None:
                 _llm_tls.ok = info.get("ok", True)
                 _llm_tls.input_tokens = info.get("input_tokens")
                 _llm_tls.output_tokens = info.get("output_tokens")
-                entry = getattr(_entry_tls, "entry", None)
-                if entry is not None:
-                    record_llm_tokens(entry, input_tokens=_llm_tls.input_tokens,
-                                      output_tokens=_llm_tls.output_tokens)
+                # Record the usage ONCE: the hook only publishes the figures to
+                # the calling thread's TLS; the proxy's generate() finaliser
+                # does the counting (it also knows failed / fallback).  Doing
+                # both here would double-count every token.
             except Exception:  # metrics must never break a provider callback
                 logger.debug("metrics: usage hook failed", exc_info=True)
             # Forward to the host's CURRENT callback, read dynamically -- a
@@ -498,21 +498,34 @@ def instrument_llm_client(client):
                     else:
                         inp = getattr(_llm_tls, "input_tokens", None)
                         out = getattr(_llm_tls, "output_tokens", None)
+                        def _known(value) -> bool:
+                            return isinstance(value, int) and not isinstance(value, bool)
+
                         if inp is None and out is None:
                             # provider surfaced a usage object with NO token
                             # counts on either side -> unknown, never zero
                             inc(f"{COST_USAGE_UNKNOWN_PREFIX}.{entry}")
                             _bump_current("usage_unknown")
                         elif inp is None or out is None:
-                            # exactly one side reported -> partial; the side
-                            # that WAS reported is still added to its counter
+                            # exactly one side reported -> partial.  The side
+                            # that WAS reported still lands in the frame and in
+                            # its aggregate counter: a known input count must
+                            # never be thrown away because the peer is missing.
                             inc(f"{COST_USAGE_PARTIAL_PREFIX}.{entry}")
                             _bump_current("usage_partial")
-                        else:
-                            # both sides reported: count them on the frame too
-                            if isinstance(inp, int) and not isinstance(inp, bool):
+                            if _known(inp):
+                                inc(f"{COST_INPUT_TOKENS_PREFIX}.{entry}", int(inp))
                                 _bump_current("input_tokens", int(inp))
-                            if isinstance(out, int) and not isinstance(out, bool):
+                            if _known(out):
+                                inc(f"{COST_OUTPUT_TOKENS_PREFIX}.{entry}", int(out))
+                                _bump_current("output_tokens", int(out))
+                        else:
+                            # both sides reported
+                            if _known(inp):
+                                inc(f"{COST_INPUT_TOKENS_PREFIX}.{entry}", int(inp))
+                                _bump_current("input_tokens", int(inp))
+                            if _known(out):
+                                inc(f"{COST_OUTPUT_TOKENS_PREFIX}.{entry}", int(out))
                                 _bump_current("output_tokens", int(out))
 
     return _Proxy(client)

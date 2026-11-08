@@ -298,6 +298,67 @@ appending stays O(1) in log length.
 the same lock, then `fsync`ed) → the main-DB commit.  A crash at any point
 leaves a state that the next startup classifies above without guessing.
 
+### 5a-bis. The deletion-log witness (M5 patch 5)
+
+A binding marker proves a log *existed*; it cannot prove the log is
+*complete*.  A separate **witness** records the log's head so a truncation,
+a rollback, or a main-DB restore with an old watermark is detected.
+
+**What it records**: `db_id`, `genesis_hash`, `tail_seq`, `tail_hash`,
+`checkpoint_seq`, `updated_at`, authenticated with a MAC.
+
+**Where it lives** (deliberately outside the log tree):
+
+| backend | witness store | MAC key |
+|---|---|---|
+| file | `MM_DELETION_WITNESS_DIR`, default `<logdir>-witness` (a sibling) | `MM_DELETION_WITNESS_KEY`, default `~/.mirror-memory/deletion-witness.key` (0600) |
+| postgres | table `mm_deletion_log_witness` in the **log** database (never in a main-DB `pg_dump`) | same key file |
+
+The key is never stored inside the witness directory: whoever can write the
+witness must not be able to read the key and re-forge the MAC.
+
+**Ordering and durability.** `append()` fsyncs the log entry, then publishes
+the witness (temp file → fsync → `os.replace` → directory fsync) while still
+holding the append lock.  The log is always durable *before* the witness
+advances, so a crash can only leave `witness.tail < log.head` (recoverable by
+healing forward) — never the reverse, which would look like a truncation.
+`checkpoint_seq` is monotonic and never regresses.  A failed directory fsync
+is logged loudly: the witness may then be older than the log (the safe
+direction), never newer.
+
+**Startup rule** (runs before `replay.reconcile`):
+
+| log head vs witness tail | meaning | action |
+|---|---|---|
+| equal, same hash | healthy | serve |
+| log head **<** witness tail | entries were LOST (truncation/rollback) | **refuse** (`WitnessAhead`) |
+| same seq, different hash | history diverged | **refuse** (`DeletionLogCorrupted`) |
+| log head **>** witness tail | crash between log and witness | heal forward |
+| no witness, `applied == 0`, chain verifies | legacy deployment | adopt the head |
+| no witness, `applied > 0` | witness store lost | **refuse**, operator must reconcile |
+| witness present, MAC fails / key missing | untrusted witness | **refuse**, operator must retire explicitly |
+
+**Backups must include the witness.** A "whole machine" backup has to capture
+the log directory *and* the witness directory (and the key).  Restoring a log
+WITHOUT its witness is precisely the state that looks like a truncation — the
+engine refuses rather than guessing.
+
+**Operator recovery** (the only supported paths; nothing is ever auto-minted):
+
+```
+python -m mirror_memory.deletion_adopt --database-url <url> --db-id <db_id>     --reconcile-witness     # adopt the log's CURRENT head after verifying it
+python -m mirror_memory.deletion_adopt --database-url <url> --db-id <db_id>     --retire-witness        # drop an untrusted/obsolete witness (then adopt)
+```
+
+**Threat model — what this does NOT do.** It defeats truncation, rollback and
+a main-DB restore with an old watermark.  It does **not** defeat an actor with
+write access to the log directory, the witness directory *and* the key file,
+who erases both consistently: no purely local mechanism can distinguish
+"history never existed" from "history was perfectly erased".  An offline
+external anchor (object-lock storage, a separate trust domain, an audit
+trail) is required for that threat, and must be sized to the deployment's
+retention before relying on it.
+
 ### 5b. Per-call cost is scope-local
 
 `metrics.recent_costs(entry)` returns one record per *outermost* invocation.

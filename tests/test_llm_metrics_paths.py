@@ -494,3 +494,87 @@ def test_out_of_scope_calls_record_nothing_regardless_of_host_callbacks():
     proxy.generate(system_prompt="s", payload_text="p")
     assert len(seen) == 1                     # host hook ran exactly once
     assert not any(k.startswith("llm_") for k in metrics.snapshot())
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 5 §2: a KNOWN token count must never be discarded because the
+# other side is missing -- it has to appear in the per-call record AND in the
+# aggregate counters.  Covers: both sides, input-only, output-only, neither,
+# fallback failure, and an exception.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "usage, expect_input, expect_output, expect_unknown, expect_partial",
+    [
+        (_Usage(prompt=10, completion=4), 10, 4, 0, 0),
+        (_Usage(prompt=10, completion=None), 10, 0, 0, 1),
+        (_Usage(prompt=None, completion=4), 0, 4, 0, 1),
+        (_Usage(prompt=None, completion=None), 0, 0, 1, 0),
+        (None, 0, 0, 1, 0),
+    ],
+)
+def test_usage_sides_land_in_both_record_and_counters(
+        usage, expect_input, expect_output, expect_unknown, expect_partial):
+    llm = _llm_with(lambda: _Resp("x", usage=usage))
+    proxy = metrics.instrument_llm_client(llm)
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        proxy.generate(system_prompt="s", payload_text="p")
+
+    snap = metrics.snapshot()
+    assert snap.get("llm_input_tokens.observe", 0) == expect_input
+    assert snap.get("llm_output_tokens.observe", 0) == expect_output
+    assert snap.get("llm_usage_unknown_total.observe", 0) == expect_unknown
+    assert snap.get("llm_usage_partial_total.observe", 0) == expect_partial
+
+    rec = metrics.recent_costs(metrics.ENTRY_OBSERVE)[0]
+    assert rec["input_tokens"] == expect_input
+    assert rec["output_tokens"] == expect_output
+    assert rec["usage_unknown"] == expect_unknown
+    assert rec["usage_partial"] == expect_partial
+    assert rec["llm_calls"] == 1
+
+
+def test_fallback_failure_record_has_zero_tokens_and_one_failed_call():
+    def boom():
+        raise RuntimeError("provider down")
+
+    llm = _llm_with(boom)
+    proxy = metrics.instrument_llm_client(llm)
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        out = proxy.generate(system_prompt="s", payload_text="p",
+                             fallback=lambda: "FB")
+    assert out == "FB"
+    rec = metrics.recent_costs(metrics.ENTRY_OBSERVE)[0]
+    assert rec["llm_calls"] == 1
+    assert rec["llm_calls_failed"] == 1
+    assert rec["input_tokens"] == 0 and rec["output_tokens"] == 0
+    assert rec["usage_unknown"] == 0 and rec["usage_partial"] == 0
+
+
+def test_generate_exception_still_yields_one_record():
+    def boom():
+        raise RuntimeError("hard failure")
+
+    llm = _llm_with(boom)
+    proxy = metrics.instrument_llm_client(llm)
+    with pytest.raises(RuntimeError):
+        with metrics.entry_scope(metrics.ENTRY_RECALL):
+            proxy.generate(system_prompt="s", payload_text="p")
+    recs = metrics.recent_costs(metrics.ENTRY_RECALL)
+    assert len(recs) == 1
+    assert recs[0]["llm_calls"] == 1
+    assert recs[0]["llm_calls_failed"] == 1
+
+
+def test_nested_different_entries_are_attributed_to_the_outer():
+    """Different entries nested: the counters go to the OUTERMOST frame (the
+    invoction that owns the record); the inner span contributes to it."""
+    with metrics.entry_scope(metrics.ENTRY_OBSERVE):
+        metrics.record_sql("observe", 2)
+        with metrics.entry_scope(metrics.ENTRY_RECALL):
+            metrics.record_sql("recall", 3)
+    observe = metrics.recent_costs(metrics.ENTRY_OBSERVE)
+    recall = metrics.recent_costs(metrics.ENTRY_RECALL)
+    assert len(observe) == 1 and len(recall) == 0
+    assert observe[0]["sql_statements"] == 5     # both spans, one record
