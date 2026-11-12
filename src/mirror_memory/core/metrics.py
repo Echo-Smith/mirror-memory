@@ -361,19 +361,14 @@ def _install_chained_hook(inner) -> None:
     with _llm_install_lock:
         if _installed_hook(inner) and _chain_installed(inner):
             return
-        # A host callback present on the raw client is adopted ONLY when it is
-        # a write we have not already accounted for.  ``_mm_metrics_synced``
-        # remembers the raw value we last synchronised with; when it still
-        # matches, the raw client has not been written since -- so a LATER
-        # proxy write (e.g. an explicit clear) stays in effect.
+        # A host callback present on the raw client BEFORE this install is
+        # adopted as the host callback (the classic "host wired first, engine
+        # instruments second" flow).  It is recorded as the latest write with
+        # a fresh sequence, so later proxy writes still win over it.
         host_current = getattr(inner, "_on_call", None)
-        if host_current is not getattr(inner, "_mm_metrics_chain", None):
-            if not hasattr(inner, "_mm_metrics_synced"):
-                inner._mm_metrics_synced = host_current
-                _note_host_write(inner, host_current)
-            elif host_current is not inner._mm_metrics_synced:
-                inner._mm_metrics_synced = host_current
-                _note_host_write(inner, host_current)
+        if host_current is not None and not hasattr(inner, "_mm_metrics_synced"):
+            _note_host_write(inner, host_current)
+            inner._mm_metrics_synced = host_current
 
         def _chain(info: dict) -> None:
             try:
@@ -425,7 +420,22 @@ def instrument_llm_client(client):
     callback without touching the metrics chain; a host that replaces the
     callback on the RAW client reference is detected and adopted on the next
     call.  The proxy is transparent for every other attribute, idempotent, and
-    never raises from bookkeeping."""
+    never raises from bookkeeping.
+
+    CONTRACT on raw-reference writes (M5 patch 6 §5, honest limits):
+
+    * every write THROUGH THE PROXY is sequenced -- the last proxy write
+      always wins, including re-setting the same object or ``None`` twice;
+    * a write on the RAW reference is detected by identity comparison against
+      the value the chain last synchronised with.  This detects every CHANGED
+      raw value (set A, set B, set None) but CANNOT detect a raw write that
+      re-assigns the object already current at the raw layer (set A; proxy
+      clears; raw sets A again -- the raw layer's value went back to the
+      synced one).  That single corner is undetectable without hooking the
+      client's ``set_on_call`` itself; hosts needing it should write through
+      the proxy (or we add an explicit on-write notification API to the LLM
+      client contract).  Not silently claimed as solved.
+    """
     if client is None:
         return None
     if isinstance(client, _LLMClientProxy):
@@ -739,9 +749,9 @@ _hist_sums: dict[str, float] = {}
 
 
 def _bucket_index(ms: float) -> int:
-    """Bucket for *ms*: index i holds values in [2**(i-1), 2**i) with a
-    separate bucket for [0,1).  Index == _HIST_BUCKET_COUNT is the overflow
-    (>= 2**26 ms)."""
+    """Bucket for *ms*: index i holds values in the range 2**(i-1) to 2**i
+    with a separate bucket for values below 1 ms.  Index == _HIST_BUCKET_COUNT
+    is the overflow (about 2**26 ms)."""
     if ms < 1.0:
         return 0
     idx = int(math.ceil(math.log2(ms))) if ms > 0 else 0

@@ -45,6 +45,11 @@ def main() -> int:
     parser.add_argument("--default-app", default="default",
                         help="the default app for the pre-M4 migration "
                              "(default: default)")
+    parser.add_argument("--yes", action="store_true",
+                        help="confirm the requested change.  WITHOUT it the "
+                             "command prints what it WOULD do and exits "
+                             "without touching the main database, the log "
+                             "or the witness (a dry run).")
     parser.add_argument("--retire-witness", action="store_true",
                         help="REMOVE the deletion-log witness for this db_id.  "
                              "Only for an operator who has verified the log by "
@@ -67,6 +72,61 @@ def main() -> int:
     args = parser.parse_args()
 
     from sqlalchemy import create_engine
+
+    # -- witness-only operations (M5 patch 6 §3) --------------------------
+    # Separated from the watermark adoption: they validate FIRST, change
+    # something ONLY with --yes, and never touch the main database.
+    if args.retire_witness or args.reconcile_witness:
+        from mirror_memory.config.loader import load_config
+        from mirror_memory.core.deletion import deletion_log_from_config
+
+        log = deletion_log_from_config(
+            load_config(args.config_dir).deletion_log,
+            args.database_url)
+        if log is None:
+            raise SystemExit("no deletion log is configured: nothing to do")
+        db_id = args.db_id
+        head_seq, head_hash = log.head(db_id)
+        existing = None
+        try:
+            existing = log.witness.read(db_id)
+        except Exception as exc:  # noqa: BLE001 - shown, decided below
+            existing_error = str(exc)
+        else:
+            existing_error = None
+        print(f"db_id {db_id[:8]}...: log head seq {head_seq}")
+        if existing is not None:
+            print(f"  witness: tail seq {existing.tail_seq} "
+                  f"({existing.tail_hash[:12]}...)")
+        if existing_error:
+            print(f"  witness: UNTRUSTED ({existing_error})")
+        if args.retire_witness and args.reconcile_witness:
+            raise SystemExit("choose ONE of --retire-witness / "
+                             "--reconcile-witness")
+        if args.retire_witness:
+            print("  would do: REMOVE the witness (startup will then adopt "
+                  "the log head it finds, or refuse)")
+        if args.reconcile_witness:
+            print("  would do: RECORD the current head (seq "
+                  f"{head_seq}, {head_hash[:12]}...) as the witnessed state")
+            if existing is not None and existing.tail_seq > head_seq:
+                print("  REFUSING: the existing witness (seq "
+                      f"{existing.tail_seq}) is AHEAD of the log head (seq "
+                      f"{head_seq}) -- reconciling would bless a shorter "
+                      "history.  Restore the log first.")
+                raise SystemExit(1)
+        if not args.yes:
+            print("dry run: nothing changed (pass --yes to apply)")
+            return 0
+        # validation passed and confirmed: perform the change
+        if args.retire_witness:
+            log.witness.retire(db_id)
+            print(f"witness retired for db_id={db_id[:8]}...")
+        if args.reconcile_witness:
+            log.witness.record(log._witness_state(
+                db_id, tail_seq=head_seq, tail_hash=head_hash))
+            print(f"witness reconciled: now records head seq {head_seq}")
+        return 0
 
     engine = create_engine(args.database_url)
     try:

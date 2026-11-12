@@ -332,16 +332,50 @@ def test_torn_line_is_corruption_and_evidence_kept(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_log_without_witness_is_adopted_when_nothing_was_deleted(tmp_path):
-    """An old deployment (log + genesis, no witness, applied == 0) upgrades
-    safely: nothing was ever deleted, so the current head is adopted."""
+def test_credentialed_log_without_witness(
+        tmp_path):
+    """M5 patch 6 §1: a log with a creation credential but no witness.
+
+    Two shapes, decided by PROOF:
+
+    * log == exactly the registered genesis, applied == 0 -> the provable
+      interrupted-publication window of the FIRST CREATION: finishing the
+      witness publication is safe (nothing else ever landed);
+    * the log holds MORE than the genesis (or applied > 0) -> a lost or
+      rolled-back witness store; whether entries were lost cannot be
+      proven -> refuse, the operator reconciles explicitly."""
     log_dir = tmp_path / "log"
     log = FileDeletionLog(log_dir)
     db_id = "a1" * 16
-    # simulate the pre-patch-5 state: genesis written, then the witness removed
     log.ensure_genesis(db_id, applied=0)
     log.witness.retire(db_id)
-    assert log.witness.read(db_id) is None
+
+    # shape 1: provable interruption -> the witness is re-published
+    log.verify_witness(db_id, applied=0)
+    assert log.witness.read(db_id) is not None
+    assert log.witness.read(db_id).tail_seq == 0
+
+    # shape 2: the same erasure AFTER an append -> refuse
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    log.witness.retire(db_id)
+    with pytest.raises(DeletionLogCorrupted) as excinfo:
+        log.verify_witness(db_id, applied=0)
+    assert "witness" in str(excinfo.value).lower()
+    assert log.witness.read(db_id) is None, "no witness may be forged"
+
+
+def test_legacy_log_without_witness_or_credential_at_zero_adopts(tmp_path):
+    """A log that this store NEVER registered (no credential, no witness) and
+    an empty watermark is the one provable-brand-new shape: adopt it."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "a1" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.witness.retire(db_id)
+    # remove the creation credential too: the pre-patch-6 state has neither
+    (log.directory / ".creation-registry.jsonl").unlink()
 
     log.verify_witness(db_id, applied=0)       # adopts the head
     state = log.witness.read(db_id)
@@ -410,14 +444,16 @@ def test_witness_missing_key_is_refused_not_trusted(tmp_path):
 
 
 def test_restored_log_ahead_of_witness_advances_it(tmp_path):
-    """After restoring an OLDER main DB whose log is intact and AHEAD of the
-    witness (a crash between log fsync and witness write), the witness is
-    advanced to the log head -- nothing was lost."""
+    """A log AHEAD of its witness (a crash between log fsync and witness
+    write) heals forward: the witness is advanced to the log head."""
     log_dir = tmp_path / "log"
     log = FileDeletionLog(log_dir)
     db_id = "a6" * 16
     log.ensure_genesis(db_id, applied=0)
     state_before = log.witness.read(db_id)
+    # keep the registry out of the way: the credential was recorded at
+    # creation with the GENESIS hash, which has not changed -- only the
+    # witness was rewound, which is the crash-window shape being tested
     # simulate the crash window: log has an entry the witness never saw
     log.append(DeletionEntry(
         db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
@@ -652,3 +688,348 @@ def test_witness_key_is_outside_the_witness_directory(tmp_path, monkeypatch):
         "the key must NOT live inside the witness directory"
     )
     assert key.stat().st_mode & 0o077 == 0, "the key must be 0600"
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 6 §1: the creation registry — the answer to "was this life EVER
+# initialised?" that neither applied==0, an empty file, nor a self-consistent
+# chain can give.
+# ---------------------------------------------------------------------------
+
+
+def test_forged_selfconsistent_log_is_refused_by_credential(tmp_path):
+    """The headline attack: erase the witness AND replace the log with a fresh
+    self-consistent one (new genesis + valid chain).  applied == 0.  The
+    credential's genesis hash exposes the replacement."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "f1" * 16
+    log.ensure_genesis(db_id, applied=0)
+    original_genesis = log.witness.read(db_id).genesis_hash
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+
+    # the attack: forge a brand-new, internally consistent history.  The
+    # forge itself is refused at ensure_genesis (the credential proves the
+    # life already existed); the deepest check -- verify_witness on the
+    # planted file -- must ALSO refuse via the genesis-hash mismatch.
+    # Part 1: the guarded creation refuses the forge outright (the registry
+    # proves the life already existed).
+    path = _log_file(log_dir, db_id)
+    saved_log = path.read_bytes()
+    saved_witness = log.witness.read(db_id)
+    path.unlink()
+    with pytest.raises(DeletionLogCorrupted):
+        FileDeletionLog(log_dir).ensure_genesis(db_id, applied=0)
+    # restore the state so Part 2 exercises the verify layer
+    path.write_bytes(saved_log)
+    log.witness.record(saved_witness)
+    log._index_invalidate(db_id)
+
+    # Part 2: even when a forged file IS planted while the witness is intact,
+    # verify_witness rejects it on the genesis-hash mismatch (the witness at
+    # the original genesis can never match a foreign chain).
+    forged = FileDeletionLog(tmp_path / "staging")
+    forged.ensure_genesis(db_id, applied=0)
+    forged.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    import shutil as _sh
+    _sh.copy2(_log_file(tmp_path / "staging", db_id), path)
+    log._index_invalidate(db_id)
+
+    # the planted foreign chain is refused -- by the divergence check or the
+    # genesis-mismatch check, whichever fires first (both are correct).
+    with pytest.raises(DeletionLogCorrupted):
+        log.verify_witness(db_id, applied=0)
+    # and the ORIGINAL genesis hash was preserved by the registry
+    cred = FileDeletionLog(log_dir).registry.find(db_id)
+    assert cred is not None
+    assert cred.genesis_hash == original_genesis
+
+
+def test_witness_and_log_erased_but_credential_kept_refuses(tmp_path):
+    """Both witness and log erased; only the credential survives.  Whether
+    entries were lost cannot be proven -> refuse, do not re-initialise."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "f2" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+
+    log.witness.retire(db_id)
+    _log_file(log_dir, db_id).unlink()
+
+    with pytest.raises(DeletionLogCorrupted) as excinfo:
+        log.ensure_genesis(db_id, applied=0)
+    assert "credential" in str(excinfo.value).lower()
+    assert not _log_file(log_dir, db_id).exists(), "no new log may be minted"
+
+
+def test_registry_tampering_is_refused(tmp_path):
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "f3" * 16
+    log.ensure_genesis(db_id, applied=0)
+
+    reg_path = log.directory / ".creation-registry.jsonl"
+    lines = reg_path.read_text().splitlines()
+    record = json.loads(lines[0])
+    record["payload"]["genesis_hash"] = "0" * 64
+    lines[0] = json.dumps(record, sort_keys=True)
+    reg_path.write_text("\n".join(lines) + "\n")
+
+    from mirror_memory.core.creation_registry import RegistryError
+    with pytest.raises(RegistryError):
+        log.registry.find(db_id)
+
+
+def test_brand_new_life_registers_and_then_refuses_erasures(tmp_path):
+    """A genuinely new life registers itself; from then on, deleting the log
+    (even with the witness) is a refusal, not a re-creation."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "f4" * 16
+    log.ensure_genesis(db_id, applied=0)
+    assert log.registry.find(db_id) is not None, "creation was registered"
+
+    _log_file(log_dir, db_id).unlink()
+    log.witness.retire(db_id)                  # the whole evidence erased
+
+    with pytest.raises(DeletionLogCorrupted):
+        log.ensure_genesis(db_id, applied=0), log.verify_witness(db_id, applied=0)
+
+
+def test_multiprocess_creation_writes_exactly_one_credential(tmp_path):
+    log_dir = tmp_path / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    db_id = "f5" * 16
+    ctx = mp.get_context("spawn")
+    procs = [ctx.Process(target=_mp_first_creation, args=(str(log_dir), db_id))
+             for _ in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0, p.exitcode
+
+    log = FileDeletionLog(log_dir)
+    records = [r for r in log.registry.created_lives() if r == db_id]
+    assert records == [db_id], "exactly one credential"
+    assert _line_count(_log_file(log_dir, db_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 6 §2: the heal-forward path proves ANCESTRY, not just seq order.
+# A rollback + re-append that lands on a higher seq must NOT be healed.
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_with_reappend_to_higher_seq_is_refused(tmp_path):
+    """Roll the log back to seq 1, keep the witness at seq 3, then append two
+    NEW entries so the log reaches seq 3 again with DIFFERENT hashes.  The
+    ancestry check must refuse the heal."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "g1" * 16
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    assert log.witness.read(db_id).tail_seq == 3
+
+    # roll back: keep genesis + first entry only
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    path.write_bytes(b"\n".join(lines[:2]) + b"\n")
+    log._index_invalidate(db_id)
+
+    # re-appending onto the rolled-back log must be REFUSED at the write
+    # (M5 patch 6 §2: the append validates the witness-vs-head under the
+    # lock) -- the attack can never launder its forged head into the witness.
+    for i in range(1, 3):
+        with pytest.raises((WitnessAhead, DeletionLogCorrupted)):
+            log.append(DeletionEntry(
+                db_id=db_id, tenant_id="t", app_id="a", user_id=f"x{i}",
+                scope="session", scope_key=f"x{i}", fingerprints=[],
+                generation=100 + i, purpose="other"))
+    # the log still holds exactly the surviving entries
+    assert log.head(db_id)[0] == 1
+    # the witness was NOT overwritten by the forged head
+    assert log.witness.read(db_id).tail_seq == 3
+
+    # and verify_witness still refuses the truncated state
+    with pytest.raises(WitnessAhead):
+        log.verify_witness(db_id, applied=3)
+
+
+def test_rollback_with_reappend_still_refused_even_at_lower_head(tmp_path):
+    """The attacker does not even need to reach the witnessed seq: a rollback
+    to seq 1 with the witness at 3 must refuse outright (WitnessAhead)."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "g2" * 16
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    path.write_bytes(b"\n".join(lines[:2]) + b"\n")
+    log._index_invalidate(db_id)
+
+    with pytest.raises(WitnessAhead):
+        log.verify_witness(db_id, applied=3)
+    # the witness is untouched
+    assert log.witness.read(db_id).tail_seq == 3
+
+
+def test_crash_heal_still_works_when_the_chain_is_genuine(tmp_path):
+    """The legitimate crash window (log ahead, witness behind, SAME chain)
+    still heals -- the ancestry proof accepts the real history."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "g3" * 16
+    log.ensure_genesis(db_id, applied=0)
+    stale = log.witness.read(db_id)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=2, purpose="p"))
+    log.witness.record(stale)                  # simulate the crash window
+    assert log.witness.read(db_id).tail_seq == 0
+
+    log.verify_witness(db_id, applied=2)       # heal forward
+    assert log.witness.read(db_id).tail_seq == 2
+    assert log.witness.read(db_id).tail_hash == log.head(db_id)[1]
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 6 §3/§4: the operator CLI — dry-run by default, --yes to apply,
+# failures change nothing, and the reconcile refuses to bless a SHORTER
+# history than the witness already records.
+# ---------------------------------------------------------------------------
+
+
+
+
+def _patch_adopt_log(monkeypatch, log):
+    """Make the CLI operate on the SAME FileDeletionLog object the test built
+    (the real config loader does not carry the test's directory)."""
+    from mirror_memory import deletion_adopt
+
+    from mirror_memory.core import deletion as _deletion_mod
+
+    monkeypatch.setattr(
+        _deletion_mod, "deletion_log_from_config", lambda *a, **k: log)
+
+
+def _run_adopt(args, monkeypatch, capsys):
+    from mirror_memory import deletion_adopt
+
+    monkeypatch.setattr("sys.argv", ["deletion-adopt", *args])
+    return deletion_adopt.main()
+
+
+def test_adopt_witness_dry_run_changes_nothing(tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "h1" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    _patch_adopt_log(monkeypatch, log)
+    before = log.witness.read(db_id)
+
+    rc = _run_adopt(
+        ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+         "--db-id", db_id, "--config-dir", "config/",
+         "--reconcile-witness"], monkeypatch, capsys)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "dry run" in out and "nothing changed" in out
+    # the witness is untouched
+    assert log.witness.read(db_id).tail_seq == before.tail_seq
+
+
+def test_adopt_witness_reconcile_refuses_a_shorter_history(
+        tmp_path, monkeypatch, capsys):
+    """The witness says seq 3; the log only reaches seq 2.  A reconcile would
+    bless the shorter history -- refused, and nothing changes."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "h2" * 16
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    path.write_bytes(b"\n".join(lines[:3]) + b"\n")   # head drops to 2
+    log._index_invalidate(db_id)
+    _patch_adopt_log(monkeypatch, log)
+    before = log.witness.read(db_id)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run_adopt(
+            ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+             "--db-id", db_id, "--config-dir", "config/",
+             "--reconcile-witness", "--yes"], monkeypatch, capsys)
+    assert excinfo.value.code == 1
+    out = capsys.readouterr().out
+    assert "REFUSING" in out
+    assert log.witness.read(db_id).tail_seq == before.tail_seq
+
+
+def test_adopt_witness_reconcile_applies_with_yes(
+        tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "h3" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.witness.retire(db_id)
+    head_seq, head_hash = log.head(db_id)
+    _patch_adopt_log(monkeypatch, log)
+
+    rc = _run_adopt(
+        ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+         "--db-id", db_id, "--config-dir", "config/",
+         "--reconcile-witness", "--yes"], monkeypatch, capsys)
+    assert rc == 0
+    state = log.witness.read(db_id)
+    assert state.tail_seq == head_seq
+    assert state.tail_hash == head_hash
+
+
+def test_adopt_witness_retire_removes_only_the_witness(
+        tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "h4" * 16
+    log.ensure_genesis(db_id, applied=0)
+    path = _log_file(log_dir, db_id)
+    log_bytes = path.read_bytes()
+    registry_bytes = (log_dir / ".creation-registry.jsonl").read_bytes()
+    _patch_adopt_log(monkeypatch, log)
+
+    rc = _run_adopt(
+        ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+         "--db-id", db_id, "--config-dir", "config/",
+         "--retire-witness", "--yes"], monkeypatch, capsys)
+    assert rc == 0
+    assert log.witness.read(db_id) is None
+    # log and registry untouched
+    assert path.read_bytes() == log_bytes
+    assert (log_dir / ".creation-registry.jsonl").read_bytes() == registry_bytes

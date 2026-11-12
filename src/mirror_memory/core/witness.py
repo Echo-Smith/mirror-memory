@@ -435,22 +435,45 @@ class PgDeletionLogWitness:
         mac = self._mac(key, payload)
         engine = self._engine_getter()
         with engine.begin() as conn:
+            # serialize witness writers per db_id (its own advisory lock, in
+            # the SAME database as the witness row -- the log's lock guards
+            # the log, not this table)
+            conn.execute(text(
+                "SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                {"k": f"deletion-witness:{state.db_id}"})
+            # MONOTONIC compare-and-set: the row is only advanced (or left
+            # equal).  A lagging writer whose head is behind the recorded one
+            # is REFUSED rather than allowed to regress the witness.
             updated = conn.execute(text(
                 f"UPDATE {self.TABLE} SET genesis_hash = :g, tail_seq = :ts, "
                 f"tail_hash = :th, checkpoint_seq = :cs, updated_at = :ua, "
-                f"mac = :mac WHERE db_id = :db"),
+                f"mac = :mac WHERE db_id = :db AND "
+                f"(tail_seq < :ts OR (tail_seq = :ts AND tail_hash = :th))"),
                 {"g": state.genesis_hash, "ts": state.tail_seq,
                  "th": state.tail_hash, "cs": state.checkpoint_seq,
                  "ua": state.updated_at, "mac": mac, "db": state.db_id}).rowcount
             if not updated:
-                conn.execute(text(
-                    f"INSERT INTO {self.TABLE} (db_id, genesis_hash, tail_seq, "
-                    f"tail_hash, checkpoint_seq, updated_at, mac) VALUES "
-                    f"(:db, :g, :ts, :th, :cs, :ua, :mac)"),
-                    {"db": state.db_id, "g": state.genesis_hash,
-                     "ts": state.tail_seq, "th": state.tail_hash,
-                     "cs": state.checkpoint_seq, "ua": state.updated_at,
-                     "mac": mac})
+                existing = conn.execute(text(
+                    f"SELECT tail_seq, tail_hash FROM {self.TABLE} "
+                    f"WHERE db_id = :db"), {"db": state.db_id}).first()
+                if existing is None:
+                    conn.execute(text(
+                        f"INSERT INTO {self.TABLE} (db_id, genesis_hash, "
+                        f"tail_seq, tail_hash, checkpoint_seq, updated_at, mac) "
+                        f"VALUES (:db, :g, :ts, :th, :cs, :ua, :mac)"),
+                        {"db": state.db_id, "g": state.genesis_hash,
+                         "ts": state.tail_seq, "th": state.tail_hash,
+                         "cs": state.checkpoint_seq, "ua": state.updated_at,
+                         "mac": mac})
+                elif int(existing[0]) > state.tail_seq:
+                    raise WitnessAhead(
+                        f"cannot record the deletion-log witness for "
+                        f"{state.db_id[:8]}...: the stored witness is at seq "
+                        f"{existing[0]} but this writer only reached seq "
+                        f"{state.tail_seq} -- recording it would REGRESS the "
+                        "witness.  This instance is behind; it must catch up "
+                        "before writing.")
+                # equal seq + equal hash: idempotent, nothing to do
 
     def retire(self, db_id: str) -> None:
         from sqlalchemy import text

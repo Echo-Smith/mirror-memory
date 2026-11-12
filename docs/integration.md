@@ -338,7 +338,31 @@ direction), never newer.
 | no witness, `applied > 0` | witness store lost | **refuse**, operator must reconcile |
 | witness present, MAC fails / key missing | untrusted witness | **refuse**, operator must retire explicitly |
 
-**Backups must include the witness.** A "whole machine" backup has to capture
+**The creation registry (M5 patch 6 §1).**  A witness alone cannot answer
+"was this life EVER initialised?" — an attacker that erases the witness AND
+plants a fresh self-consistent log (new genesis + valid chain) would pass
+every witness-only check.  The registry is an append-only, MAC'd JSONL file
+(``<logdir>/.creation-registry.jsonl``) that records EVERY life this store
+has created: ``db_id``, ``genesis_hash``, ``created_at``.  It is written ONCE
+at first creation (under the creation lock, flock-guarded against racing
+processes, fsynced) and never rewritten or pruned.
+
+With the registry, the "no witness" cases become decidable:
+
+| state | decision |
+|---|---|
+| no credential, no witness, `applied == 0` | provable brand-new life → initialise |
+| no credential, `applied > 0` | stores lost — indistinguishable from erased → **refuse** |
+| credential exists, no witness, log == exactly the registered genesis, `applied == 0` | provable interrupted first-creation publication → finish it |
+| credential exists, no witness, anything else | lost/rolled-back witness store → **refuse**, operator reconciles |
+| credential genesis ≠ log genesis | the history was REPLACED → **refuse** |
+
+What this proves and what it cannot: erasing the witness alone no longer
+makes a forged history look new (the registry still names the original
+genesis).  An actor who erases log, witness, registry AND key together still
+wins — that needs an offline anchor, as documented above.
+
+**Backups must include the witness.****Backups must include the witness.** A "whole machine" backup has to capture
 the log directory *and* the witness directory (and the key).  Restoring a log
 WITHOUT its witness is precisely the state that looks like a truncation — the
 engine refuses rather than guessing.

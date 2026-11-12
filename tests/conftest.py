@@ -719,6 +719,40 @@ import mirror_memory.config.loader as _cfg_loader
 _original_load_config = _cfg_loader.load_config
 
 
+_test_log_root = None
+_test_log_target = None
+_test_log_test = None
+
+
+def _per_test_log_directory():
+    """A FRESH deletion-log directory per test (M5 patch 6): the creation
+    registry / witness are per-store state, so tests sharing one directory
+    would read each other's credentials and fail on genesis mismatches —
+    correct engine behaviour, wrong test isolation.
+
+    STABLE WITHIN one test: ``load_config`` runs several times per test
+    (every engine build); wiping the directory on each call would delete a
+    live engine's log while its witness survived (they are siblings), which
+    is exactly the "log lost, witness present" refusal.  Wipe only when the
+    TEST changes."""
+    global _test_log_root, _test_log_target, _test_log_test
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from urllib.parse import quote as _quote
+
+    test_name = _os.environ.get("PYTEST_CURRENT_TEST", "unknown")
+    if _test_log_root is None:
+        _test_log_root = _tempfile.mkdtemp(prefix="mm-test-logs-")
+    if _test_log_test != test_name or _test_log_target is None:
+        target = _os.path.join(_test_log_root, _quote(test_name)[:120])
+        _shutil.rmtree(target, ignore_errors=True)
+        _os.makedirs(target, exist_ok=True)
+        _test_log_target = target
+        _test_log_test = test_name
+    return _test_log_target
+
+
 @_functools.wraps(_original_load_config)
 def _load_config_with_log_directory(*args, **kwargs):
     cfg = _original_load_config(*args, **kwargs)
@@ -726,8 +760,7 @@ def _load_config_with_log_directory(*args, **kwargs):
 
     if _os.environ.get("MM_DATABASE_URL", "").startswith("postgres"):
         cfg.deletion_log.directory = (
-            cfg.deletion_log.directory
-            or f"/tmp/mm-test-deletions-{_os.getpid()}")
+            cfg.deletion_log.directory or _per_test_log_directory())
     return cfg
 
 

@@ -308,3 +308,87 @@ def test_pg_witness_tampered_row_is_refused(log_db_url, tmp_path, monkeypatch):
 
     with pytest.raises(DeletionLogCorrupted):
         log.verify_witness(db_id, applied=1)
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 6 §2: the PG witness write is a MONOTONIC compare-and-set guarded
+# by its own advisory lock (in the witness's database).  A lagging writer can
+# never regress the witness, and concurrent appends keep the witness at the
+# true head.
+# ---------------------------------------------------------------------------
+
+
+def test_pg_witness_rejects_a_lagging_writer(log_db_url, tmp_path, monkeypatch):
+    from mirror_memory.core.witness import WitnessAhead, WitnessState
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    current = log.witness.read(db_id)
+    assert current.tail_seq == 1
+
+    # a stale state (seq 0) must be refused, not overwrite the witness
+    stale = WitnessState(
+        db_id=db_id, genesis_hash=current.genesis_hash, tail_seq=0,
+        tail_hash=current.genesis_hash, checkpoint_seq=0,
+        updated_at=current.updated_at)
+    with pytest.raises(WitnessAhead):
+        log.witness.record(stale)
+    assert log.witness.read(db_id).tail_seq == 1, "no regression"
+
+
+def test_pg_witness_equal_seq_same_hash_is_idempotent(
+        log_db_url, tmp_path, monkeypatch):
+    from mirror_memory.core.witness import WitnessState
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    current = log.witness.read(db_id)
+    same = WitnessState(
+        db_id=db_id, genesis_hash=current.genesis_hash, tail_seq=0,
+        tail_hash=current.tail_hash, checkpoint_seq=0,
+        updated_at=current.updated_at)
+    log.witness.record(same)                   # equal seq + same hash: OK
+    assert log.witness.read(db_id).tail_seq == 0
+
+
+def test_pg_concurrent_appends_witness_matches_head(
+        log_db_url, tmp_path, monkeypatch):
+    import threading
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    errors: list[BaseException] = []
+
+    def worker(idx):
+        try:
+            for j in range(6):
+                log.append(DeletionEntry(
+                    db_id=db_id, tenant_id="t", app_id="a",
+                    user_id=f"u{idx}", scope="session",
+                    scope_key=f"s{idx}-{j}", fingerprints=[],
+                    generation=j + 1, purpose="p"))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors[:2]
+
+    head_seq, head_hash = log.head(db_id)
+    assert head_seq == 18
+    state = log.witness.read(db_id)
+    assert state.tail_seq == 18
+    assert state.tail_hash == head_hash
+    log.verify_witness(db_id, applied=18)

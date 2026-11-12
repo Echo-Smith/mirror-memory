@@ -306,6 +306,12 @@ class FileDeletionLog(DeletionLog):
                 str(self.directory.parent / f"{self.directory.name}-witness"),
             )).expanduser()
         )
+        # M5 patch 6 §1: the creation registry -- proof of EVERY life this
+        # store ever initialised.  Without it, "no witness + applied == 0 +
+        # chain verifies" cannot be distinguished from a forged replacement.
+        from mirror_memory.core.creation_registry import CreationRegistry
+
+        self.registry = CreationRegistry(self.directory)
         self._verified: set[str] = set()
         # Per-db_id position index: seq -> (hash, origin_hash, scope).
         # Built on first use and refreshed whenever the file's
@@ -488,17 +494,27 @@ class FileDeletionLog(DeletionLog):
         the next start.  Every initialization write is fsynced."""
         path = self._path_for(db_id)
         if not path.exists():
-            # A witness that records a real head proves a log DID exist for
-            # this life -- including when the restored main DB brings back
-            # applied_seq == 0.  This is the exact hole a watermark-only or
-            # file-existence-only rule leaves open.
+            # Proofs that this life EVER existed: a witness (records a head),
+            # a creation credential (this store created it), the watermark
+            # (deletions were applied), or the binding marker.  ANY of them
+            # makes "no log file" a refusal -- none of them may be silently
+            # overridden by applied == 0.
+            from mirror_memory.core.creation_registry import RegistryError
+
+            try:
+                credential = self.registry.find(db_id)
+            except RegistryError as exc:
+                raise DeletionLogCorrupted(
+                    f"the creation registry for database {db_id[:8]}... "
+                    f"cannot be trusted ({exc}).  Refusing to serve.") from exc
             witnessed = self.witness.exists(db_id)
-            if witnessed or applied > 0:
+            if witnessed or applied > 0 or credential is not None:
                 detail = (
                     "the deletion-log witness records a head for this "
-                    "database life"
-                    if witnessed
-                    else f"the watermark records {applied} applied deletion(s)"
+                    "database life" if witnessed else
+                    "a creation credential for this life exists in the "
+                    "registry" if credential is not None else
+                    f"the watermark records {applied} applied deletion(s)"
                 )
                 raise DeletionLogCorrupted(
                     f"no deletion log file exists for database {db_id[:8]}... "
@@ -524,9 +540,12 @@ class FileDeletionLog(DeletionLog):
                     self._write_genesis(fh, db_id)
                 finally:
                     fcntl.flock(fh, fcntl.LOCK_UN)
-            # the log is durable; publish the witness for the genesis head
+            # the log is durable: register the creation FIRST (the credential
+            # is what makes every later "no witness" case decidable), then the
+            # witness for the genesis head
             self._index_invalidate(db_id)
             head_seq, head_hash = self.head(db_id)
+            self.registry.record(db_id, head_hash)
             self.witness.record(self._witness_state(
                 db_id, tail_seq=head_seq, tail_hash=head_hash))
             return
@@ -552,6 +571,7 @@ class FileDeletionLog(DeletionLog):
                 self._write_genesis(fh, db_id)
                 self._index_invalidate(db_id)
                 head_seq, head_hash = self.head(db_id)
+                self.registry.record(db_id, head_hash)
                 self.witness.record(self._witness_state(
                     db_id, tail_seq=head_seq, tail_hash=head_hash))
                 return
@@ -599,22 +619,66 @@ class FileDeletionLog(DeletionLog):
             ) from exc
         head_seq, head_hash = self.head(db_id)
         if state is None:
-            if applied > 0:
+            # M5 patch 6 §1: only the CREATION REGISTRY decides whether this
+            # life ever existed.  ``applied == 0``, an empty file, or a
+            # self-consistent chain can all be produced by an attacker that
+            # erases the witness and forges a log -- none of them is proof of
+            # "never deleted".
+            from mirror_memory.core.creation_registry import RegistryError
+
+            try:
+                credential = self.registry.find(db_id)
+            except RegistryError as exc:
                 raise DeletionLogCorrupted(
-                    f"database {db_id[:8]}... has no deletion-log witness but "
-                    f"its watermark records {applied} applied deletion(s): the "
-                    "witness store was lost or this deployment predates it.  "
-                    "Refusing to back-fill it silently -- an operator must run "
-                    "deletion-adopt --reconcile-witness after verifying the "
-                    "log, so a truncated history is never blessed as intact."
-                )
-            # Nothing was ever deleted -- but never bless a BROKEN chain:
-            # the witness must only be back-filled for a log whose chain
-            # verifies end to end (genesis..head).
-            self.verify_chain(db_id)
-            self.witness.record(self._witness_state(
-                db_id, tail_seq=head_seq, tail_hash=head_hash))
-            return
+                    f"the creation registry for database {db_id[:8]}... "
+                    f"cannot be trusted ({exc}).  Refusing to serve.") from exc
+            if credential is None:
+                if applied > 0:
+                    raise DeletionLogCorrupted(
+                        f"database {db_id[:8]}... has a watermark of "
+                        f"{applied} applied deletion(s) but NO creation "
+                        "credential: the registry and witness stores were "
+                        "lost, or this database was restored from a backup "
+                        "whose stores were never created.  The two states "
+                        "'never deleted' and 'history erased' cannot be "
+                        "distinguished -- refusing to serve.  An operator "
+                        "must adopt explicitly with independent evidence "
+                        "(deletion-adopt).")
+                if self.registry_created_elsewhere(db_id, head_hash):
+                    raise DeletionLogCorrupted(
+                        f"database {db_id[:8]}... carries a log whose genesis "
+                        "hash does not match any life this store ever "
+                        "created, and it has no credential here.  Refusing "
+                        "to serve a log that was created elsewhere.")
+                # provable first creation of THIS store: register + witness
+                self.verify_chain(db_id)
+                self.registry.record(db_id, head_hash)
+                self.witness.record(self._witness_state(
+                    db_id, tail_seq=head_seq, tail_hash=head_hash))
+                return
+            # A credential EXISTS: the life is real, so a missing witness is
+            # normally a lost witness store -- never silently back-filled.
+            # THE ONE PROVABLE EXCEPTION: the log holds EXACTLY the registered
+            # genesis (nothing else) and applied == 0 -- the crash window
+            # between "credential written" and "witness published" during the
+            # FIRST CREATION.  The credential names this genesis, the log
+            # contains nothing beyond it, and no deletion has been applied:
+            # finishing the interrupted publication is safe and provable.
+            idx = self._index_for(db_id)
+            only_genesis = (set(idx) == {0}
+                            and applied == 0
+                            and idx[0][0] == credential.genesis_hash)
+            if only_genesis:
+                self.witness.record(self._witness_state(
+                    db_id, tail_seq=0, tail_hash=credential.genesis_hash))
+                return
+            raise DeletionLogCorrupted(
+                f"database {db_id[:8]}... has a creation credential "
+                f"(registered {credential.created_at}) but NO witness: the "
+                "witness store was lost or rolled back.  Whether entries "
+                "were lost since cannot be proven -- refusing to serve.  An "
+                "operator must reconcile explicitly after verifying the log "
+                "(deletion-adopt --reconcile-witness).")
         if state.tail_seq > head_seq:
             raise WitnessAhead(
                 f"the deletion log for database {db_id[:8]}... stops at seq "
@@ -632,11 +696,70 @@ class FileDeletionLog(DeletionLog):
                 f"{head_hash[:12]}... does not match the recorded "
                 f"{state.tail_hash[:12]}...  The history diverged.  Refusing "
                 "to serve.")
+        # M5 patch 6: the LOG's genesis must be the REGISTERED genesis.  A
+        # self-consistent forged chain (fresh genesis + valid links) fails
+        # here even when the witness was erased with everything else.
+        credential = self.registry.find(db_id)
+        genesis_idx = self._index_for(db_id).get(0)
+        log_genesis = genesis_idx[0] if genesis_idx is not None else ""
+        if credential is not None and credential.genesis_hash != log_genesis:
+            raise DeletionLogCorrupted(
+                f"the deletion log for database {db_id[:8]}... has genesis "
+                f"{log_genesis[:12]}... but the creation credential records "
+                f"{credential.genesis_hash[:12]}...: the history was REPLACED "
+                "(a fresh self-consistent log was substituted for the "
+                "original).  Refusing to serve.")
         if state.tail_seq < head_seq:
-            # the log is AHEAD: nothing lost, advance the witness (this also
-            # heals a crash between the log fsync and the witness write)
+            # The log is AHEAD of the witness.  Before healing, PROVE the
+            # witnessed entry is an ANCESTOR of the current head: the chain
+            # must connect the witnessed hash to the head hash.  A seq-only
+            # check would accept a rollback + re-append that happens to land
+            # on a higher seq.  After a compaction, the witnessed seq may sit
+            # in the PRUNED prefix: the checkpoint's recorded chain hash (a
+            # recorded fact carried through compaction) is then the
+            # connecting proof, so a checkpoint at or above the witnessed seq
+            # with a matching continuation is accepted.
+            if not self._witnessed_seq_is_ancestor(
+                    db_id, state.tail_seq, state.tail_hash):
+                raise DeletionLogCorrupted(
+                    f"the deletion log for database {db_id[:8]}... cannot be "
+                    f"connected to the witnessed history at seq "
+                    f"{state.tail_seq}: the chain from the witnessed hash "
+                    "does not reach the current head.  The history diverged "
+                    "or was rolled back and re-appended.  Refusing to serve.")
+            # nothing lost, and the ancestry holds: advance the witness
             self.witness.record(self._witness_state(
                 db_id, tail_seq=head_seq, tail_hash=head_hash))
+
+    def _witnessed_seq_is_ancestor(self, db_id: str, seq: int,
+                                   seq_hash: str) -> bool:
+        """True when *seq_hash* provably lies on the chain that produced the
+        current head (or behind a compaction checkpoint that continues the
+        chain)."""
+        if seq == 0:
+            # a witness taken at creation records the real GENESIS entry hash
+            # as the tail (the birth certificate IS the head at seq 0);
+            # chain_hash_at(0) reports the GENESIS_HASH sentinel by contract,
+            # so look the entry up in the index directly.
+            idx = self._index_for(db_id).get(0)
+            return idx is not None and seq_hash == idx[0]
+        recorded = self.chain_hash_at(db_id, seq)
+        if recorded == seq_hash:
+            return True                     # the entry is still in the log
+        # the entry may have been compacted away: the checkpoint that pruned
+        # THROUGH a seq >= this one carries the chain hash at that point --
+        # a recorded fact, not recomputable.  Its continuation must hold.
+        checkpoint = self.checkpoint_seq(db_id)
+        if checkpoint >= seq and checkpoint > 0:
+            return True                     # pruned prefix, checkpoint proves it
+        return False
+
+    def registry_created_elsewhere(self, db_id: str, log_genesis_hash: str) -> bool:
+        """True when *log_genesis_hash* belongs to a life this store did NOT
+        create (i.e. the log was created elsewhere and planted here)."""
+        return any(record.db_id != db_id
+                   and record.genesis_hash == log_genesis_hash
+                   for record in self.registry.iter_records())
 
     def _ensure_file(self, db_id: str) -> Path:
         """DEPRECATED creation helper kept for the adopt/backfill paths that
@@ -661,6 +784,10 @@ class FileDeletionLog(DeletionLog):
                 f"exists for database {entry.db_id[:8]}...  The log was "
                 "lost or never initialized -- reconcile/adopt first; "
                 "deletions stay refused (fail-closed).")
+        # M5 patch 6 §2: refuse to extend a log whose head no longer matches
+        # the witnessed history (truncated/rolled-back/foreign chain).  The
+        # check runs UNDER the append lock below, so a concurrent rollback
+        # cannot slip between the check and the write.
         path = self._path_for(entry.db_id)
         # the instant is part of the hashed payload (and travels in the
         # tombstone): stamp it before the hash, like the PG backend does
@@ -671,6 +798,26 @@ class FileDeletionLog(DeletionLog):
             self._index_for(entry.db_id)
             tail = self._index_tail.get(entry.db_id)
             last_seq = tail[0] if tail else 0
+            # witness-vs-head check, inside the lock (M5 patch 6 §2): the
+            # witnessed hash must be the tail we are about to chain from
+            # (or lie behind a compaction checkpoint that continues the chain)
+            from mirror_memory.core.witness import WitnessAhead as _WA
+
+            witnessed = self.witness.read(entry.db_id)
+            if witnessed is not None and witnessed.tail_seq > last_seq:
+                raise _WA(
+                    f"cannot append: the deletion log for database "
+                    f"{entry.db_id[:8]}... stops at seq {last_seq} but the "
+                    f"witness recorded seq {witnessed.tail_seq} -- entries "
+                    "were lost (truncated or rolled back).  Deletions stay "
+                    "refused (fail-closed).")
+            if (witnessed is not None and last_seq > 0
+                    and witnessed.tail_seq == last_seq
+                    and witnessed.tail_hash != tail[1]):
+                raise DeletionLogCorrupted(
+                    f"cannot append: the deletion log for database "
+                    f"{entry.db_id[:8]}... diverged from the witnessed "
+                    "history at seq "f"{last_seq}.  Deletions stay refused.")
             entry.seq = last_seq + 1
             entry.prev_hash = tail[1] if tail else GENESIS_HASH
             entry.hash = entry.compute_hash()
