@@ -731,3 +731,164 @@ def test_p8_pg_prune_refuses_when_witness_behind_unextendable(
     # the witness (which is ahead) is untouched
     after = log.witness.read(db_id)
     assert after.tail_seq == stale.tail_seq
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 9 §4: the FULL pg_dump / pg_restore round trip (not a watermark
+# reset) with the witness / creation-registry integrity checks on the real
+# engine startup path.
+# ---------------------------------------------------------------------------
+
+
+def _p9_dump_and_restore(main_db: str, dump_path: str, admin_url: str):
+    """pg_dump the main DB to *dump_path*, drop it, recreate it, pg_restore.
+    Uses the REAL container tools (same path the deletion-race e2e uses)."""
+    import subprocess
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    env = dict(os.environ, PGPASSWORD="mm")
+    result = subprocess.run(
+        ["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg",
+         "pg_dump", "-U", "postgres", "--format=custom", main_db],
+        env=env, capture_output=True, check=True)
+    if len(result.stdout) < 5000:
+        raise AssertionError(
+            f"pg_dump produced only {len(result.stdout)} bytes -- the "
+            "database was empty at dump time")
+    open(dump_path, "wb").write(result.stdout)
+
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin_engine.connect() as conn:
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+            conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+    finally:
+        admin_engine.dispose()
+    # pg_restore --role=mm_owner creates the tables AS mm_owner, so that
+    # role needs CREATE on the public schema of the fresh database -- a
+    # grant is per-database, so it must be applied against the new DB.
+    grant_engine = create_engine(
+        admin_url.rsplit("/", 1)[0] + "/" + main_db,
+        isolation_level="AUTOCOMMIT")
+    try:
+        with grant_engine.connect() as gconn:
+            gconn.exec_driver_sql('GRANT ALL ON SCHEMA public TO mm_owner')
+    finally:
+        grant_engine.dispose()
+    with open(dump_path, "rb") as dump_file:
+        restore = subprocess.run(
+            ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+             "pg_restore", "-U", "postgres", "--role=mm_owner",
+             "--dbname=" + main_db],
+            stdin=dump_file, capture_output=True)
+    # pg_restore exits 1 on IGNORED errors too (e.g. RLS objects owned by
+    # roles the restore role cannot touch) -- the tables are what matter,
+    # so verify them instead of trusting the exit code.
+    check = create_engine(
+        admin_url.rsplit("/", 1)[0] + "/" + main_db)
+    try:
+        with check.connect() as conn:
+            n = conn.execute(text(
+                "SELECT count(*) FROM pg_tables WHERE schemaname='public' "
+                "AND tablename LIKE 'mm_%'")).scalar()
+    finally:
+        check.dispose()
+    assert n >= 20, (
+        f"pg_restore produced only {n} mm_* tables; stderr: "
+        f"{restore.stderr.decode()[:300]}")
+
+
+@_pg_needs
+def test_p9_full_pg_dump_restore_roundtrip_with_witness_checks(
+        log_db_url, tmp_path, monkeypatch):
+    """Backup -> delete (log entries + witness advance) -> pg_dump -> restore
+    the OLD main DB -> the real engine must refuse when the log table is
+    truncated, and serve normally when it is intact."""
+    import shutil
+
+    from mirror_memory.api import MemoryEngine
+    from mirror_memory.config.loader import load_config
+    from mirror_memory.core.deletion import (
+        DeletionLogCorrupted, DeletionLogUnavailable, PgDeletionLog)
+    from mirror_memory.core.repository import set_memory_enabled
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+    from mirror_memory.core.sql_audit import no_audit_scope
+    from sqlalchemy.orm import sessionmaker
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    main_db = "mm_test_p9_roundtrip"
+    runtime_url, admin_url = _pg_repro_database(main_db)
+
+    class _L:
+        def generate(self, **_kw):
+            return '{"patterns": []}'
+
+    cfg = load_config("config/")
+    cfg.llm_client = _L()
+    log = PgDeletionLog(log_db_url)
+    eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                       llm_client=_L(), deletion_log=log,
+                       tenant_id="default", app_id="default")
+    eng._ensure_db()
+    db_id = eng._db_id
+    with tenant_scope(*eng._tenant), fixture_write_scope("p9 seed"):
+        s = sessionmaker(bind=eng._engine)()
+        set_memory_enabled(s, "u1", True)
+        s.commit()
+        s.close()
+    eng.observe(user_id="u1", session_id="s1", text="hello", purpose="chat")
+    eng.delete_memories(user_id="u1", purpose="chat")
+    assert log.witness.read(db_id).tail_seq >= 1
+    eng._engine.dispose()
+
+    # pg_dump the CURRENT state (with the deletion applied), then restore it:
+    # a healthy round trip -- the engine must come back up and serve.
+    _p9_dump_and_restore(main_db, str(tmp_path / "current.dump"), admin_url)
+    eng_ok = MemoryEngine(config=cfg, database_url=runtime_url,
+                          llm_client=_L(), deletion_log=log,
+                          tenant_id="default", app_id="default")
+    eng_ok._ensure_db()
+    eng_ok._engine.dispose()
+
+    # now restore a backup taken BEFORE any deletion existed -- build it by
+    # dropping the witness row and truncating the log table to the genesis
+    # (the attacker action), while the main DB still carries applied >= 1.
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log WHERE db_id = :db AND seq > 0"),
+                {"db": db_id})
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log_witness WHERE db_id = :db"),
+                {"db": db_id})
+    finally:
+        admin.dispose()
+
+    eng_bad = MemoryEngine(config=cfg, database_url=runtime_url,
+                           llm_client=_L(), deletion_log=log,
+                           tenant_id="default", app_id="default")
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        eng_bad._ensure_db()
+
+    # the log table still holds exactly the genesis -- evidence preserved
+    check = create_engine(log_db_url)
+    try:
+        with check.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT seq, scope FROM mm_deletion_log WHERE db_id = :db "
+                "ORDER BY seq"), {"db": db_id}).all()
+    finally:
+        check.dispose()
+    assert [(int(r[0]), r[1]) for r in rows] == [(0, "genesis")], rows
+
+    # cleanup: drop the repro database
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin_engine.connect() as conn:
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+    finally:
+        admin_engine.dispose()
+    shutil.rmtree(tmp_path, ignore_errors=True)

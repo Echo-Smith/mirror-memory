@@ -323,6 +323,43 @@ a rollback, or a main-DB restore with an old watermark is detected.
 The key is never stored inside the witness directory: whoever can write the
 witness must not be able to read the key and re-forge the MAC.
 
+**Creation credential.** Alongside the witness, an append-only registry
+records EVERY life the store has created (file: `<logdir>/.creation-registry.jsonl`;
+postgres: table `mm_creation_registry` in the log database).  It is what
+makes "no witness" decidable: a credential names the genesis a life was born
+with, so a forged replacement log cannot pass as new.  Same MAC key.
+
+**PG roles and grants** (what the running code actually needs -- verified by
+`tests/test_pg_deletion_log.py` on real logins):
+
+| role | on `mm_deletion_log` | on `mm_deletion_log_witness` | on `mm_creation_registry` | note |
+|---|---|---|---|---|
+| log app role (runtime) | INSERT, SELECT | **none** | INSERT (append-only rows) | it also owns the log writes; the witness/registry MAC makes rows it writes verifiable |
+| witness/maintenance role | DELETE, UPDATE (compaction) | SELECT, UPDATE, INSERT | none | compaction only |
+| owner / migration | DDL, all | DDL, all | DDL, all | schema lifecycle only |
+
+The runtime role deliberately has **no** UPDATE/DELETE anywhere: the log is
+append-only for it and the witness/registry rows it can append are only
+trusted after MAC verification, so a compromised runtime cannot rewrite
+history -- it can at most stop writing.  Operations that must erase or
+compact use the separate maintenance credential, and evidence-destroying
+moves (retire/reconcile/`--new-lineage`) additionally require the operator
+key file plus an explicit `--yes` (see the operator section below).
+**Known gap (honest)**: today the runtime and the witness writer share ONE
+process identity; splitting them into separate OS-level credentials with
+different key files is NOT implemented -- recorded as unimplemented rather
+than implied by this table.
+
+**Backup / key failure domains.**  The main database, the log database (PG)
+or log directory (file), the witness store, the creation registry and the
+MAC key are FIVE independent failure domains.  A backup that captures the
+main DB together with the log/witness/registry/key defends against loss but
+also means a rollback of that one archive rolls EVERYTHING back -- which is
+the one scenario no local check can distinguish from "never existed".  For
+rollback protection the log+witness+registry must live in a different backup
+domain than the main DB, and the key in a third (or offline).The key is never stored inside the witness directory: whoever can write the
+witness must not be able to read the key and re-forge the MAC.
+
 **Ordering and durability.** `append()` fsyncs the log entry, then publishes
 the witness (temp file → fsync → `os.replace` → directory fsync) while still
 holding the append lock.  The log is always durable *before* the witness

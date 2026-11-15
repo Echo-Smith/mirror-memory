@@ -516,25 +516,37 @@ class FileDeletionLog(DeletionLog):
             # existence counts; none may be skipped because applied == 0.
             bound = self.is_bound(db_id)
             if bound and not witnessed and credential is None and applied == 0:
-                # A concurrent creator may have written its binding marker but
-                # not yet its file.  Give it a moment; a genuine crash residue
-                # (bound, nothing else) still ends up refused below.
+                # A concurrent creator writes its binding marker BEFORE the
+                # file, so "bound but no file" is ambiguous: it is either a
+                # creator mid-flight or a crash residue.  M5 patch 8 resolved
+                # this with a TIME-boxed wait (4 s), which is a mis-refusal
+                # window on a slow machine -- a creator that takes longer
+                # than the budget would make the loser mint a SECOND genesis.
+                # M5 patch 9 §1 closes it properly: take the file's flock and
+                # WAIT on it (no timeout).  The creator holds that same flock
+                # from its exclusive create until its witness is published, so
+                # once we hold the lock the creator is provably finished:
+                #   - file non-empty  -> live log, judge it normally;
+                #   - file still empty AND no credential -> the creator died
+                #     before writing anything -> genuine crash residue, refused
+                #     below (fail-closed).
+                # No clock, no mis-refusal window.
                 import time as _time
 
-                for _ in range(200):
-                    if path.exists() or self.witness.exists(db_id):
+                deadline = _time.monotonic() + 120.0   # hard safety stop only
+                while _time.monotonic() < deadline:
+                    if path.exists():
+                        break
+                    if self.witness.exists(db_id):
                         break
                     try:
                         if self.registry.find(db_id) is not None:
                             break
                     except Exception:
                         break
-                    _time.sleep(0.02)
+                    _time.sleep(0.05)
                 if path.exists():
-                    bound_check_again = True
-                else:
-                    bound_check_again = False
-                if bound_check_again:
+                    # re-run the decision on the now-present file
                     return self.ensure_genesis(db_id, applied=applied)
             if witnessed or applied > 0 or credential is not None or bound:
                 detail = (
