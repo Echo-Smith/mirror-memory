@@ -94,7 +94,31 @@ def main() -> int:
             existing_error = str(exc)
         else:
             existing_error = None
+        # M5 patch 8 §3: authenticate the evidence BEFORE deciding anything.
+        # A reconcile over a log whose chain does not verify -- or whose
+        # creation registry cannot be authenticated -- must not proceed even
+        # in a dry run that claims to be a faithful preview.
+        try:
+            log.verify_chain(db_id)
+            chain_ok, chain_err = True, None
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            chain_ok, chain_err = False, str(exc)
+        try:
+            credential = log.registry.find(db_id)
+            cred_err = None
+        except Exception as exc:  # noqa: BLE001
+            credential, cred_err = None, str(exc)
         print(f"db_id {db_id[:8]}...: log head seq {head_seq}")
+        if not chain_ok:
+            print(f"  chain: BROKEN ({chain_err})")
+        else:
+            print("  chain: verified")
+        if cred_err is not None:
+            print(f"  creation credential: UNTRUSTED ({cred_err})")
+        elif credential is None:
+            print("  creation credential: none recorded")
+        else:
+            print(f"  creation credential: registered {credential.created_at}")
         if existing is not None:
             print(f"  witness: tail seq {existing.tail_seq} "
                   f"({existing.tail_hash[:12]}...)")
@@ -124,6 +148,15 @@ def main() -> int:
                       "bless the fork.  Restore the log that matches the "
                       "witness first.")
                 raise SystemExit(1)
+        if args.reconcile_witness and not chain_ok:
+            print("  REFUSING: the deletion-log chain does not verify; "
+                  "reconciling would bless a broken history.")
+            raise SystemExit(1)
+        if args.reconcile_witness and cred_err is not None:
+            print("  REFUSING: the creation credential cannot be "
+                  "authenticated; reconciling would bless an unproven "
+                  "history.")
+            raise SystemExit(1)
         if not args.yes:
             print("dry run: nothing changed (pass --yes to apply)")
             return 0

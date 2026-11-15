@@ -352,14 +352,16 @@ def test_credentialed_log_without_witness_always_refused(
     assert "indistinguishable" in str(excinfo.value).lower()
     assert log.witness.read(db_id) is None, "no witness may be forged"
 
-    # shape 2: log holds an append -> refused identically
-    log.append(DeletionEntry(
-        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
-        scope_key="", fingerprints=[], generation=1, purpose="p"))
-    log.witness.retire(db_id)
+    # shape 2: the same erasure AFTER a deletion, now against append() too
+    # (M5 patch 8: append no longer skips its checks when the witness is
+    # absent -- before, a removed witness let the log be extended and the
+    # witness re-minted from the forged head)
     with pytest.raises(DeletionLogCorrupted):
-        log.verify_witness(db_id, applied=0)
-    assert log.witness.read(db_id) is None
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id="u",
+            scope="user", scope_key="", fingerprints=[], generation=1,
+            purpose="p"))
+    assert log.witness.read(db_id) is None, "no witness may be forged"
 
 
 def test_legacy_log_without_witness_or_credential_at_zero_adopts(tmp_path):
@@ -1292,3 +1294,185 @@ def test_brief_repro_2_through_real_engine_append(tmp_path):
     after = log.witness.read(db_id)
     assert after.tail_seq == witness_before.tail_seq
     assert after.tail_hash == witness_before.tail_hash
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 8 §4: the required runtime regressions.
+# ---------------------------------------------------------------------------
+
+
+def test_p8_runtime_witness_removed_and_log_truncated_then_append(tmp_path):
+    """① An ALREADY-RUNNING history: the witness is removed and the log is
+    truncated to its genesis, then append() is attempted.  It must be
+    refused, and neither the log nor the (absent) witness may change."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "r1" * 16
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+
+    # the attack, against the RUNNING log object (not a restart)
+    log.witness.retire(db_id)
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    path.write_bytes(lines[0] + b"\n")
+    log._index_invalidate(db_id)
+    before_log = path.read_bytes()
+
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id="x",
+            scope="user", scope_key="", fingerprints=[], generation=99,
+            purpose="x"))
+
+    assert path.read_bytes() == before_log, "the log must not change"
+    assert log.witness.read(db_id) is None, "no witness may be minted"
+
+
+def test_p8_witness_behind_and_tail_tampered_startup_does_not_heal(
+        tmp_path):
+    """③ The witness is BEHIND (log longer) and the extra entries are
+    tampered.  Startup must NOT heal-forward the witness before the chain
+    has been verified -- verify_chain runs first (M5 patch 7/8 §1)."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "r2" * 16
+    log.ensure_genesis(db_id, applied=0)
+    stale = log.witness.read(db_id)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    log.witness.record(stale)                 # the witness is behind
+    assert log.witness.read(db_id).tail_seq == 0
+
+    # tamper the LAST entry's hash (chain broken beyond the witness)
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    record = json.loads(lines[-1])
+    record["hash"] = "f" * 64
+    lines[-1] = json.dumps(record, sort_keys=True).encode()
+    path.write_bytes(b"\n".join(lines) + b"\n")
+    log._index_invalidate(db_id)
+    witness_before = log.witness.read(db_id)
+
+    # verify_witness itself must run the chain check BEFORE healing
+    with pytest.raises(Exception):
+        log.verify_witness(db_id, applied=0)
+
+    after = log.witness.read(db_id)
+    assert after.tail_seq == witness_before.tail_seq, (
+        "the witness must NOT be healed forward over a broken chain")
+    assert after.tail_hash == witness_before.tail_hash
+
+
+def test_p8_bound_and_key_present_but_all_evidence_gone(tmp_path):
+    """④ Binding and key survive, but log, witness and registry are all
+    missing and the old watermark is 0.  Must NOT mint."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "r3" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    key_path = log.witness.key_path
+
+    # erase everything except the binding marker and the key
+    log.witness.retire(db_id)
+    (log_dir / ".creation-registry.jsonl").unlink()
+    _log_file(log_dir, db_id).unlink()
+    assert log.is_bound(db_id), "the binding marker survived"
+    assert key_path.exists()
+
+    with pytest.raises(DeletionLogCorrupted) as excinfo:
+        log.ensure_genesis(db_id, applied=0)
+    assert "bound" in str(excinfo.value).lower()
+    assert not _log_file(log_dir, db_id).exists(), "no new log may be minted"
+    assert log.witness.read(db_id) is None
+
+
+def test_p8_bound_and_key_only_through_real_engine(tmp_path):
+    """④ through the REAL engine: only the binding marker and the key
+    survive; log, witness and registry are gone and the main DB watermark is
+    0.  Startup must refuse and nothing may be created."""
+    log_dir = tmp_path / "log"
+    db = tmp_path / "main.db"
+    eng = _engine(tmp_path, log_dir, db)
+    _enable(eng)
+    _observe(eng)
+    eng.delete_memories(user_id="u1", purpose="chat")
+    db_id = eng._db_id
+    eng._engine.dispose()
+
+    log = FileDeletionLog(log_dir)
+    log.witness.retire(db_id)
+    (log_dir / ".creation-registry.jsonl").unlink()
+    _log_file(log_dir, db_id).unlink()
+    assert log.is_bound(db_id) and log.witness.key_path.exists()
+
+    eng2 = _engine(tmp_path, log_dir, db)
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        eng2._ensure_db()
+    assert not _log_file(log_dir, db_id).exists(), "no log may be minted"
+
+
+def test_p8_cli_dry_run_has_no_persistent_side_effects(
+        tmp_path, monkeypatch, capsys):
+    """§3: a dry run must not change the log, the witness OR the registry --
+    and it must report the chain/credential state."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "d8" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    _patch_adopt_log(monkeypatch, log)
+    before = _cli_state(log_dir, db_id)
+
+    rc = _run_adopt(
+        ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+         "--db-id", db_id, "--config-dir", "config/",
+         "--reconcile-witness"], monkeypatch, capsys)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "chain: verified" in out
+    assert "dry run" in out
+    assert _cli_state(log_dir, db_id) == before, "a dry run changed state"
+
+
+def test_p8_cli_refuses_when_chain_is_broken(tmp_path, monkeypatch, capsys):
+    """A reconcile over a BROKEN chain must refuse (and change nothing)."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "d9" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    log.witness.retire(db_id)
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    record = json.loads(lines[-1])
+    record["hash"] = "e" * 64
+    lines[-1] = json.dumps(record, sort_keys=True).encode()
+    path.write_bytes(b"\n".join(lines) + b"\n")
+    log._index_invalidate(db_id)
+    _patch_adopt_log(monkeypatch, log)
+    before = _cli_state(log_dir, db_id)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run_adopt(
+            ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+             "--db-id", db_id, "--config-dir", "config/",
+             "--reconcile-witness", "--yes"], monkeypatch, capsys)
+    assert excinfo.value.code == 1
+    out = capsys.readouterr().out
+    assert "REFUSING" in out
+    assert _cli_state(log_dir, db_id) == before

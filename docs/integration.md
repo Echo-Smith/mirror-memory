@@ -257,11 +257,16 @@ exclusive create is the provable creator) plus the per-file `flock`, writes
 the genesis under the lock, and `fsync`s it.  Threads and processes racing
 this are serialised by those two primitives — exactly one genesis ever lands.
 
-**2. Interrupted creation — recovered automatically, but only with proof.**
+**2. Interrupted creation — completed automatically ONLY with the full proof.**
 A crash between the create and the genesis write leaves a zero-byte file.
-That is recoverable **only** when the watermark is `applied == 0` *and* the
-binding marker does not exist (nothing was ever deleted, so an empty file can
-hold nothing but a genesis).
+M5 patch 7/8 narrowed this to the single shape that is provable: NO creation
+credential for the life, `applied == 0`, and no witness.  Once a credential
+or a witness exists, the same zero-byte/truncated shape is
+indistinguishable from "deletions happened, then the witness was erased and
+the log truncated" and is refused -- the operator reconciles explicitly.
+A concurrent creator that lost the exclusive create waits for the winner
+(under the same flock) instead of mistaking the winner's in-progress write
+for crash residue.
 
 **3. Anything else — refused (`DeletionLogCorrupted`, a subclass of
 `DeletionLogUnavailable`), and the file is left untouched:**
@@ -269,6 +274,7 @@ hold nothing but a genesis).
 | state | why it is refused |
 |---|---|
 | no log file, `applied > 0` | the log was lost after deletions happened |
+| no log file, but a creation credential / witness / **binding** exists | the log was lost for a life that already existed |
 | empty log, but the store **is bound** to this `db_id` | truncated — or a restore brought back a database whose log is gone |
 | content but no genesis entry | corrupted or not written by this engine |
 | a line that is not valid JSON | truncated/tampered mid-write; the chain cannot be trusted past it |
@@ -366,6 +372,43 @@ wins — that needs an offline anchor, as documented above.
 the log directory *and* the witness directory (and the key).  Restoring a log
 WITHOUT its witness is precisely the state that looks like a truncation — the
 engine refuses rather than guessing.
+
+**Continuity gates on every write path (M5 patch 8).**  Both backends verify
+BEFORE they change anything:
+
+| operation | precondition |
+|---|---|
+| `append` | witness present + authenticated; not ahead; no equal-height divergence; the witnessed hash is an ancestor of the head |
+| `prune` | full `verify_chain`, witness continuity, same ancestry rule |
+| startup / `reconcile` | genesis exists, chain verifies, then the witness check |
+| heal-forward | `verify_chain` FIRST, then provenance and ancestry -- a tampered tail is never blessed by the heal |
+
+A missing or unauthenticated witness over a life that HAS a creation
+credential is refused on all of them: it cannot be distinguished from an
+erased history.
+
+**Trust premises per store** (all must hold for the guarantees above):
+
+| store | what it proves | rolls back with a main-DB backup? |
+|---|---|---|
+| log file / log table | the entries themselves (hash chain) | yes (file backend); no (separate log DB) |
+| witness (file/table) | head seq + hash reached before | no (outside the log tree / in the log DB) |
+| creation registry | this life was initialised, and by which genesis | no |
+| binding marker (`.bound`) | a log file existed here at least once | sits in the log dir -- it DOES roll back with it |
+| MAC key (file) | the witness/registry rows are ours | no (outside both trees) |
+
+The binding marker is weak on purpose: it is a cheap "this happened"
+breadcrumb, NOT an integrity proof, and it can roll back together with the
+log directory.  A missing log whose only surviving evidence is the marker is
+refused (never minted), but the marker alone cannot tell a healthy rollback
+from an erasure -- that needs the witness/registry (or an offline anchor).
+
+**What is impossible to prove locally.**  If log, witness, registry, binding
+marker AND key are erased or rolled back *together*, no first-party check can
+distinguish "never existed" from "perfectly erased".  There is no flag that
+re-establishes trust automatically; the operator path is explicit adoption
+with independent evidence, and that limitation is stated rather than papered
+over with a rollback-able flag.
 
 **Operator recovery** (the only supported paths; nothing is ever auto-minted):
 

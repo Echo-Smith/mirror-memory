@@ -636,3 +636,98 @@ def test_pg_brief_repro_1_truncated_log_table_refused(
         check.dispose()
     assert [(int(r[0]), r[1]) for r in rows] == [(0, "genesis")], rows
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 8 §2/§4⑤: the PG append/prune continuity gates.
+# ---------------------------------------------------------------------------
+
+
+def test_p8_pg_append_refuses_missing_witness(log_db_url, tmp_path, monkeypatch):
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    log.witness.retire(db_id)                 # the witness row is gone
+
+    with pytest.raises(DeletionLogCorrupted):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id="x", scope="user",
+            scope_key="", fingerprints=[], generation=2, purpose="x"))
+    # the table did not grow
+    assert log.head(db_id)[0] == 1
+    assert log.witness.read(db_id) is None
+
+
+def test_p8_pg_append_refuses_equal_height_divergence(
+        log_db_url, tmp_path, monkeypatch):
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 3):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    witness = log.witness.read(db_id)
+
+    # rewrite the tail row's hash in the table (a same-height divergence)
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "UPDATE mm_deletion_log SET hash = repeat('f', 64) "
+                "WHERE db_id = :db AND seq = 2"), {"db": db_id})
+    finally:
+        admin.dispose()
+
+    with pytest.raises((DeletionLogCorrupted, Exception)):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id="x", scope="user",
+            scope_key="", fingerprints=[], generation=3, purpose="x"))
+    # the witness is not overwritten with the forged head
+    after = log.witness.read(db_id)
+    assert after.tail_seq == witness.tail_seq
+    assert after.tail_hash == witness.tail_hash
+
+
+def test_p8_pg_prune_refuses_when_witness_behind_unextendable(
+        log_db_url, tmp_path, monkeypatch):
+    """Prune must verify the witnessed continuity before rewriting rows."""
+    from mirror_memory.core.witness import WitnessAhead
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url, maintenance_url=log_db_url.replace(
+        "postgres:mm@", "postgres:mm@"))
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 5):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    stale = log.witness.read(db_id)
+
+    # delete the tail rows: the witness is now AHEAD of the table
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log WHERE db_id = :db AND seq > 2"),
+                {"db": db_id})
+    finally:
+        admin.dispose()
+
+    with pytest.raises((WitnessAhead, Exception)):
+        log.prune(db_id, 2)
+    # the witness (which is ahead) is untouched
+    after = log.witness.read(db_id)
+    assert after.tail_seq == stale.tail_seq
