@@ -80,6 +80,42 @@ def _log_fsync_problem(directory: Path, exc: OSError) -> None:
         "(recoverable), never ahead of it.", directory, exc)
 
 
+def _relation_exists(engine, name: str) -> bool:
+    """True when ``public.<name>`` already exists (cheap catalog lookup)."""
+    from sqlalchemy import text as _text
+
+    with engine.connect() as conn:
+        return conn.execute(
+            _text("SELECT to_regclass(:n)"),
+            {"n": f"public.{name}"},
+        ).scalar() is not None
+
+
+def _create_if_absent(engine, name: str, ddl: str) -> None:
+    """Run *ddl* only when the relation is ABSENT.
+
+    M5 patch 10 §4: the runtime role deliberately holds no DDL, but
+    PostgreSQL checks CREATE privilege for ``CREATE TABLE IF NOT EXISTS``
+    even when the table already exists.  Skipping the statement when the
+    catalog already has the relation is what lets a restricted runtime login
+    run the real log/witness chain.  A genuinely missing table still fails
+    closed with the original error (the owner must provision).
+    """
+    from sqlalchemy import text as _text
+
+    if _relation_exists(engine, name):
+        return
+    from sqlalchemy.exc import ProgrammingError
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(_text(ddl))
+    except ProgrammingError:
+        # lost a race to another provisioner: fine if it exists now
+        if not _relation_exists(engine, name):
+            raise
+
+
 class WitnessError(RuntimeError):
     """The witness cannot be trusted (missing key, bad MAC, bad shape)."""
 
@@ -359,22 +395,17 @@ class PgDeletionLogWitness:
     # -- schema --------------------------------------------------------
 
     def _ensure(self) -> None:
-        if self._ensure_schema is not None:
-            self._ensure_schema()
         engine = self._engine_getter()
-        from sqlalchemy import text
-
-        with engine.begin() as conn:
-            conn.execute(text(
-                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
-                " db_id CHAR(32) PRIMARY KEY,"
-                " genesis_hash CHAR(64) NOT NULL,"
-                " tail_seq BIGINT NOT NULL,"
-                " tail_hash CHAR(64) NOT NULL,"
-                " checkpoint_seq BIGINT NOT NULL DEFAULT 0,"
-                " updated_at VARCHAR(64) NOT NULL,"
-                " mac CHAR(64) NOT NULL)"
-            ))
+        _create_if_absent(
+            engine, self.TABLE,
+            f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+            " db_id CHAR(32) PRIMARY KEY,"
+            " genesis_hash CHAR(64) NOT NULL,"
+            " tail_seq BIGINT NOT NULL,"
+            " tail_hash CHAR(64) NOT NULL,"
+            " checkpoint_seq BIGINT NOT NULL DEFAULT 0,"
+            " updated_at VARCHAR(64) NOT NULL,"
+            " mac CHAR(64) NOT NULL)")
 
     # -- read / write --------------------------------------------------
 
@@ -515,18 +546,14 @@ class PgCreationRegistry:
         return PgDeletionLogWitness._mac(key, payload)
 
     def _ensure(self):
-        if self._ensure_schema is not None:
-            self._ensure_schema()
-        from sqlalchemy import text
-
         engine = self._engine_getter()
-        with engine.begin() as conn:
-            conn.execute(text(
-                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
-                " db_id CHAR(32) PRIMARY KEY,"
-                " genesis_hash CHAR(64) NOT NULL,"
-                " created_at VARCHAR(64) NOT NULL,"
-                " mac CHAR(64) NOT NULL)"))
+        _create_if_absent(
+            engine, self.TABLE,
+            f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+            " db_id CHAR(32) PRIMARY KEY,"
+            " genesis_hash CHAR(64) NOT NULL,"
+            " created_at VARCHAR(64) NOT NULL,"
+            " mac CHAR(64) NOT NULL)")
 
     def record(self, db_id: str, genesis_hash: str) -> None:
         from sqlalchemy import text

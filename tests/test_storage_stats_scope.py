@@ -191,6 +191,22 @@ def test_pg_app_role_rls_storage_stats(pg_app_url):
     does not, and a raw unpredicated read is still narrowed by RLS."""
     from sqlalchemy import text
 
+    # Test hygiene (M5 patch 10): the log tests share this database and may
+    # have left the DELETION-LOG tables here.  In production the log lives in
+    # its own database, so they must not be reflected by a main-DB capacity
+    # report (the app role has no SELECT on them and that is correct).
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    admin = create_engine(
+        os.environ["MM_DATABASE_URL"], isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin.connect() as conn:
+            for table in ("mm_deletion_log_witness", "mm_creation_registry",
+                          "mm_deletion_log"):
+                conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{table}"')
+    finally:
+        admin.dispose()
+
     eng = _pg_engine(pg_app_url)
     try:
         _pg_seed(eng, [("tA", "app", "uSame"), ("tB", "app", "uSame")])

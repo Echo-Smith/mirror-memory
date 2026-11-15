@@ -397,6 +397,36 @@ class FileDeletionLog(DeletionLog):
         return self.directory / f"{db_id}.deletions.jsonl"
 
     @contextlib.contextmanager
+    def _creation_lock(self, db_id: str):
+        """The per-life FIRST-CREATION lock (M5 patch 10 §3).
+
+        Every creator (winner or potential loser) takes this ONE lock before
+        deciding anything, and holds it through the whole decide-and-create
+        sequence.  ``flock`` gives us real blocking semantics with no clock:
+
+        * a process that finds it held is a genuine concurrent creator and
+          simply blocks until that creator finishes -- no polling, no timeout,
+          no mis-refusal window on a slow machine;
+        * a creator that CRASHES has its lock released by the kernel, so the
+          next process acquires it and judges the leftover state (empty file,
+          no credential => crash residue => refused; full state => live log).
+
+        The lock file is created O_CREAT (never O_EXCL) so it is safe to open
+        from any number of racing processes; it is a coordination artifact,
+        not evidence.
+        """
+        lock_path = self.directory / f"{db_id}.creating.lock"
+        self.directory.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)     # BLOCKS (no timeout)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @contextlib.contextmanager
     def _locked(self, path: Path):
         with open(path, "a+b") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)
@@ -466,6 +496,15 @@ class FileDeletionLog(DeletionLog):
         os.fsync(fh.fileno())
 
     def ensure_genesis(self, db_id: str, *, applied: int = 0) -> None:
+        """Bind the log to this database life — under the per-life CREATION
+        LOCK (M5 patch 10 §3), so every creator serialises with real blocking
+        semantics and a crashed creator is detected by lock release rather
+        than by a clock.  See :meth:`_ensure_genesis_locked` for the decision
+        table."""
+        with self._creation_lock(db_id):
+            return self._ensure_genesis_locked(db_id, applied=applied)
+
+    def _ensure_genesis_locked(self, db_id: str, *, applied: int = 0) -> None:
         """Bind the log to this database life (M5 patch 4, task 1).
 
         Creation protocol -- only a PROVABLE first creation initializes:
@@ -515,39 +554,15 @@ class FileDeletionLog(DeletionLog):
             # brand-new and minted fresh history.  Every proof of past
             # existence counts; none may be skipped because applied == 0.
             bound = self.is_bound(db_id)
-            if bound and not witnessed and credential is None and applied == 0:
-                # A concurrent creator writes its binding marker BEFORE the
-                # file, so "bound but no file" is ambiguous: it is either a
-                # creator mid-flight or a crash residue.  M5 patch 8 resolved
-                # this with a TIME-boxed wait (4 s), which is a mis-refusal
-                # window on a slow machine -- a creator that takes longer
-                # than the budget would make the loser mint a SECOND genesis.
-                # M5 patch 9 §1 closes it properly: take the file's flock and
-                # WAIT on it (no timeout).  The creator holds that same flock
-                # from its exclusive create until its witness is published, so
-                # once we hold the lock the creator is provably finished:
-                #   - file non-empty  -> live log, judge it normally;
-                #   - file still empty AND no credential -> the creator died
-                #     before writing anything -> genuine crash residue, refused
-                #     below (fail-closed).
-                # No clock, no mis-refusal window.
-                import time as _time
-
-                deadline = _time.monotonic() + 120.0   # hard safety stop only
-                while _time.monotonic() < deadline:
-                    if path.exists():
-                        break
-                    if self.witness.exists(db_id):
-                        break
-                    try:
-                        if self.registry.find(db_id) is not None:
-                            break
-                    except Exception:
-                        break
-                    _time.sleep(0.05)
-                if path.exists():
-                    # re-run the decision on the now-present file
-                    return self.ensure_genesis(db_id, applied=applied)
+            # "bound but no log file" is ambiguous: a concurrent creator
+            # (which writes the marker before the file) or a crash residue.
+            # M5 patch 10 §3: this is decided by the CREATION LOCK, never by a
+            # clock.  ``ensure_genesis`` holds that lock for the whole
+            # decide-and-create sequence, so by the time this line runs no
+            # creator can still be mid-flight -- a missing file here means the
+            # creator died before writing anything (kernel released its lock).
+            # That is crash residue, and it is REFUSED below (fail-closed)
+            # rather than re-minted.
             if witnessed or applied > 0 or credential is not None or bound:
                 detail = (
                     "the deletion-log witness records a head for this "
@@ -599,52 +614,13 @@ class FileDeletionLog(DeletionLog):
                 finally:
                     fcntl.flock(fh, fcntl.LOCK_UN)
             return
-        # the file pre-exists: decide on CONTENT + applied under the lock.
-        # M5 patch 8 §4: a LOSER of the exclusive create arrives here while
-        # the winner may still be writing its genesis.  That is "first
-        # creation in progress", not an interrupted creation: wait for the
-        # winner to finish (its flock is held while it writes) and re-examine.
-        # Only a still-empty file AFTER the lock is acquired can be treated as
-        # the crash residue.
+        # the file pre-exists: decide on CONTENT + applied under the file lock.
+        # M5 patch 10 §3: because ``ensure_genesis`` holds the CREATION LOCK
+        # for this whole sequence, no other creator can be mid-write here --
+        # there is nothing to poll for and no clock in the decision.  If the
+        # file is empty at this point it is crash residue, judged below.
         with self._locked(path) as fh:
             size = os.fstat(fh.fileno()).st_size
-            if size == 0:
-                try:
-                    _cred_race = self.registry.find(db_id)
-                except Exception:
-                    _cred_race = None
-                if _cred_race is None:
-                    # The winner may not have written its credential yet.  A
-                    # LOSER of the exclusive create must never interpret the
-                    # temporary emptiness as crash residue (M5 patch 8 §4).
-                    # Wait under OUR file lock: the winner writes its
-                    # genesis INSIDE the same flock, so once we hold it with
-                    # a still-empty file, no live creator can be mid-write --
-                    # that is genuinely the crash residue.
-                    import time as _time
-
-                    for _ in range(500):
-                        if self.registry.find(db_id) is not None:
-                            break
-                        if os.fstat(fh.fileno()).st_size > 0:
-                            break
-                        _time.sleep(0.02)
-                    try:
-                        _cred_race = self.registry.find(db_id)
-                    except Exception:
-                        _cred_race = None
-                if _cred_race is not None:
-                    # the winner already registered: it is mid-publish.  Wait
-                    # briefly for its witness, then let the normal live-log
-                    # path judge it (never mint a second genesis).
-                    import time as _time
-
-                    for _ in range(200):        # up to ~10s
-                        if self.witness.exists(db_id) or os.fstat(
-                                fh.fileno()).st_size > 0:
-                            break
-                        _time.sleep(0.05)
-                    size = os.fstat(fh.fileno()).st_size
             if size == 0:
                 if applied > 0 or was_bound or self.witness.exists(db_id):
                     # bound + empty (or applied > 0): history was lost.  A
@@ -1275,29 +1251,78 @@ class PgDeletionLog(DeletionLog):
         self.registry = PgCreationRegistry(
             lambda: self._engine, _ensure=self._ensure_schema)
 
+    def provision_schema(self) -> None:
+        """OWNER-side provisioning: create the log, witness and creation-
+        registry tables (M5 patch 10 §4).
+
+        The runtime log role deliberately holds no DDL: it can INSERT into
+        the log and maintain the witness row, but it must never create or
+        drop tables.  The witness/registry objects are therefore created HERE,
+        once, by the owner credential -- not lazily on the runtime's first
+        write (which would require CREATE TABLE at runtime).
+        """
+        self._ensure_schema()
+        self._migrate_sync_columns()
+        self.witness._ensure()
+        self.registry._ensure()
+
     def _ensure_schema(self) -> None:
+        # M5 patch 10 §4: skip the DDL entirely when the table already exists
+        # (PostgreSQL checks CREATE privilege for CREATE TABLE IF NOT EXISTS
+        # even for an existing relation, which would force the runtime log
+        # role to hold DDL it should never have).  A genuinely absent table
+        # still fails closed with the owner's provisioning error.
+        from mirror_memory.core.witness import _create_if_absent
+
+        from sqlalchemy import inspect as _inspect
+
+        _REQUIRED = {"global_key", "origin", "origin_seq", "origin_hash"}
+        if _inspect(self._engine).has_table("mm_deletion_log"):
+            existing = {c["name"] for c in
+                        _inspect(self._engine).get_columns("mm_deletion_log")}
+            missing = _REQUIRED - existing
+            if missing:
+                # a log DB from an older schema: only the OWNER can migrate.
+                # Try it (an owner connection succeeds); a restricted runtime
+                # login gets an actionable error instead of a mid-insert
+                # "column does not exist".
+                try:
+                    self._migrate_sync_columns()
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        "the deletion-log table predates the sync columns "
+                        f"({sorted(missing)}) and this login cannot ALTER it: "
+                        "run PgDeletionLog.provision_schema() (or "
+                        "_migrate_sync_columns) with the OWNER credential.  "
+                        f"Underlying error: {exc}") from exc
+            return
+
+        _create_if_absent(
+            self._engine,
+            "mm_deletion_log",
+            "CREATE TABLE IF NOT EXISTS mm_deletion_log ("
+            " db_id CHAR(32) NOT NULL,"
+            " seq BIGINT GENERATED BY DEFAULT AS IDENTITY,"
+            " tenant_id VARCHAR(64) NOT NULL,"
+            " app_id VARCHAR(64) NOT NULL,"
+            " user_id VARCHAR(64) NOT NULL,"
+            " scope VARCHAR(16) NOT NULL,"
+            " scope_key VARCHAR(128) NOT NULL DEFAULT '',"
+            " fingerprints_json TEXT NOT NULL DEFAULT '[]',"
+            " generation INTEGER NOT NULL DEFAULT 0,"
+            " purpose VARCHAR(64) NOT NULL DEFAULT '',"
+            " prev_hash CHAR(64) NOT NULL,"
+            " hash CHAR(64) NOT NULL,"
+            " created_at TIMESTAMP NOT NULL DEFAULT now(),"
+            " global_key VARCHAR(128) NOT NULL DEFAULT '',"
+            " origin CHAR(32) NOT NULL DEFAULT '',"
+            " origin_seq BIGINT NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (db_id, seq))",
+        )
+
+    def _migrate_sync_columns(self) -> None:
+        """Owner-only: add the batch-2 sync columns to a pre-batch-2 log DB."""
         with self._engine.begin() as conn:
-            conn.execute(text(
-                "CREATE TABLE IF NOT EXISTS mm_deletion_log ("
-                " db_id CHAR(32) NOT NULL,"
-                " seq BIGINT GENERATED BY DEFAULT AS IDENTITY,"
-                " tenant_id VARCHAR(64) NOT NULL,"
-                " app_id VARCHAR(64) NOT NULL,"
-                " user_id VARCHAR(64) NOT NULL,"
-                " scope VARCHAR(16) NOT NULL,"
-                " scope_key VARCHAR(128) NOT NULL DEFAULT '',"
-                " fingerprints_json TEXT NOT NULL DEFAULT '[]',"
-                " generation INTEGER NOT NULL DEFAULT 0,"
-                " purpose VARCHAR(64) NOT NULL DEFAULT '',"
-                " prev_hash CHAR(64) NOT NULL,"
-                " hash CHAR(64) NOT NULL,"
-                " created_at TIMESTAMP NOT NULL DEFAULT now(),"
-                " global_key VARCHAR(128) NOT NULL DEFAULT '',"
-                " origin CHAR(32) NOT NULL DEFAULT '',"
-                " origin_seq BIGINT NOT NULL DEFAULT 0,"
-                " PRIMARY KEY (db_id, seq))"
-            ))
-            # a log database created before batch 2: add the sync columns
             for ddl in (
                 "ALTER TABLE mm_deletion_log ADD COLUMN IF NOT EXISTS "
                 "global_key VARCHAR(128) NOT NULL DEFAULT ''",
@@ -1454,11 +1479,21 @@ class PgDeletionLog(DeletionLog):
         return recorded_cp >= seq and current_cp == recorded_cp
 
     def prune(self, db_id: str, before_seq: int, **_kwargs) -> int:
-        """M5 patch 8 §2: the table may only be compacted when the chain and
-        the witnessed continuity hold -- pruning must never rewrite history
-        it cannot prove."""
+        """M5 patch 10 §1: unified with the file backend's gate — verify the
+        FULL chain and the witnessed continuity (including ancestry) BEFORE
+        the compaction transaction; a prune must never rewrite history it
+        cannot prove.  WitnessAhead passes through (it is the precise
+        'entries were lost' refusal); an unauthenticated witness fails
+        closed with the table untouched."""
         from mirror_memory.core.witness import WitnessAhead, WitnessError
 
+        try:
+            self.verify_chain(db_id)
+        except Exception as exc:
+            raise DeletionLogCorrupted(
+                f"cannot prune: the deletion-log chain for database "
+                f"{db_id[:8]}... does not verify ({exc}).  The log table is "
+                "left untouched (fail-closed).") from exc
         try:
             self.verify_witness(db_id, applied=0)
         except WitnessAhead:
@@ -1468,6 +1503,16 @@ class PgDeletionLog(DeletionLog):
                 f"cannot prune: the witness for {db_id[:8]}... cannot be "
                 f"authenticated ({exc}).  The log table is left untouched."
             ) from exc
+        # ancestry: the witnessed hash must still lie on the chain (or behind
+        # the compaction checkpoint the witness itself recorded)
+        state = self.witness.read(db_id)
+        if state is not None and not self._witnessed_seq_is_ancestor(
+                db_id, state.tail_seq, state.tail_hash):
+            raise DeletionLogCorrupted(
+                f"cannot prune: the deletion-log table for database "
+                f"{db_id[:8]}... does not contain the witnessed history "
+                f"(seq {state.tail_seq}, hash {state.tail_hash[:12]}...).  "
+                "The log table is left untouched (fail-closed).")
         return self._prune_impl(db_id, before_seq, **_kwargs)
 
     def verify_witness(self, db_id: str, *, applied: int = 0) -> None:
@@ -1660,11 +1705,13 @@ class PgDeletionLog(DeletionLog):
         # M5 patch 4: the same first-creation proof as the file backend --
         # a missing genesis with applied > 0 means the table's history was
         # lost (rows deleted); never mint a fresh one over it.
+        from mirror_memory.core.witness import WitnessError as _WErr
+
         witnessed = self.witness.exists(db_id)
         credential = None
         try:
             credential = self.registry.find(db_id)
-        except WitnessError as exc:
+        except _WErr as exc:
             raise DeletionLogCorrupted(
                 f"the creation credential for database {db_id[:8]}... "
                 f"cannot be trusted ({exc}).  Refusing to serve.") from exc

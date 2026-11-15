@@ -892,3 +892,412 @@ def test_p9_full_pg_dump_restore_roundtrip_with_witness_checks(
     finally:
         admin_engine.dispose()
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 10 §1: the PG prune gate is unified with the file backend —
+# full chain verification + witness continuity + ancestry BEFORE the
+# compaction transaction.
+# ---------------------------------------------------------------------------
+
+
+def test_p10_pg_prune_refuses_a_broken_chain(log_db_url, tmp_path, monkeypatch):
+    """A tampered entry hash anywhere in the table: prune refuses and the
+    table is untouched (fail-closed), even though the witness row is fine."""
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 5):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    # tamper seq 1's hash in place
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "UPDATE mm_deletion_log SET hash = repeat('e', 64) "
+                "WHERE db_id = :db AND seq = 1"), {"db": db_id})
+    finally:
+        admin.dispose()
+    # snapshot AFTER the tamper: what must be preserved is the attacker's
+    # state at refusal time (the engine must not "repair" or compact it)
+    table_before = _table_rows(log_db_url, db_id)
+
+    with pytest.raises(DeletionLogCorrupted) as excinfo:
+        log.prune(db_id, 3)
+    assert "does not verify" in str(excinfo.value).lower()
+    assert _table_rows(log_db_url, db_id) == table_before, (
+        "a refused prune must not touch the table")
+
+
+def _table_rows(log_db_url, db_id):
+    check = create_engine(log_db_url)
+    try:
+        with check.connect() as conn:
+            return conn.execute(text(
+                "SELECT seq, hash FROM mm_deletion_log WHERE db_id = :db "
+                "ORDER BY seq"), {"db": db_id}).all()
+    finally:
+        check.dispose()
+
+
+def test_p10_pg_prune_refuses_when_witnessed_hash_not_ancestor(
+        log_db_url, tmp_path, monkeypatch):
+    """The witness records seq 2/hash H; the table's seq-2 hash differs (a
+    fork planted below the witnessed point).  Even though verify_witness's
+    own seq comparison may not fire, the ancestry check must refuse the
+    prune."""
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u1", scope="session",
+        scope_key="s1", fingerprints=[], generation=1, purpose="p"))
+    assert log.witness.read(db_id).tail_seq == 1
+
+    # replace seq 1 with a DIFFERENT valid-looking entry (fork below witness)
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log WHERE db_id = :db AND seq = 1"),
+                {"db": db_id})
+    finally:
+        admin.dispose()
+    forked = DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="zz", scope="session",
+        scope_key="zz", fingerprints=[], generation=1, purpose="forged")
+    forked.seq = 1
+    forked.prev_hash = "0" * 64
+    forked.created_at = None
+    forked.hash = forked.compute_hash()
+    log._insert(create_engine(log_db_url).connect(), forked) \
+        if False else None
+    from sqlalchemy import text as _t
+
+    eng = create_engine(log_db_url)
+    try:
+        with eng.begin() as conn:
+            conn.execute(_t(
+                "INSERT INTO mm_deletion_log (db_id, seq, tenant_id, app_id, "
+                "user_id, scope, scope_key, fingerprints_json, generation, "
+                "purpose, prev_hash, hash, created_at) VALUES (:db, 1, 't', "
+                "'a', 'zz', 'session', 'zz', '[]', 1, 'forged', :prev, "
+                ":hash, NOW())"),
+                {"db": db_id, "prev": "0" * 64, "hash": forked.hash})
+    finally:
+        eng.dispose()
+
+    with pytest.raises(DeletionLogCorrupted):
+        log.prune(db_id, 1)
+
+
+@_pg_needs
+def test_p10_pg_predeletion_backup_restore_replays_the_deletion(
+        log_db_url, tmp_path, monkeypatch):
+    """§5: a REAL pre-deletion backup of the main DB, a real deletion recorded
+    in the independent log + witness, then a REAL pg_dump/pg_restore of that
+    backup.  Startup must REPLAY the deletion onto the restored rows (the
+    memory must not come back) and land the watermark at the log tail."""
+    import subprocess
+
+    from mirror_memory.api import MemoryEngine
+    from mirror_memory.config.loader import load_config
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.deletion import PgDeletionLog
+    from mirror_memory.core.models import Belief
+    from mirror_memory.core.repository import set_memory_enabled
+    from mirror_memory.core.sql_audit import no_audit_scope
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+    from sqlalchemy.orm import sessionmaker
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    main_db = "mm_test_p10_replay"
+    runtime_url, admin_url = _pg_repro_database(main_db)
+
+    class _L:
+        def generate(self, **_kw):
+            return '{"patterns": []}'
+
+    cfg = load_config("config/")
+    cfg.llm_client = _L()
+    log = PgDeletionLog(log_db_url)
+    eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                       llm_client=_L(), deletion_log=log,
+                       tenant_id="default", app_id="default")
+    eng._ensure_db()
+    db_id = eng._db_id
+
+    # ---- seed one real belief (ORM, under the proper scopes) -------------
+    with tenant_scope(*eng._tenant), fixture_write_scope("p10 seed"):
+        s = sessionmaker(bind=eng._engine)()
+        set_memory_enabled(s, "u1", True)
+        s.add(Belief(user_id="u1", dimension="topic", key="tea",
+                     claim_text="I love jasmine tea", confidence=0.9))
+        s.commit()
+        s.close()
+    eng._engine.dispose()
+
+    # ---- the PRE-deletion backup (real pg_dump of the main DB) ----------
+    env = dict(os.environ, PGPASSWORD="mm")
+    dump = subprocess.run(
+        ["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg", "pg_dump", "-U",
+         "postgres", "--format=custom", main_db],
+        env=env, capture_output=True, check=True)
+    assert len(dump.stdout) > 5000, "the pre-deletion dump is suspiciously empty"
+    assert b"mm_deletion_watermark" in dump.stdout, (
+        "the pre-deletion dump must carry the watermark table")
+    assert b"mm_beliefs" in dump.stdout, "the dump must carry the belief table"
+    pre_dump = tmp_path / "pre_deletion.dump"
+    pre_dump.write_bytes(dump.stdout)
+
+    # ---- the deletion happens AFTER that backup --------------------------
+    eng2 = MemoryEngine(config=cfg, database_url=runtime_url,
+                        llm_client=_L(), deletion_log=log,
+                        tenant_id="default", app_id="default")
+    eng2._ensure_db()
+    result = eng2.delete_memories(user_id="u1", purpose="chat")
+    assert result.beliefs >= 1, result
+    tail, tail_hash = log.head(db_id)
+    assert tail >= 1, "the deletion must be recorded in the independent log"
+    witness_after = log.witness.read(db_id)
+    assert witness_after.tail_seq == tail and witness_after.tail_hash == tail_hash
+    eng2._engine.dispose()
+
+    # ---- restore the PRE-deletion backup (real pg_restore) ---------------
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin_engine.connect() as conn:
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+            conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+    finally:
+        admin_engine.dispose()
+    # m5 patch 10: a GRANT applies to ONE database, so it must be issued
+    # against the freshly created database (issuing it on the admin
+    # connection targets `postgres`, leaving pg_restore unable to create
+    # tables -- the bug this note exists to prevent).
+    grant_engine = create_engine(
+        admin_url.rsplit("/", 1)[0] + "/" + main_db,
+        isolation_level="AUTOCOMMIT")
+    try:
+        with grant_engine.connect() as gconn:
+            gconn.exec_driver_sql('GRANT ALL ON SCHEMA public TO mm_owner')
+    finally:
+        grant_engine.dispose()
+    with open(pre_dump, "rb") as dump_file:
+        restore = subprocess.run(
+            ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+             "pg_restore", "-U", "postgres", "--role=mm_owner",
+             "--dbname=" + main_db],
+            stdin=dump_file, capture_output=True)
+    # verification reads use the OWNER login inside no_audit_scope (the
+    # tenant-predicate audit rule is for runtime paths, not test checks)
+    owner = create_engine(
+        admin_url.rsplit("/", 1)[0] + "/" + main_db)
+    try:
+        with no_audit_scope(), owner.connect() as conn:
+            n_tables = conn.execute(text(
+                "SELECT count(*) FROM pg_tables WHERE schemaname='public' "
+                "AND tablename LIKE 'mm_%'")).scalar()
+            applied = conn.execute(text(
+                "SELECT applied_seq FROM mm_deletion_watermark WHERE id = 1"
+            )).scalar()
+            beliefs_restored = conn.execute(text(
+                "SELECT count(*) FROM mm_beliefs WHERE user_id='u1'")).scalar()
+    finally:
+        owner.dispose()
+    assert n_tables >= 20, (
+        f"pg_restore produced only {n_tables} mm_* tables; "
+        f"stderr={restore.stderr.decode()[:600]}")
+
+    # the restored backup really is BEHIND the log (that is what replay is for)
+    assert applied < tail, (applied, tail)
+    assert beliefs_restored >= 1, "the restored backup still holds the memory"
+
+    # ---- startup on the restored DB: replay must re-apply the deletion ----
+    eng3 = MemoryEngine(config=cfg, database_url=runtime_url,
+                        llm_client=_L(), deletion_log=log,
+                        tenant_id="default", app_id="default")
+    eng3._ensure_db()          # witness/credential/chain gates + replay
+    check = create_engine(admin_url.rsplit("/", 1)[0] + "/" + main_db)
+    try:
+        with no_audit_scope(), check.connect() as conn:
+            left = conn.execute(text(
+                "SELECT count(*) FROM mm_beliefs WHERE user_id='u1'")).scalar()
+            landed = conn.execute(text(
+                "SELECT applied_seq FROM mm_deletion_watermark WHERE id = 1"
+            )).scalar()
+    finally:
+        check.dispose()
+    eng3._engine.dispose()
+    assert left == 0, "the restored memory must be deleted by the replay"
+    assert landed == tail, (landed, tail)
+
+    # cleanup
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin_engine.connect() as conn:
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+    finally:
+        admin_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 10 §4: the ACTUAL log/witness chain runs on REAL RESTRICTED
+# credentials -- not separate GRANT probes.  Owner provisions; the runtime
+# log role (no DDL, no DELETE) performs genesis/append/verify; the
+# maintenance role performs the compaction.
+# ---------------------------------------------------------------------------
+
+BASE_PG = "postgresql://postgres:mm@127.0.0.1:5437"
+P10_LOGDB = "mm_test_p10_roles"
+P10_APP = ("mm_p10_logapp", "pw_mm_p10_logapp")
+P10_MAINT = ("mm_p10_logmaint", "pw_mm_p10_logmaint")
+
+
+def _p10_build_restricted_log_db():
+    """Owner provisions a log DB + the two restricted roles; returns the
+    (app_url, maint_url) the running code must use."""
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    admin = create_engine(BASE_PG + "/postgres", isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin.connect() as conn:
+            for role, pw in (P10_APP, P10_MAINT):
+                if not conn.execute(text(
+                        "SELECT 1 FROM pg_roles WHERE rolname = :r"),
+                        {"r": role}).first():
+                    conn.exec_driver_sql(
+                        f"CREATE ROLE {role} LOGIN PASSWORD '{pw}'")
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{P10_LOGDB}" WITH (FORCE)')
+            conn.exec_driver_sql(f'CREATE DATABASE "{P10_LOGDB}"')
+    finally:
+        admin.dispose()
+
+    owner = create_engine(BASE_PG + "/" + P10_LOGDB)
+    try:
+        PgDeletionLog(owner).provision_schema()   # owner-only DDL
+        with owner.begin() as conn:
+            conn.exec_driver_sql(
+                f"GRANT USAGE ON SCHEMA public TO {P10_APP[0]}, {P10_MAINT[0]}")
+            # runtime log role: append-only on the log, witness maintenance,
+            # registry append.  NO DDL, NO DELETE.
+            conn.exec_driver_sql(
+                f"GRANT SELECT, INSERT ON mm_deletion_log TO {P10_APP[0]}")
+            conn.exec_driver_sql(
+                "GRANT SELECT, INSERT, UPDATE ON mm_deletion_log_witness "
+                f"TO {P10_APP[0]}")
+            conn.exec_driver_sql(
+                "GRANT SELECT, INSERT ON mm_creation_registry "
+                f"TO {P10_APP[0]}")
+            # maintenance: compaction only
+            conn.exec_driver_sql(
+                "GRANT SELECT, INSERT, DELETE ON mm_deletion_log "
+                f"TO {P10_MAINT[0]}")
+            conn.exec_driver_sql(
+                "GRANT SELECT ON mm_deletion_log_witness "
+                f"TO {P10_MAINT[0]}")
+    finally:
+        owner.dispose()
+
+    def _url(role, pw):
+        return (BASE_PG.replace("postgres:mm", f"{role}:{pw}")
+                + "/" + P10_LOGDB)
+
+    return _url(*P10_APP), _url(*P10_MAINT)
+
+
+def _p10_drop_restricted_log_db():
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    admin = create_engine(BASE_PG + "/postgres", isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin.connect() as conn:
+            conn.exec_driver_sql(
+                f'DROP DATABASE IF EXISTS "{P10_LOGDB}" WITH (FORCE)')
+    finally:
+        admin.dispose()
+
+
+def test_p10_pg_chain_runs_on_restricted_roles(tmp_path, monkeypatch):
+    """The REAL running code on REAL restricted logins: genesis, append,
+    verify and prune all succeed, and the runtime role is proven unable to
+    DROP the table or DELETE log rows."""
+    _pg_witness_env(tmp_path, monkeypatch)
+    app_url, maint_url = _p10_build_restricted_log_db()
+    try:
+        log = PgDeletionLog(app_url, maintenance_url=maint_url)
+        db_id = "b1" * 16
+        log.ensure_genesis(db_id, applied=0)
+        for i in range(1, 4):
+            log.append(DeletionEntry(
+                db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+                scope="session", scope_key=f"s{i}", fingerprints=[],
+                generation=i, purpose="p"))
+        assert log.head(db_id)[0] == 3
+        log.verify_witness(db_id, applied=3)
+
+        # compaction on the MAINTENANCE credential
+        assert log.prune(db_id, 2) == 2
+        assert log.checkpoint_seq(db_id) == 2
+        log.verify_witness(db_id, applied=3)
+        assert log.witness.read(db_id).tail_seq == 3
+
+        # the runtime role must NOT be able to delete rows or drop tables
+        app_engine = create_engine(app_url, isolation_level="AUTOCOMMIT")
+        try:
+            for statement in (
+                "DELETE FROM mm_deletion_log WHERE db_id = :db",
+                "DROP TABLE mm_deletion_log",
+            ):
+                with pytest.raises(Exception) as excinfo:
+                    with app_engine.begin() as conn:
+                        conn.execute(text(statement), {"db": db_id})
+                # PostgreSQL refuses these two ways depending on the object:
+                # missing table privilege -> "permission denied", non-owner
+                # DROP -> "must be owner".  Both are the intended refusal.
+                msg = str(excinfo.value).lower()
+                assert ("permission denied" in msg or "must be owner" in msg), (
+                    statement, msg[:120])
+        finally:
+            app_engine.dispose()
+
+        # evidence still intact after the refused destructive attempts
+        assert log.head(db_id)[0] == 3
+    finally:
+        _p10_drop_restricted_log_db()
+
+
+def test_p10_pg_issue_genesis_on_restricted_role_without_owner(
+        tmp_path, monkeypatch):
+    """The runtime role cannot provision: a MISSING table fails closed with
+    the owner-provisioning error instead of silently creating it."""
+    _pg_witness_env(tmp_path, monkeypatch)
+    app_url, maint_url = _p10_build_restricted_log_db()
+    from mirror_memory.core.sql_audit import no_audit_scope
+
+    admin = create_engine(BASE_PG + "/" + P10_LOGDB, isolation_level="AUTOCOMMIT")
+    try:
+        with no_audit_scope(), admin.connect() as conn:
+            conn.exec_driver_sql("DROP TABLE IF EXISTS mm_creation_registry")
+    finally:
+        admin.dispose()
+    try:
+        log = PgDeletionLog(app_url, maintenance_url=maint_url)
+        with pytest.raises(Exception) as excinfo:
+            log.ensure_genesis("b2" * 16, applied=0)
+        msg = str(excinfo.value).lower()
+        assert "permission denied" in msg or "does not exist" in msg, msg[:160]
+    finally:
+        _p10_drop_restricted_log_db()

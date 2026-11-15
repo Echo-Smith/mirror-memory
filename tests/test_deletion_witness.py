@@ -1476,3 +1476,106 @@ def test_p8_cli_refuses_when_chain_is_broken(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "REFUSING" in out
     assert _cli_state(log_dir, db_id) == before
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 10 §3: the FIRST-CREATION lock, proven deterministically.
+# No repeat-the-test-hoping: each case pins the schedule with a Barrier or a
+# real SIGKILL, and asserts the exact outcome.
+# ---------------------------------------------------------------------------
+
+
+def test_p10_creation_lock_blocks_a_second_creator_until_release(tmp_path):
+    """Deterministic: while a creator holds the creation lock, a second
+    creator must BLOCK (not refuse, not mint) and then observe the finished
+    state once the lock is released."""
+    import threading
+
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "c1" * 16
+
+    holder_has_lock = threading.Event()
+    release = threading.Event()
+    second_done = threading.Event()
+    outcomes: list[str] = []
+
+    def holder():
+        with log._creation_lock(db_id):
+            holder_has_lock.set()
+            # emulate a slow creation: hold the lock, write nothing yet
+            release.wait(timeout=30)
+
+    def second():
+        holder_has_lock.wait(timeout=30)
+        try:
+            # this must BLOCK on the creation lock until holder releases
+            log.ensure_genesis(db_id, applied=0)
+            outcomes.append("created")
+        except BaseException as exc:  # noqa: BLE001
+            outcomes.append(f"{type(exc).__name__}")
+        finally:
+            second_done.set()
+
+    t1 = threading.Thread(target=holder)
+    t2 = threading.Thread(target=second)
+    t1.start(); t2.start()
+    assert holder_has_lock.wait(timeout=10)
+    # the second creator must NOT have finished while the lock is held
+    assert not second_done.wait(timeout=0.5), (
+        "the second creator must block on the creation lock, not proceed")
+    release.set()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert outcomes == ["created"], outcomes
+    # exactly one genesis, one credential, one witness
+    assert _line_count(log_dir / f"{db_id}.deletions.jsonl") == 1
+    assert log.registry.find(db_id) is not None
+    assert log.witness.read(db_id).tail_seq == 0
+    log.verify_chain(db_id)
+
+
+def _mp_hold_creation_lock(log_dir_s, db_id_s, ready_ev, hold_ev):
+    """Module-level so spawn can pickle it: take the creation lock, publish
+    the binding marker, then wait to be killed."""
+    from mirror_memory.core.deletion import FileDeletionLog as FDL
+
+    log = FDL(log_dir_s)
+    with log._creation_lock(db_id_s):
+        log._mark_bound(db_id_s)
+        ready_ev.set()
+        hold_ev.wait(timeout=60)
+
+
+def test_p10_creator_killed_while_holding_the_lock_leaves_safe_state(tmp_path):
+    """A creator that holds the creation lock and dies (SIGKILL, no cleanup)
+    must leave a state the NEXT creator judges safely -- no hang, no second
+    genesis."""
+    import multiprocessing as mp
+    import os as _os
+
+    log_dir = tmp_path / "log"
+    db_id = "c2" * 16
+
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    hold = ctx.Event()
+
+    proc = ctx.Process(
+        target=_mp_hold_creation_lock,
+        args=(str(log_dir), db_id, ready, hold))
+    proc.start()
+    assert ready.wait(timeout=60), "the child never reached the locked state"
+    proc.kill()                              # SIGKILL: no finally, no unlock
+    proc.join(timeout=30)
+    assert proc.exitcode != 0
+
+    # the kernel released the flock, so the parent can now take it promptly
+    log = FileDeletionLog(log_dir)
+    with log._creation_lock(db_id):
+        pass                                  # proves the lock is NOT stuck
+    # the leftover state is "bound, no file": refused, never minted
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        log.ensure_genesis(db_id, applied=0)
+    assert not (log_dir / f"{db_id}.deletions.jsonl").exists(), (
+        "crash residue must not be re-minted into a fresh history")

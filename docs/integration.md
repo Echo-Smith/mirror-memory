@@ -329,26 +329,37 @@ postgres: table `mm_creation_registry` in the log database).  It is what
 makes "no witness" decidable: a credential names the genesis a life was born
 with, so a forged replacement log cannot pass as new.  Same MAC key.
 
-**PG roles and grants** (what the running code actually needs -- verified by
-`tests/test_pg_deletion_log.py` on real logins):
+**PG roles and grants** — verified by running the REAL chain on REAL
+restricted logins (`tests/test_pg_deletion_log.py::test_p10_pg_chain_runs_on_restricted_roles`),
+not by issuing GRANT statements and assuming they suffice:
 
-| role | on `mm_deletion_log` | on `mm_deletion_log_witness` | on `mm_creation_registry` | note |
+| role | `mm_deletion_log` | `mm_deletion_log_witness` | `mm_creation_registry` | never |
 |---|---|---|---|---|
-| log app role (runtime) | INSERT, SELECT | **none** | INSERT (append-only rows) | it also owns the log writes; the witness/registry MAC makes rows it writes verifiable |
-| witness/maintenance role | DELETE, UPDATE (compaction) | SELECT, UPDATE, INSERT | none | compaction only |
-| owner / migration | DDL, all | DDL, all | DDL, all | schema lifecycle only |
+| **runtime log role** | SELECT, INSERT | SELECT, INSERT, UPDATE | SELECT, INSERT | no DDL, no DELETE |
+| **maintenance role** | SELECT, INSERT, DELETE | SELECT | — | no DDL |
+| **owner / migration** | DDL + all | DDL + all | DDL + all | — |
 
-The runtime role deliberately has **no** UPDATE/DELETE anywhere: the log is
-append-only for it and the witness/registry rows it can append are only
-trusted after MAC verification, so a compromised runtime cannot rewrite
-history -- it can at most stop writing.  Operations that must erase or
-compact use the separate maintenance credential, and evidence-destroying
-moves (retire/reconcile/`--new-lineage`) additionally require the operator
-key file plus an explicit `--yes` (see the operator section below).
-**Known gap (honest)**: today the runtime and the witness writer share ONE
-process identity; splitting them into separate OS-level credentials with
-different key files is NOT implemented -- recorded as unimplemented rather
-than implied by this table.
+The runtime role needs UPDATE on the witness because advancing the head is an
+UPDATE of the single row (INSERT only on the first publish).  It needs no
+CREATE: `CREATE TABLE IF NOT EXISTS` still requires schema CREATE privilege in
+PostgreSQL even for an existing table, so the engine now SKIPS the DDL when
+the relation exists (`_create_if_absent`) and the owner provisions once:
+
+```python
+from mirror_memory.core.deletion import PgDeletionLog
+PgDeletionLog(owner_url).provision_schema()   # owner credential, once
+```
+
+A runtime login on an UNPROVISIONED log database fails closed with an
+actionable error (it can never create the tables itself).  A legacy log table
+missing the sync columns (`global_key`/`origin`/`origin_seq`/`origin_hash`)
+is migrated by the owner; a runtime login on such a table gets an explicit
+"run provision_schema with the owner credential" error rather than a mid-
+insert "column does not exist".
+
+**Known gap (honest)**: the runtime engine and the witness writer still share
+ONE login.  The table above is the verified MINIMUM for that single login;
+splitting the two into distinct credentials is NOT implemented.
 
 **Backup / key failure domains.**  The main database, the log database (PG)
 or log directory (file), the witness store, the creation registry and the
