@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+from datetime import datetime
 import hmac
 import json
 import logging
@@ -483,3 +484,91 @@ class PgDeletionLogWitness:
         with engine.begin() as conn:
             conn.execute(text(f"DELETE FROM {self.TABLE} WHERE db_id = :db"),
                          {"db": db_id})
+
+
+class PgCreationRegistry:
+    """The PostgreSQL creation credential: one row per life this log store
+    created, in the LOG database (``mm_creation_registry``), MAC'd with the
+    same key file as the witness.
+
+    Appended once at first creation; never rewritten or deleted by the
+    engine.  It is what makes 'no witness' decidable on the postgres
+    backend -- a forged replacement log has a DIFFERENT genesis hash than
+    the credential records."""
+
+    TABLE = "mm_creation_registry"
+
+    def __init__(self, engine_getter, *, _ensure=None):
+        self._engine_getter = engine_getter
+        self._ensure_schema = _ensure
+        self._witness = PgDeletionLogWitness(engine_getter, _ensure=_ensure)
+
+    @property
+    def key_path(self):
+        return self._witness.key_path
+
+    def _key(self, *, create: bool):
+        return self._witness._key(create=create)
+
+    @staticmethod
+    def _mac(key, payload):
+        return PgDeletionLogWitness._mac(key, payload)
+
+    def _ensure(self):
+        if self._ensure_schema is not None:
+            self._ensure_schema()
+        from sqlalchemy import text
+
+        engine = self._engine_getter()
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+                " db_id CHAR(32) PRIMARY KEY,"
+                " genesis_hash CHAR(64) NOT NULL,"
+                " created_at VARCHAR(64) NOT NULL,"
+                " mac CHAR(64) NOT NULL)"))
+
+    def record(self, db_id: str, genesis_hash: str) -> None:
+        from sqlalchemy import text
+
+        key = self._key(create=True)
+        self._ensure()
+        payload = {"db_id": db_id, "genesis_hash": genesis_hash,
+                   "created_at": datetime.utcnow().isoformat()}
+        mac = self._mac(key, payload)
+        engine = self._engine_getter()
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"INSERT INTO {self.TABLE} (db_id, genesis_hash, created_at, "
+                f"mac) VALUES (:db, :g, :ua, :mac) "
+                f"ON CONFLICT (db_id) DO NOTHING"),
+                {"db": db_id, "g": genesis_hash,
+                 "ua": payload["created_at"], "mac": mac})
+
+    def find(self, db_id: str):
+        from sqlalchemy import text
+
+        self._ensure()
+        engine = self._engine_getter()
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                f"SELECT genesis_hash, created_at, mac FROM {self.TABLE} "
+                f"WHERE db_id = :db"), {"db": db_id}).first()
+        if row is None:
+            return None
+        payload = {"db_id": db_id, "genesis_hash": row[0],
+                   "created_at": str(row[1])}
+        key = self._key(create=False)
+        if key is None:
+            raise WitnessError(
+                f"a creation credential exists for {db_id[:8]}... but the "
+                f"witness key file {self.key_path} is missing: it cannot be "
+                "authenticated")
+        if not hmac.compare_digest(self._mac(key, payload), row[2]):
+            raise WitnessError(
+                f"creation credential for {db_id[:8]}... failed its MAC "
+                "check: modified outside this engine")
+        from mirror_memory.core.creation_registry import CreationRecord
+
+        return CreationRecord(
+            db_id=db_id, genesis_hash=row[0], created_at=str(row[1]))

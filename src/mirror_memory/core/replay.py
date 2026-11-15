@@ -326,6 +326,13 @@ def _reconcile_scoped(session_factory, log: DeletionLog) -> str:
                 "the database with the matching db_id."
             )
         log.verify_chain(db_id)
+        # M5 patch 7 §2: the integrity check on the REAL startup path, for
+        # both backends -- after the chain verification above, compare the
+        # log's head against the last durably witnessed state.  Missing
+        # witness over a credentialed life, tail truncation, equal-height
+        # divergence: all refuse here, before any replay may run.
+        if hasattr(log, "verify_witness"):
+            log.verify_witness(db_id, applied=applied)
         tail_seq, _tail_hash = log.head(db_id)
         # M4 batch 2 task 4: a restored backup whose watermark lies below
         # the compaction checkpoint is OLDER than the log's retention --

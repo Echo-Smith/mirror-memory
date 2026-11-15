@@ -332,38 +332,34 @@ def test_torn_line_is_corruption_and_evidence_kept(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_credentialed_log_without_witness(
+def test_credentialed_log_without_witness_always_refused(
         tmp_path):
-    """M5 patch 6 §1: a log with a creation credential but no witness.
-
-    Two shapes, decided by PROOF:
-
-    * log == exactly the registered genesis, applied == 0 -> the provable
-      interrupted-publication window of the FIRST CREATION: finishing the
-      witness publication is safe (nothing else ever landed);
-    * the log holds MORE than the genesis (or applied > 0) -> a lost or
-      rolled-back witness store; whether entries were lost cannot be
-      proven -> refuse, the operator reconciles explicitly."""
+    """M5 patch 7 §1: a log with a creation credential but no witness is
+    refused in EVERY shape.  Patch 6 exempted the "log == exactly the
+    registered genesis, applied == 0" case as a provable first-creation
+    interruption -- but that shape is indistinguishable from "deletions
+    happened, then the witness was erased and the log truncated to the
+    genesis" (brief repro 1).  Fail closed in both; the operator reconciles."""
     log_dir = tmp_path / "log"
     log = FileDeletionLog(log_dir)
     db_id = "a1" * 16
     log.ensure_genesis(db_id, applied=0)
     log.witness.retire(db_id)
 
-    # shape 1: provable interruption -> the witness is re-published
-    log.verify_witness(db_id, applied=0)
-    assert log.witness.read(db_id) is not None
-    assert log.witness.read(db_id).tail_seq == 0
+    # shape 1: log holds only the genesis -> STILL refused (indistinguishable)
+    with pytest.raises(DeletionLogCorrupted) as excinfo:
+        log.verify_witness(db_id, applied=0)
+    assert "indistinguishable" in str(excinfo.value).lower()
+    assert log.witness.read(db_id) is None, "no witness may be forged"
 
-    # shape 2: the same erasure AFTER an append -> refuse
+    # shape 2: log holds an append -> refused identically
     log.append(DeletionEntry(
         db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
         scope_key="", fingerprints=[], generation=1, purpose="p"))
     log.witness.retire(db_id)
-    with pytest.raises(DeletionLogCorrupted) as excinfo:
+    with pytest.raises(DeletionLogCorrupted):
         log.verify_witness(db_id, applied=0)
-    assert "witness" in str(excinfo.value).lower()
-    assert log.witness.read(db_id) is None, "no witness may be forged"
+    assert log.witness.read(db_id) is None
 
 
 def test_legacy_log_without_witness_or_credential_at_zero_adopts(tmp_path):
@@ -1033,3 +1029,266 @@ def test_adopt_witness_retire_removes_only_the_witness(
     # log and registry untouched
     assert path.read_bytes() == log_bytes
     assert (log_dir / ".creation-registry.jsonl").read_bytes() == registry_bytes
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 7 §5: the two log-level reproductions required by the brief.
+# Both must be REFUSED and both must leave the witness untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_brief_repro_1_credential_kept_witness_removed_log_truncated(
+        tmp_path):
+    """Brief repro ①: keep the binding AND the creation credential, remove
+    the witness after a real deletion, and truncate the log to the original
+    genesis.  applied == 0 (a restored old backup).  The credential makes the
+    interrupted-first-creation shape LOOK plausible -- it must still be
+    refused, and the witness must not be re-minted."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "p1" * 16
+    log.ensure_genesis(db_id, applied=0)     # binding + credential + witness
+    credential = log.registry.find(db_id)
+    assert credential is not None
+    original_genesis = credential.genesis_hash
+
+    # a real deletion happened
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    assert log.witness.read(db_id).tail_seq == 1
+
+    # the attack: erase the witness, truncate the log to the original genesis
+    log.witness.retire(db_id)
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    path.write_bytes(lines[0] + b"\n")       # only the genesis survives
+    log._index_invalidate(db_id)
+
+    # every route must refuse
+    with pytest.raises(DeletionLogCorrupted):
+        log.verify_witness(db_id, applied=0)
+    with pytest.raises(DeletionLogCorrupted):
+        log.ensure_genesis(db_id, applied=0)
+
+    # the witness stays GONE: no silent re-mint over the truncated history
+    assert log.witness.read(db_id) is None
+    # and the truncated evidence is untouched
+    assert _line_count(path) == 1
+    # the credential still names the ORIGINAL genesis
+    assert log.registry.find(db_id).genesis_hash == original_genesis
+
+
+def test_brief_repro_2_divergent_longer_chain_at_witness_point(tmp_path):
+    """Brief repro ②: keep the OLD witness and the original genesis, but
+    replace the log beyond the witness point with a LONGER, internally valid
+    forked chain, then append.  The witness records seq N with hash H; the
+    forged chain also reaches seq >= N but via different hashes.  Must be
+    refused (equal-height different-hash or ancestry failure) with the
+    witness unchanged."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "p2" * 16
+    log.ensure_genesis(db_id, applied=0)
+    for i in range(1, 4):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{i}",
+            scope="session", scope_key=f"s{i}", fingerprints=[],
+            generation=i, purpose="p"))
+    witness = log.witness.read(db_id)
+    assert witness.tail_seq == 3
+    original_tail_hash = witness.tail_hash
+    genesis_line = [ln for ln in path_lines(log_dir, db_id)
+                    if json.loads(ln).get("scope") == "genesis"][0]
+
+    # forge: keep genesis, then build a DIFFERENT 5-entry chain from it
+    forged_entries = []
+    prev = json.loads(genesis_line)["hash"]
+    for i in range(1, 6):
+        entry = DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"f{i}",
+            scope="session", scope_key=f"z{i}", fingerprints=[],
+            generation=50 + i, purpose="forged")
+        entry.seq = i
+        entry.prev_hash = prev
+        entry.created_at = None
+        entry.hash = entry.compute_hash()
+        forged_entries.append(entry)
+        prev = entry.hash
+    path = _log_file(log_dir, db_id)
+    path.write_bytes(genesis_line.encode() + b"\n" + b"".join(
+        (json.dumps(log._line(e), sort_keys=True) + "\n").encode()
+        for e in forged_entries))
+    log._index_invalidate(db_id)
+    assert log.head(db_id)[0] == 5           # the fork is LONGER than seq 3
+
+    # append on top of the forged chain must be refused
+    with pytest.raises((WitnessAhead, DeletionLogCorrupted)):
+        log.append(DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id="x", scope="user",
+            scope_key="", fingerprints=[], generation=99, purpose="x"))
+
+    # verify must refuse (equal-ish height, different hashes => diverged)
+    with pytest.raises((WitnessAhead, DeletionLogCorrupted)):
+        log.verify_witness(db_id, applied=3)
+
+    # the witness is untouched: still the ORIGINAL seq-3 tail
+    after = log.witness.read(db_id)
+    assert after.tail_seq == 3
+    assert after.tail_hash == original_tail_hash
+
+
+def path_lines(log_dir: Path, db_id: str) -> list[str]:
+    path = log_dir / f"{db_id}.deletions.jsonl"
+    return [ln for ln in path.read_bytes().decode().split("\n") if ln]
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 7 §4: the CLI must refuse every forged shape and leave the log,
+# the witness AND the registry byte-identical on failure.
+# ---------------------------------------------------------------------------
+
+
+def _cli_state(log_dir: Path, db_id: str) -> dict:
+    log = FileDeletionLog(log_dir)
+    return {
+        "log": (log_dir / f"{db_id}.deletions.jsonl").read_bytes()
+        if (log_dir / f"{db_id}.deletions.jsonl").exists() else None,
+        "registry": (log_dir / ".creation-registry.jsonl").read_bytes()
+        if (log_dir / ".creation-registry.jsonl").exists() else None,
+        "witness": (lambda s: (
+            (log.witness.directory / f"{db_id}.witness.json").read_bytes()
+            if (log.witness.directory / f"{db_id}.witness.json").exists()
+            else None))(log),
+    }
+
+
+def test_cli_reconcile_refuses_a_diverged_fork_unchanged(
+        tmp_path, monkeypatch, capsys):
+    """A forked chain with the same height but different hashes: reconcile
+    must refuse and every artifact stays byte-identical."""
+    log_dir = tmp_path / "log"
+    log = FileDeletionLog(log_dir)
+    db_id = "q1" * 16
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    witness_before = log.witness.read(db_id)
+
+    # forge: same height (seq 1), different content
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    entry = DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="zz", scope="user",
+        scope_key="", fingerprints=[], generation=77, purpose="forged")
+    entry.seq = 1
+    entry.prev_hash = json.loads(lines[0])["hash"]
+    entry.created_at = None
+    entry.hash = entry.compute_hash()
+    path.write_bytes(lines[0] + b"\n" +
+                     (json.dumps(log._line(entry), sort_keys=True) + "\n").encode())
+    log._index_invalidate(db_id)
+    before = _cli_state(log_dir, db_id)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _patch_adopt_log(monkeypatch, log)
+        _run_adopt(
+            ["--database-url", f"sqlite:///{tmp_path/'main.db'}",
+             "--db-id", db_id, "--config-dir", "config/",
+             "--reconcile-witness", "--yes"], monkeypatch, capsys)
+    assert excinfo.value.code == 1
+    after = _cli_state(log_dir, db_id)
+    assert after == before, "a refused CLI run must change NOTHING"
+
+    # the witness still holds the ORIGINAL tail hash
+    assert log.witness.read(db_id).tail_hash == witness_before.tail_hash
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 7 §5: brief repro ① AND ② through the REAL ENGINE startup path
+# (not a direct verify_witness call), with backup/restore.
+# ---------------------------------------------------------------------------
+
+
+def _prepared_engine(tmp_path: Path, deletions: int = 2):
+    log_dir = tmp_path / "log"
+    db = tmp_path / "main.db"
+    eng = _engine(tmp_path, log_dir, db)
+    _enable(eng)
+    _observe(eng)
+    backup = tmp_path / "before.db"
+    _backup(db, backup)
+    for i in range(deletions):
+        _observe(eng, session=f"d{i}")
+        eng.delete_memories(user_id="u1", purpose="chat")
+    eng._engine.dispose()
+    return log_dir, db, backup
+
+
+def test_brief_repro_1_through_real_engine_startup(tmp_path):
+    """Repro ① end to end: real engine creates the history, the attacker
+    truncates the log to genesis + erases the witness, the old main DB is
+    restored (applied == 0), and a REAL MemoryEngine must refuse startup."""
+    log_dir, db, backup = _prepared_engine(tmp_path)
+    log = FileDeletionLog(log_dir)
+    db_id = log.created_lives()[0] if hasattr(log, "created_lives") else None
+    # find the single life
+    lives = log.registry.created_lives()
+    assert len(lives) == 1
+    db_id = lives[0]
+
+    log.witness.retire(db_id)
+    path = _log_file(log_dir, db_id)
+    lines = [ln for ln in path.read_bytes().split(b"\n") if ln]
+    path.write_bytes(lines[0] + b"\n")          # truncate to genesis
+    log._index_invalidate(db_id)
+    _restore(backup, db)
+
+    eng = _engine(tmp_path, log_dir, db)
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        eng._ensure_db()
+    assert log.witness.read(db_id) is None, "witness must stay gone"
+    assert _line_count(path) == 1, "truncated evidence must be preserved"
+
+
+def test_brief_repro_2_through_real_engine_append(tmp_path):
+    """Repro ② end to end: real history, the witness kept, the log replaced
+    by a longer forked chain; a REAL engine must refuse startup, and an
+    already-running engine must refuse observe."""
+    log_dir, db, _backup_used = _prepared_engine(tmp_path)
+    log = FileDeletionLog(log_dir)
+    db_id = log.registry.created_lives()[0]
+    witness_before = log.witness.read(db_id)
+    genesis_line = [ln for ln in path_lines(log_dir, db_id)
+                    if json.loads(ln).get("scope") == "genesis"][0]
+
+    prev = json.loads(genesis_line)["hash"]
+    forged = []
+    for i in range(1, 6):
+        entry = DeletionEntry(
+            db_id=db_id, tenant_id="t", app_id="a", user_id=f"f{i}",
+            scope="session", scope_key=f"z{i}", fingerprints=[],
+            generation=50 + i, purpose="forged")
+        entry.seq = i
+        entry.prev_hash = prev
+        entry.created_at = None
+        entry.hash = entry.compute_hash()
+        forged.append(entry)
+        prev = entry.hash
+    path = _log_file(log_dir, db_id)
+    path.write_bytes(genesis_line.encode() + b"\n" + b"".join(
+        (json.dumps(log._line(e), sort_keys=True) + "\n").encode()
+        for e in forged))
+    log._index_invalidate(db_id)
+
+    eng = _engine(tmp_path, log_dir, db)
+    with pytest.raises((WitnessAhead, DeletionLogCorrupted)):
+        eng._ensure_db()
+    with pytest.raises((WitnessAhead, DeletionLogCorrupted,
+                        DeletionLogUnavailable)):
+        eng.observe(user_id="u1", session_id="sx", text="x", purpose="chat")
+    # witness unchanged
+    after = log.witness.read(db_id)
+    assert after.tail_seq == witness_before.tail_seq
+    assert after.tail_hash == witness_before.tail_hash

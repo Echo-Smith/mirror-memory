@@ -115,6 +115,15 @@ def main() -> int:
                       f"{head_seq}) -- reconciling would bless a shorter "
                       "history.  Restore the log first.")
                 raise SystemExit(1)
+            if (existing is not None and existing.tail_seq == head_seq
+                    and existing.tail_hash != head_hash):
+                print("  REFUSING: the existing witness (seq "
+                      f"{existing.tail_seq}, {existing.tail_hash[:12]}...) "
+                      f"DIVERGES from the log head ({head_hash[:12]}...) at "
+                      "the same seq: the history forked.  Reconciling would "
+                      "bless the fork.  Restore the log that matches the "
+                      "witness first.")
+                raise SystemExit(1)
         if not args.yes:
             print("dry run: nothing changed (pass --yes to apply)")
             return 0

@@ -215,6 +215,12 @@ def test_prune_runs_on_the_maintenance_connection(log_db_url):
 # ---------------------------------------------------------------------------
 
 
+_pg_needs = pytest.mark.skipif(
+    not os.environ.get("MM_DATABASE_URL", "").startswith("postgresql"),
+    reason="needs MM_DATABASE_URL pointing at PostgreSQL",
+)
+
+
 def _pg_witness_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MM_DELETION_WITNESS_KEY", str(tmp_path / "witness.key"))
 
@@ -392,3 +398,241 @@ def test_pg_concurrent_appends_witness_matches_head(
     assert state.tail_seq == 18
     assert state.tail_hash == head_hash
     log.verify_witness(db_id, applied=18)
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 7 §3: the witness table's permission boundary, on REAL roles.
+# The log app role (INSERT/SELECT on mm_deletion_log only) must NOT be able
+# to write the witness table; a dedicated witness role can UPDATE it but
+# still cannot forge a row (the MAC lives in the key file).
+# ---------------------------------------------------------------------------
+
+
+def test_pg_witness_table_permissions_on_real_roles(
+        log_db_url, tmp_path, monkeypatch):
+    from mirror_memory.core.deletion import DeletionLogCorrupted
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)          # creates the witness table
+
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            exists = conn.execute(text(
+                "SELECT 1 FROM pg_roles WHERE rolname = 'mm_log_app'")).first()
+            if not exists:
+                conn.execute(text(
+                    "CREATE ROLE mm_log_app LOGIN PASSWORD 'logpw'"))
+            # the LOG app role's grants stay INSERT/SELECT on the log table;
+            # it gets NOTHING on the witness table (no grants at all).
+            conn.execute(text(
+                "GRANT INSERT, SELECT ON mm_deletion_log TO mm_log_app"))
+            conn.execute(text("GRANT USAGE ON SCHEMA public TO mm_log_app"))
+            # a dedicated witness role may UPDATE the witness (repair/recover)
+            wexists = conn.execute(text(
+                "SELECT 1 FROM pg_roles WHERE rolname = 'mm_witness_app'"
+            )).first()
+            if not wexists:
+                conn.execute(text(
+                    "CREATE ROLE mm_witness_app LOGIN PASSWORD 'wpw'"))
+            conn.execute(text(
+                f"GRANT SELECT, UPDATE, INSERT ON {log.witness.TABLE} "
+                "TO mm_witness_app"))
+            conn.execute(text("GRANT USAGE ON SCHEMA public TO mm_witness_app"))
+
+        # 1. the LOG app role cannot read the witness table at all
+        log_app = create_engine(
+            log_db_url.replace("postgres:mm@", "mm_log_app:logpw@"))
+        try:
+            with log_app.begin() as conn:
+                conn.execute(text(
+                    f"SELECT 1 FROM {log.witness.TABLE} LIMIT 1"))
+            raise AssertionError("mm_log_app must NOT read the witness table")
+        except Exception as exc:
+            assert "permission denied" in str(exc).lower(), str(exc)[:100]
+        finally:
+            log_app.dispose()
+
+        # 2. the log app role cannot UPDATE the witness either
+        log_app = create_engine(
+            log_db_url.replace("postgres:mm@", "mm_log_app:logpw@"))
+        try:
+            with log_app.begin() as conn:
+                conn.execute(text(
+                    f"UPDATE {log.witness.TABLE} SET tail_seq = 0 "
+                    "WHERE db_id = :db"), {"db": db_id})
+            raise AssertionError("mm_log_app must NOT update the witness")
+        except Exception as exc:
+            assert "permission denied" in str(exc).lower(), str(exc)[:100]
+        finally:
+            log_app.dispose()
+
+        # 3. even a role with UPDATE cannot forge: the MAC key is a file the
+        #    database cannot read, so a hand-written row fails the MAC check
+        witness_engine = create_engine(
+            log_db_url.replace("postgres:mm@", "mm_witness_app:wpw@"))
+        try:
+            with witness_engine.begin() as conn:
+                conn.execute(text(
+                    f"UPDATE {log.witness.TABLE} SET tail_seq = 9, "
+                    "tail_hash = 'f', mac = '0' WHERE db_id = :db"),
+                    {"db": db_id})
+        finally:
+            witness_engine.dispose()
+        from mirror_memory.core.witness import WitnessError
+
+        with pytest.raises(WitnessError):
+            log.witness.read(db_id)             # unauthenticated row
+        with pytest.raises(DeletionLogCorrupted):
+            log.verify_witness(db_id, applied=1)  # startup path: refuse
+    finally:
+        admin.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 7 §5: brief repro ① on PostgreSQL through the REAL engine path.
+# A dedicated main database (real app role + RLS), a real deletion with log
+# entries, then the attacker truncates the LOG TABLE to its genesis and
+# erases the witness row while the main DB is restored from an OLD backup.
+# The real engine must refuse startup.
+# ---------------------------------------------------------------------------
+
+
+def _pg_repro_database(main_db: str):
+    """A fresh main database with the M4/M5 schema, served through the app
+    role (the same shape the deletion-race e2e uses)."""
+    import contextlib
+
+    from mirror_memory.core import schema_migration as sm
+    from mirror_memory.core.models import Base
+    from mirror_memory.core.schema_migration import (
+        Step11DeletionReplay,
+        install_row_level_security,
+    )
+    from mirror_memory.core.sql_audit import no_audit_scope
+    from sqlalchemy.engine import make_url
+
+    from tests.conftest import PG_TEST_ROLE_PASSWORDS
+
+    admin_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/postgres"
+    main_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with no_audit_scope(), admin_engine.connect() as conn:
+        conn.exec_driver_sql(
+            f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+        conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+    admin_engine.dispose()
+
+    from mirror_memory.core import rls as _rls
+    from mirror_memory.core.tenancy import system_scope as _system_scope
+
+    owner_engine = create_engine(main_url)
+    Base.metadata.create_all(owner_engine)
+    with _system_scope(reason="p7 repro: watermark parity"):
+        sm.ensure_watermark(owner_engine)
+    install_row_level_security(owner_engine, verify=False)
+    Step11DeletionReplay().apply(owner_engine)
+    Step11DeletionReplay().verify(owner_engine)
+    with owner_engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"GRANT SELECT, INSERT, UPDATE ON mm_deletion_watermark "
+            f"TO {_rls.app_role()}, {_rls.maintenance_role()}")
+    owner_engine.dispose()
+    runtime_url = make_url(main_url).set(
+        username="mm_app",
+        password=PG_TEST_ROLE_PASSWORDS["app"],
+    ).render_as_string(hide_password=False)
+    return runtime_url, admin_url
+
+
+@_pg_needs
+def test_pg_brief_repro_1_truncated_log_table_refused(
+        log_db_url, tmp_path, monkeypatch):
+    """The PG equivalent of brief repro 1: real engine + real app role + RLS;
+    the log TABLE is truncated to its genesis and the witness row removed
+    while the main DB (restored backup) carries applied == 0."""
+    import shutil
+
+    from mirror_memory.api import MemoryEngine
+    from mirror_memory.config.loader import load_config
+    from mirror_memory.core.deletion import (
+        DeletionLogCorrupted,
+        DeletionLogUnavailable,
+        PgDeletionLog,
+    )
+    from mirror_memory.core.repository import set_memory_enabled
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+    from sqlalchemy.orm import sessionmaker
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    main_db = "mm_test_p7_repro"
+    runtime_url, admin_url = _pg_repro_database(main_db)
+
+    class _L:
+        def generate(self, **_kw):
+            return '{"patterns": []}'
+
+    cfg = load_config("config/")
+    cfg.llm_client = _L()
+    log = PgDeletionLog(log_db_url)
+    eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                       llm_client=_L(), deletion_log=log,
+                       tenant_id="default", app_id="default")
+    eng._ensure_db()
+    db_id = eng._db_id
+    with tenant_scope(*eng._tenant), fixture_write_scope("p7 seed"):
+        s = sessionmaker(bind=eng._engine)()
+        set_memory_enabled(s, "u1", True)
+        s.commit()
+        s.close()
+    n = eng.observe(user_id="u1", session_id="s1",
+                    text="hello", purpose="chat")
+    r = eng.delete_memories(user_id="u1", purpose="chat")
+    assert r.beliefs >= 1 or n >= 0
+    witness_before = log.witness.read(db_id)
+    assert witness_before is not None and witness_before.tail_seq >= 1
+    eng._engine.dispose()
+
+    # the attack: truncate the log table to its genesis + drop the witness row
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log WHERE db_id = :db AND seq > 0"),
+                {"db": db_id})
+            conn.execute(text(
+                "DELETE FROM mm_deletion_log_witness WHERE db_id = :db"),
+                {"db": db_id})
+    finally:
+        admin.dispose()
+
+    # reset the main DB's watermark to 0 (what an old backup carries)
+    owner_url = os.environ["MM_DATABASE_URL"].rsplit("/", 1)[0] + "/" + main_db
+    owner = create_engine(owner_url)
+    try:
+        with owner.begin() as conn:
+            conn.execute(text(
+                "UPDATE mm_deletion_watermark SET applied_seq = 0 "
+                "WHERE id = 1"))
+    finally:
+        owner.dispose()
+
+    eng2 = MemoryEngine(config=cfg, database_url=runtime_url,
+                        llm_client=_L(), deletion_log=log,
+                        tenant_id="default", app_id="default")
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        eng2._ensure_db()
+
+    # the log table was NOT re-minted: still exactly the genesis
+    check = create_engine(log_db_url)
+    try:
+        with check.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT seq, scope FROM mm_deletion_log WHERE db_id = :db "
+                "ORDER BY seq"), {"db": db_id}).all()
+    finally:
+        check.dispose()
+    assert [(int(r[0]), r[1]) for r in rows] == [(0, "genesis")], rows
+    shutil.rmtree(tmp_path, ignore_errors=True)
