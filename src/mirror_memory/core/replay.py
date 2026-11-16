@@ -35,6 +35,7 @@ import logging
 from pathlib import Path
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine
 
 from mirror_memory.core import schema_migration as sm
@@ -253,12 +254,21 @@ def apply_entry(session, entry: DeletionEntry) -> dict[str, int]:
         )
         counts["jobs_cancelled"] = int(cancelled)
         # the LOG is the authority: align (never roll back) the generation
-        exists = session.get(DeletionGeneration,
-                             (tenant_id, app_id, entry.user_id, entry.generation))
-        if exists is None:
-            session.add(DeletionGeneration(
-                user_id=entry.user_id, generation=entry.generation,
-                scope=entry.scope))
+        # M5 patch 12 §3: the generation row is aligned TO THE LOG.  A
+        # duplicate (user, generation) is not an error after a restore -- but
+        # it can also come from a row this very transaction has not flushed
+        # yet, which no SELECT can see.  Insert inside a SAVEPOINT and treat a
+        # PK violation as "already present": the surrounding replay keeps
+        # going instead of aborting the whole restore.  The ORM path is kept
+        # (NOT a bare INSERT) so TenantScoped/RLS context is supplied.
+        try:
+            with session.begin_nested():
+                session.add(DeletionGeneration(
+                    user_id=entry.user_id, generation=entry.generation,
+                    scope=entry.scope))
+                session.flush()
+        except IntegrityError:
+            pass          # already aligned to the log: idempotent
     session.flush()
     return counts
 

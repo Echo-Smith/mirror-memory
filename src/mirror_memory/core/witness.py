@@ -105,15 +105,20 @@ def _create_if_absent(engine, name: str, ddl: str) -> None:
 
     if _relation_exists(engine, name):
         return
-    from sqlalchemy.exc import ProgrammingError
+    from sqlalchemy.exc import IntegrityError, ProgrammingError
 
     try:
         with engine.begin() as conn:
             conn.execute(_text(ddl))
-    except ProgrammingError:
-        # lost a race to another provisioner: fine if it exists now
-        if not _relation_exists(engine, name):
-            raise
+    except (ProgrammingError, IntegrityError) as exc:
+        # M5 patch 12 §3: racing provisioners can collide INSIDE the CREATE
+        # on pg_class/pg_type (UniqueViolation on an internal catalog
+        # constraint) before either can see the other's relation.  That is
+        # "someone else created it first" -- the relation existing now is a
+        # success, not an error.  A genuinely missing relation still raises.
+        if _relation_exists(engine, name):
+            return
+        raise
 
 
 class WitnessError(RuntimeError):

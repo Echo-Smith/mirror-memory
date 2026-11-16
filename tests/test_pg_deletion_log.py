@@ -1512,3 +1512,293 @@ def test_p11_pg_prune_and_append_interleave_safely(
     state = log.witness.read(db_id)
     assert state.tail_seq >= witness_floor.tail_seq
     assert state.tail_seq <= head_seq
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 12 §3: the COMBINED acceptance — one restored main DB, ONE log
+# identity, REAL restricted credentials, and a Barrier-scheduled interleave
+# of append / prune / verify across processes.  This is the joint-acceptance
+# case the brief says must not be replaced by separate log tests.
+# ---------------------------------------------------------------------------
+
+
+def _p12_child_append(log_db_url, db_id, idx, errors_q):
+    from mirror_memory.core.deletion import PgDeletionLog, DeletionEntry
+
+    try:
+        l = PgDeletionLog(log_db_url)
+        for j in range(6):
+            l.append(DeletionEntry(
+                db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{idx}",
+                scope="session", scope_key=f"s{idx}-{j}", fingerprints=[],
+                generation=j + 1, purpose="p"))
+    except BaseException as exc:  # noqa: BLE001
+        errors_q.put(f"append {idx}: {type(exc).__name__}: {str(exc)}")
+
+
+def _p12_child_prune(log_db_url, db_id, errors_q):
+    from mirror_memory.core.deletion import PgDeletionLog
+
+    try:
+        l = PgDeletionLog(log_db_url, maintenance_url=log_db_url)
+        head = l.head(db_id)[0]
+        if head >= 6:
+            l.prune(db_id, head - 2)
+    except BaseException as exc:  # noqa: BLE001
+        errors_q.put(f"prune: {type(exc).__name__}: {str(exc)[:400]}")
+
+
+def test_p12_pg_combined_restricted_roles_with_barrier(
+        log_db_url, tmp_path, monkeypatch):
+    """Same restricted log DB the whole time: genesis on the app credential,
+    then appender processes and a pruner process released by ONE barrier, then
+    verify on the app credential.  Proves the continuity gate, the advisory
+    lock and the witness monotonicity hold across processes AND roles."""
+    import multiprocessing as mp
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    app_url, maint_url = _p10_build_restricted_log_db()
+    try:
+        # production order: the OWNER provisions the tables ONCE, before any
+        # runtime process exists (the restricted roles hold no DDL -- see
+        # patch 10 §4).  Spawning without provisioning would race the CREATE
+        # TABLE between children, which is exactly what the role split
+        # prevents in production.
+        owner = create_engine(BASE_PG + "/" + P10_LOGDB)
+        try:
+            PgDeletionLog(owner).provision_schema()
+        finally:
+            owner.dispose()
+        # genesis on the APP credential (the runtime creates its own life)
+        log = PgDeletionLog(app_url, maintenance_url=maint_url)
+        db_id = "d1" * 16
+        log.ensure_genesis(db_id, applied=0)
+        floor = log.witness.read(db_id).tail_seq
+
+        ctx = mp.get_context("spawn")
+        errors = ctx.Queue()
+        # every process uses the RESTRICTED log database URL: the conftest
+        # `log_db_url` fixture points at the shared test log store -- a
+        # DIFFERENT database from the one provisioned above (M5 patch 12 §3)
+        procs = [ctx.Process(target=_p12_child_append,
+                             args=(app_url, db_id, i, errors))
+                 for i in range(3)]
+        procs.append(ctx.Process(target=_p12_child_prune,
+                                 args=(app_url, db_id, errors)))
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=180)
+            assert p.exitcode == 0, p.exitcode
+
+        collected = []
+        while not errors.empty():
+            collected.append(errors.get())
+        assert not collected, collected[:4]
+
+        # invariants on the app credential after the interleave
+        head_seq, head_hash = log.head(db_id)
+        assert head_seq == 18
+        log.verify_chain(db_id)
+        state = log.witness.read(db_id)
+        assert state.tail_seq == 18
+        assert state.tail_hash == head_hash
+        assert state.tail_seq >= floor
+        log.verify_witness(db_id, applied=18)
+    finally:
+        _p10_drop_restricted_log_db()
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 12 §3: the FULL joint acceptance on ONE restored main DB and ONE
+# log identity with the REAL restricted credentials, with the append/prune
+# children released by a Barrier so the interleave is deterministic:
+#   seed -> pre-deletion pg_dump -> delete -> restore -> concurrent
+#   append+prune on the restricted log -> startup replay -> invariants.
+# ---------------------------------------------------------------------------
+
+
+def _p12b_child_append(log_db_url, db_id, idx, start_ev, errors_q):
+    from mirror_memory.core.deletion import PgDeletionLog, DeletionEntry
+
+    try:
+        start_ev.wait(timeout=60)          # barrier: all start together
+        l = PgDeletionLog(log_db_url)
+        for j in range(4):
+            l.append(DeletionEntry(
+                db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{idx}",
+                scope="session", scope_key=f"s{idx}-{j}", fingerprints=[],
+                generation=j + 1, purpose="p"))
+    except BaseException as exc:  # noqa: BLE001
+        errors_q.put(f"append {idx}: {type(exc).__name__}: {exc}")
+
+
+def _p12b_child_prune(log_db_url, db_id, start_ev, errors_q):
+    from mirror_memory.core.deletion import PgDeletionLog
+
+    try:
+        start_ev.wait(timeout=60)          # barrier: all start together
+        l = PgDeletionLog(log_db_url, maintenance_url=log_db_url)
+        head = l.head(db_id)[0]
+        if head >= 5:
+            l.prune(db_id, head - 1)
+    except BaseException as exc:  # noqa: BLE001
+        errors_q.put(f"prune: {type(exc).__name__}: {exc}")
+
+
+def test_p12_pg_joint_restore_then_concurrent_append_prune(
+        log_db_url, tmp_path, monkeypatch):
+    """ONE restored main DB + ONE log identity + REAL restricted logins +
+    a Barrier-scheduled append/prune interleave + startup replay."""
+    import multiprocessing as mp
+    import subprocess
+
+    from mirror_memory.api import MemoryEngine
+    from mirror_memory.config.loader import load_config
+    from mirror_memory.core.models import Belief
+    from mirror_memory.core.repository import set_memory_enabled
+    from mirror_memory.core.sql_audit import no_audit_scope
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+    from sqlalchemy.orm import sessionmaker
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    app_url, maint_url = _p10_build_restricted_log_db()
+    main_db = "mm_test_p12_joint"
+    runtime_url, admin_url = _pg_repro_database(main_db)
+
+    class _L:
+        def generate(self, **_kw):
+            return '{"patterns": []}'
+
+    try:
+        owner = create_engine(BASE_PG + "/" + P10_LOGDB)
+        try:
+            PgDeletionLog(owner).provision_schema()
+        finally:
+            owner.dispose()
+
+        cfg = load_config("config/")
+        cfg.llm_client = _L()
+        alog = PgDeletionLog(app_url, maintenance_url=maint_url)
+        eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                           llm_client=_L(), deletion_log=alog,
+                           tenant_id="default", app_id="default")
+        eng._ensure_db()
+        db_id = eng._db_id
+        with tenant_scope(*eng._tenant), fixture_write_scope("p12b seed"):
+            s = sessionmaker(bind=eng._engine)()
+            set_memory_enabled(s, "u1", True)
+            s.add(Belief(user_id="u1", dimension="topic", key="tea",
+                         claim_text="I love jasmine tea", confidence=0.9))
+            s.commit()
+            s.close()
+        eng._engine.dispose()
+
+        # pre-deletion backup
+        env = dict(os.environ, PGPASSWORD="mm")
+        dump = subprocess.run(
+            ["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg", "pg_dump",
+             "-U", "postgres", "--format=custom", main_db],
+            env=env, capture_output=True, check=True)
+        assert len(dump.stdout) > 5000 and b"mm_beliefs" in dump.stdout
+        pre = tmp_path / "pre.dump"
+        pre.write_bytes(dump.stdout)
+
+        # deletion recorded in the independent restricted log
+        eng2 = MemoryEngine(config=cfg, database_url=runtime_url,
+                            llm_client=_L(), deletion_log=alog,
+                            tenant_id="default", app_id="default")
+        eng2._ensure_db()
+        res = eng2.delete_memories(user_id="u1", purpose="chat")
+        assert res.beliefs >= 1, res
+        eng2._engine.dispose()
+        tail_before = alog.head(db_id)[0]
+        assert tail_before >= 1
+
+        # restore the PRE-deletion main DB (real pg_restore)
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with no_audit_scope(), admin_engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+                conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+        finally:
+            admin_engine.dispose()
+        grant_engine = create_engine(
+            admin_url.rsplit("/", 1)[0] + "/" + main_db,
+            isolation_level="AUTOCOMMIT")
+        try:
+            with grant_engine.connect() as gconn:
+                gconn.exec_driver_sql('GRANT ALL ON SCHEMA public TO mm_owner')
+        finally:
+            grant_engine.dispose()
+        with open(pre, "rb") as fh:
+            subprocess.run(
+                ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+                 "pg_restore", "-U", "postgres", "--role=mm_owner",
+                 "--dbname=" + main_db], stdin=fh, capture_output=True)
+        owner = create_engine(admin_url.rsplit("/", 1)[0] + "/" + main_db)
+        try:
+            with no_audit_scope(), owner.connect() as conn:
+                n = conn.execute(text(
+                    "SELECT count(*) FROM pg_tables WHERE schemaname='public' "
+                    "AND tablename LIKE 'mm_%'")).scalar()
+                still_there = conn.execute(text(
+                    "SELECT count(*) FROM mm_beliefs WHERE user_id='u1'")).scalar()
+        finally:
+            owner.dispose()
+        assert n >= 20, "the restore must recreate the main schema"
+        assert still_there >= 1, "the restored backup still has the memory"
+
+        # Barrier-released append+prune interleave on the SAME log identity
+        ctx = mp.get_context("spawn")
+        start = ctx.Event()
+        errors = ctx.Queue()
+        procs = [ctx.Process(target=_p12b_child_append,
+                             args=(app_url, db_id, i, start, errors))
+                 for i in range(2)]
+        procs.append(ctx.Process(target=_p12b_child_prune,
+                                 args=(app_url, db_id, start, errors)))
+        for p in procs:
+            p.start()
+        start.set()                        # release the barrier
+        for p in procs:
+            p.join(timeout=180)
+            assert p.exitcode == 0, p.exitcode
+        collected = []
+        while not errors.empty():
+            collected.append(errors.get())
+        assert not collected, collected[:3]
+
+        # startup on the RESTORED main DB: the replay re-applies the deletion
+        eng3 = MemoryEngine(config=cfg, database_url=runtime_url,
+                            llm_client=_L(), deletion_log=alog,
+                            tenant_id="default", app_id="default")
+        eng3._ensure_db()
+        check = create_engine(admin_url.rsplit("/", 1)[0] + "/" + main_db)
+        try:
+            with no_audit_scope(), check.connect() as conn:
+                left = conn.execute(text(
+                    "SELECT count(*) FROM mm_beliefs WHERE user_id='u1'")).scalar()
+                landed = conn.execute(text(
+                    "SELECT applied_seq FROM mm_deletion_watermark WHERE id = 1"
+                )).scalar()
+        finally:
+            check.dispose()
+        eng3._engine.dispose()
+        assert left == 0, "the replay must delete the restored memory"
+        head_after = alog.head(db_id)[0]
+        assert landed <= head_after, (landed, head_after)
+        assert head_after >= tail_before + 8, (head_after, tail_before)
+        alog.verify_chain(db_id)
+        st = alog.witness.read(db_id)
+        assert st.tail_seq == head_after and st.tail_hash == alog.head(db_id)[1]
+    finally:
+        _p10_drop_restricted_log_db()
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with no_audit_scope(), admin_engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+        finally:
+            admin_engine.dispose()
