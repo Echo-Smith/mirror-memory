@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import secrets
+import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -77,7 +79,7 @@ def _engine(tmp_path: Path, log_dir: Path, db: Path | None = None) -> MemoryEngi
     )
 
 
-def _enable(eng: MemoryEngine, user: str = "u1"):
+def _enable(eng: MemoryEngine, user: str = "u1", *, expected_version=None):
     from sqlalchemy.orm import Session
 
     eng._ensure_db()
@@ -85,11 +87,19 @@ def _enable(eng: MemoryEngine, user: str = "u1"):
         s = Session(eng._engine)
         try:
             set_memory_enabled(s, user, True)
-            authorization.grant_purpose(
-                s, user, "chat",
-                operations=list(authorization.OPERATIONS),
-                issuer="m5p5-harness", reason="integrity test grant",
-            )
+            if expected_version is None:
+                authorization.grant_purpose(
+                    s, user, "chat",
+                    operations=list(authorization.OPERATIONS),
+                    issuer="m5p5-harness", reason="integrity test grant",
+                )
+            else:
+                authorization.grant_purpose(
+                    s, user, "chat",
+                    operations=list(authorization.OPERATIONS),
+                    issuer="m5p5-harness", reason="integrity test grant",
+                    expected_version=expected_version,
+                )
             s.commit()
         finally:
             s.close()
@@ -1579,3 +1589,141 @@ def test_p10_creator_killed_while_holding_the_lock_leaves_safe_state(tmp_path):
         log.ensure_genesis(db_id, applied=0)
     assert not (log_dir / f"{db_id}.deletions.jsonl").exists(), (
         "crash residue must not be re-minted into a fresh history")
+
+
+# ---------------------------------------------------------------------------
+# ADR-006 (second revision) must-fix items, per Echo-Smith's decisions:
+#   G2 — multi-generation rollback with the restore point BEFORE a compaction
+#        checkpoint (different code path from the single-generation replay);
+#   G5 — KEY REPLACEMENT (distinct from key-missing): an existing witness and
+#        registry signed under the old key must fail authentication after the
+#        key file is replaced -> refuse service, evidence untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_g2_multi_generation_rollback_with_checkpoint_between(tmp_path):
+    """Two deletion generations; backups taken after EACH; restore to the
+    EARLIEST backup while a compaction checkpoint sits between the restored
+    watermark and the log tail.  The replay must re-apply BOTH generations
+    (nothing revives) and land the watermark at the log tail."""
+    log_dir = tmp_path / "log"
+    db = tmp_path / "main.db"
+    backup1 = tmp_path / "after_gen1.db"
+
+    eng = _engine(tmp_path, log_dir, db)
+    _enable(eng)
+    _observe(eng, session="g1a")
+    eng.delete_memories(user_id="u1", purpose="chat")       # generation 1
+    db_id = eng._db_id
+    applied1 = eng._engine  # watermark checked below via sm helper
+    from mirror_memory.core import schema_migration as sm
+    from sqlalchemy import create_engine as _ce
+    wm = sm.read_watermark(_ce(f"sqlite:///{db}"))
+    applied1 = wm[1]
+    assert applied1 >= 1
+    eng._engine.dispose()
+
+    _backup(db, backup1)                                     # backup AFTER gen 1
+
+    # generation 2: new memories, deleted again; then compact the log so a
+    # checkpoint lands between the restored watermark and the new tail
+    eng = _engine(tmp_path, log_dir, db)
+    _enable(eng, expected_version=1)
+    _observe(eng, session="g2a")
+    _observe(eng, session="g2b")
+    eng.delete_memories(user_id="u1", purpose="chat")       # generation 2
+    from mirror_memory.core.deletion import FileDeletionLog
+    log = FileDeletionLog(log_dir)
+    tail = log.head(db_id)[0]
+    assert tail > applied1, (tail, applied1)   # generation 2 appended
+    cp = max(1, applied1 - 1)                  # checkpoint BEFORE the restore point
+    log.prune(db_id, cp)
+    assert log.checkpoint_seq(db_id) == cp
+    wm2 = sm.read_watermark(_ce(f"sqlite:///{db}"))
+    assert wm2[1] == tail
+    eng._engine.dispose()
+
+    # restore the EARLIEST backup (after gen 1): watermark rolls back to
+    # applied1 and the round-2 memories come back -- restore point (applied1)
+    # is BEFORE the checkpoint (seq 2)
+    shutil.copy(backup1, db)
+
+    # startup: the replay must re-apply the post-checkpoint entries
+    eng = _engine(tmp_path, log_dir, db)
+    eng._ensure_db()
+    from sqlalchemy import create_engine as _ce2, text as _text
+    from mirror_memory.core.sql_audit import no_audit_scope
+    check = _ce2(f"sqlite:///{db}")
+    try:
+        with no_audit_scope(), check.connect() as conn:
+            left = conn.execute(_text(
+                "SELECT count(*) FROM mm_beliefs")).scalar()
+            landed = conn.execute(_text(
+                "SELECT applied_seq FROM mm_deletion_watermark WHERE id = 1"
+            )).scalar()
+    finally:
+        check.dispose()
+    eng._engine.dispose()
+    assert left == 0, f"{left} memories survived a multi-generation rollback"
+    assert landed == tail, (landed, tail)
+    log.verify_chain(db_id)
+    st = log.witness.read(db_id)
+    assert st.tail_seq == log.head(db_id)[0]
+
+
+def test_g5_key_replacement_fails_authentication_and_refuses(
+        tmp_path, monkeypatch):
+    """G5: REPLACING the MAC key file (operator rotation or compromise) must
+    make the EXISTING witness and registry fail authentication -> the engine
+    refuses to serve, and the evidence bytes are untouched (proven by
+    restoring the original key and re-verifying).  The key lives in a
+    per-test file (monkeypatched env), never the user's real default."""
+    log_dir = tmp_path / "log"
+    key_file = tmp_path / "witness-key"
+    monkeypatch.setenv("MM_DELETION_WITNESS_KEY", str(key_file))
+    monkeypatch.setenv("MM_DELETION_WITNESS_DIR", str(tmp_path / "witness"))
+
+    db = tmp_path / "main.db"
+    eng = _engine(tmp_path, log_dir, db)
+    _enable(eng)
+    _observe(eng)
+    eng.delete_memories(user_id="u1", purpose="chat")
+    eng._engine.dispose()
+
+    log = FileDeletionLog(log_dir)
+    db_id = eng._db_id
+    witness_before = log.witness.read(db_id)
+    registry_before = log.registry.find(db_id)
+    assert witness_before is not None and registry_before is not None
+
+    # derive the real paths from the instance (the witness dir comes from
+    # MM_DELETION_WITNESS_DIR, not a hardcoded sibling)
+    wpath = Path(log.witness.directory) / f"{db_id}.witness.json"
+    rpath = log_dir / ".creation-registry.jsonl"
+    old_witness_bytes = wpath.read_bytes()
+    old_registry_bytes = rpath.read_bytes()
+
+    # REPLACE the key (rotation / compromise), keeping the original bytes
+    old_key = key_file.read_bytes()
+    key_file.write_bytes(secrets.token_hex(32).encode() + b"\n")
+
+    # the existing evidence no longer authenticates under the new key
+    from mirror_memory.core.witness import WitnessError
+
+    with pytest.raises(WitnessError):
+        log.witness.read(db_id)
+    with pytest.raises(Exception):
+        log.registry.find(db_id)
+
+    # the engine refuses to serve (fail-closed) on the REAL startup path
+    eng2 = _engine(tmp_path, log_dir, db)
+    with pytest.raises((DeletionLogCorrupted, DeletionLogUnavailable)):
+        eng2._ensure_db()
+
+    # the evidence bytes were untouched by the refusal...
+    assert wpath.read_bytes() == old_witness_bytes
+    assert rpath.read_bytes() == old_registry_bytes
+    # ...and restoring the original key proves it: everything verifies again
+    key_file.write_bytes(old_key)
+    assert log.witness.read(db_id).tail_seq == witness_before.tail_seq
+    assert log.registry.find(db_id).genesis_hash == registry_before.genesis_hash

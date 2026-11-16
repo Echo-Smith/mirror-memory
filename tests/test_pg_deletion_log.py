@@ -1802,3 +1802,201 @@ def test_p12_pg_joint_restore_then_concurrent_append_prune(
                     f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
         finally:
             admin_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# ADR-006 second revision, must-fix G2 (PG variant): restore point BEFORE a
+# compaction checkpoint, multi-generation rollback on the real restricted
+# log.  Three beliefs, three deletion rounds, pg_dump after round 1, prune
+# past the restore point, restore, replay must re-apply rounds 2+3.
+# ---------------------------------------------------------------------------
+
+
+@_pg_needs
+def test_g2_pg_restore_point_before_checkpoint_replays_two_generations(
+        log_db_url, tmp_path, monkeypatch):
+    import subprocess
+
+    from mirror_memory.api import MemoryEngine
+    from mirror_memory.config.loader import load_config
+    from mirror_memory.core.models import Belief
+    from mirror_memory.core.repository import set_memory_enabled
+    from mirror_memory.core.sql_audit import no_audit_scope
+    from mirror_memory.core.tenancy import fixture_write_scope, tenant_scope
+    from sqlalchemy.orm import sessionmaker
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    main_db = "mm_test_g2_gen"
+    runtime_url, admin_url = _pg_repro_database(main_db)
+
+    class _L:
+        def generate(self, **_kw):
+            return '{"patterns": []}'
+
+    try:
+        cfg = load_config("config/")
+        cfg.llm_client = _L()
+        log = PgDeletionLog(log_db_url)
+        eng = MemoryEngine(config=cfg, database_url=runtime_url,
+                           llm_client=_L(), deletion_log=log,
+                           tenant_id="default", app_id="default")
+        eng._ensure_db()
+        db_id = eng._db_id
+        ids = {}
+        with tenant_scope(*eng._tenant), fixture_write_scope("g2 seed"):
+            s = sessionmaker(bind=eng._engine)()
+            set_memory_enabled(s, "u1", True)
+            for key in ("tea", "coffee", "nap"):
+                b = Belief(user_id="u1", dimension="topic", key=key,
+                           claim_text=f"I love {key}", confidence=0.9)
+                s.add(b)
+                s.flush()
+                ids[key] = b.id
+            s.commit()
+            s.close()
+        eng._engine.dispose()
+
+        def round_delete(key):
+            e = MemoryEngine(config=cfg, database_url=runtime_url,
+                             llm_client=_L(), deletion_log=log,
+                             tenant_id="default", app_id="default")
+            e._ensure_db()
+            ok = e.forget_belief(user_id="u1", belief_id=ids[key],
+                                 purpose="chat")
+            e._engine.dispose()
+            return ok
+
+        # round 1
+        assert round_delete("tea") is True
+        applied1 = create_engine(runtime_url)
+        try:
+            with applied1.connect() as conn:
+                a1 = conn.execute(text(
+                    "SELECT applied_seq FROM mm_deletion_watermark "
+                    "WHERE id = 1")).scalar()
+        finally:
+            applied1.dispose()
+        assert a1 >= 1
+
+        # pg_dump AFTER round 1 (the restore point)
+        env = dict(os.environ, PGPASSWORD="mm")
+        dump = subprocess.run(
+            ["docker", "exec", "-e", "PGPASSWORD=mm", "mm-pg", "pg_dump",
+             "-U", "postgres", "--format=custom", main_db],
+            env=env, capture_output=True, check=True)
+        assert len(dump.stdout) > 5000
+        pre = tmp_path / "after_round1.dump"
+        pre.write_bytes(dump.stdout)
+
+        # rounds 2 and 3, then compact PAST the restore point
+        assert round_delete("coffee") is True
+        assert round_delete("nap") is True
+        tail = log.head(db_id)[0]
+        assert tail > a1
+        # compaction runs on the MAINTENANCE credential against the LOG
+        # database (the app role has no DELETE there; the log table lives in
+        # the log DB, never in the restored main DB)
+        clog = PgDeletionLog(log_db_url, maintenance_url=log_db_url)
+        # CASE 1 setup: checkpoint AT the restore point -> replay must work
+        clog.prune(db_id, a1)
+        assert log.checkpoint_seq(db_id) == a1
+
+        # restore the after-round-1 backup
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with no_audit_scope(), admin_engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+                conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+        finally:
+            admin_engine.dispose()
+        grant_engine = create_engine(
+            admin_url.rsplit("/", 1)[0] + "/" + main_db,
+            isolation_level="AUTOCOMMIT")
+        try:
+            with grant_engine.connect() as gconn:
+                gconn.exec_driver_sql('GRANT ALL ON SCHEMA public TO mm_owner')
+        finally:
+            grant_engine.dispose()
+        with open(pre, "rb") as fh:
+            restore = subprocess.run(
+                ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+                 "pg_restore", "-U", "postgres", "--role=mm_owner",
+                 "--dbname=" + main_db], stdin=fh, capture_output=True)
+        vfy = create_engine(runtime_url)
+        try:
+            with vfy.connect() as conn:
+                n = conn.execute(text(
+                    "SELECT count(*) FROM pg_tables WHERE schemaname="
+                    "'public' AND tablename LIKE 'mm_%'")).scalar()
+                assert n >= 20, f"restore made {n} tables"
+        finally:
+            vfy.dispose()
+
+        # startup: replay re-applies rounds 2+3 (below the checkpoint)
+        eng3 = MemoryEngine(config=cfg, database_url=runtime_url,
+                            llm_client=_L(), deletion_log=log,
+                            tenant_id="default", app_id="default")
+        eng3._ensure_db()
+        check = create_engine(admin_url.rsplit("/", 1)[0] + "/" + main_db)
+        try:
+            with no_audit_scope(), check.connect() as conn:
+                left = conn.execute(text(
+                    "SELECT count(*) FROM mm_beliefs WHERE user_id='u1'"
+                )).scalar()
+                landed = conn.execute(text(
+                    "SELECT applied_seq FROM mm_deletion_watermark "
+                    "WHERE id = 1")).scalar()
+        finally:
+            check.dispose()
+        eng3._engine.dispose()
+        assert left == 0, f"{left} beliefs survived the multi-gen rollback"
+        assert landed == tail, (landed, tail)
+        log.verify_chain(db_id)
+        st = log.witness.read(db_id)
+        assert st.tail_seq == tail
+
+        # CASE 2 (regime boundary): compact PAST the restore point, restore
+        # the same older backup again -> the pruned prefix can no longer be
+        # replayed -> the REAL engine must refuse (DeletionLogPruned), not
+        # silently serve a partially-replayed database.
+        from mirror_memory.core.deletion import DeletionLogPruned
+
+        clog.prune(db_id, a1 + 1)
+        assert log.checkpoint_seq(db_id) >= a1 + 1
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with no_audit_scope(), admin_engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+                conn.exec_driver_sql(f'CREATE DATABASE "{main_db}"')
+        finally:
+            admin_engine.dispose()
+        grant_engine = create_engine(
+            admin_url.rsplit("/", 1)[0] + "/" + main_db,
+            isolation_level="AUTOCOMMIT")
+        try:
+            with grant_engine.connect() as gconn:
+                gconn.exec_driver_sql('GRANT ALL ON SCHEMA public TO mm_owner')
+        finally:
+            grant_engine.dispose()
+        with open(pre, "rb") as fh:
+            subprocess.run(
+                ["docker", "exec", "-i", "-e", "PGPASSWORD=mm", "mm-pg",
+                 "pg_restore", "-U", "postgres", "--role=mm_owner",
+                 "--dbname=" + main_db],
+                input=fh.read(), capture_output=True)
+        eng4 = MemoryEngine(config=cfg, database_url=runtime_url,
+                            llm_client=_L(), deletion_log=log,
+                            tenant_id="default", app_id="default")
+        with pytest.raises(DeletionLogPruned):
+            eng4._ensure_db()
+        eng4._engine.dispose()
+    finally:
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with no_audit_scope(), admin_engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS "{main_db}" WITH (FORCE)')
+        finally:
+            admin_engine.dispose()

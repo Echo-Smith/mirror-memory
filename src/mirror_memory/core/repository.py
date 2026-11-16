@@ -2833,7 +2833,15 @@ def forget_belief(
              ProposalLog.created_belief_id == belief_id),),
         fingerprints, "mm_proposal_log",
     )
-    fingerprints and fingerprints.append(_fingerprint_row("mm_beliefs", belief))
+    # M5 ADR-006 G-fix: `fingerprints and ...append(...)` is WRONG here —
+    # the collector starts as an EMPTY list (falsy), so the belief row's own
+    # fingerprint was never recorded and the log entry carried [] -- making
+    # a targeted forget UNREPLAYABLE (after a backup restore the replay
+    # deleted nothing and the forgotten belief resurrected; found by the
+    # ADR-006 G2 acceptance test).  `None` means "not collecting"; an empty
+    # list is a live collector that must collect.
+    if fingerprints is not None:
+        fingerprints.append(_fingerprint_row("mm_beliefs", belief))
     session.delete(belief)
     session.flush()
     # Evidence no belief points at is garbage, not provenance.
@@ -2896,7 +2904,8 @@ def _purge_belief_ledger(session: Session, belief: Belief,
         session.query(BeliefVersion).filter(
             BeliefVersion.identity_id == identity.id
         ).delete(synchronize_session=False)
-    fingerprints and fingerprints.append(_fingerprint_row("mm_belief_identities", identity))
+    if fingerprints is not None:   # empty list collects (see mm_beliefs note)
+        fingerprints.append(_fingerprint_row("mm_belief_identities", identity))
     session.delete(identity)
     return {"versions": 1, "identities": 1}
 
