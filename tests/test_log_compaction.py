@@ -173,3 +173,22 @@ def test_export_refuses_a_cursor_before_the_checkpoint(tmp_path):
     # a cursor at or after the checkpoint exports normally
     batch, cursor, _skipped = export_from_log(log, db_id, 2, 100)
     assert [e.origin_seq for e in batch.entries] == [3, 4] and cursor == 4
+
+
+def test_second_compaction_continues_the_chain(tmp_path):
+    """M5 patch 11 §3: the SECOND prune of a life must anchor its checkpoint
+    at the PREVIOUS checkpoint's hash, not at genesis — re-anchoring severs
+    the kept entries' prev_hash links and verify_chain fails."""
+    log, db_id = _log_with_entries(tmp_path, 10)
+    log.prune(db_id, 3)          # first compaction: checkpoint at 3
+    log.prune(db_id, 6)          # second compaction: checkpoint at 6
+    log.verify_chain(db_id)      # must not raise LogChainBroken
+
+    assert log.checkpoint_seq(db_id) == 6
+    # the kept entries still chain from the second checkpoint
+    head_seq, _ = log.head(db_id)
+    assert head_seq == 10
+    # a replay from the checkpoint still sees the right entries
+    entries = list(log.read_from(db_id, 0))
+    seqs = [e.seq for e in entries]
+    assert 6 in seqs and 10 in seqs

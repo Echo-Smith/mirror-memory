@@ -13,6 +13,8 @@ from __future__ import annotations
 import os
 import uuid
 
+import time
+
 import pytest
 from sqlalchemy import create_engine, text
 
@@ -1142,6 +1144,26 @@ def test_p10_pg_predeletion_backup_restore_replays_the_deletion(
     assert left == 0, "the restored memory must be deleted by the replay"
     assert landed == tail, (landed, tail)
 
+    # §3: the same restored main DB + independent log, driven through the
+    # RESTRICTED credentials (runtime log role appends/maintains the witness,
+    # maintenance role compacts) — the full chain on limited grants.
+    app_url, maint_url = _p10_build_restricted_log_db()
+    try:
+        rlog = PgDeletionLog(app_url, maintenance_url=maint_url)
+        rid = "c1" * 16
+        rlog.ensure_genesis(rid, applied=0)
+        for i in range(1, 4):
+            rlog.append(DeletionEntry(
+                db_id=rid, tenant_id="t", app_id="a", user_id=f"u{i}",
+                scope="session", scope_key=f"s{i}", fingerprints=[],
+                generation=i, purpose="p"))
+        rlog.verify_witness(rid, applied=3)
+        assert rlog.prune(rid, 2) == 2
+        rlog.verify_witness(rid, applied=3)
+        assert rlog.witness.read(rid).tail_seq == 3
+    finally:
+        _p10_drop_restricted_log_db()
+
     # cleanup
     admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
@@ -1301,3 +1323,192 @@ def test_p10_pg_issue_genesis_on_restricted_role_without_owner(
         assert "permission denied" in msg or "does not exist" in msg, msg[:160]
     finally:
         _p10_drop_restricted_log_db()
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 11 §2: deletion-adopt on the REAL PG path — dry run with no side
+# effects, reconcile refused on divergence, retire applied.  The CLI must
+# work identically on the postgres backend (patch 9 flagged the signature
+# mismatch; this pins it).
+# ---------------------------------------------------------------------------
+
+
+def test_p11_adopt_cli_on_pg_backend_dry_run_and_reconcile(
+        log_db_url, tmp_path, monkeypatch, capsys):
+    from mirror_memory import deletion_adopt
+    from mirror_memory.core import deletion as _dm
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+
+    monkeypatch.setattr(_dm, "deletion_log_from_config",
+                        lambda *a, **k: log)
+    witness_row_before = log.witness.read(db_id)
+
+    # 1. dry run: prints the plan, changes nothing
+    monkeypatch.setattr("sys.argv", ["deletion-adopt", "--database-url",
+                                     log_db_url, "--db-id", db_id,
+                                     "--config-dir", "config/",
+                                     "--reconcile-witness"])
+    rc = deletion_adopt.main()
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "dry run" in out and "chain: verified" in out
+    assert log.witness.read(db_id).__dict__ == witness_row_before.__dict__
+
+    # 2. apply with --yes
+    monkeypatch.setattr("sys.argv", ["deletion-adopt", "--database-url",
+                                     log_db_url, "--db-id", db_id,
+                                     "--config-dir", "config/",
+                                     "--reconcile-witness", "--yes"])
+    rc = deletion_adopt.main()
+    assert rc == 0
+    state = log.witness.read(db_id)
+    assert state.tail_seq == log.head(db_id)[0]
+    assert state.tail_hash == log.head(db_id)[1]
+
+
+def test_p11_adopt_cli_on_pg_backend_retire(
+        log_db_url, tmp_path, monkeypatch, capsys):
+    from mirror_memory import deletion_adopt
+    from mirror_memory.core import deletion as _dm
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    assert log.witness.read(db_id) is not None
+
+    monkeypatch.setattr(_dm, "deletion_log_from_config",
+                        lambda *a, **k: log)
+    monkeypatch.setattr("sys.argv", ["deletion-adopt", "--database-url",
+                                     log_db_url, "--db-id", db_id,
+                                     "--config-dir", "config/",
+                                     "--retire-witness", "--yes"])
+    rc = deletion_adopt.main()
+    assert rc == 0
+    assert log.witness.read(db_id) is None
+
+
+def test_p11_adopt_cli_on_pg_backend_refuses_divergence(
+        log_db_url, tmp_path, monkeypatch, capsys):
+    from mirror_memory import deletion_adopt
+    from mirror_memory.core import deletion as _dm
+    from mirror_memory.core.witness import WitnessError
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    log.append(DeletionEntry(
+        db_id=db_id, tenant_id="t", app_id="a", user_id="u", scope="user",
+        scope_key="", fingerprints=[], generation=1, purpose="p"))
+    witness_before = log.witness.read(db_id)
+
+    # tamper the row so the head hash no longer matches the witness
+    admin = create_engine(log_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(
+                "UPDATE mm_deletion_log SET hash = repeat('d', 64) "
+                "WHERE db_id = :db AND seq = 1"), {"db": db_id})
+    finally:
+        admin.dispose()
+
+    monkeypatch.setattr(_dm, "deletion_log_from_config",
+                        lambda *a, **k: log)
+    monkeypatch.setattr("sys.argv", ["deletion-adopt", "--database-url",
+                                     log_db_url, "--db-id", db_id,
+                                     "--config-dir", "config/",
+                                     "--reconcile-witness", "--yes"])
+    with pytest.raises(SystemExit) as excinfo:
+        deletion_adopt.main()
+    assert excinfo.value.code == 1
+    # the witness still holds the ORIGINAL tail hash
+    after = log.witness.read(db_id)
+    assert after.tail_hash == witness_before.tail_hash
+
+
+# ---------------------------------------------------------------------------
+# M5 patch 11 §3: deterministic multiprocess prune/restore interleaving.
+# Process A holds the log advisory lock (append mid-transaction) while
+# process B attempts a prune; B must not compact an unverified or
+# concurrently-changing history.
+# ---------------------------------------------------------------------------
+
+
+def _p11_appender(log_db_url, db_id, idx, errors_q):
+    """Module-level so spawn can pickle it."""
+    from mirror_memory.core.deletion import PgDeletionLog, DeletionEntry
+
+    try:
+        l = PgDeletionLog(log_db_url)
+        for j in range(8):
+            l.append(DeletionEntry(
+                db_id=db_id, tenant_id="t", app_id="a", user_id=f"u{idx}",
+                scope="session", scope_key=f"s{idx}-{j}", fingerprints=[],
+                generation=j + 1, purpose="p"))
+    except BaseException as exc:  # noqa: BLE001
+        errors_q.put(f"appender {idx}: {type(exc).__name__}: {str(exc)[:140]}")
+
+
+def _p11_pruner(log_db_url, db_id, errors_q):
+    """Module-level so spawn can pickle it."""
+    import time as _time
+
+    from mirror_memory.core.deletion import PgDeletionLog
+
+    try:
+        l = PgDeletionLog(log_db_url, maintenance_url=log_db_url)
+        for _ in range(4):
+            head = l.head(db_id)[0]
+            if head > 4:
+                l.prune(db_id, head - 2)
+            _time.sleep(0.05)
+    except BaseException as exc:  # noqa: BLE001
+        errors_q.put(f"pruner: {type(exc).__name__}: {str(exc)[:140]}")
+
+
+def test_p11_pg_prune_and_append_interleave_safely(
+        log_db_url, tmp_path, monkeypatch):
+    """Deterministic interleave: 4 appender processes + 1 pruner, all on the
+    same db_id.  Every prune runs under the verified-continuity gate and the
+    witness never regresses or blesses a fork."""
+    import multiprocessing as mp
+
+    _pg_witness_env(tmp_path, monkeypatch)
+    log = PgDeletionLog(log_db_url)
+    db_id = _db_id()
+    log.ensure_genesis(db_id, applied=0)
+    witness_floor = log.witness.read(db_id)
+
+    ctx = mp.get_context("spawn")
+    errors: list = ctx.Queue()
+
+    procs = [ctx.Process(target=_p11_appender,
+                         args=(log_db_url, db_id, i, errors))
+             for i in range(4)]
+    procs.append(ctx.Process(target=_p11_pruner,
+                             args=(log_db_url, db_id, errors)))
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=180)
+        assert p.exitcode == 0, p.exitcode
+
+    collected = []
+    while not errors.empty():
+        collected.append(errors.get())
+    assert not collected, collected[:4]
+
+    head_seq, head_hash = log.head(db_id)
+    assert head_seq >= 32, head_seq
+    log.verify_chain(db_id)
+    state = log.witness.read(db_id)
+    assert state.tail_seq >= witness_floor.tail_seq
+    assert state.tail_seq <= head_seq

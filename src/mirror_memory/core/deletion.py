@@ -1160,10 +1160,17 @@ class FileDeletionLog(DeletionLog):
                 db_id=db_id, seq=before_seq, tenant_id="", app_id="", user_id="",
                 scope="checkpoint", scope_key="", fingerprints=[],
                 generation=0, purpose=f"pruned through seq {before_seq}",
-                # prev continues the kept chain (the genesis); the hash is
-                # the chain hash AT the pruned-through point -- a recorded
-                # fact, not recomputable (its payload is gone)
-                prev_hash=genesis_hash, hash=chain_at,
+                # prev continues the REWRITTEN file's chain, which starts at
+                # the genesis: after the rewrite the checkpoint is the entry
+                # right after genesis, so its prev_hash must be GENESIS_HASH.
+                # (M5 patch 11: anchoring a second compaction at the previous
+                # checkpoint's hash severed the rewritten chain and
+                # verify_chain failed with "checkpoint does not continue the
+                # chain".)  The checkpoint's own hash stays the chain hash AT
+                # the pruned-through point -- a recorded fact, not
+                # recomputable, because the pruned payload is gone.
+                prev_hash=genesis_hash,
+                hash=chain_at,
                 created_at=datetime.utcnow(),
             )
             fh.seek(0)
@@ -1363,59 +1370,66 @@ class PgDeletionLog(DeletionLog):
                 f"cannot append: no genesis entry exists in the deletion "
                 f"log table for database {entry.db_id[:8]}...  reconcile/"
                 "adopt first; deletions stay refused (fail-closed).")
-        # M5 patch 8 §2: the SAME continuity gate the file backend applies --
-        # a missing/unauthenticated witness, a witness ahead, an equal-height
-        # divergence or a longer fork must all refuse BEFORE the row lands.
-        # Previously the PG append recorded the witness unconditionally, so a
-        # truncated/forked table was silently re-blessed at its new head.
+        # M5 patch 11 §1: the continuity gate runs INSIDE the advisory-lock
+        # transaction, not before it.  Checking first and locking later left a
+        # window in which another instance could prune/truncate the table
+        # between the check and the insert, so this append would bless an
+        # unverified head.  Now: lock -> read head -> verify witness vs that
+        # head -> insert, all under one transaction; a concurrent change is
+        # either serialised before our check or happens after our commit.
         from mirror_memory.core.witness import WitnessAhead, WitnessError
 
-        try:
-            _w = self.witness.read(entry.db_id)
-        except WitnessError as _exc:
-            raise DeletionLogCorrupted(
-                f"cannot append: the deletion-log witness for database "
-                f"{entry.db_id[:8]}... cannot be authenticated ({_exc}).  "
-                "Deletions stay refused (fail-closed).") from _exc
-        _head_seq, _head_hash = self.head(entry.db_id)
-        if _w is None:
-            _cred = self.registry.find(entry.db_id)
-            if _cred is not None:
-                raise DeletionLogCorrupted(
-                    f"cannot append: database {entry.db_id[:8]}... has a "
-                    "creation credential but NO witness row -- the witness "
-                    "store was lost and cannot be distinguished from an "
-                    "erased history.  Deletions stay refused (fail-closed).")
-        else:
-            if _w.tail_seq > _head_seq:
-                raise WitnessAhead(
-                    f"cannot append: the deletion log table for database "
-                    f"{entry.db_id[:8]}... stops at seq {_head_seq} but the "
-                    f"witness recorded seq {_w.tail_seq} -- entries were "
-                    "lost.  Deletions stay refused (fail-closed).")
-            if (_w.tail_seq == _head_seq and _head_seq > 0
-                    and _w.tail_hash != _head_hash):
-                raise DeletionLogCorrupted(
-                    f"cannot append: the deletion log table for database "
-                    f"{entry.db_id[:8]}... diverged from the witnessed "
-                    f"history at seq {_head_seq}.  Deletions stay refused.")
-            if not self._witnessed_seq_is_ancestor(
-                    entry.db_id, _w.tail_seq, _w.tail_hash):
-                raise DeletionLogCorrupted(
-                    f"cannot append: the deletion log table for database "
-                    f"{entry.db_id[:8]}... does not contain the witnessed "
-                    "history (a longer fork).  Deletions stay refused.")
         entry.created_at = entry.created_at or datetime.utcnow()
         with self._engine.begin() as conn:
-            # serialise appends per database life so prev_hash is exact
+            # serialise appends AND the verify-vs-head comparison per database
+            # life so the checked head IS the head we chain from
             conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
                          {"k": f"deletion-log:{entry.db_id}"})
             row = conn.execute(text(
                 "SELECT seq, hash FROM mm_deletion_log WHERE db_id = :db "
                 "ORDER BY seq DESC LIMIT 1"
             ), {"db": entry.db_id}).first()
-            entry.seq = (row[0] if row else 0) + 1
-            entry.prev_hash = row[1] if row else GENESIS_HASH
+            _head_seq = int(row[0]) if row else 0
+            _head_hash = row[1] if row else GENESIS_HASH
+
+            try:
+                _w = self.witness.read(entry.db_id)
+            except WitnessError as _exc:
+                raise DeletionLogCorrupted(
+                    f"cannot append: the deletion-log witness for database "
+                    f"{entry.db_id[:8]}... cannot be authenticated ({_exc}).  "
+                    "Deletions stay refused (fail-closed).") from _exc
+            if _w is None:
+                _cred = self.registry.find(entry.db_id)
+                if _cred is not None:
+                    raise DeletionLogCorrupted(
+                        f"cannot append: database {entry.db_id[:8]}... has a "
+                        "creation credential but NO witness row -- the "
+                        "witness store was lost and cannot be distinguished "
+                        "from an erased history.  Deletions stay refused "
+                        "(fail-closed).")
+            elif _w.tail_seq > _head_seq:
+                raise WitnessAhead(
+                    f"cannot append: the deletion log table for database "
+                    f"{entry.db_id[:8]}... stops at seq {_head_seq} but the "
+                    f"witness recorded seq {_w.tail_seq} -- entries were "
+                    "lost.  Deletions stay refused (fail-closed).")
+            elif (_w.tail_seq == _head_seq and _head_seq > 0
+                    and _w.tail_hash != _head_hash):
+                raise DeletionLogCorrupted(
+                    f"cannot append: the deletion log table for database "
+                    f"{entry.db_id[:8]}... diverged from the witnessed "
+                    f"history at seq {_head_seq}.  Deletions stay refused.")
+            elif _w.tail_seq < _head_seq and not \
+                    self._witnessed_seq_is_ancestor(
+                        entry.db_id, _w.tail_seq, _w.tail_hash):
+                raise DeletionLogCorrupted(
+                    f"cannot append: the deletion log table for database "
+                    f"{entry.db_id[:8]}... does not contain the witnessed "
+                    "history (a longer fork).  Deletions stay refused.")
+
+            entry.seq = _head_seq + 1
+            entry.prev_hash = _head_hash
             entry.hash = entry.compute_hash()
             self._insert(conn, entry)
         # ORDERING (M5 patch 5): the log row is COMMITTED before the witness
@@ -1424,10 +1438,17 @@ class PgDeletionLog(DeletionLog):
         self.witness.record(self._witness_state(entry.db_id))
         return entry
 
-    def _witness_state(self, db_id: str):
+    def _witness_state(self, db_id: str, *, tail_seq: int | None = None,
+                       tail_hash: str | None = None):
+        """M5 patch 11 §2: the SAME signature as the file backend.  When
+        tail_seq/tail_hash are omitted they are read from the table — the
+        deletion-adopt CLI calls the file-shaped form on both backends."""
         from mirror_memory.core.witness import WitnessState
 
-        tail_seq, tail_hash = self.head(db_id)
+        if tail_seq is None or tail_hash is None:
+            _seq, _hash = self.head(db_id)
+            tail_seq = tail_seq if tail_seq is not None else _seq
+            tail_hash = tail_hash if tail_hash is not None else _hash
         genesis = None
         with self._engine.connect() as conn:
             row = conn.execute(text(
@@ -1680,7 +1701,17 @@ class PgDeletionLog(DeletionLog):
             genesis = conn.execute(text(
                 "SELECT hash FROM mm_deletion_log "
                 "WHERE db_id = :db AND seq = 0"), {"db": db_id}).first()
-            prev = genesis[0] if genesis else chain[0]
+            # M5 patch 11 §3: continue the chain from the LAST checkpoint if
+            # the table was already compacted before, not from genesis —
+            # re-anchoring at genesis severs the kept entries' prev_hash
+            # links and verify_chain then fails with "checkpoint does not
+            # continue the chain".
+            prior_cp = conn.execute(text(
+                "SELECT seq, hash FROM mm_deletion_log "
+                "WHERE db_id = :db AND scope = 'checkpoint' "
+                "ORDER BY seq DESC LIMIT 1"), {"db": db_id}).first()
+            prev = prior_cp[1] if prior_cp else (
+                genesis[0] if genesis else chain[0])
             already = conn.execute(text(
                 "SELECT 1 FROM mm_deletion_log "
                 "WHERE db_id = :db AND seq = :s AND scope = 'checkpoint'"),
