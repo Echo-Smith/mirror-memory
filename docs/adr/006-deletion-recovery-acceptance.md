@@ -1,6 +1,6 @@
-# ADR-006: 删除恢复验收设计（草案 · 待独立复核）
+# ADR-006: 删除恢复验收设计（草案 · 第二次修订）
 
-状态: DRAFT — 设计文档，未包含任何代码改动。
+状态: DRAFT — 设计文档，未包含任何代码改动。**尚未冻结为验收基线**（见 §4b/§4c 复核结论）。
 基线: `6f7a840`（M5 第一批补丁 12）。
 证据分级: **R** = 本仓库真实运行过并有记录的测试；**P** = 部分覆盖（真实运行但场景组合不完整）；**N** = 从未运行（明确未跑）。
 
@@ -14,13 +14,32 @@
 
 | # | 性质 | 反例即失败 |
 |---|---|---|
-| S1 | 已删除的记忆在任何恢复路径上**不复活** | 恢复旧备份后启动，`mm_beliefs` 中重新出现已删除行 |
+| S1 | 已删除的记忆在**可信证据完整**的恢复路径上不复活（判定标准见 §1.1b） | 恢复旧备份后启动，约定的公开读取入口仍返回已删除内容 |
 | S2 | 恢复后主库水位**单调前进**到日志 tail，绝不回退 | `applied_seq` 小于日志 tail 而引擎正常服务 |
-| S3 | 见证 tail 与日志 head 满足 `witness.tail_seq ≤ head_seq`，且 hash 一致 | 见证指向一个日志中不存在的 hash |
+| S3 | 见证落后于日志时（`witness.tail_seq < head_seq`），日志自身**历史连续性**可验证；见证超前或分叉时拒绝（判定标准见 §1.1b） | 把见证记回旧值后 heal 通过了验链失败的日志 |
 | S4 | 任何被拒绝的路径（缺见证 / 不连续 / 认证失败 / 分叉）**三份证据字节不变** | 拒绝的同时日志、见证或注册表被改写 |
 | S5 | 并发交错（append/prune/恢复发布窗口）下，日志哈希链**始终可验证**，见证**永不回退** | 交错后 `verify_chain` 失败或见证 tail_seq 下降 |
 | S6 | 首次创建与"证据丢失"可区分；不可区分时 fail-closed | 无凭据无见证但 applied>0 的库被铸出新历史 |
 | S7 | 受限角色下全链路可运行，且运行时角色**无法**改写历史 | `mm_p10_logapp` 成功 DELETE/DROP 日志表 |
+
+### 1.1a 恢复承诺的三种情形（第二次修订：划清 S1 边界）
+
+复核指出：S1 写"任何恢复路径都不复活"，而 §1.2 又承认全套证据一起回滚时无法判断历史——G1 若要求三存储一起恢复后仍保证不复活，则与前提矛盾。因此 S1 **只在情形 1 下承诺**：
+
+| 情形 | 条件 | 行为 | S1 适用？ |
+|---|---|---|---|
+| **1. 可信依据完整** | 独立日志 + 见证 + 凭据 + 密钥均未随主库回滚（且认证通过） | 恢复主库并重放；不复活（S1/S2 成立） | **是** |
+| **2. 证据异常或不足** | 见证缺失/超前/认证失败/分叉，或凭据缺失且 applied>0 | **拒绝服务**，进入受控恢复（operator adopt，独立证据 + 授权 + 确认 + 审计） | 部分：不复活由"拒绝"间接保证，但服务不可用是代价 |
+| **3. 全部可信依据一起回滚** | 主库与日志/见证/注册表/密钥来自同一备份 | **本地无法判定**：不宣称自动解决；文档如实说明该边界，唯一出路是外部离线锚点（未实现）或人工流程 | **否**（明确不承诺） |
+
+**推论**：G1 的验收目标必须改写——不是"三存储一起恢复后仍保证不复活"（与 §1.2 矛盾），而是验证**情形 1 与情形 2 的分界实现正确**：日志/见证独立于主库备份时走情形 1；随主库一起回滚时系统是否正确进入情形 2/3 的判定路径（而不是错误地按情形 1 重放一个可能被回滚的日志）。这需要先明确**备份故障域假设**（见 §3 G1 修订）。
+
+### 1.1b 可观察的判定标准（第二次修订）
+
+复核指出原判据过窄，修订：
+
+- **S1 不只看 `mm_beliefs` 一张表**。判定 = 约定的公开读取入口（observe/recall/serve 的实际查询路径）在恢复后不返回已删除内容，且**覆盖删除的三种范围**（belief 级 `forget_belief`、session 级 `forget_session`、全量 `delete_memories`）；同时**验证未删除的对照数据仍可用**（防"恢复后服务坏了所以看似没有复活"的假阳性）。
+- **S3 是历史连续性判定，不是两个位置 hash 相等**。正确判据：`witness.tail_seq < head_seq` 时，要求被见证的 `(seq, hash)` 仍是当前链上的祖先（`_witnessed_seq_is_ancestor`），日志整链 `verify_chain` 通过——两个位置 hash 天然不同，简单比较相等是错误判据；`witness.tail_seq > head_seq` 或祖先关系不成立时拒绝（WitnessAhead / DeletionLogCorrupted）。
 
 ### 1.2 明确**不承诺**的性质（本地不可证明）
 
@@ -43,7 +62,7 @@
 | A1 健康首建（O_EXCL 胜者） | **R** `test_deletion_witness` 首建系列 | **R** `test_p10_pg_chain_runs_on_restricted_roles` |
 | A2 并发首建（确定性 Barrier/锁） | **R** `test_p10_creation_lock_blocks_a_second_creator_until_release` | **N**（复核降级：p12 combined 的子进程是 append/prune，genesis 在 spawn 前单进程完成——**PG 并发首建从未被测试**，见 G10） |
 | A3 创建者持锁被 SIGKILL 后的残留判定 | **R** `test_p10_creator_killed_while_holding_the_lock_leaves_safe_state` | **N** PG 无对应崩溃注入 |
-| A4 bound 标记 + 密钥存活、其余全缺、applied=0 | **P**（复核更正引用：原引测试实为 applied>0 的 A5 场景。applied=0 由 `test_p10_creator_killed...`（残留后拒绝）与 `test_p8_bound_and_key_present_but_all_evidence_gone` 覆盖，但**仅到 log-API 层，未经真实 MemoryEngine 启动路径**） | **R**（凭据缺失拒绝，`..._without_owner`） |
+| A4 bound 标记 + 密钥存活、其余全缺、applied=0 | **P**（复核更正引用：原引测试实为 applied>0 的 A5 场景。applied=0 由 `test_p10_creator_killed...`（残留后拒绝）与 `test_p8_bound_and_key_present_but_all_evidence_gone` 覆盖，但**仅到 log-API 层，未经真实 MemoryEngine 启动路径**） | **N**（二次复核降级：`..._without_owner` 验证的是**缺表时受限角色不能建表**，不是本行描述的"绑定标记和密钥存活、其余证据缺失"场景） |
 | A5 applied>0 且无凭据（不可区分） | **R** fail-closed 拒绝 | **R** 同上语义 |
 
 ### 阶段 B：删除与见证推进（S1/S3）
@@ -59,7 +78,7 @@
 | 场景 | 文件 | PG |
 |---|---|---|
 | C1 删除前备份 → 删除 → 恢复 → 启动重放 → 记忆不复活 | **R** brief-repro ①（sqlite3.backup） | **R** `test_p10_pg_predeletion_backup_restore_replays_the_deletion`（pg_dump/pg_restore） |
-| C2 同一主库 + 同一日志标识 + 受限角色 + Barrier 交错 + 重放 | **N** 文件后端无此联合场景 | **R** `test_p12_pg_joint_restore_then_concurrent_append_prune` |
+| C2 同一主库 + 同一日志标识 + 受限角色 + Barrier 交错 + 重放 | **N** 文件后端无此联合场景 | **P**（二次复核降级：p12 测试用启动 Event，**没有确定性控制关键事务窗口**；prune 在压缩条件不满足时可能不执行——是组合测试的进展，不能证明指定交错已覆盖） |
 | C3 恢复后水位落在日志 tail | **P**（在 C1 中隐式断言） | **R** 显式断言 `landed == tail` |
 | C4 三存储（主库+日志库+见证）同时恢复 | **N** | **N** 明确未做 |
 | C5 恢复的是**更旧**的备份（跨多个删除代） | **N** 只有单代回退 | **N** |
@@ -73,7 +92,7 @@
 | D2 等高分叉 | **R** | **R** |
 | D3 更长分叉（见证 hash 非祖先） | **R** | **R** `test_p10_pg_prune_refuses_when_witnessed_hash_not_ancestor` |
 | D4 见证认证失败（MAC 错） | **R** | **R** |
-| D5 CLI dry-run 零副作用（逐字节） | **R** `test_p8_cli_dry_run_has_no_persistent_side_effects` | **R** `test_p11_adopt_cli_on_pg_backend_dry_run_and_reconcile` |
+| D5 CLI dry-run 零副作用（逐字节） | **R** `test_p8_cli_dry_run_has_no_persistent_side_effects` | **P**（二次复核降级：PG 测试**替换了配置工厂**且只比较已有见证状态；**首次真实配置**的 dry-run 对全部持久证据零副作用未被证明） |
 | D6 CLI 分叉拒绝（即使 --yes） | **R** | **R** `test_p11_adopt_cli_on_pg_backend_refuses_divergence` |
 
 ### 阶段 E：并发与崩溃窗口（S5）
@@ -81,7 +100,7 @@
 | 场景 | 文件 | PG |
 |---|---|---|
 | E1 多进程 append 交错 | **P**（复核降级：multiprocess 测试均为首建/锁场景；文件后端 append 交错只有**线程版** `test_concurrent_appends_keep_log_and_witness_consistent`——跨进程 flock 语义未测，见 G9） | **R** `test_p11_pg_prune_and_append_interleave_safely` |
-| E2 append/prune 进程交错（Barrier） | **P**（补丁 12 用 Event 非严格 Barrier；文件后端无） | **R** p12 系列 |
+| E2 append/prune 进程交错（Barrier） | **P**（补丁 12 用 Event 非严格 Barrier；文件后端无） | **P**（二次复核降级：同 C2——无确定性事务窗口控制，prune 可能未执行） |
 | E3 二次压缩锚点（连续两次 prune 后链完整） | **R** `test_second_compaction_continues_the_chain` | **R** 同名场景经 interleave 触发 |
 | E4 prune 与恢复发布窗口交错 | **N** 未单独注入 | **P** p12 联合场景间接覆盖 |
 | E5 重放与用户写入并发 | **N** 未测 | **N** |
@@ -94,7 +113,7 @@
 | F1 受限角色跑 genesis→append→verify→prune 全链 | **R** `test_p10_pg_chain_runs_on_restricted_roles` |
 | F2 运行时角色 DELETE/DROP 被拒 | **R** 同上 |
 | F3 未 provision 的库对运行时 fail-closed | **R** `test_p10_pg_issue_genesis_on_restricted_role_without_owner` |
-| F4 运行时角色无法伪造见证（MAC） | **R** 补丁 7 系列 |
+| F4 运行时角色无法伪造见证（MAC） | **P**（二次复核降级：MAC 测试证明的是**持有 UPDATE 权限的角色**无法伪造；运行时与见证写入者**仍共用同一登录身份**（F5 未实现），不能声称"运行时角色"单独无法伪造——身份拆分前该承诺无从谈起） |
 | F5 日志/见证/注册表/密钥分属不同 OS 凭据 | **N** 明确未实现（运行时与见证写入者同登录） |
 
 ---
@@ -109,7 +128,7 @@
 | G4 | **E6 恢复期间的新写入**未测——恢复停机窗口外，是否有写入绕过停机 | 中 | 明确运维约束（恢复必须停写）并写入 runbook；或加测试证明恢复期间的 append 会被水位检查拒绝 |
 | G5 | **C6 密钥丢失/轮换**只写在文档，无测试 | 中 | 至少补"密钥文件被替换后见证认证失败 → fail-closed"的单测 |
 | G6 | **E5 重放与用户写入并发** | 低-中 | 依赖 SQLite/PG 事务隔离；可推迟 |
-| G7 | **F5 角色隔离** | 低（已如实标注未实现） | 长期项 |
+| G7 | **F5 角色隔离**（**待定**：复核指出是否可延期取决于实际部署与愿意承担的风险，不能默认标低风险） | **需决定** | 需 Echo-Smith 决定：单登录是否为可接受的部署假设 |
 | G8 | 共享测试目录密钥残留（夹具根因） | 低（测试卫生） | 建议单独修，不属验收范围 |
 | G9 | **文件后端多进程 append 交错**未测（复核新增）：现有 multiprocess 测试均限于首建/锁；跨进程 flock 语义与线程不同 | 中 | spawn 多进程 append 交错测试 |
 | G10 | **PG 并发首建**未测（复核新增）：combined 测试为避免 CREATE TABLE 竞态而特意让 genesis 在 spawn 前单进程完成，因此该竞态从未被注入 | 中 | provision 后 spawn 多进程同时 `ensure_genesis`（凭据/witness 发布竞态仍可注入） |
@@ -144,6 +163,18 @@
 **可不修**：G3（模拟崩溃窗口已覆盖语义）、G4/G6（可推迟）、G7（已如实标注）、G8（测试卫生）。
 
 **总结论**：草案可作为**可信的验收基线**——证据分级总体诚实，绝大多数 R 格子经查属实（含真实 pg_dump/pg_restore、真实受限角色、MAC 伪造拒绝）；但 G1/G2/G5 须在发布前补测。
+
+## 4c. 第二次复核（Echo-Smith，2026-11-16）及本修订
+
+复核结论：草案适合作为讨论起点，**暂不能冻结为可信验收基线**，也不能据此认定只需处理 G1/G2/G5。本次修订逐条落实：
+
+1. **划清恢复承诺边界**：新增 §1.1a 三情形表；S1 只在"可信依据完整"（情形 1）下承诺；G1 的验收目标改写为"验证情形分界实现正确"，并把备份故障域假设列为**先决问题**（待决定）。
+2. **重新核对 R 评级**：C2/E2 降为 P（Event 非确定性窗口、prune 可能不执行）；D5/PG 降为 P（替换配置工厂 + 只比已有见证状态，未证明首次真实配置）；A4/PG 降为 N（测的是缺表不可建，非本场景）；F4 降为 P（共用登录身份，MAC 测试不能代表"运行时角色"）。
+3. **修正绝对表述**：G2 承认现有恢复测试已覆盖"一次旧备份后三种范围的重放"（applied==tail>=3），未覆盖的是多代+压缩边界；G5 区分"密钥缺失已有测试"与"密钥替换未覆盖"。
+4. **补可观察判定标准**：新增 §1.1b——S1 覆盖三种删除范围的公开读取入口 + 对照数据可用性；S3 改为历史连续性判定（祖先关系），不是两位置 hash 相等。
+5. **优先级**：G3/G4/G6 标注"不可默认延期"；G1 备份故障域与 G7 角色隔离列为**需决定**项。
+
+**复核者声明（原文转述）**：本次为静态核对，未逐条独立运行草案中的所有测试，未运行 PG、未核验 CI。此前独立运行的文件见证与压缩测试为 56 项通过；代理报告的双库全量结果仍是本地代理的报告。
 
 ## 5. 证据汇总
 
