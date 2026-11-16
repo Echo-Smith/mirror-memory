@@ -27,7 +27,7 @@
 | 性质 | 为什么 |
 |---|---|
 | 全套证据（日志+见证+注册表+bound+密钥）同时回滚 | 无第一方锚点可区分"从未存在"与"完美擦除"；需离线外部锚点（未实现） |
-| 密钥泄露后的机密性 | MAC 密钥只保证真实性/完整性，不抵抗读密钥的攻击者 |
+| 密钥泄露后的**完整性/防伪造** | witness/registry 是 MAC 签名而非加密：能读密钥的攻击者可重签，本不存在机密性承诺可"丢失"（与 integration.md 威胁模型一致） |
 | 跨设备实时性 | 恢复检测是启动/重放时的，不是实时的 |
 
 ---
@@ -41,9 +41,9 @@
 | 场景 | 文件后端 | PG 后端 |
 |---|---|---|
 | A1 健康首建（O_EXCL 胜者） | **R** `test_deletion_witness` 首建系列 | **R** `test_p10_pg_chain_runs_on_restricted_roles` |
-| A2 并发首建（确定性 Barrier/锁） | **R** `test_p10_creation_lock_blocks_a_second_creator_until_release` | **R** `test_p12_pg_combined_restricted_roles_with_barrier`（spawn 进程） |
+| A2 并发首建（确定性 Barrier/锁） | **R** `test_p10_creation_lock_blocks_a_second_creator_until_release` | **N**（复核降级：p12 combined 的子进程是 append/prune，genesis 在 spawn 前单进程完成——**PG 并发首建从未被测试**，见 G10） |
 | A3 创建者持锁被 SIGKILL 后的残留判定 | **R** `test_p10_creator_killed_while_holding_the_lock_leaves_safe_state` | **N** PG 无对应崩溃注入 |
-| A4 bound 标记 + 密钥存活、其余全缺、applied=0 | **R** `test_p8_bound_and_key_only_through_real_engine` | **R**（凭据缺失拒绝，`..._without_owner`） |
+| A4 bound 标记 + 密钥存活、其余全缺、applied=0 | **P**（复核更正引用：原引测试实为 applied>0 的 A5 场景。applied=0 由 `test_p10_creator_killed...`（残留后拒绝）与 `test_p8_bound_and_key_present_but_all_evidence_gone` 覆盖，但**仅到 log-API 层，未经真实 MemoryEngine 启动路径**） | **R**（凭据缺失拒绝，`..._without_owner`） |
 | A5 applied>0 且无凭据（不可区分） | **R** fail-closed 拒绝 | **R** 同上语义 |
 
 ### 阶段 B：删除与见证推进（S1/S3）
@@ -51,7 +51,7 @@
 | 场景 | 文件 | PG |
 |---|---|---|
 | B1 真实引擎删除（记忆消失 + 日志推进） | **R** brief-repro 系列 | **R** `test_p10_pg_predeletion_backup_restore_replays_the_deletion` |
-| B2 日志提交后、见证发布前崩溃 | **P** 设计上只可能留下"见证落后"，由 heal 覆盖；**无直接崩溃注入测试** | **P** 同左 |
+| B2 日志提交后、见证发布前崩溃 | **P** 无直接注入，但**模拟崩溃窗口**已有测试：`test_crash_between_log_write_and_witness_advances_witness`（把见证记回旧值再 heal）与 `test_crash_heal_still_works_when_the_chain_is_genuine` | **P** 同左 |
 | B3 见证发布后日志被外部截断 | **R** witness 系列 | **R** `test_p10_pg_prune_refuses_a_broken_chain` 等 |
 
 ### 阶段 C：恢复与重放（S1/S2）
@@ -80,7 +80,7 @@
 
 | 场景 | 文件 | PG |
 |---|---|---|
-| E1 多进程 append 交错 | **R** `test_multiprocess_*` | **R** `test_p11_pg_prune_and_append_interleave_safely` |
+| E1 多进程 append 交错 | **P**（复核降级：multiprocess 测试均为首建/锁场景；文件后端 append 交错只有**线程版** `test_concurrent_appends_keep_log_and_witness_consistent`——跨进程 flock 语义未测，见 G9） | **R** `test_p11_pg_prune_and_append_interleave_safely` |
 | E2 append/prune 进程交错（Barrier） | **P**（补丁 12 用 Event 非严格 Barrier；文件后端无） | **R** p12 系列 |
 | E3 二次压缩锚点（连续两次 prune 后链完整） | **R** `test_second_compaction_continues_the_chain` | **R** 同名场景经 interleave 触发 |
 | E4 prune 与恢复发布窗口交错 | **N** 未单独注入 | **P** p12 联合场景间接覆盖 |
@@ -111,6 +111,8 @@
 | G6 | **E5 重放与用户写入并发** | 低-中 | 依赖 SQLite/PG 事务隔离；可推迟 |
 | G7 | **F5 角色隔离** | 低（已如实标注未实现） | 长期项 |
 | G8 | 共享测试目录密钥残留（夹具根因） | 低（测试卫生） | 建议单独修，不属验收范围 |
+| G9 | **文件后端多进程 append 交错**未测（复核新增）：现有 multiprocess 测试均限于首建/锁；跨进程 flock 语义与线程不同 | 中 | spawn 多进程 append 交错测试 |
+| G10 | **PG 并发首建**未测（复核新增）：combined 测试为避免 CREATE TABLE 竞态而特意让 genesis 在 spawn 前单进程完成，因此该竞态从未被注入 | 中 | provision 后 spawn 多进程同时 `ensure_genesis`（凭据/witness 发布竞态仍可注入） |
 
 ---
 
@@ -123,6 +125,25 @@
 5. 复核者**不应**修改本文件，也不应先写代码——只输出复核结论。
 
 ---
+
+## 4b. 独立复核结论（已完成，2026-11-16）
+
+复核者逐条 grep 验证了全部 R 格子与缺口清单，结论：
+
+**降级 3 处**：A2/PG（R→N：PG 并发首建从未测过）、A4/文件（R→P：引用错测试，applied=0 仅 log-API 级）、E1/文件（R→P：append 交错只有线程版）。B2 补引两个模拟崩溃窗口测试；D2/D4 补点名。
+
+**缺口修正**：G1、G2、G5 经全量 grep 确认**零覆盖**，成立；新增 **G9**（文件多进程 append 交错）与 **G10**（PG 并发首建）。G3–G8 描述属实。
+
+**一致性**：§1.2 与 integration.md 逐行核对一致；"密钥泄露"行措辞已按复核意见从"机密性"改为"完整性/防伪造"。
+
+**复核者判定的必须修复项**（发布前）：
+- **G1**（高）：生产备份最常见的形态恰是"主库+日志一起回滚"，补丁 12 的重放幂等修复正是在该形态下最需要被证明的性质——零覆盖。
+- **G2**（高）：跨多代回退命中 checkpoint/锚点边界，与单代回退走不同代码路径；在 G1 的 e2e 里多删两轮即可覆盖，成本极低。
+- **G5**（中偏高）：密钥替换后 fail-closed 是 S4/S6 的直接推论，一个单测可钉住。
+
+**可不修**：G3（模拟崩溃窗口已覆盖语义）、G4/G6（可推迟）、G7（已如实标注）、G8（测试卫生）。
+
+**总结论**：草案可作为**可信的验收基线**——证据分级总体诚实，绝大多数 R 格子经查属实（含真实 pg_dump/pg_restore、真实受限角色、MAC 伪造拒绝）；但 G1/G2/G5 须在发布前补测。
 
 ## 5. 证据汇总
 
